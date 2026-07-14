@@ -1,0 +1,26 @@
+/target/
+**/*.rs.bk
+*.pdb
+
+# Large generated test fixtures are never committed (docs/QUALITY.md §3)
+/testdata/large/
+/testdata/generated/
+*.parquet.big
+*.csv.big
+
+# Benchmark output
+/criterion/
+bench.txt
+
+# Local logs
+*.log
+/logs/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp

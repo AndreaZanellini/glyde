@@ -1,0 +1,55 @@
+[package]
+name = "glyde-core"
+description = "Glyde engine: ingestion, time indexing, multi-resolution index, and DSP. No GUI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# HARD RULE (docs/ARCHITECTURE.md §Hard rules, enforced by CI "Architecture guard"):
+# this crate must NEVER depend on eframe, egui, wgpu, winit, or any windowing
+# crate. All product logic lives here so it can be tested headlessly.
+[dependencies]
+csv.workspace = true
+csv-core.workspace = true
+parquet.workspace = true
+arrow.workspace = true
+memmap2.workspace = true
+encoding_rs.workspace = true
+chardetng.workspace = true
+
+chrono.workspace = true
+chrono-tz.workspace = true
+
+rustfft.workspace = true
+rayon.workspace = true
+
+tracing.workspace = true
+thiserror.workspace = true
+sysinfo.workspace = true
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+insta.workspace = true
+approx.workspace = true
+tempfile.workspace = true
+
+# Golden DSP tests (docs/QUALITY.md §2). These are written BEFORE the
+# implementation and are never edited to make code pass.
+[[bench]]
+name = "index_build"
+harness = false
+
+[[bench]]
+name = "viewport_query"
+harness = false
+
+[[bench]]
+name = "welch"
+harness = false

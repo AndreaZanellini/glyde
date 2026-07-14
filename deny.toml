@@ -1,0 +1,63 @@
+# cargo-deny configuration — enforced by CI (docs/QUALITY.md §4).
+#
+# Glyde ships as a redistributed binary under Apache-2.0, so every transitive
+# dependency's license must be compatible with that. This gate exists so the
+# repository can be made public without a licensing audit.
+
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses that are safe to redistribute inside an Apache-2.0 binary.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+    "BSL-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+# Copyleft (GPL/AGPL/LGPL) is absent by design: it is incompatible with the
+# distribution model. If a dependency introduces one, the dependency is wrong.
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# One canonical implementation per concept (docs/ARCHITECTURE.md §Hard rules).
+# These crates would each become a second way to do something we already do.
+deny = [
+    # Glyde streams and memory-maps; it never materializes a DataFrame.
+    { name = "polars" },
+    # FFT belongs to rustfft only; a second FFT crate means a second numeric path.
+    { name = "fftw" },
+    # Async runtimes: the threading model is explicit (docs/ARCHITECTURE.md).
+    { name = "tokio" },
+    { name = "async-std" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,28 @@
+[package]
+name = "glyde-app"
+description = "Glyde: glide through your time series."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# This crate is a THIN shell: it renders state and forwards user intent.
+# If a behavior can be tested without a window, it belongs in glyde-core.
+[dependencies]
+glyde-core = { path = "../glyde-core" }
+
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+anyhow.workspace = true
+directories.workspace = true
+
+[[bin]]
+name = "glyde"
+path = "src/main.rs"

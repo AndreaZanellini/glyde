@@ -1,0 +1,33 @@
+name: "Performance problem"
+description: Glyde was slow, stuttered, froze, or used too much memory
+title: "[perf] "
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Performance is a contract in Glyde (see docs/SPEC.md §5), so this counts
+        as a broken promise, not a wish.
+  - type: textarea
+    id: what
+    attributes:
+      label: What was slow, and how slow?
+      placeholder: "Opening a 12 GB CSV took 40 s before the first plot appeared (budget: 2 s)."
+    validations:
+      required: true
+  - type: input
+    id: file
+    attributes:
+      label: File size, format, approximate row/column count
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: Machine (CPU, RAM, OS) and Glyde version
+    validations:
+      required: true
+  - type: textarea
+    id: memory
+    attributes:
+      label: Memory observed (Activity Monitor / Task Manager) if relevant

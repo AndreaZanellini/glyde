@@ -1,0 +1,69 @@
+name: "My file won't open"
+description: Glyde fails to open your file, or reads it incorrectly. Our highest-priority bug.
+title: "[file] "
+labels: ["file-wont-open", "bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks — this is the bug type we care about most. Every file reported here
+        becomes a permanent test case, so fixing it protects everyone forever.
+
+  - type: dropdown
+    id: what-happened
+    attributes:
+      label: What happened?
+      options:
+        - Glyde refused to open the file
+        - Glyde crashed or froze
+        - It opened, but the data looks wrong
+        - It opened, but the time axis is wrong
+        - It opened, but something was inferred incorrectly
+    validations:
+      required: true
+
+  - type: textarea
+    id: sample
+    attributes:
+      label: Sample file (the important part)
+      description: |
+        Attach an anonymized sample by dragging it here. Truncated is perfect —
+        the first few thousand rows usually reproduce the problem.
+        Replace sensitive values with dummy ones; keep the *structure* intact
+        (headers, delimiters, encoding, timestamp format).
+      placeholder: Drag your file here, or explain why you cannot share one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should Glyde have shown?
+      description: e.g. "3 numeric channels sampled at 10 kHz, timestamps in epoch ms"
+    validations:
+      required: true
+
+  - type: textarea
+    id: inference-bar
+    attributes:
+      label: What did the inference bar say?
+      description: The delimiter, decimal separator, encoding, time column and format Glyde reported. A screenshot works.
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log file
+      description: |
+        Attach the Glyde log. Location:
+        macOS `~/Library/Application Support/glyde/logs/`,
+        Windows `%APPDATA%\glyde\logs\`,
+        Linux `~/.local/share/glyde/logs/`.
+      render: shell
+
+  - type: input
+    id: environment
+    attributes:
+      label: OS, Glyde version, file size
+      placeholder: "macOS 14.5 arm64 · Glyde 0.3.1 · 4.2 GB CSV"
+    validations:
+      required: true

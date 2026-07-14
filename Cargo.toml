@@ -1,0 +1,89 @@
+[workspace]
+resolver = "2"
+members = ["crates/glyde-core", "crates/glyde-app", "crates/glyde-devtools"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/AndreaZanellini/glyde"
+authors = ["Glyde contributors"]
+
+# ---------------------------------------------------------------------------
+# Dependency versions are centralized here; member crates use `workspace = true`.
+#
+# !! FIRST TASK FOR CLAUDE CODE !!
+# These versions were pinned when the repository was scaffolded and may be
+# stale. Before the first build, run `cargo add <crate>` for each entry below
+# to resolve the current release, then `cargo update`, then record the resolved
+# versions in the PR description. Do NOT silently downgrade a crate to make an
+# old API compile: fix the call site instead.
+#
+# Adding a dependency not listed here requires a one-line justification in the
+# PR description (CLAUDE.md §Architecture constraints).
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# --- Ingestion -------------------------------------------------------------
+# Streaming CSV reader: single pass over a memory-mapped file, no DataFrame.
+csv = "1.3"
+csv-core = "0.1"
+# Parquet via arrow-rs. Row-group column statistics give us min/max for free,
+# which feeds the index pyramid directly (docs/ARCHITECTURE.md §The index).
+parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd"] }
+arrow = { version = "54", default-features = false }
+memmap2 = "0.9"
+encoding_rs = "0.8"
+chardetng = "0.1"
+
+# --- Time ------------------------------------------------------------------
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10"
+
+# --- DSP -------------------------------------------------------------------
+# FFT only. Welch, windowing, normalization and detrending are OURS, on top,
+# and are locked by golden tests (docs/QUALITY.md §2).
+rustfft = "6.2"
+rayon = "1.10"
+
+# --- Runtime ---------------------------------------------------------------
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+thiserror = "2.0"
+anyhow = "1.0"
+sysinfo = "0.33"
+directories = "5.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# --- GUI (glyde-app only — NEVER glyde-core) -------------------------------
+eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts"] }
+egui = "0.31"
+rfd = "0.15"
+
+# --- Dev / test ------------------------------------------------------------
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.6"
+insta = { version = "1.42", features = ["json"] }
+approx = "0.5"
+tempfile = "3"
+clap = { version = "4.5", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Benchmarks must measure release-grade code (docs/QUALITY.md §3).
+[profile.bench]
+inherits = "release"
+debug = true
+strip = false
+
+# Tests over multi-GB fixtures are unusably slow in a debug build; optimize
+# dependencies while keeping our own crates debuggable.
+[profile.dev.package."*"]
+opt-level = 3

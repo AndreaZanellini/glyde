@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: Format & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  architecture:
+    name: Architecture guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # glyde-core must never depend on any GUI crate. See docs/ARCHITECTURE.md.
+      - name: Assert glyde-core has no GUI dependencies
+        run: |
+          if cargo tree -p glyde-core --prefix none --no-dedupe \
+             | grep -E '^(egui|eframe|wgpu|winit)( |$)'; then
+            echo "::error::glyde-core must not depend on GUI crates"
+            exit 1
+          fi
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux GUI build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev
+      # Unit tests, golden DSP tests, torture-corpus tests, property tests.
+      - run: cargo test --workspace --all-features
+
+  bench:
+    name: Performance gates
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Large fixtures are generated, never committed. See docs/QUALITY.md §3.
+      - name: Generate large synthetic fixtures
+        run: cargo run --release -p glyde-devtools --bin generate_fixtures -- --size-gb 1
+      # Budgets from docs/SPEC.md §5. Exceeding one fails the build.
+      - name: Criterion benchmarks (build-blocking budgets)
+        run: cargo bench --workspace -- --output-format bencher | tee bench.txt
+      - name: Peak memory gate
+        run: cargo run --release -p glyde-devtools --bin memory_gate
+
+  deny:
+    name: Licenses & advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

@@ -1,0 +1,31 @@
+name: "Feature idea"
+description: Propose something new — please read docs/PRODUCT.md first
+title: "[idea] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Glyde has a deliberately narrow scope: it does a few things obsessively well
+        rather than many things adequately. Ideas outside `docs/PRODUCT.md` §Scope
+        are usually declined — that is the product working as intended, not a snub.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you hitting?
+      description: Describe the problem, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: workflow
+    attributes:
+      label: What do you do today instead?
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: I have read docs/PRODUCT.md, including the non-goals
+          required: true

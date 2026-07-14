@@ -1,0 +1,33 @@
+[package]
+name = "glyde-devtools"
+description = "CI and testing tools: large fixture generation and the memory budget gate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# Kept out of glyde-core so the engine stays a pure library, and out of
+# glyde-app so it never ships in a release binary.
+[dependencies]
+glyde-core = { path = "../glyde-core" }
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sysinfo.workspace = true
+rand = "0.8"
+
+# Generates the multi-GB synthetic fixtures used by benchmarks.
+# Never committed to git (docs/QUALITY.md §3).
+[[bin]]
+name = "generate_fixtures"
+path = "src/bin/generate_fixtures.rs"
+
+# Opens the 20 GB synthetic fixture headlessly and asserts peak RSS stays
+# under the cap from docs/SPEC.md §5. This is the anti-freeze gate.
+[[bin]]
+name = "memory_gate"
+path = "src/bin/memory_gate.rs"
