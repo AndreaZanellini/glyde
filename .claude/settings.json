@@ -1,0 +1,78 @@
+{
+  "_README": [
+    "Goes at glyde/.claude/settings.json — COMMIT IT. It travels to cloud sessions too.",
+    "",
+    "defaultMode 'auto' is deliberately NOT here: Claude Code ignores 'auto' in project",
+    "settings so a repository cannot grant itself auto mode. It lives in ~/.claude/settings.json.",
+    "",
+    "deny  = hard block, applies in EVERY permission mode including auto. The only real",
+    "        guarantee in this file. Claude must never edit its own gates or rewrite its",
+    "        own contract.",
+    "ask   = always interrupts, even in auto mode. Golden tests and corpus expectations:",
+    "        the one moment you DO want to be asked, because a test weakened to make code",
+    "        pass is the failure you cannot catch by testing binaries.",
+    "allow = convenience only; pre-approves the Rust toolchain so sessions don't stall."
+  ],
+
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo bench:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo add:*)",
+      "Bash(cargo update:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo deny:*)",
+      "Bash(cargo run:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(git switch:*)",
+      "Bash(git branch:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh issue create:*)",
+      "Bash(gh issue list:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh run list:*)"
+    ],
+
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(gh pr merge:*)",
+      "Edit(.github/workflows/**)",
+      "Edit(deny.toml)",
+      "Edit(docs/SPEC.md)",
+      "Edit(docs/PRODUCT.md)",
+      "Edit(docs/QUALITY.md)",
+      "Edit(CLAUDE.md)"
+    ],
+
+    "ask": [
+      "Edit(crates/glyde-core/tests/golden/**)",
+      "Edit(testdata/corpus/**)"
+    ]
+  },
+
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo fmt --quiet 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}
