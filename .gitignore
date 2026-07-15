@@ -1,26 +1,68 @@
+# ---------------------------------------------------------------------------
+# Rust / Cargo
+# ---------------------------------------------------------------------------
 /target/
 **/*.rs.bk
 *.pdb
 
-# Large generated test fixtures are never committed (docs/QUALITY.md §3)
-/testdata/large/
+# Cargo.lock IS committed. Glyde ships as a binary, so the lockfile is what makes
+# a release reproducible. Do not add it here.
+
+# ---------------------------------------------------------------------------
+# Claude Code
+# ---------------------------------------------------------------------------
+# .claude/settings.json IS committed: it carries the project's permission rules
+# and must reach cloud sessions. Only the local overrides and scratch state below
+# stay out.
+.claude/settings.local.json
+.claude/worktrees/
+
+# ---------------------------------------------------------------------------
+# Generated test fixtures — never committed (docs/QUALITY.md §3)
+# ---------------------------------------------------------------------------
+# glyde-devtools writes multi-GB synthetic files here at CI time.
 /testdata/generated/
-*.parquet.big
-*.csv.big
+/testdata/large/
 
-# Benchmark output
-/criterion/
+# ---------------------------------------------------------------------------
+# Benchmark and profiling output
+# ---------------------------------------------------------------------------
 bench.txt
+/criterion/
+perf.data
+perf.data.old
+flamegraph.svg
 
-# Local logs
-*.log
+# ---------------------------------------------------------------------------
+# Runtime logs written by the app itself
+# ---------------------------------------------------------------------------
 /logs/
+*.log
 
+# ---------------------------------------------------------------------------
+# The torture corpus is the most valuable asset in this repository, and some of
+# its files legitimately end in .log, .txt or .csv. The rules above must never
+# swallow one silently. This negation keeps every corpus file tracked, whatever
+# its extension. Do not remove it.
+# ---------------------------------------------------------------------------
+!/testdata/corpus/**
+
+# ---------------------------------------------------------------------------
 # OS noise
+# ---------------------------------------------------------------------------
 .DS_Store
 Thumbs.db
 
+# ---------------------------------------------------------------------------
 # Editors
+# ---------------------------------------------------------------------------
 .idea/
 .vscode/
 *.swp
+*.swo
+
+# ---------------------------------------------------------------------------
+# Merge / patch artifacts
+# ---------------------------------------------------------------------------
+*.orig
+*.rej
