@@ -19,9 +19,12 @@ version = 2
 yanked = "deny"
 # The egui/winit GUI stack pulls in some crates flagged "unmaintained" in the
 # RUSTSEC database (common for platform/font shims). Those are not security
-# vulnerabilities and must not block development. We warn instead of failing.
-# Real vulnerabilities still fail regardless of this setting.
-unmaintained = "warn"
+# vulnerabilities and must not block development. In this cargo-deny version
+# `unmaintained` takes a SCOPE (all/workspace/transitive/none), not warn/deny:
+# "workspace" fails only if an unmaintained crate is a DIRECT dependency of our
+# own crates, ignoring ones pulled in transitively by the GUI stack. Real
+# vulnerabilities still fail regardless of this setting.
+unmaintained = "workspace"
 # When a real vulnerability appears with no fix yet, record it here WITH a reason,
 # so the gate stays meaningful instead of being switched off:
 #   ignore = [ { id = "RUSTSEC-YYYY-NNNN", reason = "why this is acceptable for now" } ]
