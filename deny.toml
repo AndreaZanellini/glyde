@@ -14,7 +14,17 @@ all-features = true
 
 [advisories]
 version = 2
+# Yanked crates fail the build. Security vulnerabilities always fail in v2
+# (not configurable) and that is what we want.
 yanked = "deny"
+# The egui/winit GUI stack pulls in some crates flagged "unmaintained" in the
+# RUSTSEC database (common for platform/font shims). Those are not security
+# vulnerabilities and must not block development. We warn instead of failing.
+# Real vulnerabilities still fail regardless of this setting.
+unmaintained = "warn"
+# When a real vulnerability appears with no fix yet, record it here WITH a reason,
+# so the gate stays meaningful instead of being switched off:
+#   ignore = [ { id = "RUSTSEC-YYYY-NNNN", reason = "why this is acceptable for now" } ]
 ignore = []
 
 [licenses]
@@ -24,7 +34,6 @@ allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "MIT",
-    "MIT-0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
@@ -34,6 +43,13 @@ allow = [
     "Unlicense",
     "BSL-1.0",
     "MPL-2.0",
+    # --- Font licenses, required by egui's bundled default fonts -------------
+    # eframe enables `default_fonts`, which pulls in `epaint_default_fonts`.
+    # That crate embeds fonts under OFL-1.1 (SIL Open Font License) and the
+    # Ubuntu Font Licence. Both are OSI/FSF-recognized and standard for bundled
+    # fonts; they apply only to the font data, not to our code.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 confidence-threshold = 0.9
 # Copyleft (GPL/AGPL/LGPL) is absent by design: it is incompatible with the
