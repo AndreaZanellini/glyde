@@ -99,3 +99,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # log-level info makes the advisory ID and crate visible in the log,
+          # instead of a bare "advisories FAILED". If an advisory still fails
+          # after this, its RUSTSEC id will be printed for a targeted fix.
+          log-level: info
+          command: check advisories bans licenses sources
