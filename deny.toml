@@ -30,7 +30,10 @@ unmaintained = "workspace"
 # When a real vulnerability appears with no fix yet, record it here WITH a reason,
 # so the gate stays meaningful instead of being switched off:
 #   ignore = [ { id = "RUSTSEC-YYYY-NNNN", reason = "why this is acceptable for now" } ]
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml is a build-time transitive of wayland-scanner (Linux GUI codegen). Glyde never parses network/untrusted XML; this DoS surface is unreachable. Remove when wayland-scanner moves to quick-xml >=0.41." },
+    { id = "RUSTSEC-2026-0195", reason = "same: transitive via wayland-scanner, no untrusted-XML path in Glyde. Remove when the upstream tree allows quick-xml >=0.41." },
+]
 
 [licenses]
 version = 2
