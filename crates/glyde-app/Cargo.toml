@@ -23,6 +23,9 @@ tracing-appender.workspace = true
 anyhow.workspace = true
 directories.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [[bin]]
 name = "glyde"
 path = "src/main.rs"
