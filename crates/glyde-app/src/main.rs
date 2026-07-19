@@ -17,7 +17,16 @@
 //! Thin shell: renders state and forwards user intent. If a behavior can be
 //! tested without a window, it belongs in glyde-core. See docs/ARCHITECTURE.md.
 
-fn main() {
-    // TODO(scaffold): init tracing, then launch the eframe shell.
+mod logging;
+
+fn main() -> anyhow::Result<()> {
+    // Keep the guard alive for the whole process: dropping it stops the
+    // background thread that flushes log lines to disk.
+    let _logging_guard = logging::init()?;
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "glyde starting");
+
+    // The eframe shell (window, File->Open, drag-drop) arrives with M2 —
+    // see docs/ROADMAP.md. Until then this stub proves logging works.
     println!("glyde: scaffolding stub");
+    Ok(())
 }

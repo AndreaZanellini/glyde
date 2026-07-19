@@ -1627,6 +1627,7 @@ dependencies = [
  "egui",
  "glyde-core",
  "rfd",
+ "tempfile",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

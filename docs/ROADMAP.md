@@ -29,7 +29,7 @@ them, so CI stays green while honoring "written first."
 - [ ] CI matrix (`ubuntu-latest`, `macos-14`, `windows-latest`): `fmt --check`, `clippy --all-targets -- -D warnings`, `test --workspace` → QUALITY §4.1–4.3 · proven by: 3-OS matrix green on the scaffolding PR
 - [ ] Architecture guard: CI asserts no GUI crate under `cargo tree -p glyde-core` → ARCH Hard rule 1, QUALITY §4.5 · proven by: step goes red if `egui` is added to core
 - [ ] `deny.toml` + `cargo deny check` job (licenses/advisories) → ARCH §deps, QUALITY §4.6 · proven by: deny job green
-- [ ] `tracing` + `tracing-subscriber` + `tracing-appender` init in `glyde-app` (rotating file in OS app-data dir + console) → SPEC §6, ARCH §Logging · proven by: log file appears on run
+- [x] `tracing` + `tracing-subscriber` + `tracing-appender` init in `glyde-app` (rotating file in OS app-data dir + console) → SPEC §6, ARCH §Logging · proven by: log file appears on run
 - [ ] `GlydeError` (`thiserror`) + core `Result` alias + app-boundary `anyhow` wiring → ARCH §Error philosophy · proven by: unit test constructing/propagating an error
 
 > **MAINTAINER TEST — M0**
