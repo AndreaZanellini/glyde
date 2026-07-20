@@ -19,4 +19,7 @@
 //!
 //! Scaffolding stub: modules are created by the first implementation task.
 
+mod error;
+pub use error::{GlydeError, Result};
+
 // TODO(scaffold): pub mod budget; ingest; time; index; dsp; series;

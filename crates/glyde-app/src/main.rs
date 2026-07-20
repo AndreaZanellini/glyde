@@ -17,6 +17,7 @@
 //! Thin shell: renders state and forwards user intent. If a behavior can be
 //! tested without a window, it belongs in glyde-core. See docs/ARCHITECTURE.md.
 
+mod error_boundary;
 mod logging;
 
 fn main() -> anyhow::Result<()> {
