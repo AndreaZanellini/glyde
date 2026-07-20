@@ -25,7 +25,7 @@ them, so CI stays green while honoring "written first."
 
 ## M0 — Foundation: workspace, CI, guards
 
-- [ ] Create Cargo workspace with `glyde-core`, `glyde-app`, `glyde-devtools` (publish=false) + `rust-toolchain.toml` → ARCH §Workspace layout · proven by: `cargo build --workspace` green in CI
+- [x] Create Cargo workspace with `glyde-core`, `glyde-app`, `glyde-devtools` (publish=false) + `rust-toolchain.toml` → ARCH §Workspace layout · proven by: `cargo build --workspace` green in CI
 - [ ] CI matrix (`ubuntu-latest`, `macos-14`, `windows-latest`): `fmt --check`, `clippy --all-targets -- -D warnings`, `test --workspace` → QUALITY §4.1–4.3 · proven by: 3-OS matrix green on the scaffolding PR
 - [ ] Architecture guard: CI asserts no GUI crate under `cargo tree -p glyde-core` → ARCH Hard rule 1, QUALITY §4.5 · proven by: step goes red if `egui` is added to core
 - [ ] `deny.toml` + `cargo deny check` job (licenses/advisories) → ARCH §deps, QUALITY §4.6 · proven by: deny job green
