@@ -60,21 +60,32 @@ jobs:
       - run: cargo test -p glyde-core -p glyde-devtools --all-features
 
   gui:
-    name: GUI build (${{ matrix.os }})
+    name: GUI build & test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, windows-latest]
+        os: [ubuntu-latest, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # The GUI shell is built and linted only where a windowing backend exists.
-      # This is the job that would catch a real break in glyde-app.
+      # glyde-app needs a windowing backend to compile. On Linux that means the
+      # X11/Wayland/GTK system libraries (the same set the release job installs).
+      # Since #8 gave eframe the x11+wayland backends, glyde-app now builds on
+      # Linux too, so this job covers all three shipped OSes.
+      - name: Install Linux GUI build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev
+      # Lint, TEST and build the GUI shell on every OS we ship. The test step is
+      # the fix for #4: glyde-app's own unit tests (e.g. the tracing-init test)
+      # run nowhere else — the headless `test` job excludes this crate.
       - run: cargo clippy -p glyde-app --all-targets -- -D warnings
+      - run: cargo test -p glyde-app
       - run: cargo build -p glyde-app
 
   bench:
