@@ -14,6 +14,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ### Added
 - Initial repository scaffolding: product/spec/architecture/quality documentation,
   CI matrix for Linux, macOS and Windows, issue templates.
+
+### Fixed
+- The two internal crates that make up the app (`glyde-core`, the engine, and
+  `glyde-app`, the window you actually run) are now explicitly marked as
+  "not published to crates.io", matching the third internal crate
+  (`glyde-devtools`) that already was. This has no effect on using the app —
+  it only prevents an internal build tool from ever being accidentally
+  published as a public library.
 - The app now writes a log file every time it runs, in the standard per-OS app-data
   location (e.g. `~/.local/share/Glyde/logs` on Linux, `~/Library/Application
   Support/Glyde/logs` on macOS, `%LOCALAPPDATA%\Glyde\logs` on Windows), in addition
