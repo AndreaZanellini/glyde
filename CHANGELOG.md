@@ -16,6 +16,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
   CI matrix for Linux, macOS and Windows, issue templates.
 
 ### Fixed
+- The app (`glyde-app`) now builds on Linux again. It was configured in a way that
+  left its windowing layer with no display-server backend on Linux, so it failed to
+  compile there at all — which also meant the planned Linux download could never be
+  produced. It now supports **both X11 and Wayland**: a single Linux build runs
+  under either, choosing automatically at startup. macOS and Windows are unaffected.
+  The Linux "does it still compile and lint?" check has been switched back on in CI
+  so this can't regress unnoticed (issue #8).
 - The two internal crates that make up the app (`glyde-core`, the engine, and
   `glyde-app`, the window you actually run) are now explicitly marked as
   "not published to crates.io", matching the third internal crate
