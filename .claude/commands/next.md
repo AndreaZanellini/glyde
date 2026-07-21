@@ -1,27 +1,44 @@
 ---
-description: Pick the next unchecked ROADMAP item and ship it as a PR
+description: Triage blocking issues, then ship the next roadmap item as a PR
 ---
 
-Read `docs/ROADMAP.md` and find the first unchecked item that has no open PR.
+Read `docs/ROADMAP.md` and CLAUDE.md.
 
-Then, for that item only:
+## Step 1 — triage open issues first
 
-1. State which item you picked and why it is the next one. If ROADMAP.md is missing or
-   every item is checked, say so and stop — do not invent work.
-2. Confirm the golden tests and corpus cases that already cover this item. If none exist,
-   write them FIRST and let them fail. Never write implementation before its test.
-3. Implement it on a `feat/<slug>` branch. Follow docs/ARCHITECTURE.md module boundaries.
-4. Verify: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`.
-   If you touched an indexing, decimation or DSP path, run `cargo bench` and compare against
-   the budgets in docs/SPEC.md §5.
-5. Add a plain-language entry to `CHANGELOG.md` under `[Unreleased]`. This is what the
-   maintainer reads instead of the code — write it for a human testing the app, not a reviewer.
-6. Record any assumption you had to make under "Assumptions made" in CHANGELOG.md, per
-   CLAUDE.md §"When requirements are ambiguous".
-7. Open a PR with `gh pr create`. In the body, describe what changes for the user and list
-   what you verified. Then tick the item in docs/ROADMAP.md as part of the same PR.
+Run `gh issue list --state open` and look at the labels:
 
-Scope discipline: one ROADMAP item per PR. If you discover adjacent work, open a GitHub
-issue for it and keep going — do not widen this PR.
+- Any `blocking-decision` issue → do NOT act on it, and do NOT pick roadmap work that depends
+  on the decision it raises. Tell me it is waiting on me and, if I have not decided, stop here.
+  Never resolve a `blocking-decision` issue yourself, even if the fix looks obvious — the whole
+  point is that I choose the product behaviour, not you.
+- Any `blocking-autonomous` issue with no open PR → this is a prerequisite. Make the oldest one
+  this task instead of a roadmap item (at most one per invocation), then continue from step 2
+  treating it as the work.
+- Otherwise → take the first unchecked roadmap item with no open PR.
 
-Do not merge the PR. CI and the reviewer decide; the maintainer merges.
+State which you picked and why. If ROADMAP.md is missing or everything is checked/blocked, say
+so and stop — do not invent work.
+
+## Step 2 — do it
+
+1. Confirm the golden tests / corpus cases that cover this work. If none exist, write them FIRST
+   and let them fail. Never write implementation before its test.
+2. Implement on a `feat/<slug>` or `fix/<slug>` branch, respecting docs/ARCHITECTURE.md boundaries.
+3. Verify: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`,
+   `cargo deny check`. If you touched indexing, decimation or DSP, run `cargo bench` against the
+   docs/SPEC.md §5 budgets.
+4. Add a plain-language entry to `CHANGELOG.md` under `[Unreleased]` — write it for a human
+   testing the app, not a reviewer. Record any assumption under "Assumptions made".
+5. Open a PR with `gh pr create`, describing what changes for the user and what you verified.
+   Tick the roadmap item, or reference the issue so it auto-closes, in the same PR.
+
+## If you discover new work mid-task
+
+Open a GitHub issue and LABEL it. Use this rule: if resolving it would require editing SPEC.md or
+PRODUCT.md, or choosing between two product behaviours, label it `blocking-decision`. If it is pure
+technical work that blocks progress, `blocking-autonomous`. If it is neither urgent nor a decision,
+`backlog`. When unsure, choose `blocking-decision` — asking me is always safe; deciding for me is not.
+Then keep going; do not widen this PR.
+
+Scope discipline: one item per PR. Do not merge — CI and I decide.
