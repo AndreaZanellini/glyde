@@ -1,0 +1,7 @@
+timestamp,site,value
+2026-01-01T00:00:00Z,"Site A, North",1.5
+2026-01-01T00:00:01Z,"Site A, North",1.6
+2026-01-01T00:00:02Z,"Site A, North",1.7
+2026-01-01T00:00:03Z,"Site B, South",1.8
+2026-01-01T00:00:04Z,"Site B, South",1.9
+2026-01-01T00:00:05Z,"Site B, South",2.0

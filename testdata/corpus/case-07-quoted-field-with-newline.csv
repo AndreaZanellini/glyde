@@ -1,0 +1,9 @@
+timestamp,note,value
+2026-01-01T00:00:00Z,"shift start
+all sensors nominal",1.5
+2026-01-01T00:00:01Z,"routine reading",1.6
+2026-01-01T00:00:02Z,"routine reading",1.7
+2026-01-01T00:00:03Z,"routine reading",1.8
+2026-01-01T00:00:04Z,"routine reading",1.9
+2026-01-01T00:00:05Z,"shift end
+handover logged",2.0
