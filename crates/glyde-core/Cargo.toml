@@ -41,6 +41,14 @@ insta.workspace = true
 approx.workspace = true
 tempfile.workspace = true
 
+# Off by default: no code is gated on it yet. Reserved for the torture-corpus
+# open()-and-compare test (crates/glyde-core/tests/corpus_manifest.rs,
+# docs/ROADMAP.md M1) to turn on once `ingest::open()` exists (M2), so the
+# manifest test can compare real ingestion output against each
+# `<name>.expected.json` instead of only validating the JSON's shape.
+[features]
+corpus-open-compare = []
+
 # Golden DSP tests (docs/QUALITY.md §2). These are written BEFORE the
 # implementation and are never edited to make code pass.
 [[bench]]

@@ -50,7 +50,31 @@ Versioning: [Semantic Versioning](https://semver.org/).
   the app yet; this is what makes the next features able to fail loudly and clearly
   instead of silently or with a crash, per `docs/ARCHITECTURE.md` §Error philosophy.
 
+- Internal groundwork: the torture-corpus loader and its `open()`-vs-expectation
+  comparison harness (`docs/ROADMAP.md` M1). This is the machinery that will let every
+  future PR verify a file opens correctly against `testdata/corpus/<name>.expected.json`
+  — nothing to see in the app yet, and the corpus itself is still empty (the actual
+  torture files land in the next few PRs, per `docs/QUALITY.md` §1). A test asserting
+  all 56 corpus cases are present is committed but intentionally skipped until the last
+  batch of files lands.
+
 ### Assumptions made (maintainer: veto by testing)
+- The `<name>.expected.json` schema (`encoding`, `delimiter`, `decimal_separator`,
+  `time_column`, `timestamp_format`, `row_count`, `skipped_row_count`,
+  `sampling_class`, `gap_count`) is my reading of `docs/QUALITY.md` §1's one-sentence
+  description ("inferred encoding/delimiter/decimal/time column/format, row count,
+  skipped-row count, sampling class, gap count") into concrete field names and types.
+  No per-field confidence score is included yet — `docs/SPEC.md` tracks confidence for
+  the *inference bar* (M4), and QUALITY.md's own corpus description doesn't ask for it
+  in the expectation file, so I left it out rather than inventing a second use for the
+  same data ahead of need. Every future corpus-case PR writes against this schema, so
+  it is worth the maintainer's veto now rather than after 56 files depend on it.
+- The comparison harness that will diff a real `open()` against a corpus case's
+  `.expected.json` is stubbed behind an unused `corpus-open-compare` Cargo feature on
+  `glyde-core`, rather than written against real code, because the `Reader` trait and
+  `open()` entry point don't exist yet (that's M2). Only the schema, the file-pairing
+  logic, and the comparison function itself (`compare()`) are implemented and tested
+  today; wiring it to a real `open()` call is deferred to whichever M2 PR adds ingestion.
 - The app-data location is resolved as `directories::ProjectDirs::from("com", "glyde",
   "Glyde")`. Neither `docs/SPEC.md` nor `docs/ARCHITECTURE.md` specifies the exact
   qualifier/organization/application strings, so I picked a conventional
