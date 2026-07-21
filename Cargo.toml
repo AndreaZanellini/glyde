@@ -58,7 +58,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # --- GUI (glyde-app only — NEVER glyde-core) -------------------------------
-eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts"] }
+# `x11` and `wayland` enable winit's Linux platform backends. Without at least
+# one, winit has no supported platform on Linux and fails its own compile_error!
+# (issue #8). Both are enabled so a single Linux binary runs under either display
+# server; they are no-ops on macOS/Windows.
+eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
 egui = "0.31"
 rfd = "0.15"
 

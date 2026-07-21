@@ -196,6 +196,7 @@ Reference machine: **MacBook Air M1 (2020), 16 GB**. Budgets are enforced by ben
 ## 7. Distribution
 
 - CI produces, for every tagged release: macOS arm64 `.dmg`, Windows x64 installer + portable `.exe`, Linux x64 `AppImage` + tarball.
+- The Linux build targets **both X11 and Wayland**: a single binary links both winit backends and picks one at runtime, so it runs unmodified under either display server.
 - Binaries must run with **no runtime, no toolchain, no dependencies** to install.
 - **Signing:** required before the repo goes public — macOS signing + notarization (Apple Developer account), Windows code signing (or, at minimum, winget distribution to soften SmartScreen). Until then, release notes must include the exact "unsigned build" workaround steps for macOS and Windows. A first-run security warning is a product bug, tracked as a release blocker for going public.
 - No auto-update in v1 (tracked as post-v1 issue).
