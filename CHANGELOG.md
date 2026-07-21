@@ -11,6 +11,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Roadmap bookkeeping only, no app behavior change: ticked the "architecture guard"
+  and "`cargo deny check` job" boxes in `docs/ROADMAP.md`'s foundation milestone —
+  both have been passing in CI for a while, the checklist just hadn't caught up. The
+  "CI matrix" box on the same milestone was deliberately left unticked: unlike the
+  other two, it isn't actually satisfied yet (fmt/clippy don't run across all three
+  OSes, and clippy/test don't cover the whole workspace) — see issue #7, which tracks
+  finishing that item.
+
 ### Added
 - Initial repository scaffolding: product/spec/architecture/quality documentation,
   CI matrix for Linux, macOS and Windows, issue templates.
