@@ -23,10 +23,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
   a numeric line plot — they report that they belong on the future state
   timeline instead. Proven against two torture-corpus shapes: the constant
   series (case 51) and the boolean column shown three different ways in the
-  source text (case 47, `true`/`false`, `0`/`1`, `TRUE`/`FALSE`) all produce
-  the same values once represented this way. There is nothing to see in the
-  app yet — no reader populates a `Series` until the rest of `docs/ROADMAP.md`
-  M2 lands; this is only the shape the CSV/Parquet readers will build.
+  source text (case 47, `true`/`false`, `0`/`1`, `TRUE`/`FALSE`) each parse
+  into the same `Bool` model and route to the state timeline, regardless of
+  source spelling. There is nothing to see in the app yet — no reader
+  populates a `Series` until the rest of `docs/ROADMAP.md` M2 lands; this is
+  only the shape the CSV/Parquet readers will build.
 
 ### Added
 - The eight golden tests for the future PSD (Welch) view, covering every
@@ -212,6 +213,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
   batch of files lands.
 
 ### Assumptions made (maintainer: veto by testing)
+- Corpus case 47's three boolean columns (`flag_lower`, `flag_numeric`,
+  `flag_upper`) turned out **not** to be the same boolean sequence spelled
+  three ways: `flag_numeric` (`0,1,0,1`) is the logical inverse of
+  `flag_lower`/`flag_upper` (`true/false/true/false`,
+  `TRUE/FALSE/TRUE/FALSE`) in the committed fixture. The new `Series`-model
+  test asserts each column's actual values rather than cross-column
+  equality. Worth checking whether the fixture's numeric column was meant
+  to mirror the other two and drifted — nothing in `docs/QUALITY.md` §1's
+  one-line description of case 47 requires them to match, so this is a
+  flag, not a fix.
 - The Welch golden tests are written against a new `glyde_core::dsp::welch`
   API this PR also stubs in (`WelchConfig`, `Psd`, `default_segment_length()`,
   `welch()`, `welch_segmented()`), plus two small supporting modules,
