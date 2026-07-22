@@ -154,8 +154,20 @@ pub fn discover_cases(dir: &Path) -> std::io::Result<Vec<CorpusCase>> {
     Ok(cases)
 }
 
-/// Parses a `.expected.json` file against the [`OpenSummary`] schema.
-pub fn load_expected(path: &Path) -> Result<OpenSummary, String> {
+/// What a correct `open()` of a corpus case must produce: either a full
+/// inference summary, or — for the cases QUALITY.md §1 documents as required
+/// failures (case 18 "single column", case 23 "empty file") — a mandatory
+/// error. `open()` must reject these cleanly, never panic, so the corpus
+/// needs a way to assert "must fail" as precisely as it asserts a summary.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum ExpectedOutcome {
+    Open(OpenSummary),
+    Error { error: String },
+}
+
+/// Parses a `.expected.json` file against the [`ExpectedOutcome`] schema.
+pub fn load_expected(path: &Path) -> Result<ExpectedOutcome, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -219,8 +231,25 @@ mod tests {
         .expect("write expected.json");
 
         let expected = load_expected(&path).expect("valid expected.json must parse");
-        assert_eq!(expected.encoding, "utf-8");
-        assert_eq!(expected.sampling_class, SamplingClass::Uniform);
+        let ExpectedOutcome::Open(summary) = expected else {
+            panic!("expected the Open variant, got {expected:?}");
+        };
+        assert_eq!(summary.encoding, "utf-8");
+        assert_eq!(summary.sampling_class, SamplingClass::Uniform);
+    }
+
+    #[test]
+    fn load_expected_parses_a_required_failure() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("case.expected.json");
+        fs::write(&path, r#"{ "error": "empty file: no data to read" }"#)
+            .expect("write expected.json");
+
+        let expected = load_expected(&path).expect("valid expected.json must parse");
+        let ExpectedOutcome::Error { error } = expected else {
+            panic!("expected the Error variant, got {expected:?}");
+        };
+        assert_eq!(error, "empty file: no data to read");
     }
 
     #[test]

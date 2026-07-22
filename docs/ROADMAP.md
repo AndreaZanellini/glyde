@@ -26,7 +26,7 @@ them, so CI stays green while honoring "written first."
 ## M0 — Foundation: workspace, CI, guards
 
 - [x] Create Cargo workspace with `glyde-core`, `glyde-app`, `glyde-devtools` (publish=false) + `rust-toolchain.toml` → ARCH §Workspace layout · proven by: `cargo build --workspace` green in CI
-- [ ] CI matrix (`ubuntu-latest`, `macos-14`, `windows-latest`): `fmt --check`, `clippy --all-targets -- -D warnings`, `test --workspace` → QUALITY §4.1–4.3 · proven by: 3-OS matrix green on the scaffolding PR
+- [x] CI matrix (`ubuntu-latest`, `macos-14`, `windows-latest`): `fmt --check`, `clippy --all-targets -- -D warnings`, `test --workspace` → QUALITY §4.1–4.3 · proven by: 3-OS matrix green on the scaffolding PR
 - [x] Architecture guard: CI asserts no GUI crate under `cargo tree -p glyde-core` → ARCH Hard rule 1, QUALITY §4.5 · proven by: step goes red if `egui` is added to core
 - [x] `deny.toml` + `cargo deny check` job (licenses/advisories) → ARCH §deps, QUALITY §4.6 · proven by: deny job green
 - [x] `tracing` + `tracing-subscriber` + `tracing-appender` init in `glyde-app` (rotating file in OS app-data dir + console) → SPEC §6, ARCH §Logging · proven by: log file appears on run
@@ -45,7 +45,7 @@ them, so CI stays green while honoring "written first."
 - [x] Corpus loader + `<name>.expected.json` schema + open→compare harness (behind a feature so assertions activate as ingestion lands) → QUALITY §1 · proven by: manifest test confirms 56 files each have a valid `expected.json`
 - [x] Commit corpus cases 1–7 (delimiters & locale) + expected.json → QUALITY §1 (1–7)
 - [x] Commit corpus cases 8–13 (encoding & characters) + expected.json → QUALITY §1 (8–13)
-- [ ] Commit corpus cases 14–23 (structure) + expected.json → QUALITY §1 (14–23)
+- [x] Commit corpus cases 14–23 (structure) + expected.json → QUALITY §1 (14–23)
 - [ ] Commit corpus cases 24–42 (time index) + expected.json → QUALITY §1 (24–42)
 - [ ] Commit corpus cases 43–52 (values) + expected.json → QUALITY §1 (43–52)
 - [ ] Commit corpus cases 53–56 (Parquet) + expected.json → QUALITY §1 (53–56)

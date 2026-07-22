@@ -12,6 +12,32 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Ten more real-world-shaped test files for the torture corpus
+  (`testdata/corpus/`), covering structural edge cases: a metadata preamble
+  before the real header, a file with no header row at all, duplicate column
+  names, a header with a blank column name, a single-column (time-only) file,
+  a file with just one data row, trailing blank lines and a trailing
+  delimiter on every row, rows with the wrong number of fields, a file
+  truncated mid-write, and a completely empty file. Each ships with a
+  `.expected.json` answer key. Two of these (the single-column file and the
+  empty file) are cases the app must *refuse to open* with a clear message
+  rather than crash or silently show nothing — their answer key now records
+  that expected failure instead of a successful-open summary (see
+  "Assumptions made" below). There is nothing to see in the app yet — the CSV
+  reader that will be graded against these still doesn't exist (that's
+  `docs/ROADMAP.md` M2).
+
+### Changed
+- Roadmap bookkeeping only, no app behavior change: the "CI matrix" box in
+  `docs/ROADMAP.md`'s foundation milestone is now ticked. It was left
+  unticked previously because `clippy`/`test` didn't yet cover the whole
+  workspace (`glyde-app` was excluded) and `fmt`/`clippy` weren't matrixed
+  across all three OSes; that gap has since been closed in
+  `.github/workflows/ci.yml` (the `lint`/`test`/`gui` jobs together now run
+  fmt, clippy `-D warnings`, and tests for every crate on Linux, macOS, and
+  Windows) — the checklist just hadn't caught up.
+
+### Added
 - Six more real-world-shaped test files for the torture corpus
   (`testdata/corpus/`), covering encoding and character edge cases: a
   Latin-1-safe file with `°C`/`µm/s²` in the header, a Windows-1252 file with
@@ -137,3 +163,32 @@ Versioning: [Semantic Versioning](https://semver.org/).
   app) lives on its own next to `main.rs` rather than inside a real feature, since no
   feature calls into the engine yet — File→Open lands in M2. It will move once there
   is a real call site to attach it to.
+- Corpus cases 18 (single-column file) and 23 (empty file) are QUALITY.md §1's two
+  required-failure cases ("must fail with a clear message, not a crash"), but the
+  existing `.expected.json` schema (`OpenSummary`) only had a shape for a *successful*
+  open — every field mandatory, no way to say "must error." I extended the corpus
+  loader's schema to an `ExpectedOutcome` enum: the existing `OpenSummary` shape for
+  the 21 success cases, plus a new `{ "error": "<message>" }` shape for these two. The
+  `error` string is a human-readable message for the maintainer to recognize, not
+  something a future test pattern-matches against — no error taxonomy exists yet
+  (`GlydeError` has one variant, `Io`), and inventing one now, before the CSV reader
+  that would raise it exists, would be guessing ahead of M2.
+- Corpus case 15 (no header row) assumes headerless files get synthetic column names
+  `column_0`, `column_1`, ... in source-column order. Neither `docs/SPEC.md` nor
+  `docs/ARCHITECTURE.md` specifies a naming scheme for this case; this is the smallest,
+  most predictable convention I could pick, and it only affects a fallback display
+  name — please veto if you'd rather have something else (e.g. spreadsheet-style `A`,
+  `B`, ...).
+- Corpus case 14's five `#`-prefixed metadata-preamble lines are not counted in
+  `skipped_row_count` — per `docs/SPEC.md` §1.2's header-detection rule, they are
+  consumed while *locating* the header, not read as malformed data rows, so they are
+  a different concept from the "wrong field count / unparseable / truncated" rows
+  §1.3 says `skipped_row_count` tracks (exercised by cases 21 and 22 instead).
+- Corpus case 19 (a file with exactly one data row) records `sampling_class` as
+  `"uniform"`: with only one sample there is no interval to measure, so uniformity
+  holds vacuously (there is nothing for it to violate) — the same reasoning that lets
+  a single-sample series render at all per `docs/SPEC.md` §1.4.
+- Corpus case 22's truncated final line has no value field at all (not just a
+  truncated number), so it is unambiguously incomplete rather than a valid-but-short
+  row; per `docs/SPEC.md` §1.3, which lists "truncated tails" alongside wrong-field-count
+  rows as a `skipped_row_count` category, it counts as 1 skipped row, not 0.
