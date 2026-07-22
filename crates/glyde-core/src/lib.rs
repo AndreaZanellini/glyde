@@ -23,6 +23,7 @@ pub mod dsp;
 mod error;
 pub mod ingest;
 pub mod series;
+pub mod time;
 pub use error::{GlydeError, Result};
 
-// TODO(scaffold): pub mod budget; time; index;
+// TODO(scaffold): pub mod budget; index;

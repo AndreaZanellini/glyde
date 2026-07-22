@@ -12,6 +12,25 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Four more golden tests locking in the future time axis (docs/QUALITY.md §2
+  Time): every timestamp format Glyde must recognize (ISO 8601 with and
+  without a timezone, `DD/MM`/`MM/DD`, epoch seconds through nanoseconds,
+  LabVIEW epoch, Excel serial dates) will have to parse and then format back
+  to the identical string; a multi-year timestamp span keeps its exact
+  nanosecond and picosecond digits instead of the subtle rounding an `f64`
+  seconds representation would introduce; and gap detection between samples
+  is checked against a hand-computed synthetic series. One of the four
+  already runs and passes today — it only proves the timestamp type itself
+  can hold picosecond precision exactly — the other three wait on the actual
+  time-parsing engine (`docs/ROADMAP.md` M2/M8). Also added the scaffolding
+  for two new randomized ("property") tests that will run thousands of
+  random inputs instead of fixed examples once their engines exist: one
+  proving the zoom/pan rendering can never show a value outside a series'
+  own min/max range, the other proving the CSV reader never crashes no
+  matter what bytes are thrown at it. Nothing visible in the app yet — both
+  are scaffolding for milestones still to come.
+
+### Added
 - Internal groundwork: the engine's data model for a single ingested column
   (`Series`). It records a column's values in their original data type —
   boolean, every integer width, `f32`/`f64`, or text — without ever
