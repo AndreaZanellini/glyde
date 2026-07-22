@@ -1,0 +1,5 @@
+timestamp,flag_lower,flag_numeric,flag_upper
+2026-01-01T00:00:00Z,true,0,TRUE
+2026-01-01T00:00:01Z,false,1,FALSE
+2026-01-01T00:00:02Z,true,0,TRUE
+2026-01-01T00:00:03Z,false,1,FALSE

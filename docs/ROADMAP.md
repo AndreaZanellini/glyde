@@ -47,7 +47,7 @@ them, so CI stays green while honoring "written first."
 - [x] Commit corpus cases 8–13 (encoding & characters) + expected.json → QUALITY §1 (8–13)
 - [x] Commit corpus cases 14–23 (structure) + expected.json → QUALITY §1 (14–23)
 - [x] Commit corpus cases 24–42 (time index) + expected.json → QUALITY §1 (24–42)
-- [ ] Commit corpus cases 43–52 (values) + expected.json → QUALITY §1 (43–52)
+- [x] Commit corpus cases 43–52 (values) + expected.json → QUALITY §1 (43–52)
 - [ ] Commit corpus cases 53–56 (Parquet) + expected.json → QUALITY §1 (53–56)
 - [ ] Write decimation golden tests, `#[ignore]` until M3 → QUALITY §2 Decimation (spike, envelope, pyramid, convergence, no-alias)
 - [ ] Write Welch golden tests, `#[ignore]` until M5 → QUALITY §2 Welch (sinusoid, Parseval, one-sided, window-norm, detrend, two-tone, segmented, raw-guarantee)
