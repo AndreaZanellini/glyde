@@ -21,7 +21,7 @@
 
 mod csv;
 
-pub use csv::CsvReader;
+pub use csv::{parse, CsvReader};
 
 use crate::{GlydeError, Result};
 use std::path::Path;

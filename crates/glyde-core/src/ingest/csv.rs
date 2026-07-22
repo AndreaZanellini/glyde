@@ -42,6 +42,20 @@ impl Reader for CsvReader {
     }
 }
 
+/// Parses `bytes` as delimited text (SPEC §1.1). Provisional entry point:
+/// the real streaming parse over a memory-mapped file — encoding/delimiter/
+/// decimal inference, ragged-row salvage, skipped-row counting — lands with
+/// docs/ROADMAP.md M2. This stub exists only so the CSV fuzz-lite property
+/// test (docs/QUALITY.md §2 Property tests, docs/ROADMAP.md M1) has an entry
+/// point to target today: "any random byte sequence fed to the CSV reader:
+/// never panics."
+///
+/// **Not implemented yet** (docs/ROADMAP.md M2).
+pub fn parse(bytes: &[u8]) -> crate::Result<()> {
+    let _ = bytes;
+    todo!("docs/ROADMAP.md M2: CSV streaming parse")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

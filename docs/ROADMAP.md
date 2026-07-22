@@ -51,8 +51,8 @@ them, so CI stays green while honoring "written first."
 - [x] Commit corpus cases 53–56 (Parquet) + expected.json → QUALITY §1 (53–56)
 - [x] Write decimation golden tests, `#[ignore]` until M3 → QUALITY §2 Decimation (spike, envelope, pyramid, convergence, no-alias)
 - [x] Write Welch golden tests, `#[ignore]` until M5 → QUALITY §2 Welch (sinusoid, Parseval, one-sided, window-norm, detrend, two-tone, segmented, raw-guarantee)
-- [ ] Write time golden tests, `#[ignore]` until M2/M8 → QUALITY §2 Time (format round-trip, ns/ps precision, gap detection)
-- [ ] Property-test scaffolding (`proptest`): render-never-panics + CSV fuzz-lite, `#[ignore]` until deps exist → QUALITY §2 Property tests
+- [x] Write time golden tests, `#[ignore]` until M2/M8 → QUALITY §2 Time (format round-trip, ns/ps precision, gap detection)
+- [x] Property-test scaffolding (`proptest`): render-never-panics + CSV fuzz-lite, `#[ignore]` until deps exist → QUALITY §2 Property tests
 
 > **MAINTAINER TEST — M1**
 > - Run `cargo test` → the corpus manifest test passes; `cargo test -- --ignored --list`
