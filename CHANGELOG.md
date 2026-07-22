@@ -12,6 +12,22 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Ten more real-world-shaped test files for the torture corpus
+  (`testdata/corpus/`), covering value-level edge cases: a run of consecutive
+  missing (`NaN`) samples, `Infinity`/`-Infinity` values, a single extreme
+  outlier (1e12) next to unit-scale values, a numeric column with a few
+  stray non-numeric tokens mixed in, a boolean column shown three common
+  ways (`true`/`false`, `0`/`1`, `TRUE`/`FALSE`), a string "machine state"
+  column, a mostly-empty marker column with a couple of sparse events, whole
+  integer values beyond the point where `f64` can represent them exactly,
+  a constant (unchanging) series, and a series that is entirely missing
+  values. Each ships with a `.expected.json` answer key, same as the
+  corpus cases before it. There is nothing to see in the app yet — the
+  dtype/value inference that will be graded against these still doesn't
+  exist (that's `docs/ROADMAP.md` M2). See "Assumptions made" below for the
+  inferred values the maintainer should veto by testing.
+
+### Added
 - Nineteen more real-world-shaped test files for the torture corpus
   (`testdata/corpus/`), covering how a file's time index is recognized: ISO 8601
   timestamps with and without a timezone, day-first (`DD/MM/YYYY`) and
@@ -135,6 +151,34 @@ Versioning: [Semantic Versioning](https://semver.org/).
   batch of files lands.
 
 ### Assumptions made (maintainer: veto by testing)
+- Corpus cases 43–52 all record `row_count` equal to every data row present,
+  with `skipped_row_count: 0` — per `docs/SPEC.md` §1.3, `NaN`/missing values
+  and out-of-range/mixed-type cell values are preserved as flagged anomalies
+  within a row, not reasons to drop the whole row (`skipped_row_count` is
+  reserved for structural problems like wrong field count or a truncated
+  tail, per cases 21/22). This differs from how `skipped_row_count` is used
+  elsewhere in the corpus, so it's worth an explicit veto.
+- Case 46 ("mixed numeric/string in one column") assumes the eventual dtype
+  inference falls back the whole column to `string`/categorical rather than
+  parsing the numeric-looking cells and dropping/flagging the non-numeric
+  ones — per `docs/SPEC.md` §1.4's "never upcast silently in a way that
+  loses precision" and Golden Rule 1 ("never degrade the raw data"), turning
+  `"ERR"`/`"OK"` into missing values would silently discard what the source
+  file actually says. No dtype field exists in the `.expected.json` schema
+  yet to assert this directly (same gap noted for cases 36/37 previously),
+  so this is an assumption about future behavior, not something this PR's
+  test enforces.
+- Case 49 ("sparse markers") is a 9-row file rather than literally "one
+  sample every N thousand" (`docs/QUALITY.md` §1) — the corpus favors small,
+  hand-readable fixtures (see the existing 6-56 row cases), and large-N
+  sparsity is already covered separately by the `criterion` benches and the
+  `glyde-devtools` synthetic-fixture generator (`docs/ROADMAP.md` M3). This
+  file exists to pin the *shape* (a marker column that's empty almost
+  everywhere with rare events), not the scale.
+- Case 50 (`i64` beyond 2⁵³) uses `9007199254740993` (2⁵³+1, the smallest
+  integer that loses precision when rounded to `f64`) and `i64::MAX`, to
+  bound both ends of the range `docs/SPEC.md` §1.4 says must be flagged
+  rather than silently narrowed.
 - Corpus cases 24–42 invent a `timestamp_format` vocabulary (no format names
   existed yet beyond the three examples in `testdata/corpus/README.md`):
   `iso8601`, `iso8601_naive`, `dd_mm_yyyy`, `mm_dd_yyyy`, `epoch_s`, `epoch_ms`,
