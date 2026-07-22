@@ -20,8 +20,10 @@
 //! land with each reader's own module as their own roadmap items.
 
 mod csv;
+mod infer;
 
 pub use csv::{parse, CsvReader};
+pub use infer::{decode, detect_encoding, EncodingInference, EncodingSource, HEAD_SAMPLE_BYTES};
 
 use crate::{GlydeError, Result};
 use std::path::Path;
