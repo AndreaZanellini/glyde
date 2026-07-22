@@ -10,6 +10,16 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Run every `run:` step under bash with `-eo pipefail`. GitHub's default
+# non-Windows shell is `bash -e` WITHOUT pipefail, so a failure on the left of a
+# pipe (e.g. `cargo bench ... | tee`) is masked by the exit code of the
+# right-hand command and the step still reports success. That masking is what
+# let the performance gate go green while `cargo bench` was erroring -- see
+# issue #29. `shell: bash` forces `-eo pipefail` on all three OSes.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   lint:
     name: Format & Clippy (${{ matrix.os }})
@@ -102,9 +112,16 @@ jobs:
       # Large fixtures are generated, never committed. See docs/QUALITY.md §3.
       - name: Generate large synthetic fixtures
         run: cargo run --release -p glyde-devtools --bin generate_fixtures -- --size-gb 1
-      # Budgets from docs/SPEC.md §5. Exceeding one fails the build.
+      # Benchmarks are stubs until docs/ROADMAP.md M3 lands the real criterion
+      # harnesses; today they compile and run as no-ops. Run them WITHOUT
+      # masking a nonzero exit so that, once M3 arrives, a measurement that
+      # breaches a docs/SPEC.md §5 budget fails the build. (Previously this piped
+      # `cargo bench` into `tee`, which -- with no pipefail -- discarded cargo's
+      # exit code and stayed green even while `cargo bench` was erroring on an
+      # unrecognized `--output-format` option. See #29. `cargo-criterion` is what
+      # understands that flag; it returns with the real benches in M3.)
       - name: Criterion benchmarks (build-blocking budgets)
-        run: cargo bench -p glyde-core -- --output-format bencher | tee bench.txt
+        run: cargo bench -p glyde-core
       - name: Peak memory gate
         run: cargo run --release -p glyde-devtools --bin memory_gate
 
