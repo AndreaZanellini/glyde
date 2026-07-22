@@ -16,9 +16,8 @@
 //!
 //! `every_committed_case_has_a_well_formed_expected_json` runs on every PR
 //! and covers whatever cases are committed so far. `corpus_has_all_56_cases`
-//! is the milestone-complete gate: it stays `#[ignore]`d until the last
-//! corpus batch (QUALITY.md §1, cases 53-56) lands, per the M1 convention of
-//! writing golden/manifest tests before the work they gate.
+//! is the milestone-complete gate, un-ignored now that the last corpus batch
+//! (QUALITY.md §1, cases 53-56, Parquet) has landed.
 
 mod support;
 
@@ -45,8 +44,6 @@ fn every_committed_case_has_a_well_formed_expected_json() {
 }
 
 #[test]
-#[ignore = "un-ignore once the last corpus batch (QUALITY.md §1, cases 53-56) is \
-            committed — see docs/ROADMAP.md M1"]
 fn corpus_has_all_56_cases() {
     let dir = corpus_dir();
     let cases = discover_cases(&dir).expect("read testdata/corpus");

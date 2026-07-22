@@ -1,0 +1,11 @@
+{
+  "encoding": "n/a",
+  "delimiter": null,
+  "decimal_separator": null,
+  "time_column": "timestamp",
+  "timestamp_format": "parquet_timestamp",
+  "row_count": 6,
+  "skipped_row_count": 0,
+  "sampling_class": "segmented_uniform",
+  "gap_count": 1
+}

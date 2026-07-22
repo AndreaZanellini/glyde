@@ -12,6 +12,21 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- The final four real-world-shaped test files for the torture corpus
+  (`testdata/corpus/`), covering Parquet: a clean Parquet file with a native
+  timestamp column, a Parquet file whose value column has nulls, a
+  Hive-style partitioned Parquet directory (two date partitions with a gap
+  between them), and a Parquet file with a dictionary-encoded (categorical)
+  string column, mirroring the string-state case in the CSV set. Each ships
+  with a `.expected.json` answer key, same as every other corpus case. This
+  is the last of the 56 planned corpus cases (`docs/QUALITY.md` §1) — the
+  `corpus_has_all_56_cases` milestone-complete test, committed already but
+  skipped until now, is un-ignored in this PR and passes. There is nothing
+  to see in the app yet — the Parquet reader that will be graded against
+  these still doesn't exist (that's `docs/ROADMAP.md` M7). See "Assumptions
+  made" below for the inferred values the maintainer should veto by testing.
+
+### Added
 - Ten more real-world-shaped test files for the torture corpus
   (`testdata/corpus/`), covering value-level edge cases: a run of consecutive
   missing (`NaN`) samples, `Infinity`/`-Infinity` values, a single extreme
@@ -151,6 +166,33 @@ Versioning: [Semantic Versioning](https://semver.org/).
   batch of files lands.
 
 ### Assumptions made (maintainer: veto by testing)
+- Corpus cases 53–56 (Parquet) record `"encoding": "n/a"` rather than an
+  `encoding_rs` canonical name, since Parquet is a self-describing binary
+  format with no text-encoding concept to infer — the corpus README already
+  documents `delimiter`/`decimal_separator` as `null` "for formats without a
+  delimiter concept (e.g. Parquet)" but was silent on `encoding`, which is
+  the one field in `OpenSummary` with no `Option` wrapper. `"n/a"` was the
+  smallest change that doesn't force the field optional workspace-wide for
+  four cases; worth a veto since it's a new convention, not one already in
+  the schema.
+- Corpus cases 53–56 record `"timestamp_format": "parquet_timestamp"`, a new
+  vocabulary entry (alongside `iso8601`, `epoch_ms`, etc. from cases 24–42)
+  standing for "read directly from the column's native Arrow/Parquet
+  timestamp type, no text parsing involved" — there's no format-string
+  ambiguity to name for a typed column, unlike the CSV formats it sits
+  alongside.
+- Case 54 ("Parquet with nulls") keeps `row_count: 6` and `skipped_row_count:
+  0` with the two null values still counted as present rows — consistent
+  with how CSV `NaN` runs (case 43) are treated: a missing *value* is a
+  flagged anomaly within a row (`docs/ROADMAP.md` M7: "Parquet nulls →
+  gaps" refers to a plotted discontinuity, not a dropped row), not a
+  structural reason to skip the row.
+- Case 55 ("partitioned Parquet directory") uses two Hive-style
+  `date=YYYY-MM-DD/` partitions, three rows each, one calendar-day apart —
+  large enough for the combined timestamp gap between partitions to clear
+  the ×10-median threshold (`docs/SPEC.md` §2.2), so it's recorded as
+  `sampling_class: "segmented_uniform"` with `gap_count: 1`, the same shape
+  as CSV case 40's three-bursts case rather than a from-scratch convention.
 - Corpus cases 43–52 all record `row_count` equal to every data row present,
   with `skipped_row_count: 0` — per `docs/SPEC.md` §1.3, `NaN`/missing values
   and out-of-range/mixed-type cell values are preserved as flagged anomalies
