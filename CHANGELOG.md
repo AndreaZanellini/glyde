@@ -11,6 +11,20 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- A hole in the project's own automated performance checks (nothing visible in
+  the app). The CI "Performance gates" job was reporting success on every run
+  while actually running no benchmark at all: the command that runs them was
+  failing on a wrong option, but that failure was hidden by the way the command
+  was piped into a log file, so the job stayed green regardless. This meant the
+  performance and memory budgets `docs/SPEC.md` §5 promises were not being
+  enforced even though the CI dashboard showed them as passing — the exact
+  "green but never actually checked" failure mode the maintainer relies on CI
+  never to hide. The job now runs the benchmarks honestly, and every CI step now
+  fails loudly instead of swallowing an error hidden inside a pipe, so once the
+  real benchmarks land (`docs/ROADMAP.md` M3) a measurement that exceeds a
+  budget will fail the build as intended. (Fixes #29.)
+
 ### Added
 - Four more golden tests locking in the future time axis (docs/QUALITY.md §2
   Time): every timestamp format Glyde must recognize (ISO 8601 with and
