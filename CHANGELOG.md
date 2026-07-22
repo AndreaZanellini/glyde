@@ -12,6 +12,17 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- The five golden tests for the future zoom/pan rendering path (decimation),
+  covering the guarantees `docs/QUALITY.md` §2 requires: a single-sample
+  spike never disappearing however far you zoom out, the rendered min/max
+  envelope matching a brute-force scan exactly, each zoom level being an
+  exact aggregation of the level below it, zooming in far enough always
+  reaching the true individual samples, and a 1 kHz sine wave rendering as a
+  clean constant-amplitude band instead of a beat/aliasing pattern. There is
+  nothing to see in the app yet — the pyramid/decimation engine these tests
+  grade is `docs/ROADMAP.md` M3, still to come — but the five tests are
+  committed now (skipped for the moment) so that milestone can't ship
+  without satisfying every one of them.
 - The final four real-world-shaped test files for the torture corpus
   (`testdata/corpus/`), covering Parquet: a clean Parquet file with a native
   timestamp column, a Parquet file whose value column has nulls, a
@@ -166,6 +177,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
   batch of files lands.
 
 ### Assumptions made (maintainer: veto by testing)
+- The decimation golden tests are written against a `glyde_core::dsp::decimation`
+  API this PR also stubs in (`Bucket`, `PYRAMID_FACTOR = 8`, `build_pyramid()`,
+  `decimate_viewport()`) so the tests compile — every function body is
+  `todo!()`, no algorithm is implemented, and every test is `#[ignore]`d so CI
+  stays green. This is test-first scaffolding, not a design decision on the
+  final API: `docs/ROADMAP.md` M3 is free to reshape the function signatures
+  as long as it keeps satisfying what each golden test asserts. Worth a veto
+  if the shape (e.g. `i128` tick timestamps, one `Vec<Bucket>` per pyramid
+  level) looks like the wrong direction before M3 commits to it.
 - Corpus cases 53–56 (Parquet) record `"encoding": "n/a"` rather than an
   `encoding_rs` canonical name, since Parquet is a self-describing binary
   format with no text-encoding concept to infer — the corpus README already
