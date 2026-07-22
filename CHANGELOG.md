@@ -12,6 +12,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Internal groundwork: the engine can now tell which built-in reader would
+  handle a given file, by looking at its extension (`.csv`, `.tsv`, and
+  `.txt` all route to the same delimited-text reader today; anything else is
+  reported as an unrecognized format instead of silently failing). This is
+  routing only — no file is actually parsed yet, so there is nothing to see
+  in the app. It's the first piece of `docs/ROADMAP.md` M2 ("open a clean CSV
+  → see a time plot"): the `Reader` trait and format registry that every
+  future format (and the real CSV parser) will plug into.
+
+### Added
 - Ten more real-world-shaped test files for the torture corpus
   (`testdata/corpus/`), covering structural edge cases: a metadata preamble
   before the real header, a file with no header row at all, duplicate column

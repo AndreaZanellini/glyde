@@ -31,6 +31,12 @@ pub enum GlydeError {
         #[source]
         source: std::io::Error,
     },
+
+    /// No registered [`crate::ingest::Reader`] recognizes this path's format
+    /// (docs/SPEC.md §1.1 lists the v1-frozen set: `.csv`, `.tsv`, `.txt`,
+    /// `.parquet`).
+    #[error("unrecognized format: {path}")]
+    UnrecognizedFormat { path: PathBuf },
 }
 
 /// The `Result` alias every fallible `glyde-core` function returns.
@@ -65,7 +71,9 @@ mod tests {
         let path = Path::new("/nonexistent/glyde-error-test.csv");
         let err = read_file(path).expect_err("reading a nonexistent file must fail");
 
-        let GlydeError::Io { path: err_path, .. } = &err;
+        let GlydeError::Io { path: err_path, .. } = &err else {
+            panic!("expected the Io variant, got {err:?}");
+        };
         assert_eq!(err_path, path);
 
         let source = std::error::Error::source(&err).expect("Io variant must carry a source");
