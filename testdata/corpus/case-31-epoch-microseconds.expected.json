@@ -1,0 +1,11 @@
+{
+  "encoding": "utf-8",
+  "delimiter": ",",
+  "decimal_separator": ".",
+  "time_column": "timestamp",
+  "timestamp_format": "epoch_us",
+  "row_count": 6,
+  "skipped_row_count": 0,
+  "sampling_class": "uniform",
+  "gap_count": 0
+}
