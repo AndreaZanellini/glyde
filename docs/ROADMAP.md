@@ -66,7 +66,7 @@ them, so CI stays green while honoring "written first."
 
 ## M2 — Open a clean CSV → see a time plot (first end-to-end slice)
 
-- [ ] `Series` + dtype model (`bool`, `i8..i64`, `u8..u64`, `f32`, `f64`, string/categorical) + anomaly container → SPEC §1.4 · proven by: corpus 51 (constant), 47 (bool dtype)
+- [x] `Series` + dtype model (`bool`, `i8..i64`, `u8..u64`, `f32`, `f64`, string/categorical) + anomaly container → SPEC §1.4 · proven by: corpus 51 (constant), 47 (bool dtype)
 - [x] `Reader` trait + `open()` entry point + format registry → ARCH Hard rule 5, SPEC §1.1 · proven by: unit test registering the CSV reader
 - [ ] Encoding inference (`encoding_rs` BOM sniff → `chardetng` heuristic, invalid bytes replaced) → SPEC §1.2.1 · proven by: corpus 8, 9, 10, 11, 12
 - [ ] Joint delimiter / header / decimal-separator inference (column-count consistency; `1,5;2,3` = 2 cols) → SPEC §1.2.2–1.2.4 · proven by: corpus 1, 2, 3, 4, 5, 6, 7, 14, 15

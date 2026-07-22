@@ -12,6 +12,24 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Internal groundwork: the engine's data model for a single ingested column
+  (`Series`). It records a column's values in their original data type —
+  boolean, every integer width, `f32`/`f64`, or text — without ever
+  converting one type into another, plus a container for anomalies flagged
+  against it (missing-value runs, outliers, skipped rows) that nothing yet
+  populates. Two rules from `docs/SPEC.md` §1.4 are enforced here already: a
+  constant or single-sample column is a valid, ordinary input (not a special
+  case to reject), and boolean/text columns know they must never be drawn as
+  a numeric line plot — they report that they belong on the future state
+  timeline instead. Proven against two torture-corpus shapes: the constant
+  series (case 51) and the boolean column shown three different ways in the
+  source text (case 47, `true`/`false`, `0`/`1`, `TRUE`/`FALSE`) each parse
+  into the same `Bool` model and route to the state timeline, regardless of
+  source spelling. There is nothing to see in the app yet — no reader
+  populates a `Series` until the rest of `docs/ROADMAP.md` M2 lands; this is
+  only the shape the CSV/Parquet readers will build.
+
+### Added
 - The eight golden tests for the future PSD (Welch) view, covering every
   guarantee `docs/QUALITY.md` §2 Welch requires: a known sinusoid's peak
   landing at its exact frequency bin with the right recovered amplitude,
@@ -195,6 +213,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
   batch of files lands.
 
 ### Assumptions made (maintainer: veto by testing)
+- Corpus case 47's three boolean columns (`flag_lower`, `flag_numeric`,
+  `flag_upper`) turned out **not** to be the same boolean sequence spelled
+  three ways: `flag_numeric` (`0,1,0,1`) is the logical inverse of
+  `flag_lower`/`flag_upper` (`true/false/true/false`,
+  `TRUE/FALSE/TRUE/FALSE`) in the committed fixture. The new `Series`-model
+  test asserts each column's actual values rather than cross-column
+  equality. Worth checking whether the fixture's numeric column was meant
+  to mirror the other two and drifted — nothing in `docs/QUALITY.md` §1's
+  one-line description of case 47 requires them to match, so this is a
+  flag, not a fix.
 - The Welch golden tests are written against a new `glyde_core::dsp::welch`
   API this PR also stubs in (`WelchConfig`, `Psd`, `default_segment_length()`,
   `welch()`, `welch_segmented()`), plus two small supporting modules,
