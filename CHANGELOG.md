@@ -24,6 +24,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
 - Initial repository scaffolding: product/spec/architecture/quality documentation,
   CI matrix for Linux, macOS and Windows, issue templates.
 
+### Added
+- Seven real-world-shaped test files for the "torture corpus" (`testdata/corpus/`),
+  the fixture set the app will be proven against as ingestion lands: a clean
+  comma-delimited file, the European semicolon-delimiter/comma-decimal trap, a
+  tab-delimited file, a whitespace-aligned `.txt`, a pipe-delimited file, a file with
+  a comma-containing value quoted inside a field, and a file with an embedded
+  newline quoted inside a field. Each ships with a `.expected.json` describing
+  exactly what a correct open should infer. There is nothing to see in the app yet —
+  these are the answer key the CSV reader will be graded against once it lands.
+
 ### Fixed
 - The app (`glyde-app`) now builds on Linux again. It was configured in a way that
   left its windowing layer with no display-server backend on Linux, so it failed to
@@ -75,6 +85,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `open()` entry point don't exist yet (that's M2). Only the schema, the file-pairing
   logic, and the comparison function itself (`compare()`) are implemented and tested
   today; wiring it to a real `open()` call is deferred to whichever M2 PR adds ingestion.
+- Corpus case 4 (whitespace-aligned `.txt`) records its `delimiter` as a single
+  space (`" "`) in `.expected.json`, standing in for "one or more whitespace
+  characters" rather than a literal single-space separator — no format-specific
+  delimiter vocabulary is defined yet.
+- Corpus case 7's quoted field spans a physical newline inside the file, so its
+  `row_count` (6) is *lower* than a naive line count (8) — this is intentional: a
+  correct CSV reader must treat the quoted newline as part of one field, not as a
+  new row. Recorded here since it's easy to misread as an error at a glance.
 - The app-data location is resolved as `directories::ProjectDirs::from("com", "glyde",
   "Glyde")`. Neither `docs/SPEC.md` nor `docs/ARCHITECTURE.md` specifies the exact
   qualifier/organization/application strings, so I picked a conventional

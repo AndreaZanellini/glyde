@@ -43,7 +43,7 @@ them, so CI stays green while honoring "written first."
 ## M1 — Torture corpus + golden-test scaffolding (the safety net, built first)
 
 - [x] Corpus loader + `<name>.expected.json` schema + open→compare harness (behind a feature so assertions activate as ingestion lands) → QUALITY §1 · proven by: manifest test confirms 56 files each have a valid `expected.json`
-- [ ] Commit corpus cases 1–7 (delimiters & locale) + expected.json → QUALITY §1 (1–7)
+- [x] Commit corpus cases 1–7 (delimiters & locale) + expected.json → QUALITY §1 (1–7)
 - [ ] Commit corpus cases 8–13 (encoding & characters) + expected.json → QUALITY §1 (8–13)
 - [ ] Commit corpus cases 14–23 (structure) + expected.json → QUALITY §1 (14–23)
 - [ ] Commit corpus cases 24–42 (time index) + expected.json → QUALITY §1 (24–42)
