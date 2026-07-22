@@ -21,11 +21,15 @@ stem automatically — no manifest file to update by hand.
 
 ## `<name>.expected.json` schema
 
-The canonical schema is the `OpenSummary` struct in
+The canonical schema is the `ExpectedOutcome` enum in
 [`../../crates/glyde-core/tests/support/mod.rs`](../../crates/glyde-core/tests/support/mod.rs);
-this is a human-readable mirror of it.
+this is a human-readable mirror of it. Most cases assert a successful
+`open()` (the `OpenSummary` shape); a few (QUALITY.md §1 cases 18 and 23)
+document a file that `open()` must reject cleanly, and use the shorter
+error shape instead.
 
 ```jsonc
+// The common case: open() must succeed and produce exactly this.
 {
   // encoding_rs canonical name, e.g. "utf-8", "windows-1252", "utf-16le".
   "encoding": "utf-8",
@@ -44,5 +48,12 @@ this is a human-readable mirror of it.
 }
 ```
 
-Every field is mandatory in the JSON (no field defaults) so a corpus case
-can never assert less than the full inference story.
+Every field is mandatory in the `OpenSummary` shape (no field defaults) so
+a corpus case can never assert less than the full inference story.
+
+```jsonc
+// The required-failure case: open() must return an error, never a panic
+// and never a partial summary. "error" is a human-readable message
+// substring the maintainer can recognize; it is not pattern-matched.
+{ "error": "empty file: no data to read" }
+```
