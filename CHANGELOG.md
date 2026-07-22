@@ -12,6 +12,24 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- The eight golden tests for the future PSD (Welch) view, covering every
+  guarantee `docs/QUALITY.md` §2 Welch requires: a known sinusoid's peak
+  landing at its exact frequency bin with the right recovered amplitude,
+  total power summing back to a white-noise signal's known variance (the
+  test that catches window-normalization bugs), DC and Nyquist bins never
+  being doubled while every other bin is, three different windows
+  (rectangular/Hann/Hamming) reporting the same total power for the same
+  signal, a large DC offset's spectral leakage disappearing once detrending
+  is applied, two simultaneous tones resolving at their correct frequencies
+  and relative levels, a 3-segment signal's PSD matching the length-weighted
+  average of its per-segment spectra with no window ever crossing a gap
+  (proven by injecting a discontinuity at each gap that a leaking window
+  would show up as broadband noise), and a "zoomed in" vs. "zoomed out"
+  selection of the same raw samples producing bit-identical results. There
+  is nothing to see in the app yet — the Welch engine these tests grade is
+  `docs/ROADMAP.md` M5, still to come — but the eight tests are committed
+  now (skipped for the moment) so that milestone can't ship without
+  satisfying every one of them.
 - The five golden tests for the future zoom/pan rendering path (decimation),
   covering the guarantees `docs/QUALITY.md` §2 requires: a single-sample
   spike never disappearing however far you zoom out, the rendered min/max
@@ -177,6 +195,20 @@ Versioning: [Semantic Versioning](https://semver.org/).
   batch of files lands.
 
 ### Assumptions made (maintainer: veto by testing)
+- The Welch golden tests are written against a new `glyde_core::dsp::welch`
+  API this PR also stubs in (`WelchConfig`, `Psd`, `default_segment_length()`,
+  `welch()`, `welch_segmented()`), plus two small supporting modules,
+  `glyde_core::dsp::window` (`Window` enum, `coefficients()`, `mean_square()`)
+  and `glyde_core::dsp::detrend` (`Detrend` enum, `apply()`) — matching
+  `docs/ARCHITECTURE.md`'s planned `dsp/welch.rs`, `dsp/window.rs`,
+  `dsp/detrend.rs` file layout. Every function body is `todo!()`, no algorithm
+  is implemented, and every test is `#[ignore]`d so CI stays green. This is
+  test-first scaffolding, not a design decision on the final API:
+  `docs/ROADMAP.md` M5 is free to reshape the function signatures as long as
+  it keeps satisfying what each golden test asserts. Worth a veto if the shape
+  (e.g. `welch_segmented()` taking `&[&[f64]]` rather than a richer segment
+  type, or `overlap` as a bare `f64` fraction) looks like the wrong direction
+  before M5 commits to it.
 - The decimation golden tests are written against a `glyde_core::dsp::decimation`
   API this PR also stubs in (`Bucket`, `PYRAMID_FACTOR = 8`, `build_pyramid()`,
   `decimate_viewport()`) so the tests compile — every function body is

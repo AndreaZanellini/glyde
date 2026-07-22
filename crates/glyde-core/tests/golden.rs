@@ -17,3 +17,5 @@
 
 #[path = "golden/decimation.rs"]
 mod decimation;
+#[path = "golden/welch.rs"]
+mod welch;

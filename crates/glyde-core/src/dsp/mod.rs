@@ -20,3 +20,6 @@
 //! and is never modified to make an implementation pass.
 
 pub mod decimation;
+pub mod detrend;
+pub mod welch;
+pub mod window;
