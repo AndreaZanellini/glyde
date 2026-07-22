@@ -12,6 +12,24 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Nineteen more real-world-shaped test files for the torture corpus
+  (`testdata/corpus/`), covering how a file's time index is recognized: ISO 8601
+  timestamps with and without a timezone, day-first (`DD/MM/YYYY`) and
+  month-first (`MM/DD/YYYY`) dates, a fully ambiguous date that could be read
+  either way, Unix epoch counters in seconds/milliseconds/microseconds/
+  nanoseconds, Excel serial dates, a LabVIEW-style epoch, a plain progressive
+  row counter with no real time column, non-monotonic and duplicated
+  timestamps, timestamps with small millisecond jitter, an irregular event log,
+  a run made of three separated bursts, a picosecond-resolution index, and a
+  multi-year series sampled once a year. Each ships with a `.expected.json`
+  answer key recording the expected time column, timestamp format, and sampling
+  classification (uniform / segmented / irregular / progressive index). There is
+  nothing to see in the app yet — the time-index inference that will be graded
+  against these still doesn't exist (that's `docs/ROADMAP.md` M2). See
+  "Assumptions made" below for the inferred values the maintainer should veto by
+  testing.
+
+### Added
 - Internal groundwork: the engine can now tell which built-in reader would
   handle a given file, by looking at its extension (`.csv`, `.tsv`, and
   `.txt` all route to the same delimited-text reader today; anything else is
@@ -117,6 +135,37 @@ Versioning: [Semantic Versioning](https://semver.org/).
   batch of files lands.
 
 ### Assumptions made (maintainer: veto by testing)
+- Corpus cases 24–42 invent a `timestamp_format` vocabulary (no format names
+  existed yet beyond the three examples in `testdata/corpus/README.md`):
+  `iso8601`, `iso8601_naive`, `dd_mm_yyyy`, `mm_dd_yyyy`, `epoch_s`, `epoch_ms`,
+  `epoch_us`, `epoch_ns`, `excel_serial`, `labview_epoch`. These are the labels
+  a correct reader will report once time-index inference lands (M2); veto any
+  name now, before the inference code depends on them.
+- Corpus case 28 (fully ambiguous `01/02/2026` dates) records `dd_mm_yyyy` per
+  `docs/SPEC.md` §2.1's stated ISO-leaning default. The "low confidence →
+  expanded inference bar" half of that case can't be expressed here — the
+  answer-key schema has no confidence field — so it's deferred to the UI work
+  in M4.
+- Corpus case 34 (LabVIEW epoch) uses an approximate 1904-epoch second count for
+  2026 (~122 years × 365.25 days); the arithmetic was not verified against a
+  reference implementation, since only the *shape* of a LabVIEW-epoch value
+  matters for this fixture, not the exact real-world instant it names.
+- Corpus cases 36 (non-monotonic) and 37 (duplicate timestamps) are both
+  recorded as `sampling_class: "uniform"`, because the answer-key schema has no
+  monotonicity or duplicate-count field: a single reversed or repeated interval
+  doesn't move a robust (MAD-based) jitter statistic past the 1% threshold. The
+  non-monotonic/duplicate *flagging* `docs/SPEC.md` §2.1 requires isn't
+  observable through this schema at all yet — arguably a schema gap worth its
+  own issue once the real time-inference code needs to assert it.
+- Corpus case 39 (irregular event log) is shaped so exactly one interval (24 s
+  vs. a 2 s median) exceeds the ×10 gap threshold (`gap_count: 1`) while the
+  segment as a whole is non-uniform enough to fail the "uniform within segments"
+  requirement, landing on `irregular` per `docs/SPEC.md` §2.2. Case 40 (three
+  bursts) matches `docs/QUALITY.md` §1's explicit "→ SegmentedUniform, 2 gaps"
+  wording.
+- All nineteen cases use plain `utf-8` / `,` / `.` for encoding/delimiter/
+  decimal — this batch exercises time-column inference only, not delimiter or
+  encoding detection (those are cases 1–13).
 - Corpus case 8 ("Latin-1 header") is written using only bytes in the
   0xA0–0xFF range (`°`, `µ`, `²`), which are byte-identical between true
   ISO-8859-1 and Windows-1252, and its `.expected.json` records `"encoding":
