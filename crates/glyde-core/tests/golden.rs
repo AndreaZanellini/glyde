@@ -12,16 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Glyde engine: ingestion, time indexing, multi-resolution index, and DSP.
-//!
-//! This crate contains ALL product logic and has NO GUI dependencies, so every
-//! behavior is testable headlessly. See docs/ARCHITECTURE.md.
-//!
-//! Scaffolding stub: modules are created by the first implementation task.
+//! Golden DSP tests (docs/QUALITY.md §2), one module per algorithm family.
+//! Written before their implementation; never modified to make code pass.
 
-pub mod dsp;
-mod error;
-pub mod ingest;
-pub use error::{GlydeError, Result};
-
-// TODO(scaffold): pub mod budget; time; index; series;
+#[path = "golden/decimation.rs"]
+mod decimation;

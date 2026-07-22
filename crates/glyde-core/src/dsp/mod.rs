@@ -12,16 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Glyde engine: ingestion, time indexing, multi-resolution index, and DSP.
+//! Signal processing: rendering decimation (docs/ROADMAP.md M3) and Welch
+//! PSD (docs/ROADMAP.md M5).
 //!
-//! This crate contains ALL product logic and has NO GUI dependencies, so every
-//! behavior is testable headlessly. See docs/ARCHITECTURE.md.
-//!
-//! Scaffolding stub: modules are created by the first implementation task.
+//! Every algorithm here is locked by a golden test written before its
+//! implementation (`crates/glyde-core/tests/golden/`, docs/QUALITY.md §2)
+//! and is never modified to make an implementation pass.
 
-pub mod dsp;
-mod error;
-pub mod ingest;
-pub use error::{GlydeError, Result};
-
-// TODO(scaffold): pub mod budget; time; index; series;
+pub mod decimation;
