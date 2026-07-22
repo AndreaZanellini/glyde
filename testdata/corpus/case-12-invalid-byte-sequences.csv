@@ -1,0 +1,7 @@
+timestamp,value,note
+2026-01-01T00:00:00Z,1.5,sensor ok
+2026-01-01T00:00:01Z,1.6,sensor ok
+2026-01-01T00:00:02Z,1.7,sensor ÿok
+2026-01-01T00:00:03Z,1.8,sensor ok
+2026-01-01T00:00:04Z,1.9,sensor ok
+2026-01-01T00:00:05Z,2.0,sensor ok

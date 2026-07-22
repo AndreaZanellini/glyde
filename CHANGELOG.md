@@ -11,6 +11,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Six more real-world-shaped test files for the torture corpus
+  (`testdata/corpus/`), covering encoding and character edge cases: a
+  Latin-1-safe file with `°C`/`µm/s²` in the header, a Windows-1252 file with
+  smart quotes and an em dash in a text column, a UTF-8 file with a leading
+  byte-order mark, a full UTF-16LE file, a file with one invalid byte spliced
+  into an otherwise-valid UTF-8 field, and a file whose header uses bracketed
+  unit suffixes (`Temp [°C]`). Each ships with a `.expected.json` answer key,
+  same as the first seven corpus cases. There is nothing to see in the app
+  yet — the CSV reader that will be graded against these still doesn't exist
+  (that's `docs/ROADMAP.md` M2).
+
 ### Changed
 - Roadmap bookkeeping only, no app behavior change: ticked the "architecture guard"
   and "`cargo deny check` job" boxes in `docs/ROADMAP.md`'s foundation milestone —
@@ -69,6 +81,20 @@ Versioning: [Semantic Versioning](https://semver.org/).
   batch of files lands.
 
 ### Assumptions made (maintainer: veto by testing)
+- Corpus case 8 ("Latin-1 header") is written using only bytes in the
+  0xA0–0xFF range (`°`, `µ`, `²`), which are byte-identical between true
+  ISO-8859-1 and Windows-1252, and its `.expected.json` records `"encoding":
+  "windows-1252"` rather than an ISO-8859-1-specific label. `encoding_rs`
+  (the crate `docs/SPEC.md` §1.2.1 names for encoding inference) has no
+  separate ISO-8859-1 decoder — the WHATWG standard it implements aliases
+  that label to windows-1252 — so this is what a correct reader will actually
+  report once ingestion lands. Case 9 is the one that exercises the
+  0x80–0x9F range (smart quotes, em dash) where the two encodings diverge.
+- Corpus case 12 ("invalid byte sequences mid-file") assumes the eventual CSV
+  reader replaces individual invalid bytes with U+FFFD in place (per
+  `docs/SPEC.md` §1.2.1) rather than dropping the whole row, so its
+  `row_count` is 6 and `skipped_row_count` is 0 — the malformed byte sits
+  inside one field's value, not on a delimiter, so row structure survives.
 - The `<name>.expected.json` schema (`encoding`, `delimiter`, `decimal_separator`,
   `time_column`, `timestamp_format`, `row_count`, `skipped_row_count`,
   `sampling_class`, `gap_count`) is my reading of `docs/QUALITY.md` §1's one-sentence
