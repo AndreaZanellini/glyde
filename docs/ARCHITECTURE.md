@@ -96,6 +96,41 @@ open(path)
        → ALWAYS raw samples, streaming, per uniform segment → Welch → render
 ```
 
+### Two classes of inference (decision, issue #38)
+
+Sniffing runs on a bounded head sample (SPEC §1.2, default 1 MB). Not every
+inference it produces has the same authority once streaming begins:
+
+- **File-format inferences** — encoding, delimiter, header, decimal separator —
+  are *stable configuration*. They describe how bytes are laid out, so a correct
+  sniff settles them for the whole file. If a later row seems to contradict one
+  (e.g. a sudden column-count change), that is malformed input to be salvaged
+  under SPEC §1.3 — a skipped/flagged row — **not** a signal to re-decide the
+  format. They are never "promoted" mid-stream.
+- **Semantic inferences** — column dtype — are *provisional hypotheses*. A
+  bounded sample can only ever guess a candidate dtype; a value in an unsampled
+  row that doesn't fit is **new information, not an error**. The natural model is
+  therefore monotonic promotion along the widening lattice
+  `Bool → Integer → Float → String` (String being the always-safe terminus that
+  degrades no raw data — Golden Rule 1): the streaming reader may widen a
+  column's dtype as it observes more rows, never narrow it.
+
+This is why dtype inference splits into two responsibilities across two pipeline
+stages:
+
+- `infer` (sniff, bounded sample): produce a **candidate** dtype + confidence.
+  Materializes nothing — the raw column stays memory-mapped.
+- The **streaming reader / index build** (budget-aware): validate the candidate
+  against every row, promote it when a row demands it, and materialize typed
+  values in bounded chunks under the peak-RSS cap (SPEC §5.1). The full column is
+  never held at once.
+
+The `infer_delimiter` / `infer_header` / `infer_decimal_separator` sample-only
+signatures are correct as they stand (stable configuration); `infer_column`'s
+whole-column `&[String] → Series` shape is the odd one out and belongs to the
+streaming stage, not to `infer`. Reconciling it is the M2 "CSV-reader wiring"
+item's job, built to this principle.
+
 ## The index
 
 The multi-resolution min/max pyramid is the heart of the performance contract.
