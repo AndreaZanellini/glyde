@@ -37,6 +37,11 @@ pub enum GlydeError {
     /// `.parquet`).
     #[error("unrecognized format: {path}")]
     UnrecognizedFormat { path: PathBuf },
+
+    /// The input has no data to read (corpus case 23, docs/QUALITY.md §1.23:
+    /// "clear message, no crash").
+    #[error("empty file: no data to read")]
+    EmptyFile,
 }
 
 /// The `Result` alias every fallible `glyde-core` function returns.

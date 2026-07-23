@@ -213,7 +213,11 @@ impl Delimiter {
     /// The single byte a quote-aware CSV tokenizer should split on, or
     /// `None` for [`Delimiter::Whitespace`], which is handled separately
     /// (it collapses runs of whitespace rather than splitting on one byte).
-    fn as_csv_byte(self) -> Option<u8> {
+    ///
+    /// `pub(crate)`: also used by `ingest::csv`'s full-file streaming parse,
+    /// which needs the same byte-vs-whitespace split this module's own
+    /// sample tokenizer uses.
+    pub(crate) fn as_csv_byte(self) -> Option<u8> {
         match self {
             Delimiter::Comma => Some(b','),
             Delimiter::Semicolon => Some(b';'),
