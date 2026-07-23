@@ -12,6 +12,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Internal groundwork: when the dtype engine reads a column of only `0`s and
+  `1`s as a boolean flag rather than a whole-number column, it now flags that
+  specific call as low-confidence, matching how every other automatic guess
+  (encoding, delimiter, header, decimal separator) already carries a
+  confidence signal (`docs/SPEC.md` §1.2). Nothing else about dtype
+  inference changes — explicit `true`/`false` spellings are still read as
+  confidently boolean, and whole numbers, decimals, and free text are
+  unaffected. There is nothing to see in the app yet: this is a data-shape
+  change to an internal function that isn't wired into the CSV reader until
+  the rest of `docs/ROADMAP.md` M2 lands, so no existing behavior can
+  regress from it. (Issue #37.)
+
 - Internal groundwork: the engine can now work out each column's data type
   from the plain text a delimited file actually contains (`docs/SPEC.md`
   §1.4) — whole numbers, decimals, `true`/`false` (spelled as `true`/`false`,

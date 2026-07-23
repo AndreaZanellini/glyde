@@ -529,6 +529,31 @@ pub fn infer_header(sample: &str, delimiter: Delimiter) -> HeaderInference {
     }
 }
 
+/// Result of SPEC §1.4 column dtype inference: the parsed [`Series`], and
+/// whether the dtype choice was ambiguous (SPEC §1.2 "confidence is tracked
+/// per inference"), mirroring [`EncodingInference`], [`DelimiterInference`],
+/// [`DecimalSeparatorInference`], and [`HeaderInference`] in this same file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DtypeInference {
+    pub series: Series,
+    /// The column parsed as `Bool` purely because every field is the bare
+    /// `"0"`/`"1"` convention — every field there also parses as a valid
+    /// `i64`, so nothing in the source text itself rules integer out. This
+    /// is exactly the kind of low-confidence call CLAUDE.md's Golden Rule 2
+    /// says must surface to the user rather than be silently guessed;
+    /// `false` for every other dtype outcome, including explicit
+    /// `true`/`false` spellings, which no integer parse would ever accept.
+    pub ambiguous: bool,
+}
+
+/// Whether every field in `fields` is the bare numeric `"0"`/`"1"` boolean
+/// convention (trimmed) — the one spelling [`parse_bool_field`] accepts that
+/// an integer parse would *also* accept, making the bool-vs-integer choice
+/// genuinely ambiguous rather than a confident dtype match.
+fn is_ambiguous_numeric_bool_column(fields: &[String]) -> bool {
+    !fields.is_empty() && fields.iter().all(|field| matches!(field.trim(), "0" | "1"))
+}
+
 /// Infers a column's dtype from its raw source-text fields (SPEC §1.4) and
 /// parses every field into that representation in one pass. Tried in order
 /// — bool, then integer, then float — so a dtype only wins when *every*
@@ -548,14 +573,28 @@ pub fn infer_header(sample: &str, delimiter: Delimiter) -> HeaderInference {
 /// lossless signed/floating representation is the safe default; narrower
 /// integer widths (`i8`..`i32`, `u8`..`u64`) and `f32` are a later item's
 /// job, not required by any corpus case this one is proven against.
-pub fn infer_column(name: impl Into<String>, fields: &[String]) -> Series {
+pub fn infer_column(name: impl Into<String>, fields: &[String]) -> DtypeInference {
     if let Some(values) = parse_every(fields, parse_bool_field) {
-        info!(
-            dtype = "bool",
-            field_count = fields.len(),
-            "column dtype inferred (SPEC §1.4)"
-        );
-        return Series::new(name, SeriesValues::Bool(values));
+        let ambiguous = is_ambiguous_numeric_bool_column(fields);
+        if ambiguous {
+            warn!(
+                dtype = "bool",
+                field_count = fields.len(),
+                "column dtype inferred as bool from the bare 0/1 convention, but every field \
+                 also parses as i64 — low-confidence dtype choice (SPEC §1.2, CLAUDE.md \
+                 Golden Rule 2)"
+            );
+        } else {
+            info!(
+                dtype = "bool",
+                field_count = fields.len(),
+                "column dtype inferred (SPEC §1.4)"
+            );
+        }
+        return DtypeInference {
+            series: Series::new(name, SeriesValues::Bool(values)),
+            ambiguous,
+        };
     }
     if let Some(values) = parse_every(fields, |field| field.trim().parse::<i64>().ok()) {
         info!(
@@ -563,7 +602,10 @@ pub fn infer_column(name: impl Into<String>, fields: &[String]) -> Series {
             field_count = fields.len(),
             "column dtype inferred (SPEC §1.4)"
         );
-        return Series::new(name, SeriesValues::I64(values));
+        return DtypeInference {
+            series: Series::new(name, SeriesValues::I64(values)),
+            ambiguous: false,
+        };
     }
     if let Some(values) = parse_every(fields, |field| field.trim().parse::<f64>().ok()) {
         let nan_runs = detect_nan_runs(&values);
@@ -578,14 +620,17 @@ pub fn infer_column(name: impl Into<String>, fields: &[String]) -> Series {
             field_count = fields.len(),
             "column dtype inferred (SPEC §1.4)"
         );
-        return Series::with_anomalies(
-            name,
-            SeriesValues::F64(values),
-            Anomalies {
-                nan_runs,
-                ..Anomalies::default()
-            },
-        );
+        return DtypeInference {
+            series: Series::with_anomalies(
+                name,
+                SeriesValues::F64(values),
+                Anomalies {
+                    nan_runs,
+                    ..Anomalies::default()
+                },
+            ),
+            ambiguous: false,
+        };
     }
 
     info!(
@@ -594,7 +639,10 @@ pub fn infer_column(name: impl Into<String>, fields: &[String]) -> Series {
         "column dtype inferred as string/categorical — not every field parsed as bool, \
          integer, or float (SPEC §1.4)"
     );
-    Series::new(name, SeriesValues::String(fields.to_vec()))
+    DtypeInference {
+        series: Series::new(name, SeriesValues::String(fields.to_vec())),
+        ambiguous: false,
+    }
 }
 
 /// Parses every field with `parse`, succeeding only if all of them do —
@@ -1068,7 +1116,8 @@ mod tests {
     fn corpus_case_43_nan_runs_infers_f64_with_one_flagged_run() {
         let fields = corpus_column("case-43-nan-runs.csv", "value");
 
-        let series = infer_column("value", &fields);
+        let inference = infer_column("value", &fields);
+        let series = inference.series;
 
         assert_eq!(series.dtype(), Dtype::F64);
         let SeriesValues::F64(values) = series.values() else {
@@ -1077,6 +1126,7 @@ mod tests {
         assert_eq!(values.len(), 7);
         assert_eq!(values[2..5].iter().filter(|v| v.is_nan()).count(), 3);
         assert_eq!(series.anomalies().nan_runs, vec![2..5]);
+        assert!(!inference.ambiguous);
     }
 
     // Corpus case 44: `Infinity`/`-Infinity` are valid float values, not a
@@ -1085,7 +1135,7 @@ mod tests {
     fn corpus_case_44_infinities_infer_f64_without_anomalies() {
         let fields = corpus_column("case-44-infinities.csv", "value");
 
-        let series = infer_column("value", &fields);
+        let series = infer_column("value", &fields).series;
 
         assert_eq!(series.dtype(), Dtype::F64);
         let SeriesValues::F64(values) = series.values() else {
@@ -1109,7 +1159,7 @@ mod tests {
     fn corpus_case_46_mixed_numeric_string_falls_back_to_string_dtype() {
         let fields = corpus_column("case-46-mixed-numeric-string.csv", "value");
 
-        let series = infer_column("value", &fields);
+        let series = infer_column("value", &fields).series;
 
         assert_eq!(series.dtype(), Dtype::String);
         assert_eq!(series.values(), &SeriesValues::String(fields));
@@ -1126,7 +1176,7 @@ mod tests {
         ] {
             let fields = corpus_column("case-47-boolean-column.csv", column);
 
-            let series = infer_column(column, &fields);
+            let series = infer_column(column, &fields).series;
 
             assert_eq!(series.dtype(), Dtype::Bool);
             assert_eq!(series.values(), &SeriesValues::Bool(expected));
@@ -1139,7 +1189,7 @@ mod tests {
     fn corpus_case_48_string_state_column_infers_string_dtype() {
         let fields = corpus_column("case-48-string-state-column.csv", "state");
 
-        let series = infer_column("state", &fields);
+        let series = infer_column("state", &fields).series;
 
         assert_eq!(series.dtype(), Dtype::String);
         assert_eq!(series.values(), &SeriesValues::String(fields));
@@ -1151,24 +1201,42 @@ mod tests {
             .map(str::to_string)
             .to_vec();
 
-        let series = infer_column("value", &fields);
+        let inference = infer_column("value", &fields);
 
-        assert_eq!(series.dtype(), Dtype::I64);
+        assert_eq!(inference.series.dtype(), Dtype::I64);
         assert_eq!(
-            series.values(),
+            inference.series.values(),
             &SeriesValues::I64(vec![1, -2, 3, 9223372036854775807])
         );
+        assert!(!inference.ambiguous);
     }
 
     // A column of only `0`/`1` reads as boolean (corpus case 47), not as an
-    // integer series, even though every field also parses as an integer.
+    // integer series, even though every field also parses as an integer —
+    // and per issue #37, this specific call is genuinely ambiguous: nothing
+    // in the source text itself rules out `Integer`, so it must be flagged
+    // low-confidence (SPEC §1.2, CLAUDE.md Golden Rule 2) rather than
+    // presented as if `Bool` were a confident read.
     #[test]
-    fn infer_column_prefers_bool_over_integer_for_zero_one_columns() {
+    fn infer_column_prefers_bool_over_integer_for_zero_one_columns_but_flags_it_ambiguous() {
         let fields = vec!["0".to_string(), "1".to_string(), "0".to_string()];
 
-        let series = infer_column("flag", &fields);
+        let inference = infer_column("flag", &fields);
 
-        assert_eq!(series.dtype(), Dtype::Bool);
+        assert_eq!(inference.series.dtype(), Dtype::Bool);
+        assert!(inference.ambiguous);
+    }
+
+    // Explicit `true`/`false` spellings are not ambiguous: no integer parse
+    // would ever accept them, so `Bool` is the only dtype that fits.
+    #[test]
+    fn infer_column_of_explicit_true_false_spellings_is_not_ambiguous() {
+        let fields = vec!["true".to_string(), "false".to_string(), "TRUE".to_string()];
+
+        let inference = infer_column("flag", &fields);
+
+        assert_eq!(inference.series.dtype(), Dtype::Bool);
+        assert!(!inference.ambiguous);
     }
 
     // A column that mixes an integer-looking cell with a fractional one must
@@ -1178,17 +1246,19 @@ mod tests {
     fn infer_column_of_mixed_integer_and_float_text_infers_f64() {
         let fields = vec!["10".to_string(), "10.5".to_string(), "11".to_string()];
 
-        let series = infer_column("value", &fields);
+        let inference = infer_column("value", &fields);
 
-        assert_eq!(series.dtype(), Dtype::F64);
+        assert_eq!(inference.series.dtype(), Dtype::F64);
+        assert!(!inference.ambiguous);
     }
 
     #[test]
     fn infer_column_falls_back_to_string_when_nothing_numeric_matches() {
         let fields = vec!["idle".to_string(), "running".to_string()];
 
-        let series = infer_column("state", &fields);
+        let inference = infer_column("state", &fields);
 
-        assert_eq!(series.dtype(), Dtype::String);
+        assert_eq!(inference.series.dtype(), Dtype::String);
+        assert!(!inference.ambiguous);
     }
 }

@@ -25,8 +25,8 @@ mod infer;
 pub use csv::{open_path, parse, CsvParseOutcome, CsvReader};
 pub use infer::{
     decode, detect_encoding, infer_column, infer_decimal_separator, infer_delimiter, infer_header,
-    DecimalSeparator, DecimalSeparatorInference, Delimiter, DelimiterInference, EncodingInference,
-    EncodingSource, HeaderInference, HEAD_SAMPLE_BYTES,
+    DecimalSeparator, DecimalSeparatorInference, Delimiter, DelimiterInference, DtypeInference,
+    EncodingInference, EncodingSource, HeaderInference, HEAD_SAMPLE_BYTES,
 };
 
 use crate::{GlydeError, Result};
