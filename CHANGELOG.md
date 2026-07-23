@@ -12,6 +12,33 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Internal groundwork: the engine can now work out each column's data type
+  from the plain text a delimited file actually contains (`docs/SPEC.md`
+  §1.4) — whole numbers, decimals, `true`/`false` (spelled as `true`/`false`,
+  `0`/`1`, or `TRUE`/`FALSE`), or free text — one column at a time. A run of
+  missing (`NaN`) readings is kept as real values and flagged as a single
+  gap rather than three separate ones; `Infinity`/`-Infinity` are accepted as
+  ordinary numbers, not treated as broken data; and a column with even one
+  stray non-numeric entry (a sensor's `"ERR"`/`"OK"` reading mixed in with
+  its normal numbers) is kept as plain text in its entirety — the numbers in
+  it are never silently parsed out while the odd entries are quietly
+  dropped. Proven against the five relevant torture-corpus cases: a run of
+  missing values, infinities, a mixed numeric/text column, a boolean column
+  spelled three different ways, and a plain text "machine state" column.
+  There is nothing to see in the app yet — this plugs into the CSV reader
+  once the rest of `docs/ROADMAP.md` M2 lands.
+
+  **Assumption made:** whole-number columns always come out as the widest
+  signed integer type (`i64`) and decimal columns always as the widest
+  floating-point type (`f64`), never a narrower width. A delimited text file
+  has no dtype of its own to preserve the way a typed Parquet column will
+  (`docs/ROADMAP.md` M7) — there's only a dtype to infer — so defaulting to
+  the widest lossless type is the safe choice until a narrower one is
+  actually needed. Also: a column containing only `0`s and `1`s reads as
+  boolean rather than as whole numbers, matching torture-corpus case 47's
+  `flag_numeric` column; flag if a genuinely numeric 0/1 column should be
+  told apart from a boolean one before more of M2 depends on this rule.
+
 - Internal groundwork: the engine can now actually read a delimited text
   file end to end in one streaming pass over the file's bytes, not just
   sniff its shape (`docs/SPEC.md` §1.3, `docs/ARCHITECTURE.md` §CSV). Rows
