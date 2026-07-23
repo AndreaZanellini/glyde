@@ -128,7 +128,6 @@ fn month_first_round_trips() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M2: LabVIEW epoch timestamp parsing not implemented yet"]
 fn lab_view_epoch_round_trips() {
     assert_round_trips(
         glyde_core::time::TimestampFormat::LabViewEpoch,
@@ -137,9 +136,24 @@ fn lab_view_epoch_round_trips() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M2: Excel serial timestamp parsing not implemented yet"]
 fn excel_serial_round_trips() {
     assert_round_trips(glyde_core::time::TimestampFormat::ExcelSerial, "46590");
+}
+
+#[test]
+fn iso8601_with_offset_picosecond_round_trips() {
+    assert_round_trips(
+        glyde_core::time::TimestampFormat::Iso8601WithOffset,
+        "2026-07-22T14:30:00.123456789012+02:00",
+    );
+}
+
+#[test]
+fn iso8601_naive_picosecond_round_trips() {
+    assert_round_trips(
+        glyde_core::time::TimestampFormat::Iso8601Naive,
+        "2026-07-22T14:30:00.123456789012",
+    );
 }
 
 #[test]

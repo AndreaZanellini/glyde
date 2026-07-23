@@ -12,6 +12,39 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Internal groundwork: the engine can now also read two more absolute-timestamp
+  formats named in `docs/SPEC.md` §2.1 — Excel serial dates (days since
+  1899-12-30, e.g. `46023`) and the LabVIEW/NI epoch (seconds since
+  1904-01-01, e.g. `3850027200.0`) — and correctly tells both apart from a
+  plain epoch-seconds column and from each other by their typical magnitude,
+  the same way the four Unix epoch resolutions are already told apart.
+  Separately, a timestamp column with more than nanosecond precision (a
+  picosecond-resolution log, `docs/SPEC.md` §2.1's "sub-nanosecond sources")
+  is now read with every picosecond digit intact instead of being silently
+  rounded down to the nearest nanosecond, which is what would otherwise
+  happen with off-the-shelf date parsing. Proven against the four relevant
+  torture-corpus cases: Excel serial dates, LabVIEW epoch, a
+  picosecond-resolution index, and a plain multi-year series (a scale check
+  that nothing above breaks ordinary multi-year files). There is nothing to
+  see in the app yet — this plugs into the CSV reader once the rest of
+  `docs/ROADMAP.md` M2 lands.
+
+  **Assumptions made:**
+  - Excel serial dates and LabVIEW epoch values can carry a fractional part
+    (a time of day for Excel, sub-second precision for LabVIEW) per
+    `docs/SPEC.md` §2.1, but no torture-corpus fixture uses one — every
+    value in cases 33/34 is a whole number. Fractional support is
+    implemented and covered by two hand-written tests (not a corpus case),
+    computed with exact whole-number arithmetic rather than `f64`, so a
+    fractional value is never silently mis-scaled; worth a veto if a real
+    file's fractional values expose a rounding case these two tests don't.
+  - Telling Excel serial dates and the LabVIEW epoch apart from the four
+    Unix epoch resolutions (and from a plain progressive-index column) uses
+    the same "plausible modern-era magnitude" heuristic already in place for
+    the four epoch formats, shifted into each format's own epoch and unit.
+    This isn't written down in `docs/SPEC.md`; flag if a real file's values
+    could plausibly fall outside that window.
+
 - Internal groundwork: when a timestamp column uses ambiguous slash-separated
   dates (`25/01/2026` or `01/25/2026`), the engine now works out on its own
   whether the file means day-first (`DD/MM`) or month-first (`MM/DD`), the
