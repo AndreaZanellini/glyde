@@ -12,6 +12,23 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Internal groundwork: when a timestamp column uses ambiguous slash-separated
+  dates (`25/01/2026` or `01/25/2026`), the engine now works out on its own
+  whether the file means day-first (`DD/MM`) or month-first (`MM/DD`), the
+  same way a person would: it looks for any date in the column where one of
+  the two number fields is bigger than 12 — since no month can be 13 or
+  higher, that settles which field is the day and which is the month
+  (`docs/SPEC.md` §2.1). If every date in the file is ambiguous even after
+  checking (e.g. every row is in the first twelve days of the month), it
+  never silently guesses: it defaults to day-first and marks the inference
+  as low-confidence, so the upcoming "inference bar" (`docs/ROADMAP.md` M4)
+  can show it as a one-click-correctable guess rather than a hidden
+  assumption. Proven against the three relevant torture-corpus cases: an
+  unambiguous day-first file, an unambiguous month-first file, and a fully
+  ambiguous one. There is nothing to see in the app yet — this plugs into
+  the CSV reader once the rest of `docs/ROADMAP.md` M2 lands.
+
+### Added
 - Internal groundwork: the engine can now read and re-write absolute
   timestamps in the most common formats (`docs/SPEC.md` §2.1) — ISO 8601
   with a timezone offset (`2026-07-22T14:30:00+02:00`) or without one
@@ -25,8 +42,8 @@ Versioning: [Semantic Versioning](https://semver.org/).
   without a timezone, all four epoch resolutions, and the progressive
   row-counter file. There is nothing to see in the app yet — this plugs
   into the CSV reader once the remaining `docs/ROADMAP.md` M2 time-index
-  items (day-first/month-first date disambiguation, Excel/LabVIEW formats,
-  and sampling classification) land alongside it.
+  items (Excel/LabVIEW formats and sampling classification) land alongside
+  it.
 
   **Assumptions made:**
   - `docs/SPEC.md` §2.1 says epoch values may be "integer or float"; only

@@ -15,11 +15,14 @@
 //! Absolute-timestamp parsing and formatting (docs/SPEC.md §2.1).
 //!
 //! [`TimestampFormat::Iso8601WithOffset`], [`TimestampFormat::Iso8601Naive`],
-//! and the four epoch formats are implemented (docs/ROADMAP.md M2 "Time
-//! index: progressive numeric + core timestamp formats"); `DateTimeSpace`,
-//! `DayFirst`/`MonthFirst` (ambiguity resolution), `LabViewEpoch`, and
-//! `ExcelSerial` are separate, not-yet-started M2 roadmap items and remain
-//! `todo!()`.
+//! the four epoch formats, and [`TimestampFormat::DayFirst`] /
+//! [`TimestampFormat::MonthFirst`] (with the SPEC §2.1 day-vs-month ambiguity
+//! rule) are implemented (docs/ROADMAP.md M2's "Time index" item and its
+//! "DD/MM vs MM/DD disambiguation" item). `DateTimeSpace`, `LabViewEpoch`,
+//! and `ExcelSerial` are separate, not-yet-started M2 roadmap items and
+//! remain `todo!()`.
+
+use tracing::{info, warn};
 
 /// The native tick resolution a timestamp source declares (SPEC §2.1: "store
 /// the native tick resolution declared by the source ... never store
@@ -105,7 +108,8 @@ pub enum TimestampFormat {
     DateTimeSpace,
     /// `DD/MM/YYYY HH:MM:SS`, used once the day-vs-month ambiguity is
     /// resolved (SPEC §2.1 ambiguity rule) — this format itself assumes an
-    /// already-disambiguated column.
+    /// already-disambiguated column. Also the ISO-leaning default
+    /// [`infer_timestamp_format`] picks when a column is fully ambiguous.
     DayFirst,
     /// `MM/DD/YYYY HH:MM:SS`, the disambiguated counterpart of
     /// [`TimestampFormat::DayFirst`].
@@ -128,20 +132,19 @@ pub enum TimestampFormat {
 /// Parses `input` as `format`, producing a [`Timestamp`] in that format's
 /// native resolution (SPEC §2.1).
 ///
-/// `DateTimeSpace`, `DayFirst`/`MonthFirst`, `LabViewEpoch`, and
-/// `ExcelSerial` are separate, not-yet-started roadmap items and remain
-/// `todo!()`.
+/// `DateTimeSpace`, `LabViewEpoch`, and `ExcelSerial` are separate,
+/// not-yet-started roadmap items and remain `todo!()`.
 pub fn parse_timestamp(input: &str, format: TimestampFormat) -> crate::Result<Timestamp> {
     match format {
         TimestampFormat::Iso8601WithOffset => parse_iso8601_with_offset(input),
         TimestampFormat::Iso8601Naive => parse_iso8601_naive(input),
+        TimestampFormat::DayFirst => parse_naive_with_pattern(input, "%d/%m/%Y %H:%M:%S", format),
+        TimestampFormat::MonthFirst => parse_naive_with_pattern(input, "%m/%d/%Y %H:%M:%S", format),
         TimestampFormat::EpochSeconds => parse_epoch_integer(input, TimeUnit::Seconds, format),
         TimestampFormat::EpochMillis => parse_epoch_integer(input, TimeUnit::Milliseconds, format),
         TimestampFormat::EpochMicros => parse_epoch_integer(input, TimeUnit::Microseconds, format),
         TimestampFormat::EpochNanos => parse_epoch_integer(input, TimeUnit::Nanoseconds, format),
         TimestampFormat::DateTimeSpace
-        | TimestampFormat::DayFirst
-        | TimestampFormat::MonthFirst
         | TimestampFormat::LabViewEpoch
         | TimestampFormat::ExcelSerial => {
             todo!("docs/ROADMAP.md M2: {format:?} timestamp parsing is a separate, not-yet-started roadmap item")
@@ -154,20 +157,19 @@ pub fn parse_timestamp(input: &str, format: TimestampFormat) -> crate::Result<Ti
 /// `format_timestamp(&parse_timestamp(s, format)?, format) == s`
 /// (docs/QUALITY.md §2 Time: format round-trip).
 ///
-/// `DateTimeSpace`, `DayFirst`/`MonthFirst`, `LabViewEpoch`, and
-/// `ExcelSerial` are separate, not-yet-started roadmap items and remain
-/// `todo!()`.
+/// `DateTimeSpace`, `LabViewEpoch`, and `ExcelSerial` are separate,
+/// not-yet-started roadmap items and remain `todo!()`.
 pub fn format_timestamp(timestamp: &Timestamp, format: TimestampFormat) -> String {
     match format {
         TimestampFormat::Iso8601WithOffset => format_iso8601_with_offset(timestamp),
         TimestampFormat::Iso8601Naive => format_iso8601_naive(timestamp),
+        TimestampFormat::DayFirst => format_naive_with_pattern(timestamp, "%d/%m/%Y %H:%M:%S"),
+        TimestampFormat::MonthFirst => format_naive_with_pattern(timestamp, "%m/%d/%Y %H:%M:%S"),
         TimestampFormat::EpochSeconds
         | TimestampFormat::EpochMillis
         | TimestampFormat::EpochMicros
         | TimestampFormat::EpochNanos => timestamp.ticks.to_string(),
         TimestampFormat::DateTimeSpace
-        | TimestampFormat::DayFirst
-        | TimestampFormat::MonthFirst
         | TimestampFormat::LabViewEpoch
         | TimestampFormat::ExcelSerial => {
             todo!("docs/ROADMAP.md M2: {format:?} timestamp formatting is a separate, not-yet-started roadmap item")
@@ -217,6 +219,36 @@ fn parse_iso8601_naive(input: &str) -> crate::Result<Timestamp> {
 fn format_iso8601_naive(timestamp: &Timestamp) -> String {
     utc_datetime_from_ticks(timestamp)
         .format("%Y-%m-%dT%H:%M:%S%.f")
+        .to_string()
+}
+
+/// Shared parser for [`TimestampFormat::DayFirst`] and
+/// [`TimestampFormat::MonthFirst`]: both are naive (no timezone in the SPEC
+/// §2.1 grammar, unlike [`TimestampFormat::Iso8601WithOffset`]) `chrono`
+/// strptime patterns differing only in whether `%d` or `%m` comes first.
+/// `chrono` itself rejects an out-of-range day/month (e.g. a "month" field >
+/// 12), which is what lets [`infer_day_month_format`] use this as the final
+/// confirmation step after its own field-scan.
+fn parse_naive_with_pattern(
+    input: &str,
+    pattern: &str,
+    format: TimestampFormat,
+) -> crate::Result<Timestamp> {
+    let parsed = chrono::NaiveDateTime::parse_from_str(input, pattern).map_err(|source| {
+        crate::GlydeError::InvalidTimestamp {
+            input: input.to_string(),
+            format,
+            reason: source.to_string(),
+        }
+    })?;
+    let ticks = nanos_since_epoch(input, format, &parsed.and_utc())?;
+    Ok(Timestamp::new(ticks, TimeUnit::Nanoseconds))
+}
+
+/// The inverse of [`parse_naive_with_pattern`].
+fn format_naive_with_pattern(timestamp: &Timestamp, pattern: &str) -> String {
+    utc_datetime_from_ticks(timestamp)
+        .format(pattern)
         .to_string()
 }
 
@@ -272,10 +304,30 @@ fn parse_epoch_integer(
     Ok(Timestamp::new(ticks, unit))
 }
 
-/// The in-scope absolute-timestamp formats [`infer_timestamp_format`] tries.
-/// `DateTimeSpace`, `DayFirst`/`MonthFirst`, `LabViewEpoch`, and
-/// `ExcelSerial` are separate, not-yet-started roadmap items and are never
-/// inferred.
+/// The result of [`infer_timestamp_format`]: which [`TimestampFormat`] every
+/// field matched, and whether that choice was a confident one or SPEC §2.1's
+/// ambiguity-rule fallback — mirroring `ingest::infer::DtypeInference`'s
+/// `ambiguous` flag (SPEC §1.2 "confidence is tracked per inference").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimestampFormatInference {
+    pub format: TimestampFormat,
+    /// `true` only for the [`TimestampFormat::DayFirst`]/
+    /// [`TimestampFormat::MonthFirst`] ambiguity fallback (SPEC §2.1: "If the
+    /// whole column is ambiguous ... mark the inference low confidence").
+    /// Every other format is either an unambiguous syntactic match or not a
+    /// match at all — there is no partial confidence to report for them.
+    pub ambiguous: bool,
+}
+
+/// The in-scope, syntactically self-disambiguating absolute-timestamp
+/// formats [`infer_timestamp_format`] tries first. [`TimestampFormat::DayFirst`]
+/// / [`TimestampFormat::MonthFirst`] are deliberately excluded from this list
+/// — unlike every format here, a `DD/MM/YYYY ...` and an `MM/DD/YYYY ...`
+/// string can be syntactically identical, so picking between them needs
+/// [`infer_day_month_format`]'s dedicated field-scan (SPEC §2.1 ambiguity
+/// rule) rather than the "first format that parses every field" rule this
+/// list is tried under. `DateTimeSpace`, `LabViewEpoch`, and `ExcelSerial`
+/// are separate, not-yet-started roadmap items and are never inferred.
 const IN_SCOPE_FORMATS: [TimestampFormat; 6] = [
     TimestampFormat::Iso8601WithOffset,
     TimestampFormat::Iso8601Naive,
@@ -325,21 +377,102 @@ fn field_matches_format(field: &str, format: TimestampFormat) -> bool {
     }
 }
 
-/// Infers which in-scope [`TimestampFormat`] every value in `fields`
-/// matches, if exactly one does (SPEC §2.1). Returns `None` when no
-/// candidate explains every field — the signal a caller uses to fall back to
-/// a progressive-numeric index (corpus case 35) rather than mis-detecting an
+/// Extracts the first two `/`-separated numeric groups from a
+/// `DD/MM/YYYY ...` or `MM/DD/YYYY ...` field, e.g. `"25/01/2026 08:00:00"`
+/// -> `Some((25, 1))`. Returns `None` for anything that does not have the
+/// three-part `.../.../...`  shape (a bare `"3/4"`, a non-numeric field, or a
+/// field with no `/` at all), so [`infer_day_month_format`] only treats a
+/// column as a slash-delimited date candidate once every field actually
+/// looks like one.
+fn leading_day_month_groups(field: &str) -> Option<(u32, u32)> {
+    let mut parts = field.trim().splitn(3, '/');
+    let first = parts.next()?.trim().parse::<u32>().ok()?;
+    let second = parts.next()?.trim().parse::<u32>().ok()?;
+    parts.next()?; // the year-and-time remainder; its mere presence confirms the 3-part shape
+    Some((first, second))
+}
+
+/// Implements SPEC §2.1's day-vs-month ambiguity rule for a column of
+/// `DD/MM/YYYY HH:MM:SS` / `MM/DD/YYYY HH:MM:SS` candidates: "never
+/// coin-flip. Resolve by scanning enough rows to find a discriminating value
+/// (a field > 12 settles day-vs-month). If the whole column is ambiguous,
+/// pick ISO-leaning default (`DD/MM` ...), mark the inference low
+/// confidence ... Log the decision."
+///
+/// A value in the first slash-group greater than 12 can only be a day (no
+/// month exceeds 12), which settles [`TimestampFormat::DayFirst`]; the
+/// symmetric case in the second group settles
+/// [`TimestampFormat::MonthFirst`]. A column where evidence for *both*
+/// readings appears across different rows is genuinely contradictory — no
+/// single fixed format explains every row — so that is reported as "no
+/// match" (`None`) rather than guessed either way, the same fidelity-first
+/// default `field_matches_format`'s epoch-magnitude window applies to
+/// implausible epoch values.
+fn infer_day_month_format(fields: &[String]) -> Option<TimestampFormatInference> {
+    let groups: Vec<(u32, u32)> = fields
+        .iter()
+        .map(|field| leading_day_month_groups(field))
+        .collect::<Option<Vec<_>>>()?;
+
+    let day_first_evidence = groups.iter().any(|&(first, _)| first > 12);
+    let month_first_evidence = groups.iter().any(|&(_, second)| second > 12);
+
+    let (format, ambiguous) = match (day_first_evidence, month_first_evidence) {
+        (true, true) => return None,
+        (true, false) => (TimestampFormat::DayFirst, false),
+        (false, true) => (TimestampFormat::MonthFirst, false),
+        (false, false) => (TimestampFormat::DayFirst, true),
+    };
+
+    if !fields
+        .iter()
+        .all(|field| parse_timestamp(field, format).is_ok())
+    {
+        return None;
+    }
+
+    if ambiguous {
+        warn!(
+            format = ?format,
+            field_count = fields.len(),
+            "day-vs-month ambiguous in every row (no field > 12 in either position) — defaulting \
+             to the ISO-leaning DD/MM reading per SPEC §2.1; low-confidence inference"
+        );
+    } else {
+        info!(
+            format = ?format,
+            field_count = fields.len(),
+            "day-vs-month disambiguated by a field > 12 (SPEC §2.1 ambiguity rule)"
+        );
+    }
+
+    Some(TimestampFormatInference { format, ambiguous })
+}
+
+/// Infers which [`TimestampFormat`] every value in `fields` matches (SPEC
+/// §2.1), first trying the syntactically self-disambiguating
+/// [`IN_SCOPE_FORMATS`], then falling back to [`infer_day_month_format`]'s
+/// dedicated ambiguity resolution. Returns `None` when no candidate explains
+/// every field — the signal a caller uses to fall back to a
+/// progressive-numeric index (corpus case 35) rather than mis-detecting an
 /// absolute timestamp.
-pub fn infer_timestamp_format(fields: &[String]) -> Option<TimestampFormat> {
+pub fn infer_timestamp_format(fields: &[String]) -> Option<TimestampFormatInference> {
     if fields.is_empty() {
         return None;
     }
 
-    IN_SCOPE_FORMATS.into_iter().find(|&format| {
+    if let Some(format) = IN_SCOPE_FORMATS.into_iter().find(|&format| {
         fields
             .iter()
             .all(|field| field_matches_format(field, format))
-    })
+    }) {
+        return Some(TimestampFormatInference {
+            format,
+            ambiguous: false,
+        });
+    }
+
+    infer_day_month_format(fields)
 }
 
 #[cfg(test)]
@@ -411,12 +544,13 @@ mod tests {
     fn corpus_case_24_iso8601_with_timezone_detects_and_parses() {
         let fields = corpus_column("case-24-iso8601-with-timezone.csv", "timestamp");
 
-        let format = infer_timestamp_format(&fields);
-        assert_eq!(format, Some(TimestampFormat::Iso8601WithOffset));
+        let inference = infer_timestamp_format(&fields).expect("must infer a format");
+        assert_eq!(inference.format, TimestampFormat::Iso8601WithOffset);
+        assert!(!inference.ambiguous);
 
         let timestamps: Vec<Timestamp> = fields
             .iter()
-            .map(|field| parse_timestamp(field, format.unwrap()).expect("must parse"))
+            .map(|field| parse_timestamp(field, inference.format).expect("must parse"))
             .collect();
         assert_eq!(timestamps.len(), 6);
         assert_monotonically_increasing(&timestamps);
@@ -433,12 +567,13 @@ mod tests {
     fn corpus_case_25_iso8601_naive_detects_and_parses() {
         let fields = corpus_column("case-25-iso8601-naive.csv", "timestamp");
 
-        let format = infer_timestamp_format(&fields);
-        assert_eq!(format, Some(TimestampFormat::Iso8601Naive));
+        let inference = infer_timestamp_format(&fields).expect("must infer a format");
+        assert_eq!(inference.format, TimestampFormat::Iso8601Naive);
+        assert!(!inference.ambiguous);
 
         let timestamps: Vec<Timestamp> = fields
             .iter()
-            .map(|field| parse_timestamp(field, format.unwrap()).expect("must parse"))
+            .map(|field| parse_timestamp(field, inference.format).expect("must parse"))
             .collect();
         assert_eq!(timestamps.len(), 6);
         assert_monotonically_increasing(&timestamps);
@@ -453,12 +588,13 @@ mod tests {
     fn corpus_case_29_epoch_seconds_detects_and_parses() {
         let fields = corpus_column("case-29-epoch-seconds.csv", "timestamp");
 
-        let format = infer_timestamp_format(&fields);
-        assert_eq!(format, Some(TimestampFormat::EpochSeconds));
+        let inference = infer_timestamp_format(&fields).expect("must infer a format");
+        assert_eq!(inference.format, TimestampFormat::EpochSeconds);
+        assert!(!inference.ambiguous);
 
         let timestamps: Vec<Timestamp> = fields
             .iter()
-            .map(|field| parse_timestamp(field, format.unwrap()).expect("must parse"))
+            .map(|field| parse_timestamp(field, inference.format).expect("must parse"))
             .collect();
         assert_eq!(
             timestamps[0],
@@ -471,12 +607,13 @@ mod tests {
     fn corpus_case_30_epoch_milliseconds_detects_and_parses() {
         let fields = corpus_column("case-30-epoch-milliseconds.csv", "timestamp");
 
-        let format = infer_timestamp_format(&fields);
-        assert_eq!(format, Some(TimestampFormat::EpochMillis));
+        let inference = infer_timestamp_format(&fields).expect("must infer a format");
+        assert_eq!(inference.format, TimestampFormat::EpochMillis);
+        assert!(!inference.ambiguous);
 
         let timestamps: Vec<Timestamp> = fields
             .iter()
-            .map(|field| parse_timestamp(field, format.unwrap()).expect("must parse"))
+            .map(|field| parse_timestamp(field, inference.format).expect("must parse"))
             .collect();
         assert_eq!(
             timestamps[0],
@@ -489,12 +626,13 @@ mod tests {
     fn corpus_case_31_epoch_microseconds_detects_and_parses() {
         let fields = corpus_column("case-31-epoch-microseconds.csv", "timestamp");
 
-        let format = infer_timestamp_format(&fields);
-        assert_eq!(format, Some(TimestampFormat::EpochMicros));
+        let inference = infer_timestamp_format(&fields).expect("must infer a format");
+        assert_eq!(inference.format, TimestampFormat::EpochMicros);
+        assert!(!inference.ambiguous);
 
         let timestamps: Vec<Timestamp> = fields
             .iter()
-            .map(|field| parse_timestamp(field, format.unwrap()).expect("must parse"))
+            .map(|field| parse_timestamp(field, inference.format).expect("must parse"))
             .collect();
         assert_eq!(
             timestamps[0],
@@ -507,18 +645,104 @@ mod tests {
     fn corpus_case_32_epoch_nanoseconds_detects_and_parses() {
         let fields = corpus_column("case-32-epoch-nanoseconds.csv", "timestamp");
 
-        let format = infer_timestamp_format(&fields);
-        assert_eq!(format, Some(TimestampFormat::EpochNanos));
+        let inference = infer_timestamp_format(&fields).expect("must infer a format");
+        assert_eq!(inference.format, TimestampFormat::EpochNanos);
+        assert!(!inference.ambiguous);
 
         let timestamps: Vec<Timestamp> = fields
             .iter()
-            .map(|field| parse_timestamp(field, format.unwrap()).expect("must parse"))
+            .map(|field| parse_timestamp(field, inference.format).expect("must parse"))
             .collect();
         assert_eq!(
             timestamps[0],
             Timestamp::new(1_770_000_000_000_000_000, TimeUnit::Nanoseconds)
         );
         assert_monotonically_increasing(&timestamps);
+    }
+
+    // Corpus case 26 (docs/QUALITY.md §1.26): every day field is 25, which
+    // exceeds the maximum month (12) — SPEC §2.1's discriminating value that
+    // settles `DayFirst` with full confidence (not the ambiguous fallback).
+    #[test]
+    fn corpus_case_26_dd_mm_yyyy_unambiguous_detects_day_first_confidently() {
+        let fields = corpus_column("case-26-dd-mm-yyyy-unambiguous.csv", "timestamp");
+
+        let inference = infer_timestamp_format(&fields).expect("must infer a format");
+        assert_eq!(inference.format, TimestampFormat::DayFirst);
+        assert!(
+            !inference.ambiguous,
+            "a field > 12 in the first position must resolve confidently, not fall back to the \
+             ambiguous default"
+        );
+
+        let timestamps: Vec<Timestamp> = fields
+            .iter()
+            .map(|field| parse_timestamp(field, inference.format).expect("must parse"))
+            .collect();
+        assert_eq!(timestamps.len(), 6);
+        assert_monotonically_increasing(&timestamps);
+    }
+
+    // Corpus case 27: the mirror of case 26 — every second field is 25, which
+    // settles `MonthFirst` with full confidence.
+    #[test]
+    fn corpus_case_27_mm_dd_yyyy_unambiguous_detects_month_first_confidently() {
+        let fields = corpus_column("case-27-mm-dd-yyyy-unambiguous.csv", "timestamp");
+
+        let inference = infer_timestamp_format(&fields).expect("must infer a format");
+        assert_eq!(inference.format, TimestampFormat::MonthFirst);
+        assert!(
+            !inference.ambiguous,
+            "a field > 12 in the second position must resolve confidently, not fall back to the \
+             ambiguous default"
+        );
+
+        let timestamps: Vec<Timestamp> = fields
+            .iter()
+            .map(|field| parse_timestamp(field, inference.format).expect("must parse"))
+            .collect();
+        assert_eq!(timestamps.len(), 6);
+        assert_monotonically_increasing(&timestamps);
+    }
+
+    // Corpus case 28: every field is `01/02/2026 ...` — both positions stay
+    // <= 12 in every row, so no field ever discriminates day from month. SPEC
+    // §2.1: "If the whole column is ambiguous, pick ISO-leaning default
+    // (`DD/MM` ...), mark the inference low confidence."
+    #[test]
+    fn corpus_case_28_fully_ambiguous_dates_defaults_to_day_first_low_confidence() {
+        let fields = corpus_column("case-28-fully-ambiguous-dates.csv", "timestamp");
+
+        let inference = infer_timestamp_format(&fields).expect("must infer a format");
+        assert_eq!(inference.format, TimestampFormat::DayFirst);
+        assert!(
+            inference.ambiguous,
+            "a column with no discriminating field must be flagged low-confidence, never a \
+             silent coin-flip (CLAUDE.md Golden Rule 2)"
+        );
+
+        let timestamps: Vec<Timestamp> = fields
+            .iter()
+            .map(|field| parse_timestamp(field, inference.format).expect("must parse"))
+            .collect();
+        assert_eq!(timestamps.len(), 6);
+        assert_monotonically_increasing(&timestamps);
+    }
+
+    // Not itself a corpus case: a column where different rows individually
+    // discriminate toward opposite readings (one row's first field > 12,
+    // another row's second field > 12). No single fixed format explains every
+    // row, so this must be reported as "no match" rather than guessed either
+    // way (CLAUDE.md Golden Rule 2) — the same fidelity-first treatment
+    // `field_matches_format`'s epoch-magnitude window gives an implausible
+    // epoch value.
+    #[test]
+    fn infer_timestamp_format_rejects_a_column_with_contradictory_day_month_evidence() {
+        let fields = vec![
+            "25/01/2026 08:00:00".to_string(),
+            "01/25/2026 09:00:00".to_string(),
+        ];
+        assert_eq!(infer_timestamp_format(&fields), None);
     }
 
     // Corpus case 35 (docs/QUALITY.md §1.35): a small monotonic integer
