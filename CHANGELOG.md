@@ -12,6 +12,29 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Internal groundwork: the engine can now work out a text file's column
+  delimiter (comma, semicolon, tab, pipe, or aligned whitespace), where its
+  header row is, and whether its decimals use a `.` or a `,` (`docs/SPEC.md`
+  §1.2.2-1.2.4). The three are resolved together, not one at a time: a file
+  like `timestamp;value;pressure` / `...;1,5;101,3` is correctly read as
+  three semicolon-separated columns with comma decimals, never mis-split
+  into extra columns by treating every comma as a separator. A metadata
+  preamble of junk lines above the real header is skipped without being
+  mistaken for data, and a file with no header at all still gets usable
+  column names. Proven against the 9 relevant torture-corpus cases: clean
+  comma, the semicolon/comma-decimal trap, tab, space-aligned, pipe, a
+  quoted field containing the delimiter, a quoted field containing an
+  embedded newline, a 5-line metadata preamble, and a headerless file.
+  There is nothing to see in the app yet — like the encoding inference
+  before it, this plugs into the CSV reader once the rest of
+  `docs/ROADMAP.md` M2 lands.
+
+  **Assumption made** (SPEC.md doesn't fully specify tie-breaking): when two
+  delimiter candidates are equally consistent (e.g. a tab-delimited file
+  reads just as consistently as generic whitespace), the more specific
+  delimiter wins over the generic whitespace fallback. Flagging this so it
+  can be vetoed by testing a real file where this matters.
+
 - Internal groundwork: the engine can now work out what character encoding a
   text file uses (`docs/SPEC.md` §1.2.1) — a byte-order mark if the file has
   one, and otherwise a statistical guess between plain UTF-8 and
