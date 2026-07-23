@@ -23,7 +23,11 @@ mod csv;
 mod infer;
 
 pub use csv::{parse, CsvReader};
-pub use infer::{decode, detect_encoding, EncodingInference, EncodingSource, HEAD_SAMPLE_BYTES};
+pub use infer::{
+    decode, detect_encoding, infer_decimal_separator, infer_delimiter, infer_header,
+    DecimalSeparator, DecimalSeparatorInference, Delimiter, DelimiterInference, EncodingInference,
+    EncodingSource, HeaderInference, HEAD_SAMPLE_BYTES,
+};
 
 use crate::{GlydeError, Result};
 use std::path::Path;
