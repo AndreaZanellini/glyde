@@ -71,7 +71,7 @@ them, so CI stays green while honoring "written first."
 - [x] Encoding inference (`encoding_rs` BOM sniff → `chardetng` heuristic, invalid bytes replaced) → SPEC §1.2.1 · proven by: corpus 8, 9, 10, 11, 12
 - [x] Joint delimiter / header / decimal-separator inference (column-count consistency; `1,5;2,3` = 2 cols) → SPEC §1.2.2–1.2.4 · proven by: corpus 1, 2, 3, 4, 5, 6, 7, 14, 15
 - [x] CSV reader: streaming single-pass over memmap; ragged-row salvage, skipped-row count, truncated-tail tolerance → SPEC §1.3, ARCH §CSV · proven by: corpus 20, 21, 22, 23
-- [ ] Column dtype inference incl. NaN / infinity / mixed-column handling → SPEC §1.4 · proven by: corpus 43, 44, 46, 47, 48
+- [x] Column dtype inference incl. NaN / infinity / mixed-column handling → SPEC §1.4 · proven by: corpus 43, 44, 46, 47, 48
 - [ ] Time index: progressive numeric + core timestamp formats (ISO 8601 ±tz, epoch s/ms/µs/ns); internal `i128` ns or `(i64, TimeUnit)`, never `f64` seconds → SPEC §2.1 · proven by: corpus 24, 25, 29–32, 35 + time golden round-trip (un-ignore subset)
 - [ ] `DD/MM` vs `MM/DD` disambiguation by scanning for a field > 12; fully ambiguous → low confidence → SPEC §2.1 ambiguity rule · proven by: corpus 26, 27, 28
 - [ ] Excel serial + LabVIEW epoch + multi-year/second-res + picosecond-res index → SPEC §2.1 · proven by: corpus 33, 34, 42, 41 + ns/ps precision golden (un-ignore)

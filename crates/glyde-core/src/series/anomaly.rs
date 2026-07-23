@@ -44,6 +44,29 @@ impl Anomalies {
     }
 }
 
+/// Contiguous runs of `NaN` samples in `values`, as half-open `[start, end)`
+/// sample-index ranges (SPEC §1.3: preserved as a visible discontinuity,
+/// never interpolated). Adjacent `NaN` samples merge into one run rather
+/// than being reported one index at a time (corpus case 43: three
+/// consecutive `NaN` readings are one gap, not three).
+pub fn detect_nan_runs(values: &[f64]) -> Vec<Range<usize>> {
+    let mut runs = Vec::new();
+    let mut run_start: Option<usize> = None;
+
+    for (index, value) in values.iter().enumerate() {
+        if value.is_nan() {
+            run_start.get_or_insert(index);
+        } else if let Some(start) = run_start.take() {
+            runs.push(start..index);
+        }
+    }
+    if let Some(start) = run_start {
+        runs.push(start..values.len());
+    }
+
+    runs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +105,32 @@ mod tests {
         };
 
         assert!(!anomalies.is_empty());
+    }
+
+    // Corpus case 43 (QUALITY.md §1.43): three consecutive NaN readings
+    // among otherwise-clean values must be reported as one run, not three.
+    #[test]
+    fn detect_nan_runs_merges_a_consecutive_run_into_one_range() {
+        let values = [10.0, 10.1, f64::NAN, f64::NAN, f64::NAN, 10.5, 10.6];
+
+        assert_eq!(detect_nan_runs(&values), vec![2..5]);
+    }
+
+    #[test]
+    fn detect_nan_runs_reports_two_separate_runs_as_two_ranges() {
+        let values = [f64::NAN, 1.0, f64::NAN, f64::NAN, 2.0];
+
+        assert_eq!(detect_nan_runs(&values), vec![0..1, 2..4]);
+    }
+
+    #[test]
+    fn detect_nan_runs_is_empty_for_a_run_free_series() {
+        assert!(detect_nan_runs(&[1.0, 2.0, 3.0]).is_empty());
+    }
+
+    // Infinity is a valid float value (corpus case 44), never a NaN run.
+    #[test]
+    fn detect_nan_runs_does_not_flag_infinities() {
+        assert!(detect_nan_runs(&[1.0, f64::INFINITY, f64::NEG_INFINITY, 1.0]).is_empty());
     }
 }

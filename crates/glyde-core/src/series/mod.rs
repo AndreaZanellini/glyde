@@ -22,7 +22,7 @@
 mod anomaly;
 mod dtype;
 
-pub use anomaly::Anomalies;
+pub use anomaly::{detect_nan_runs, Anomalies};
 pub use dtype::{Dtype, SeriesValues, ViewKind};
 
 /// One ingested column: its name, its values in their native dtype, and any

@@ -15,9 +15,10 @@
 //! Ingestion inference (docs/ARCHITECTURE.md `ingest/infer.rs`).
 //!
 //! Encoding inference (SPEC §1.2.1) lands first; delimiter, header, and
-//! decimal-separator inference (SPEC §1.2.2-1.2.4) join it here. Dtype
-//! inference is a later docs/ROADMAP.md M2 item.
+//! decimal-separator inference (SPEC §1.2.2-1.2.4) join it here, and column
+//! dtype inference (SPEC §1.4) after that.
 
+use crate::series::{detect_nan_runs, Anomalies, Series, SeriesValues};
 use chardetng::EncodingDetector;
 use encoding_rs::Encoding;
 use std::collections::HashMap;
@@ -528,9 +529,101 @@ pub fn infer_header(sample: &str, delimiter: Delimiter) -> HeaderInference {
     }
 }
 
+/// Infers a column's dtype from its raw source-text fields (SPEC §1.4) and
+/// parses every field into that representation in one pass. Tried in order
+/// — bool, then integer, then float — so a dtype only wins when *every*
+/// field in the column agrees with it; the first field that doesn't fit
+/// falls the whole column through to the next, less specific dtype, down to
+/// `String` if nothing else matches. A single non-numeric cell among
+/// otherwise-numeric text (corpus case 46: `"ERR"`/`"OK"`) is therefore
+/// enough to keep the *whole* column, numeric-looking cells included, as raw
+/// source text: SPEC §1.4 has no "mostly numeric" dtype, and silently
+/// parsing the numeric cells while dropping the rest would degrade the raw
+/// data (Golden Rule 1).
+///
+/// Integer columns always parse to `i64` and float columns always to `f64`.
+/// CSV text carries no dtype of its own to "preserve" the way a typed
+/// Parquet column will (a later `docs/ROADMAP.md` M7 reader) — there is
+/// nothing to preserve *from*, only a dtype to infer — so the widest
+/// lossless signed/floating representation is the safe default; narrower
+/// integer widths (`i8`..`i32`, `u8`..`u64`) and `f32` are a later item's
+/// job, not required by any corpus case this one is proven against.
+pub fn infer_column(name: impl Into<String>, fields: &[String]) -> Series {
+    if let Some(values) = parse_every(fields, parse_bool_field) {
+        info!(
+            dtype = "bool",
+            field_count = fields.len(),
+            "column dtype inferred (SPEC §1.4)"
+        );
+        return Series::new(name, SeriesValues::Bool(values));
+    }
+    if let Some(values) = parse_every(fields, |field| field.trim().parse::<i64>().ok()) {
+        info!(
+            dtype = "i64",
+            field_count = fields.len(),
+            "column dtype inferred (SPEC §1.4)"
+        );
+        return Series::new(name, SeriesValues::I64(values));
+    }
+    if let Some(values) = parse_every(fields, |field| field.trim().parse::<f64>().ok()) {
+        let nan_runs = detect_nan_runs(&values);
+        if !nan_runs.is_empty() {
+            warn!(
+                run_count = nan_runs.len(),
+                "NaN run(s) flagged in a numeric column (SPEC §1.3)"
+            );
+        }
+        info!(
+            dtype = "f64",
+            field_count = fields.len(),
+            "column dtype inferred (SPEC §1.4)"
+        );
+        return Series::with_anomalies(
+            name,
+            SeriesValues::F64(values),
+            Anomalies {
+                nan_runs,
+                ..Anomalies::default()
+            },
+        );
+    }
+
+    info!(
+        dtype = "string",
+        field_count = fields.len(),
+        "column dtype inferred as string/categorical — not every field parsed as bool, \
+         integer, or float (SPEC §1.4)"
+    );
+    Series::new(name, SeriesValues::String(fields.to_vec()))
+}
+
+/// Parses every field with `parse`, succeeding only if all of them do —
+/// `?`-style short-circuiting via `Option<Vec<_>>`'s `FromIterator` impl, so
+/// a single field that doesn't fit the candidate dtype rejects the whole
+/// column rather than partially parsing it.
+fn parse_every<T>(fields: &[String], parse: impl Fn(&str) -> Option<T>) -> Option<Vec<T>> {
+    fields.iter().map(|field| parse(field)).collect()
+}
+
+/// SPEC §1.4 / corpus case 47: the boolean spellings the torture corpus
+/// exercises — `true`/`false` case-insensitively, and the bare `0`/`1`
+/// numeric convention. Checked before integer/float inference so a column of
+/// only `0`s and `1`s reads as boolean, matching the corpus's
+/// `flag_numeric` column.
+fn parse_bool_field(field: &str) -> Option<bool> {
+    match field.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        other if other.eq_ignore_ascii_case("true") => Some(true),
+        other if other.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::series::{Dtype, SeriesValues};
     use std::path::{Path, PathBuf};
 
     fn corpus_path(file_name: &str) -> PathBuf {
@@ -938,5 +1031,164 @@ mod tests {
         assert_eq!(header.header_row_index, None);
         assert_eq!(header.skipped_preamble_rows, 0);
         assert!(!header.ambiguous);
+    }
+
+    // --- SPEC §1.4: column dtype inference (docs/ROADMAP.md M2). Golden
+    // tests written first, against the torture corpus, per CLAUDE.md's TDD
+    // rule for glyde-core::ingest.
+
+    /// Every raw-text field of `column_name` in `file_name`'s data rows, in
+    /// row order — built from the already-tested delimiter/header inference
+    /// so these tests exercise real corpus text rather than a hand-picked
+    /// `Vec<String>`.
+    fn corpus_column(file_name: &str, column_name: &str) -> Vec<String> {
+        let sample = corpus_sample(file_name);
+        let delimiter = infer_delimiter(&sample).delimiter;
+        let header = infer_header(&sample, delimiter);
+        let column_index = header
+            .column_names
+            .iter()
+            .position(|name| name == column_name)
+            .unwrap_or_else(|| panic!("column '{column_name}' not found in {file_name}"));
+        let data_start = header
+            .header_row_index
+            .map_or(header.skipped_preamble_rows, |index| index + 1);
+
+        tokenize_records(&sample, delimiter)
+            .into_iter()
+            .skip(data_start)
+            .map(|row| row[column_index].clone())
+            .collect()
+    }
+
+    // Corpus case 43: three consecutive `NaN` readings among otherwise-clean
+    // floats must parse as `f64::NAN`, not fall the column back to string,
+    // and must be flagged as one merged anomaly run rather than three.
+    #[test]
+    fn corpus_case_43_nan_runs_infers_f64_with_one_flagged_run() {
+        let fields = corpus_column("case-43-nan-runs.csv", "value");
+
+        let series = infer_column("value", &fields);
+
+        assert_eq!(series.dtype(), Dtype::F64);
+        let SeriesValues::F64(values) = series.values() else {
+            panic!("expected F64 values, got {:?}", series.values());
+        };
+        assert_eq!(values.len(), 7);
+        assert_eq!(values[2..5].iter().filter(|v| v.is_nan()).count(), 3);
+        assert_eq!(series.anomalies().nan_runs, vec![2..5]);
+    }
+
+    // Corpus case 44: `Infinity`/`-Infinity` are valid float values, not a
+    // reason to fall back to string and not a NaN anomaly.
+    #[test]
+    fn corpus_case_44_infinities_infer_f64_without_anomalies() {
+        let fields = corpus_column("case-44-infinities.csv", "value");
+
+        let series = infer_column("value", &fields);
+
+        assert_eq!(series.dtype(), Dtype::F64);
+        let SeriesValues::F64(values) = series.values() else {
+            panic!("expected F64 values, got {:?}", series.values());
+        };
+        assert_eq!(values[1], f64::INFINITY);
+        assert_eq!(values[2], f64::NEG_INFINITY);
+        assert!(
+            series.anomalies().is_empty(),
+            "infinities are valid values, not anomalies"
+        );
+    }
+
+    // Corpus case 46 (docs/QUALITY.md §1.46, CHANGELOG "assumptions made"):
+    // a column with a couple of non-numeric tokens ("ERR"/"OK") among
+    // otherwise-numeric text must fall back to `String` as a whole —
+    // dropping/flagging just the two odd cells would silently discard what
+    // the source file says (Golden Rule 1), and SPEC §1.4 has no
+    // "mostly numeric" dtype to parse the rest into.
+    #[test]
+    fn corpus_case_46_mixed_numeric_string_falls_back_to_string_dtype() {
+        let fields = corpus_column("case-46-mixed-numeric-string.csv", "value");
+
+        let series = infer_column("value", &fields);
+
+        assert_eq!(series.dtype(), Dtype::String);
+        assert_eq!(series.values(), &SeriesValues::String(fields));
+    }
+
+    // Corpus case 47: the same boolean column spelled three different ways
+    // in the source text must all infer to `Dtype::Bool`.
+    #[test]
+    fn corpus_case_47_boolean_spellings_all_infer_bool() {
+        for (column, expected) in [
+            ("flag_lower", vec![true, false, true, false]),
+            ("flag_numeric", vec![false, true, false, true]),
+            ("flag_upper", vec![true, false, true, false]),
+        ] {
+            let fields = corpus_column("case-47-boolean-column.csv", column);
+
+            let series = infer_column(column, &fields);
+
+            assert_eq!(series.dtype(), Dtype::Bool);
+            assert_eq!(series.values(), &SeriesValues::Bool(expected));
+        }
+    }
+
+    // Corpus case 48: plain machine-state text, no numeric content at all —
+    // must infer `Dtype::String` and preserve every label verbatim.
+    #[test]
+    fn corpus_case_48_string_state_column_infers_string_dtype() {
+        let fields = corpus_column("case-48-string-state-column.csv", "state");
+
+        let series = infer_column("state", &fields);
+
+        assert_eq!(series.dtype(), Dtype::String);
+        assert_eq!(series.values(), &SeriesValues::String(fields));
+    }
+
+    #[test]
+    fn infer_column_of_plain_integers_infers_i64() {
+        let fields = ["1", "-2", "3", "9223372036854775807"]
+            .map(str::to_string)
+            .to_vec();
+
+        let series = infer_column("value", &fields);
+
+        assert_eq!(series.dtype(), Dtype::I64);
+        assert_eq!(
+            series.values(),
+            &SeriesValues::I64(vec![1, -2, 3, 9223372036854775807])
+        );
+    }
+
+    // A column of only `0`/`1` reads as boolean (corpus case 47), not as an
+    // integer series, even though every field also parses as an integer.
+    #[test]
+    fn infer_column_prefers_bool_over_integer_for_zero_one_columns() {
+        let fields = vec!["0".to_string(), "1".to_string(), "0".to_string()];
+
+        let series = infer_column("flag", &fields);
+
+        assert_eq!(series.dtype(), Dtype::Bool);
+    }
+
+    // A column that mixes an integer-looking cell with a fractional one must
+    // infer float, not fall back to string — SPEC §1.4 lists integer and
+    // float as separate but both-numeric dtypes.
+    #[test]
+    fn infer_column_of_mixed_integer_and_float_text_infers_f64() {
+        let fields = vec!["10".to_string(), "10.5".to_string(), "11".to_string()];
+
+        let series = infer_column("value", &fields);
+
+        assert_eq!(series.dtype(), Dtype::F64);
+    }
+
+    #[test]
+    fn infer_column_falls_back_to_string_when_nothing_numeric_matches() {
+        let fields = vec!["idle".to_string(), "running".to_string()];
+
+        let series = infer_column("state", &fields);
+
+        assert_eq!(series.dtype(), Dtype::String);
     }
 }
