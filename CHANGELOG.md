@@ -11,6 +11,22 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Internal groundwork: the engine can now work out what character encoding a
+  text file uses (`docs/SPEC.md` §1.2.1) — a byte-order mark if the file has
+  one, and otherwise a statistical guess between plain UTF-8 and
+  Windows-1252 (which also covers Latin-1, since the standard the encoding
+  library follows treats the two as identical). A stray corrupted byte in an
+  otherwise-clean UTF-8 file is replaced with the standard "unknown
+  character" mark instead of misdetecting the whole file's encoding, and
+  every replacement is logged rather than silently dropped, per
+  `CLAUDE.md`'s "never guess silently" rule. Proven against the five
+  encoding torture-corpus cases: a Latin-1-flavored header with `°C`/`µm/s²`,
+  Windows-1252 smart quotes, a UTF-8 file with a leading byte-order mark, a
+  full UTF-16LE file, and a file with one corrupted byte spliced into an
+  otherwise-valid field. There is nothing to see in the app yet — this
+  plugs into the CSV reader once the rest of `docs/ROADMAP.md` M2 lands.
+
 ### Fixed
 - A hole in the project's own automated performance checks (nothing visible in
   the app). The CI "Performance gates" job was reporting success on every run
@@ -246,6 +262,23 @@ Versioning: [Semantic Versioning](https://semver.org/).
   batch of files lands.
 
 ### Assumptions made (maintainer: veto by testing)
+- Encoding inference (corpus cases 8, 9, 12) needed a judgment call
+  `docs/SPEC.md` §1.2.1 doesn't spell out: how much invalid-byte corruption
+  should still read as "UTF-8 with a few bad bytes" versus "this is actually
+  a different single-byte encoding"? I used a 1% invalid-byte-density
+  threshold over the bounded head sample (documented alongside the code) —
+  it comfortably separates case 12's one stray byte (~0.4% of the file) from
+  cases 8/9's genuinely Windows-1252 content (>1%). Above that threshold the
+  sample goes to `chardetng` (the heuristic `docs/ARCHITECTURE.md` names for
+  this step), but its guess is clamped to Windows-1252 whenever it lands
+  outside Glyde's v1-frozen encoding set (UTF-8/UTF-16/Latin-1/Windows-1252
+  per SPEC §1.2.1): on the short, mostly-ASCII case-8 fixture, chardetng's
+  raw guess is "Big5" — three high bytes happen to look like a valid
+  two-byte CJK sequence when there are only six data rows of evidence to
+  weigh against it — and Glyde has no Big5 decoder to route that to. Both
+  the density threshold and the out-of-scope clamp are new decisions this
+  PR introduces rather than something SPEC.md dictates; worth a veto before
+  more of M2 builds on this function's exact boundary.
 - Corpus case 47's three boolean columns (`flag_lower`, `flag_numeric`,
   `flag_upper`) turned out **not** to be the same boolean sequence spelled
   three ways: `flag_numeric` (`0,1,0,1`) is the logical inverse of
