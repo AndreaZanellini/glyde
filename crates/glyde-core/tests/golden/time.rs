@@ -12,57 +12,139 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Time golden tests (docs/QUALITY.md §2 Time, docs/ROADMAP.md M1). Every
-//! test here is `#[ignore]`d because `glyde_core::time::{parse_timestamp,
-//! format_timestamp, detect_gaps}` are `todo!()` stubs (docs/ROADMAP.md
-//! M2/M8); `cargo test -- --ignored --list` is the M1 maintainer proof that
-//! the full golden-test set exists. Un-ignore each test only once the
-//! implementation makes it pass — never loosen an assertion to make that
-//! happen.
+//! Time golden tests (docs/QUALITY.md §2 Time, docs/ROADMAP.md M1/M2).
+//!
+//! The single combined round-trip test M1 committed
+//! (`every_timestamp_format_round_trips_through_parse_and_format`, looping
+//! over all 11 `TimestampFormat` variants in one `#[ignore]`d `#[test]`) has
+//! been split into one test per format here: docs/ROADMAP.md M2's "Time
+//! index" item implements only `Iso8601WithOffset`, `Iso8601Naive`, and the
+//! four epoch formats (`DateTimeSpace`, `DayFirst`/`MonthFirst` ambiguity
+//! resolution, `LabViewEpoch`, and `ExcelSerial` are separate, not-yet-started
+//! M2 roadmap items) — a single shared test could not be un-ignored without
+//! either implementing every format at once or editing the loop, and this
+//! file's own rule (below) is to never do the latter. Splitting the test
+//! changes no input, no expected output, and no assertion for any format;
+//! only the in-scope formats' tests are un-ignored here. Un-ignore each
+//! remaining test only once its implementation makes it pass — never loosen
+//! an assertion to make that happen.
 
 use glyde_core::time::{detect_gaps, format_timestamp, parse_timestamp, Gap, TimeUnit, Timestamp};
 
-#[test]
-#[ignore = "docs/ROADMAP.md M2: timestamp parsing/formatting not implemented yet"]
-fn every_timestamp_format_round_trips_through_parse_and_format() {
-    use glyde_core::time::TimestampFormat::*;
-
-    // Integer-valued examples only: float epoch/serial strings have more
-    // than one valid textual spelling of the same value (`"10.5"` vs
-    // `"10.500000000"`), which would make the "identical string" oracle
-    // ambiguous rather than a property of the implementation. Each string
-    // below is unambiguous under its own format (SPEC §2.1): the `DayFirst`/
-    // `MonthFirst` examples both carry a day field > 12, so a correct joint
-    // delimiter/date resolution (SPEC §2.1 ambiguity rule) never confuses
-    // them for one another.
-    let cases: &[(glyde_core::time::TimestampFormat, &str)] = &[
-        (Iso8601WithOffset, "2026-07-22T14:30:00+02:00"),
-        (Iso8601Naive, "2026-07-22T14:30:00"),
-        (DateTimeSpace, "2026-07-22 14:30:00.123"),
-        (DayFirst, "22/07/2026 14:30:00"),
-        (MonthFirst, "07/22/2026 14:30:00"),
-        (EpochSeconds, "1753193400"),
-        (EpochMillis, "1753193400000"),
-        (EpochMicros, "1753193400000000"),
-        (EpochNanos, "1753193400000000000"),
-        (LabViewEpoch, "3849213000"),
-        (ExcelSerial, "46590"),
-    ];
-
-    for &(format, input) in cases {
-        let parsed = parse_timestamp(input, format)
-            .unwrap_or_else(|err| panic!("{input:?} under {format:?} must parse: {err}"));
-        let formatted = format_timestamp(&parsed, format);
-        assert_eq!(
-            formatted, input,
-            "{format:?}: formatting the timestamp parsed from {input:?} must reproduce the \
-             identical string, not just an equivalent one"
-        );
-    }
+/// Asserts `parse_timestamp` then `format_timestamp` reproduces `input`
+/// byte-for-byte (docs/QUALITY.md §2 Time: format round-trip) — the shared
+/// body every per-format test below calls with its own fixture.
+fn assert_round_trips(format: glyde_core::time::TimestampFormat, input: &str) {
+    let parsed = parse_timestamp(input, format)
+        .unwrap_or_else(|err| panic!("{input:?} under {format:?} must parse: {err}"));
+    let formatted = format_timestamp(&parsed, format);
+    assert_eq!(
+        formatted, input,
+        "{format:?}: formatting the timestamp parsed from {input:?} must reproduce the \
+         identical string, not just an equivalent one"
+    );
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M2: timestamp parsing not implemented yet"]
+fn iso8601_with_offset_round_trips() {
+    assert_round_trips(
+        glyde_core::time::TimestampFormat::Iso8601WithOffset,
+        "2026-07-22T14:30:00+02:00",
+    );
+}
+
+#[test]
+fn iso8601_naive_round_trips() {
+    assert_round_trips(
+        glyde_core::time::TimestampFormat::Iso8601Naive,
+        "2026-07-22T14:30:00",
+    );
+}
+
+// Integer-valued examples only: float epoch strings have more than one valid
+// textual spelling of the same value (`"10.5"` vs `"10.500000000"`), which
+// would make the "identical string" oracle ambiguous rather than a property
+// of the implementation.
+
+#[test]
+fn epoch_seconds_round_trips() {
+    assert_round_trips(
+        glyde_core::time::TimestampFormat::EpochSeconds,
+        "1753193400",
+    );
+}
+
+#[test]
+fn epoch_millis_round_trips() {
+    assert_round_trips(
+        glyde_core::time::TimestampFormat::EpochMillis,
+        "1753193400000",
+    );
+}
+
+#[test]
+fn epoch_micros_round_trips() {
+    assert_round_trips(
+        glyde_core::time::TimestampFormat::EpochMicros,
+        "1753193400000000",
+    );
+}
+
+#[test]
+fn epoch_nanos_round_trips() {
+    assert_round_trips(
+        glyde_core::time::TimestampFormat::EpochNanos,
+        "1753193400000000000",
+    );
+}
+
+// The `DayFirst`/`MonthFirst` examples both carry a day field > 12, so a
+// correct joint delimiter/date resolution (SPEC §2.1 ambiguity rule) never
+// confuses them for one another, once that item is implemented.
+
+#[test]
+#[ignore = "docs/ROADMAP.md M2: DateTimeSpace timestamp parsing not implemented yet"]
+fn date_time_space_round_trips() {
+    assert_round_trips(
+        glyde_core::time::TimestampFormat::DateTimeSpace,
+        "2026-07-22 14:30:00.123",
+    );
+}
+
+#[test]
+#[ignore = "docs/ROADMAP.md M2: DD/MM vs MM/DD disambiguation not implemented yet"]
+fn day_first_round_trips() {
+    assert_round_trips(
+        glyde_core::time::TimestampFormat::DayFirst,
+        "22/07/2026 14:30:00",
+    );
+}
+
+#[test]
+#[ignore = "docs/ROADMAP.md M2: DD/MM vs MM/DD disambiguation not implemented yet"]
+fn month_first_round_trips() {
+    assert_round_trips(
+        glyde_core::time::TimestampFormat::MonthFirst,
+        "07/22/2026 14:30:00",
+    );
+}
+
+#[test]
+#[ignore = "docs/ROADMAP.md M2: LabVIEW epoch timestamp parsing not implemented yet"]
+fn lab_view_epoch_round_trips() {
+    assert_round_trips(
+        glyde_core::time::TimestampFormat::LabViewEpoch,
+        "3849213000",
+    );
+}
+
+#[test]
+#[ignore = "docs/ROADMAP.md M2: Excel serial timestamp parsing not implemented yet"]
+fn excel_serial_round_trips() {
+    assert_round_trips(glyde_core::time::TimestampFormat::ExcelSerial, "46590");
+}
+
+#[test]
 fn nanosecond_precision_survives_a_multi_year_span_where_f64_seconds_would_not() {
     // 5 years plus a sub-second remainder, expressed in nanoseconds since the
     // Unix epoch. Chosen only to comfortably exceed 2^53 (9_007_199_254_740_992,
