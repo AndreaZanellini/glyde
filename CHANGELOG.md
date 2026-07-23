@@ -35,6 +35,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
   delimiter wins over the generic whitespace fallback. Flagging this so it
   can be vetoed by testing a real file where this matters.
 
+  Following review: header detection now correctly picks the row closest to
+  the data when more than one leading line could pass as a header (e.g. a
+  units row directly under a label row), per SPEC §1.2.3's wording; and the
+  delimiter, decimal-separator, and header results now carry their
+  confidence signal (consistency ratio, vote counts, an "ambiguous" flag)
+  instead of discarding it, so the inference bar can use it once it's wired
+  up (`docs/SPEC.md` §1.2's confidence requirement).
+
 - Internal groundwork: the engine can now work out what character encoding a
   text file uses (`docs/SPEC.md` §1.2.1) — a byte-order mark if the file has
   one, and otherwise a statistical guess between plain UTF-8 and
