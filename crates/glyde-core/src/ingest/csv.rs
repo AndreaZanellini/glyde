@@ -50,31 +50,35 @@ impl super::Reader for CsvReader {
     }
 }
 
-/// The result of a full single-pass parse: the header's column names, every
-/// row salvaged after ragged-row / truncated-tail tolerance (SPEC §1.3), and
-/// how many rows were skipped along the way.
-#[derive(Debug, Clone, PartialEq)]
+/// The result of a full single-pass parse: the header's column names, how
+/// many rows were salvaged after ragged-row / truncated-tail tolerance
+/// (SPEC §1.3), and how many were skipped along the way. This intentionally
+/// carries counts only, not the row data itself: SPEC §5.1 ("data is
+/// memory-mapped and read in bounded chunks; the full file is never
+/// loaded") is a hard budget constraint this milestone's item does not yet
+/// enforce (`docs/ROADMAP.md` M3 owns the RAM-budget module and the
+/// bounded/chunked reading built on it) — accumulating every row into an
+/// owned `Vec<Vec<String>>` here would bake an unbounded shape into the
+/// first public consumer of this reader, which is exactly the risk M3
+/// exists to close off. Row values themselves belong to whatever
+/// milestone item actually reads them under that future budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CsvParseOutcome {
     pub column_names: Vec<String>,
-    pub rows: Vec<Vec<String>>,
+    pub row_count: u64,
     pub skipped_row_count: u64,
-}
-
-impl CsvParseOutcome {
-    /// Number of rows successfully salvaged (the corpus schema's `row_count`).
-    pub fn row_count(&self) -> u64 {
-        self.rows.len() as u64
-    }
 }
 
 /// Parses `bytes` as delimited text (SPEC §1.1) in one streaming pass:
 /// encoding and delimiter/header are inferred from a bounded head sample
-/// (SPEC §1.2), then every remaining row is read once and kept or skipped —
-/// never re-read, never loaded into an intermediate table. A row whose field
-/// count disagrees with the header (ragged rows, a truncated final line) is
-/// skipped, counted, and logged at `warn` rather than aborting the read
-/// (SPEC §1.3). Malformed data never causes a `panic!`; an empty input is
-/// the only rejected input, reported as [`GlydeError::EmptyFile`].
+/// (SPEC §1.2), then every remaining row is read once and tallied — kept or
+/// skipped, never accumulated into an intermediate table (see
+/// [`CsvParseOutcome`]'s doc comment on why row *data* is out of scope
+/// here). A row whose field count disagrees with the header (ragged rows,
+/// a truncated final line) is skipped, counted, and logged at `warn`
+/// rather than aborting the read (SPEC §1.3). Malformed data never causes
+/// a `panic!`; an empty input is the only rejected input, reported as
+/// [`GlydeError::EmptyFile`].
 pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
     if bytes.is_empty() {
         return Err(GlydeError::EmptyFile);
@@ -94,7 +98,7 @@ pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
             header_row_index + 1
         });
 
-    let mut rows = Vec::new();
+    let mut row_count = 0u64;
     let mut skipped_row_count = 0u64;
 
     for (row_index, record) in stream_records(&text, delimiter).enumerate() {
@@ -102,7 +106,7 @@ pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
             continue;
         }
         match record {
-            Ok(fields) if fields.len() == expected_field_count => rows.push(fields),
+            Ok(fields) if fields.len() == expected_field_count => row_count += 1,
             Ok(fields) => {
                 warn!(
                     row_index,
@@ -123,7 +127,7 @@ pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
     }
 
     info!(
-        row_count = rows.len(),
+        row_count,
         skipped_row_count,
         column_count = expected_field_count,
         "CSV parsed in one streaming pass"
@@ -131,7 +135,7 @@ pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
 
     Ok(CsvParseOutcome {
         column_names: header.column_names,
-        rows,
+        row_count,
         skipped_row_count,
     })
 }
@@ -159,13 +163,20 @@ pub fn open_path(path: &Path) -> Result<CsvParseOutcome> {
 /// line boundary rather than an arbitrary byte offset: [`infer::infer_header`]
 /// reports row indices within this sample, and [`parse`] must line those
 /// indices up exactly with the full-text record stream, which a mid-record
-/// cut would throw off. Falls back to the raw byte cutoff (still on a
-/// `char` boundary) only for a single line longer than the whole budget.
+/// cut would throw off. Falls back to the raw byte cutoff, walked back to
+/// the nearest `char` boundary (`HEAD_SAMPLE_BYTES` is a byte count with no
+/// UTF-8 alignment guarantee — a multibyte character such as `°` or `µ`
+/// landing across it is ordinary, not malformed, input), only for a single
+/// line longer than the whole budget.
 fn bounded_head_sample(text: &str) -> &str {
     if text.len() <= infer::HEAD_SAMPLE_BYTES {
         return text;
     }
-    let budget = &text[..infer::HEAD_SAMPLE_BYTES];
+    let mut cut = infer::HEAD_SAMPLE_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let budget = &text[..cut];
     match budget.rfind('\n') {
         Some(last_newline) => &text[..=last_newline],
         None => budget,
@@ -264,7 +275,7 @@ mod tests {
             outcome.column_names,
             vec!["timestamp", "value", "pressure", ""]
         );
-        assert_eq!(outcome.row_count(), 4);
+        assert_eq!(outcome.row_count, 4);
         assert_eq!(outcome.skipped_row_count, 0);
     }
 
@@ -278,12 +289,8 @@ mod tests {
         let outcome = parse(&bytes).expect("case 21 must parse");
 
         assert_eq!(outcome.column_names, vec!["timestamp", "value", "pressure"]);
-        assert_eq!(outcome.row_count(), 3);
+        assert_eq!(outcome.row_count, 3);
         assert_eq!(outcome.skipped_row_count, 2);
-        assert_eq!(
-            outcome.rows[0],
-            vec!["2026-01-01T00:00:00Z", "1.0", "101.3"]
-        );
     }
 
     // Corpus case 22 (QUALITY.md §1.22): the file ends mid-row (no trailing
@@ -297,7 +304,7 @@ mod tests {
         let outcome = parse(&bytes).expect("case 22 must parse");
 
         assert_eq!(outcome.column_names, vec!["timestamp", "value"]);
-        assert_eq!(outcome.row_count(), 4);
+        assert_eq!(outcome.row_count, 4);
         assert_eq!(outcome.skipped_row_count, 1);
     }
 
@@ -324,7 +331,7 @@ mod tests {
         let outcome = parse(&bytes).expect("case 4 must parse");
 
         assert_eq!(outcome.column_names, vec!["timestamp", "value", "pressure"]);
-        assert_eq!(outcome.row_count(), 6);
+        assert_eq!(outcome.row_count, 6);
         assert_eq!(outcome.skipped_row_count, 0);
     }
 
@@ -333,7 +340,7 @@ mod tests {
         let outcome = open_path(&corpus_path("case-01-comma-clean.csv")).expect("case 1 must open");
 
         assert_eq!(outcome.column_names, vec!["timestamp", "value", "pressure"]);
-        assert!(outcome.row_count() > 0);
+        assert!(outcome.row_count > 0);
         assert_eq!(outcome.skipped_row_count, 0);
     }
 
@@ -373,5 +380,49 @@ mod tests {
     #[test]
     fn bounded_head_sample_is_unchanged_for_small_input() {
         assert_eq!(bounded_head_sample("a,b\n1,2\n"), "a,b\n1,2\n");
+    }
+
+    // Regression (maintainer review on PR #35): a raw `HEAD_SAMPLE_BYTES`
+    // byte-offset slice is not guaranteed to land on a UTF-8 char boundary.
+    // `°` encodes as two bytes (0xC2 0xB0); placing it so its second byte
+    // sits exactly at the cutoff — the realistic case being any
+    // `°C`/`µm/s²`-style unit header a little past 1 MiB into an otherwise
+    // ordinary file — must not panic.
+    #[test]
+    fn bounded_head_sample_never_panics_when_a_multibyte_char_straddles_the_cutoff() {
+        let prefix = "a".repeat(infer::HEAD_SAMPLE_BYTES - 1);
+        let text = format!("{prefix}\u{b0}C and more text after the cutoff\n");
+        assert!(
+            !text.is_char_boundary(infer::HEAD_SAMPLE_BYTES),
+            "fixture must actually straddle the cutoff for this test to prove anything"
+        );
+
+        let sample = bounded_head_sample(&text);
+
+        assert!(text.is_char_boundary(sample.len()));
+        assert!(sample.len() <= infer::HEAD_SAMPLE_BYTES);
+    }
+
+    #[test]
+    fn parse_never_panics_on_a_multibyte_char_straddling_the_head_sample_cutoff() {
+        // Many short single-byte rows (unlike the single-giant-row shape
+        // that would leave no data row visible in the bounded sample) so
+        // the header is confidently detected well before the cutoff, which
+        // this test then places a straddling multibyte character across.
+        let mut text = String::from("value\n");
+        while text.len() < infer::HEAD_SAMPLE_BYTES - 1 {
+            text.push_str("1\n");
+        }
+        text.truncate(infer::HEAD_SAMPLE_BYTES - 1); // every byte so far is ASCII: any length is a char boundary
+        text.push('\u{b0}'); // its second byte lands exactly at HEAD_SAMPLE_BYTES
+        text.push('\n');
+        assert!(
+            !text.is_char_boundary(infer::HEAD_SAMPLE_BYTES),
+            "fixture must actually straddle the cutoff for this test to prove anything"
+        );
+
+        let outcome = parse(text.as_bytes()).expect("valid UTF-8 must never be rejected");
+
+        assert_eq!(outcome.column_names, vec!["value"]);
     }
 }

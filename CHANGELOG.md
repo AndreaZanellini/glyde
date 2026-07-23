@@ -27,6 +27,20 @@ Versioning: [Semantic Versioning](https://semver.org/).
   this plugs into the full ingestion pipeline once the rest of
   `docs/ROADMAP.md` M2 lands.
 
+  **Assumption made** (flagged by maintainer review before merge, fixed in
+  this PR): a file's inferred header/delimiter sample was being cut at a
+  raw byte offset, which could panic on perfectly ordinary UTF-8 (a `°C`/
+  `µm/s²`-style unit character straddling the cutoff) — now cut at the
+  nearest valid character boundary, with a regression test proving it.
+  Separately, this reader only tallies row counts; it deliberately does
+  not accumulate parsed row data yet, because `docs/SPEC.md` §5.1 ("the
+  full file is never loaded") isn't enforceable until `docs/ROADMAP.md`
+  M3's RAM-budget module and bounded/chunked reading land — an early
+  `Vec` of every row would have baked an unbounded shape into the first
+  public consumer of this reader. The file's decoded text itself is still
+  held in memory for this milestone's small/clean-file scope; genuine
+  bounded reading of multi-GB files is M3's job, not this item's.
+
 - Internal groundwork: the engine can now work out a text file's column
   delimiter (comma, semicolon, tab, pipe, or aligned whitespace), where its
   header row is, and whether its decimals use a `.` or a `,` (`docs/SPEC.md`
