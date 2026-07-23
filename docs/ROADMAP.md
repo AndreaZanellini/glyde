@@ -73,7 +73,7 @@ them, so CI stays green while honoring "written first."
 - [x] CSV reader: streaming single-pass over memmap; ragged-row salvage, skipped-row count, truncated-tail tolerance → SPEC §1.3, ARCH §CSV · proven by: corpus 20, 21, 22, 23
 - [x] Column dtype inference incl. NaN / infinity / mixed-column handling → SPEC §1.4 · proven by: corpus 43, 44, 46, 47, 48
 - [x] Time index: progressive numeric + core timestamp formats (ISO 8601 ±tz, epoch s/ms/µs/ns); internal `i128` ns or `(i64, TimeUnit)`, never `f64` seconds → SPEC §2.1 · proven by: corpus 24, 25, 29–32, 35 + time golden round-trip (un-ignore subset)
-- [ ] `DD/MM` vs `MM/DD` disambiguation by scanning for a field > 12; fully ambiguous → low confidence → SPEC §2.1 ambiguity rule · proven by: corpus 26, 27, 28
+- [x] `DD/MM` vs `MM/DD` disambiguation by scanning for a field > 12; fully ambiguous → low confidence → SPEC §2.1 ambiguity rule · proven by: corpus 26, 27, 28
 - [ ] Excel serial + LabVIEW epoch + multi-year/second-res + picosecond-res index → SPEC §2.1 · proven by: corpus 33, 34, 42, 41 + ns/ps precision golden (un-ignore)
 - [ ] Sampling classification `Uniform` / `SegmentedUniform` / `Irregular` at index time (needs gap detection `Δt > 10× median`) → SPEC §2.2–2.3 · proven by: corpus 38, 39, 40 + gap-detection golden (un-ignore)
 - [ ] Non-monotonic + duplicate timestamp detection (counted, flagged, never reordered) → SPEC §2.1 · proven by: corpus 36, 37

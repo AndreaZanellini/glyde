@@ -18,16 +18,16 @@
 //! (`every_timestamp_format_round_trips_through_parse_and_format`, looping
 //! over all 11 `TimestampFormat` variants in one `#[ignore]`d `#[test]`) has
 //! been split into one test per format here: docs/ROADMAP.md M2's "Time
-//! index" item implements only `Iso8601WithOffset`, `Iso8601Naive`, and the
-//! four epoch formats (`DateTimeSpace`, `DayFirst`/`MonthFirst` ambiguity
-//! resolution, `LabViewEpoch`, and `ExcelSerial` are separate, not-yet-started
-//! M2 roadmap items) — a single shared test could not be un-ignored without
-//! either implementing every format at once or editing the loop, and this
-//! file's own rule (below) is to never do the latter. Splitting the test
-//! changes no input, no expected output, and no assertion for any format;
-//! only the in-scope formats' tests are un-ignored here. Un-ignore each
-//! remaining test only once its implementation makes it pass — never loosen
-//! an assertion to make that happen.
+//! index" item implements `Iso8601WithOffset`, `Iso8601Naive`, the four
+//! epoch formats, and `DayFirst`/`MonthFirst` (`DateTimeSpace`,
+//! `LabViewEpoch`, and `ExcelSerial` are separate, not-yet-started M2 roadmap
+//! items) — a single shared test could not be un-ignored without either
+//! implementing every format at once or editing the loop, and this file's own
+//! rule (below) is to never do the latter. Splitting the test changes no
+//! input, no expected output, and no assertion for any format; only the
+//! in-scope formats' tests are un-ignored here. Un-ignore each remaining test
+//! only once its implementation makes it pass — never loosen an assertion to
+//! make that happen.
 
 use glyde_core::time::{detect_gaps, format_timestamp, parse_timestamp, Gap, TimeUnit, Timestamp};
 
@@ -112,7 +112,6 @@ fn date_time_space_round_trips() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M2: DD/MM vs MM/DD disambiguation not implemented yet"]
 fn day_first_round_trips() {
     assert_round_trips(
         glyde_core::time::TimestampFormat::DayFirst,
@@ -121,7 +120,6 @@ fn day_first_round_trips() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M2: DD/MM vs MM/DD disambiguation not implemented yet"]
 fn month_first_round_trips() {
     assert_round_trips(
         glyde_core::time::TimestampFormat::MonthFirst,
