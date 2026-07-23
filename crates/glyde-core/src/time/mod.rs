@@ -15,13 +15,18 @@
 //! Time index: absolute-timestamp parsing/formatting and gap detection
 //! (docs/SPEC.md §2, docs/ARCHITECTURE.md workspace layout `time/`).
 //!
-//! **Not implemented yet.** This is the API surface the golden tests in
-//! `crates/glyde-core/tests/golden/time.rs` (docs/QUALITY.md §2 Time,
-//! docs/ROADMAP.md M1) are written against, `#[ignore]`d until
-//! docs/ROADMAP.md M2 (parsing/formatting) and M8 (gap view) land the real
-//! bodies. Never widen a golden test's tolerance or change its expectations
-//! to make an implementation pass — if one looks wrong, that is a
-//! `blocking-decision` issue, not an edit.
+//! Timestamp parsing/formatting for [`TimestampFormat::Iso8601WithOffset`],
+//! [`TimestampFormat::Iso8601Naive`], and the four epoch formats — plus
+//! [`infer_timestamp_format`], which also recognizes when a column is a
+//! progressive numeric index rather than an absolute timestamp — landed with
+//! docs/ROADMAP.md M2 "Time index: progressive numeric + core timestamp
+//! formats". `detect_gaps` and the remaining [`TimestampFormat`] variants
+//! (`DateTimeSpace`, `DayFirst`/`MonthFirst`, `LabViewEpoch`, `ExcelSerial`)
+//! are separate, not-yet-started M2 roadmap items and stay `#[ignore]`d /
+//! `todo!()` in `crates/glyde-core/tests/golden/time.rs`. Never widen a
+//! golden test's tolerance or change its expectations to make an
+//! implementation pass — if one looks wrong, that is a `blocking-decision`
+//! issue, not an edit.
 //!
 //! `Timestamp` stores ticks as `i128`, never `f64` seconds (SPEC §2.1) — the
 //! type system enforces Golden Rule 1 (never degrade the raw data) at the
@@ -31,5 +36,7 @@
 mod format;
 mod gap;
 
-pub use format::{format_timestamp, parse_timestamp, TimeUnit, Timestamp, TimestampFormat};
+pub use format::{
+    format_timestamp, infer_timestamp_format, parse_timestamp, TimeUnit, Timestamp, TimestampFormat,
+};
 pub use gap::{detect_gaps, Gap};

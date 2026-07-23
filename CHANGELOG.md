@@ -12,6 +12,47 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Internal groundwork: the engine can now read and re-write absolute
+  timestamps in the most common formats (`docs/SPEC.md` §2.1) — ISO 8601
+  with a timezone offset (`2026-07-22T14:30:00+02:00`) or without one
+  (honored as naive local time), and Unix epoch counters in seconds,
+  milliseconds, microseconds, or nanoseconds. It also correctly tells a real
+  timestamp column apart from a plain row counter: a small column like
+  `0, 1, 2, 3, 4, 5` is recognized as having no absolute-time meaning
+  (`docs/SPEC.md`'s "progressive numeric" index) rather than being
+  misread as a nonsensical timestamp a few seconds after 1970-01-01.
+  Proven against the six relevant torture-corpus cases: ISO 8601 with and
+  without a timezone, all four epoch resolutions, and the progressive
+  row-counter file. There is nothing to see in the app yet — this plugs
+  into the CSV reader once the remaining `docs/ROADMAP.md` M2 time-index
+  items (day-first/month-first date disambiguation, Excel/LabVIEW formats,
+  and sampling classification) land alongside it.
+
+  **Assumptions made:**
+  - `docs/SPEC.md` §2.1 says epoch values may be "integer or float"; only
+    integer epoch text is implemented here. A float epoch string like
+    `"1770000000.5"` has more than one valid spelling for the same instant
+    (`"1770000000.500"` means the same thing), which doesn't fit cleanly
+    into an exact-round-trip guarantee, and no torture-corpus case exercises
+    it yet. Tracked as a follow-up (`backlog` issue) rather than guessed at
+    here.
+  - Telling epoch seconds/milliseconds/microseconds/nanoseconds apart — and
+    telling all four apart from a plain index column — uses a magnitude
+    (digit-count) heuristic: a value only counts as a plausible epoch
+    timestamp if it falls within roughly the year 2001–2286 range at that
+    resolution. This isn't written down anywhere in `docs/SPEC.md`; it's the
+    smallest rule that both resolves the four epoch formats correctly and
+    keeps a small index-like column (torture-corpus case 35) from being
+    misread as an absolute timestamp. Worth a veto if a real file's epoch
+    values could plausibly fall outside that window.
+  - An ISO 8601 timestamp's timezone offset (e.g. `+02:00`) is now kept
+    alongside the parsed instant purely so it can be redisplayed exactly as
+    written (`docs/SPEC.md` §2.1: "honor it and display it") — comparisons
+    and future signal-processing always use the correctly offset-adjusted
+    absolute instant, never the raw offset, so this cannot affect anything
+    but on-screen formatting.
+
+### Added
 - Internal groundwork: when the dtype engine reads a column of only `0`s and
   `1`s as a boolean flag rather than a whole-number column, it now flags that
   specific call as low-confidence, matching how every other automatic guess

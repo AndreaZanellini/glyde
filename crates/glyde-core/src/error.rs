@@ -42,6 +42,14 @@ pub enum GlydeError {
     /// "clear message, no crash").
     #[error("empty file: no data to read")]
     EmptyFile,
+
+    /// `input` did not parse as a valid timestamp under `format` (SPEC §2.1).
+    #[error("invalid timestamp {input:?} for format {format:?}: {reason}")]
+    InvalidTimestamp {
+        input: String,
+        format: crate::time::TimestampFormat,
+        reason: String,
+    },
 }
 
 /// The `Result` alias every fallible `glyde-core` function returns.
