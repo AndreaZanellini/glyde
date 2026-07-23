@@ -14,12 +14,12 @@
 
 //! Property-test scaffolding (docs/QUALITY.md §2 Property tests,
 //! docs/ROADMAP.md M1): invariants that must hold across the whole input
-//! space, not just the fixed golden-test cases. Both properties below are
-//! `#[ignore]`d because the function they exercise is a `todo!()` stub
-//! (`dsp::decimation` lands in docs/ROADMAP.md M3, the CSV parser in M2);
-//! `cargo test -- --ignored --list` is the M1 maintainer proof this
-//! scaffolding exists. Un-ignore each one only once its implementation makes
-//! it pass — never loosen an assertion to make that happen.
+//! space, not just the fixed golden-test cases. The decimation property
+//! below is still `#[ignore]`d because `dsp::decimation`'s pyramid lands in
+//! docs/ROADMAP.md M3; `cargo test -- --ignored --list` is the M1
+//! maintainer proof this scaffolding exists. Un-ignore each one only once
+//! its implementation makes it pass — never loosen an assertion to make
+//! that happen.
 
 use glyde_core::dsp::decimation::{build_pyramid, decimate_viewport};
 use glyde_core::ingest;
@@ -68,7 +68,6 @@ proptest! {
     /// random byte sequence, not just the torture corpus's curated cases,
     /// handed to the CSV parser.
     #[test]
-    #[ignore = "docs/ROADMAP.md M2: CSV parsing not implemented yet"]
     fn csv_reader_never_panics_on_arbitrary_bytes(
         bytes in prop::collection::vec(any::<u8>(), 0..4096),
     ) {

@@ -12,6 +12,21 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Internal groundwork: the engine can now actually read a delimited text
+  file end to end in one streaming pass over the file's bytes, not just
+  sniff its shape (`docs/SPEC.md` §1.3, `docs/ARCHITECTURE.md` §CSV). Rows
+  whose field count doesn't match the header — a line missing a trailing
+  value, an extra stray field — are salvaged out one by one, counted, and
+  logged, rather than aborting the whole file; a file that's still being
+  written (a truncated last line) opens with everything up to that point
+  and the incomplete line quietly dropped; a genuinely empty file is
+  reported with a clear "no data to read" message instead of a crash or a
+  bogus empty plot. Proven against the 4 relevant torture-corpus cases:
+  trailing blank lines and trailing delimiters, ragged rows, a truncated
+  final line, and an empty file. There is nothing to see in the app yet —
+  this plugs into the full ingestion pipeline once the rest of
+  `docs/ROADMAP.md` M2 lands.
+
 - Internal groundwork: the engine can now work out a text file's column
   delimiter (comma, semicolon, tab, pipe, or aligned whitespace), where its
   header row is, and whether its decimals use a `.` or a `,` (`docs/SPEC.md`

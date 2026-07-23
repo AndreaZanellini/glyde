@@ -22,7 +22,7 @@
 mod csv;
 mod infer;
 
-pub use csv::{parse, CsvReader};
+pub use csv::{open_path, parse, CsvParseOutcome, CsvReader};
 pub use infer::{
     decode, detect_encoding, infer_decimal_separator, infer_delimiter, infer_header,
     DecimalSeparator, DecimalSeparatorInference, Delimiter, DelimiterInference, EncodingInference,
