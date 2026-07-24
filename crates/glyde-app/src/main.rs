@@ -21,6 +21,7 @@ mod app;
 mod error_boundary;
 mod logging;
 mod plumbing;
+mod views;
 
 use app::GlydeApp;
 

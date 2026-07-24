@@ -21,6 +21,7 @@
 use crate::series::{detect_nan_runs, Anomalies, Series, SeriesValues};
 use chardetng::EncodingDetector;
 use encoding_rs::Encoding;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use tracing::{info, warn};
 
@@ -412,6 +413,28 @@ pub fn infer_decimal_separator(sample: &str, delimiter: Delimiter) -> DecimalSep
         separator,
         dot_votes,
         comma_votes,
+    }
+}
+
+/// Rewrites `field` to use `.` as the decimal mark when `separator` is
+/// [`DecimalSeparator::Comma`], so downstream numeric parsing (`str::parse`,
+/// which only ever understands `.`) sees the same value the source author
+/// wrote (SPEC §1.2.4). Only a field that is *entirely* a
+/// `<digits>,<digits>` decimal number is rewritten — [`looks_like_decimal`]
+/// is the same joint delimiter/decimal-separator test [`infer_decimal_separator`]
+/// itself uses, so a timestamp, a state label, or any other non-decimal text
+/// passes through byte-for-byte unchanged. That makes this safe to call on
+/// every field of every column uniformly, never just the ones already known
+/// to be numeric, without ever corrupting non-numeric raw text (Golden Rule 1).
+pub(crate) fn normalize_decimal_field(field: &str, separator: DecimalSeparator) -> Cow<'_, str> {
+    if separator == DecimalSeparator::Dot {
+        return Cow::Borrowed(field);
+    }
+    let trimmed = field.trim();
+    if looks_like_decimal(trimmed, ',') {
+        Cow::Owned(trimmed.replace(',', "."))
+    } else {
+        Cow::Borrowed(field)
     }
 }
 
@@ -1032,6 +1055,50 @@ mod tests {
     fn looks_like_decimal_rejects_a_bare_timestamp_field() {
         assert!(!looks_like_decimal("2026-01-01T00:00:00Z", '.'));
         assert!(!looks_like_decimal("2026-01-01T00:00:00Z", ','));
+    }
+
+    // Corpus case 2's `1,5` under a comma-decimal separator: the value a
+    // downstream `str::parse::<f64>` call must be able to read.
+    #[test]
+    fn normalize_decimal_field_rewrites_a_comma_decimal_to_a_dot() {
+        assert_eq!(
+            normalize_decimal_field("1,5", DecimalSeparator::Comma),
+            "1.5"
+        );
+        assert_eq!(
+            normalize_decimal_field("-101,3", DecimalSeparator::Comma),
+            "-101.3"
+        );
+    }
+
+    #[test]
+    fn normalize_decimal_field_is_a_no_op_under_a_dot_separator() {
+        assert_eq!(normalize_decimal_field("1,5", DecimalSeparator::Dot), "1,5");
+        assert_eq!(normalize_decimal_field("1.5", DecimalSeparator::Dot), "1.5");
+    }
+
+    // Even under a comma-decimal file, a field that isn't entirely
+    // `<digits>,<digits>` — a timestamp, a state label, an integer with no
+    // fractional part — must pass through untouched, never partially rewritten.
+    #[test]
+    fn normalize_decimal_field_leaves_non_decimal_text_untouched_under_comma_separator() {
+        assert_eq!(
+            normalize_decimal_field("2026-01-01T00:00:00Z", DecimalSeparator::Comma),
+            "2026-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            normalize_decimal_field("running", DecimalSeparator::Comma),
+            "running"
+        );
+        assert_eq!(normalize_decimal_field("42", DecimalSeparator::Comma), "42");
+    }
+
+    #[test]
+    fn normalize_decimal_field_trims_surrounding_whitespace() {
+        assert_eq!(
+            normalize_decimal_field("  1,5  ", DecimalSeparator::Comma),
+            "1.5"
+        );
     }
 
     // Regression for a header-detection bug: SPEC §1.2.3 says the header is

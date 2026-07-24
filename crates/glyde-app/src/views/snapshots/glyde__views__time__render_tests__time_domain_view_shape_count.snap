@@ -1,0 +1,5 @@
+---
+source: crates/glyde-app/src/views/time.rs
+expression: output.shapes.len()
+---
+1470

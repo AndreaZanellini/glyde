@@ -19,17 +19,19 @@
 //! file always goes through [`crate::plumbing`], never a direct read on this
 //! thread.
 //!
-//! This is the M2 "single egui window" slice (docs/ROADMAP.md): it proves a
-//! file opens off-thread and shows the resulting [`OpenSummary`] as text.
-//! Rendering it as a time plot is the next roadmap item.
+//! This is the M2 "single egui window" + "Time-domain view v1" slice
+//! (docs/ROADMAP.md): a file opens off-thread, its [`OpenSummary`] renders as
+//! a small text header, and its samples render as a plot via
+//! [`crate::views::time`].
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use glyde_core::ingest::OpenSummary;
+use glyde_core::ingest::{Dataset, OpenSummary};
 
 use crate::plumbing::{spawn_index_job, spawn_open_dialog, IndexingMessage};
+use crate::views;
 
 /// What the central panel currently shows, driven by [`IndexingMessage`]s
 /// polled from the background indexer thread.
@@ -41,6 +43,7 @@ enum Status {
     Loaded {
         path: PathBuf,
         summary: Box<OpenSummary>,
+        dataset: Box<Dataset>,
     },
     Failed {
         path: PathBuf,
@@ -104,9 +107,16 @@ impl GlydeApp {
             }
             self.status = match message {
                 IndexingMessage::Started { path, .. } => Status::Loading { path },
-                IndexingMessage::Completed { path, summary, .. } => {
-                    Status::Loaded { path, summary }
-                }
+                IndexingMessage::Completed {
+                    path,
+                    summary,
+                    dataset,
+                    ..
+                } => Status::Loaded {
+                    path,
+                    summary,
+                    dataset,
+                },
                 IndexingMessage::Failed { path, message, .. } => Status::Failed { path, message },
             };
         }
@@ -157,13 +167,21 @@ impl eframe::App for GlydeApp {
                 // thread's channel message, so poll for it explicitly.
                 ctx.request_repaint_after(Duration::from_millis(50));
             }
-            Status::Loaded { path, summary } => {
+            Status::Loaded {
+                path,
+                summary,
+                dataset,
+            } => {
                 ui.heading(path.display().to_string());
-                ui.label(format!("{} rows", summary.row_count));
-                if summary.skipped_row_count > 0 {
-                    ui.label(format!("{} rows skipped", summary.skipped_row_count));
-                }
-                ui.label(format!("sampling: {:?}", summary.sampling_class));
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} rows", summary.row_count));
+                    if summary.skipped_row_count > 0 {
+                        ui.label(format!("{} rows skipped", summary.skipped_row_count));
+                    }
+                    ui.label(format!("sampling: {:?}", summary.sampling_class));
+                });
+                // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1".
+                views::time::show(ui, dataset);
             }
             Status::Failed { path, message } => {
                 ui.colored_label(
@@ -178,7 +196,9 @@ impl eframe::App for GlydeApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glyde_core::ingest::SamplingClass;
+    use glyde_core::ingest::{SamplingClass, TimeAxis};
+    use glyde_core::series::{Series, SeriesValues};
+    use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
 
     fn sample_summary() -> Box<OpenSummary> {
         Box::new(OpenSummary {
@@ -193,6 +213,17 @@ mod tests {
             gap_count: 0,
             non_monotonic_count: 0,
             duplicate_timestamp_count: 0,
+        })
+    }
+
+    fn sample_dataset() -> Box<Dataset> {
+        Box::new(Dataset {
+            time: TimeAxis::Absolute {
+                timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)],
+                format: TimestampFormat::EpochSeconds,
+            },
+            time_column_name: "timestamp".to_string(),
+            columns: vec![Series::new("value", SeriesValues::F64(vec![1.0]))],
         })
     }
 
@@ -214,6 +245,7 @@ mod tests {
                 generation: 1, // file A's generation, superseded by B's (2)
                 path: PathBuf::from("a.csv"),
                 summary: sample_summary(),
+                dataset: sample_dataset(),
             })
             .expect("channel send");
 
@@ -240,6 +272,7 @@ mod tests {
                 generation: 1,
                 path: path.clone(),
                 summary: sample_summary(),
+                dataset: sample_dataset(),
             })
             .expect("channel send");
 

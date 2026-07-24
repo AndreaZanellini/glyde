@@ -12,6 +12,45 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Opening a file now shows an actual plot, not just a text summary. Every
+  numeric column renders as a line with visible sample markers on a shared
+  time axis, and you can pan by dragging, zoom with the scroll wheel or a
+  box-select, and click "Fit to data" to snap back to the full range.
+  Hovering the plot shows a readout of the exact timestamp and every
+  series' exact raw value at the nearest sample — never a rounded or
+  decimated approximation (`docs/SPEC.md` §4.1, `docs/ROADMAP.md` M2
+  "Time-domain view v1"). This is the small-file, pre-pyramid version of the
+  view: every sample in the file is loaded and drawn directly, with no
+  decimation yet — that (and the performance work needed for large files)
+  is `docs/ROADMAP.md` M3.
+  European-locale files (semicolon-delimited, comma-decimal, e.g. `1,5`)
+  now plot correctly instead of the value column silently falling back to
+  text: decimal-separator normalization, previously inferred but not
+  actually applied to column values, is now wired into the file-loading
+  path. A run of `NaN`/missing samples (`docs/SPEC.md` §1.3) now always
+  shows as a visible gap in the line — the line is split at every `NaN`
+  sample rather than relying on the plotting library to do that on its own,
+  which review found it does not.
+
+  **Assumptions made:**
+  - As with the M2 "single egui window" item, this is a headless container
+    with no display server, so the plot could not be clicked through by
+    hand in this session. Unlike that item, the actual rendering code path
+    (not just the data plumbing behind it) could still be exercised
+    automatically: a new test drives the real plotting widget through a
+    headless `egui::Context` (no GPU/display needed for that, only for
+    `eframe`'s windowing shell) and checks it produces real draw output
+    without panicking, snapshotted with `insta`. The roadmap item's
+    checkbox is left unticked, matching the prior item's precedent, until
+    someone runs the manual click-through this milestone's "proven by:
+    manual" note also asks for.
+  - A file whose time-index column matches no known timestamp format and
+    also isn't a plain number (so it can neither be read as an absolute
+    timestamp nor as SPEC §2.1's progressive numeric index) now fails to
+    open with a clear message instead of silently opening with an empty
+    plot. No corpus case exercises this today; it was previously
+    unreachable because nothing actually parsed a progressive index's
+    values.
 - Glyde now has an actual window. Launching the app opens a single window
   (`docs/SPEC.md` §6) with a "File → Open…" menu and support for dragging a
   file straight onto the window. Either way, opening runs entirely on a

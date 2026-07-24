@@ -65,6 +65,13 @@ serde_json = "1.0"
 eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
 egui = "0.31"
 rfd = "0.15"
+# Time-domain view (docs/ROADMAP.md M2, SPEC §4.1): pan/zoom/box-zoom and
+# fit-to-data over a plot come free from egui_plot, the companion plotting
+# widget maintained alongside egui itself — writing our own pan/zoom/hit-test
+# math on top of raw egui shapes would duplicate what it already does
+# correctly. Decimation (min/max pyramid) stays entirely ours (SPEC §3.1);
+# egui_plot is used only as a renderer for whatever points we hand it.
+egui_plot = "0.31"
 
 # --- Dev / test ------------------------------------------------------------
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -16,17 +16,21 @@
 //! docs/SPEC.md §1.1, docs/ROADMAP.md M2).
 //!
 //! [`open`] is routing only: which registered [`Reader`] claims a path.
-//! [`report::inspect`] is the actual delimited-text pipeline — encoding,
-//! delimiter, header, decimal separator, and time-index inference wired
-//! together into one [`OpenSummary`] (docs/ROADMAP.md M2 "Activate corpus
-//! open→compare gate"). Dtype inference is landed ([`infer_column`]) but not
-//! yet wired into either pipeline.
+//! [`report::inspect`] wires encoding, delimiter, header, decimal separator,
+//! and time-index inference together into one [`OpenSummary`]
+//! (docs/ROADMAP.md M2 "Activate corpus open→compare gate") — counts and
+//! classifications only, no materialized values. [`dataset::load`] wires the
+//! same pieces together with [`infer_column`] (decimal-normalized per SPEC
+//! §1.2.4 first) into a full in-memory [`Dataset`], for `glyde-app`'s
+//! time-domain view (docs/ROADMAP.md M2 "Time-domain view v1").
 
 mod csv;
+mod dataset;
 mod infer;
 mod report;
 
 pub use csv::{open_path, parse, CsvParseOutcome, CsvReader};
+pub use dataset::{load, Dataset, TimeAxis};
 pub use infer::{
     decode, detect_encoding, infer_column, infer_decimal_separator, infer_delimiter, infer_header,
     DecimalSeparator, DecimalSeparatorInference, Delimiter, DelimiterInference, DtypeInference,

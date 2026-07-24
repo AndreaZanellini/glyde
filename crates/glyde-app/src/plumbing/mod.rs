@@ -27,17 +27,19 @@
 //! state when it eventually arrives late — the generation is how the caller
 //! tells a current message from a stale, superseded one.
 //!
-//! This is deliberately the M2 "single egui window" slice, not the M3 index
-//! pyramid: [`spawn_index_job`] wires up the channel plumbing and reuses
-//! [`glyde_core::ingest::inspect`], the same pipeline the torture-corpus gate
-//! already exercises. Streaming a full pyramid build in the background is
-//! M3's job.
+//! This is deliberately the M2 "single egui window" / "Time-domain view v1"
+//! slice, not the M3 index pyramid: [`spawn_index_job`] wires up the channel
+//! plumbing and reuses [`glyde_core::ingest::inspect`] (the same pipeline the
+//! torture-corpus gate already exercises) for the summary, plus
+//! [`glyde_core::ingest::load`] for the actual samples the time-domain view
+//! plots. Streaming a full pyramid build in the background, instead of
+//! loading the whole file at once, is M3's job.
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::thread;
 
-use glyde_core::ingest::OpenSummary;
+use glyde_core::ingest::{Dataset, OpenSummary};
 
 /// Progress emitted by a background indexing job, polled by the UI thread.
 /// `generation` identifies which open request this message belongs to (see
@@ -47,11 +49,13 @@ use glyde_core::ingest::OpenSummary;
 pub enum IndexingMessage {
     /// The indexer thread started work on `path`.
     Started { generation: u64, path: PathBuf },
-    /// `path` opened successfully; `summary` is what was inferred.
+    /// `path` opened successfully; `summary` is what was inferred and
+    /// `dataset` is every sample, ready for [`crate::views::time::show`].
     Completed {
         generation: u64,
         path: PathBuf,
         summary: Box<OpenSummary>,
+        dataset: Box<Dataset>,
     },
     /// `path` failed to open; `message` is the human-readable reason.
     Failed {
@@ -125,8 +129,29 @@ fn run_index_job(generation: u64, path: PathBuf, tx: &Sender<IndexingMessage>) {
         return;
     }
 
-    match glyde_core::ingest::inspect(&path) {
-        Ok(summary) => {
+    let summary = match glyde_core::ingest::inspect(&path) {
+        Ok(summary) => summary,
+        Err(err) => {
+            tracing::error!(path = %path.display(), error = %err, "failed to open file");
+            let _ = tx.send(IndexingMessage::Failed {
+                generation,
+                path,
+                message: err.to_string(),
+            });
+            return;
+        }
+    };
+
+    // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1": the summary alone
+    // has no samples to plot, so the same background pass also materializes
+    // the full dataset `views::time::show` renders. Both calls re-parse the
+    // file today (M3's pyramid/index build is what makes this a single
+    // pass); an open that produces a summary but fails to load as a dataset
+    // (e.g. a progressive-index column whose fields aren't actually numeric,
+    // `GlydeError::NonNumericTimeIndex`) still has nothing to show, so it is
+    // reported as a failed open rather than a summary with no plot.
+    match glyde_core::ingest::load(&path) {
+        Ok(dataset) => {
             tracing::info!(
                 path = %path.display(),
                 row_count = summary.row_count,
@@ -137,10 +162,11 @@ fn run_index_job(generation: u64, path: PathBuf, tx: &Sender<IndexingMessage>) {
                 generation,
                 path,
                 summary: Box::new(summary),
+                dataset: Box::new(dataset),
             });
         }
         Err(err) => {
-            tracing::error!(path = %path.display(), error = %err, "failed to open file");
+            tracing::error!(path = %path.display(), error = %err, "failed to load dataset");
             let _ = tx.send(IndexingMessage::Failed {
                 generation,
                 path,
@@ -188,11 +214,14 @@ mod tests {
                 generation,
                 path: completed_path,
                 summary,
+                dataset,
             } => {
                 assert_eq!(generation, 7);
                 assert_eq!(completed_path, path);
                 assert_eq!(summary.row_count, 6);
                 assert_eq!(summary.skipped_row_count, 0);
+                assert_eq!(dataset.time.len(), 6);
+                assert_eq!(dataset.columns.len(), 2);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
