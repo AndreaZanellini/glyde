@@ -42,6 +42,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
     Unix epoch resolutions (and from a plain progressive-index column) uses
     the same "plausible modern-era magnitude" heuristic already in place for
     the four epoch formats, shifted into each format's own epoch and unit.
+
+    **Caught and fixed by maintainer review before merge:** a whole-number
+    LabVIEW-epoch column (no trailing `.0` — an entirely ordinary shape for a
+    real LabVIEW/NI export) fell inside the same plausible-magnitude window
+    as plain epoch seconds, and epoch seconds was checked first — so such a
+    column would have been read as a Unix timestamp roughly 66 years off,
+    confidently and with nothing flagged. It's now read the same way the
+    `DD/MM` vs `MM/DD` date ambiguity already is: still reported as epoch
+    seconds (by far the more common real-world format at that magnitude),
+    but marked low-confidence rather than asserted outright, so the
+    upcoming inference bar (`docs/ROADMAP.md` M4) can surface it as a
+    one-click-correctable guess.
     This isn't written down in `docs/SPEC.md`; flag if a real file's values
     could plausibly fall outside that window.
 

@@ -607,9 +607,14 @@ fn format_excel_serial(timestamp: &Timestamp) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimestampFormatInference {
     pub format: TimestampFormat,
-    /// `true` only for the [`TimestampFormat::DayFirst`]/
-    /// [`TimestampFormat::MonthFirst`] ambiguity fallback (SPEC §2.1: "If the
-    /// whole column is ambiguous ... mark the inference low confidence").
+    /// `true` for the [`TimestampFormat::DayFirst`]/[`TimestampFormat::MonthFirst`]
+    /// ambiguity fallback and for [`TimestampFormat::EpochSeconds`] when a
+    /// bare-integer column's magnitude also falls in
+    /// [`TimestampFormat::LabViewEpoch`]'s plausibility window (SPEC §2.1:
+    /// "If the whole column is ambiguous ... mark the inference low
+    /// confidence") — both are the same shape: two absolute-time readings
+    /// are syntactically indistinguishable, so a single pick is reported as
+    /// the best guess but flagged, never asserted with full confidence.
     /// Every other format is either an unambiguous syntactic match or not a
     /// match at all — there is no partial confidence to report for them.
     pub ambiguous: bool,
@@ -804,13 +809,37 @@ pub fn infer_timestamp_format(fields: &[String]) -> Option<TimestampFormatInfere
             .iter()
             .all(|field| field_matches_format(field, format))
     }) {
-        return Some(TimestampFormatInference {
-            format,
-            ambiguous: false,
-        });
+        let ambiguous = epoch_seconds_labview_epoch_overlap(format, fields);
+        if ambiguous {
+            warn!(
+                field_count = fields.len(),
+                "column magnitude matches both EpochSeconds and LabViewEpoch's plausibility \
+                 windows (SPEC §2.1) — defaulting to the far more common EpochSeconds reading; \
+                 low-confidence inference"
+            );
+        }
+        return Some(TimestampFormatInference { format, ambiguous });
     }
 
     infer_day_month_format(fields)
+}
+
+/// Whether `format`/`fields` is [`TimestampFormat::EpochSeconds`] chosen for
+/// a column whose magnitude *also* falls in
+/// [`plausible_labview_epoch_magnitude`]'s window — i.e. every field is a
+/// bare integer syntactically valid under both readings, ~66 years apart
+/// ([`LABVIEW_EPOCH_OFFSET_SECONDS`]) depending on which one is right (PR #44
+/// review: [`IN_SCOPE_FORMATS`] tries `EpochSeconds` first, so without this
+/// check that reading would win with full, unwarranted confidence — Golden
+/// Rule 2). `LabViewEpoch` itself never needs the symmetric check: reaching
+/// it here already means every field failed `EpochSeconds`'s pure-integer
+/// match (almost always because of a decimal point, e.g. corpus case 34's
+/// `.0`), which is itself the disambiguating evidence.
+fn epoch_seconds_labview_epoch_overlap(format: TimestampFormat, fields: &[String]) -> bool {
+    format == TimestampFormat::EpochSeconds
+        && fields
+            .iter()
+            .all(|field| field_matches_format(field, TimestampFormat::LabViewEpoch))
 }
 
 #[cfg(test)]
@@ -1215,6 +1244,31 @@ mod tests {
             "01/25/2026 09:00:00".to_string(),
         ];
         assert_eq!(infer_timestamp_format(&fields), None);
+    }
+
+    // Flagged in PR #44 review: a bare-integer field (no trailing `.0`, the
+    // ordinary shape for a plain LabVIEW/NI logger export) whose magnitude
+    // falls inside the overlap between `EpochSeconds`'s and `LabViewEpoch`'s
+    // plausibility windows (~3.08-10 billion) is a syntactically valid
+    // reading under *both* formats, ~66 years apart
+    // (`LABVIEW_EPOCH_OFFSET_SECONDS`). `IN_SCOPE_FORMATS` tries
+    // `EpochSeconds` first, so without this check it would win confidently
+    // and silently — exactly the "wrong-but-silent" failure CLAUDE.md Golden
+    // Rule 2 forbids. `EpochSeconds` is still the reported best guess (by far
+    // the more common real-world format at this magnitude), but the column
+    // must come back low-confidence, the same treatment SPEC §2.1 requires
+    // for the DD/MM vs MM/DD ambiguity.
+    #[test]
+    fn infer_timestamp_format_flags_the_epoch_seconds_labview_epoch_overlap_as_ambiguous() {
+        let fields = vec!["3850027200".to_string(), "3850027201".to_string()];
+
+        let inference = infer_timestamp_format(&fields).expect("must infer a format");
+        assert_eq!(inference.format, TimestampFormat::EpochSeconds);
+        assert!(
+            inference.ambiguous,
+            "a bare integer in the EpochSeconds/LabViewEpoch overlap must never be a silent \
+             confident pick (CLAUDE.md Golden Rule 2)"
+        );
     }
 
     // Corpus case 35 (docs/QUALITY.md §1.35): a small monotonic integer
