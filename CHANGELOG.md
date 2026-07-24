@@ -27,7 +27,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
   now plot correctly instead of the value column silently falling back to
   text: decimal-separator normalization, previously inferred but not
   actually applied to column values, is now wired into the file-loading
-  path.
+  path. A run of `NaN`/missing samples (`docs/SPEC.md` §1.3) now always
+  shows as a visible gap in the line — the line is split at every `NaN`
+  sample rather than relying on the plotting library to do that on its own,
+  which review found it does not.
 
   **Assumptions made:**
   - As with the M2 "single egui window" item, this is a headless container

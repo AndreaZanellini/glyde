@@ -65,13 +65,23 @@ pub fn show(ui: &mut egui::Ui, dataset: &Dataset) {
             if series.view_kind() != ViewKind::TimeDomain {
                 continue;
             }
-            let points = series_points(&x, series.values());
-            plot_ui.line(Line::new(PlotPoints::new(points.clone())).name(series.name()));
+            let segments = series_segments(&x, series.values());
+            // SPEC §1.3: "NaN / missing values ... rendered as a visible
+            // discontinuity ... never interpolated." Each NaN-delimited run
+            // is drawn as its own `Line`, so the line can never be drawn
+            // across a NaN sample by construction — not by relying on
+            // whatever `egui_plot`'s own tessellation happens to do with a
+            // NaN vertex. Every segment shares `series.name()` so they group
+            // under a single legend entry instead of one per run.
+            for segment in &segments {
+                plot_ui.line(Line::new(PlotPoints::new(segment.clone())).name(series.name()));
+            }
             // SPEC §3.1: "when the visible range contains fewer samples than
             // pixels, draw the raw samples with visible point markers ... the
             // user must be able to reach the individual sample." There is no
             // decimation pyramid yet (M3), so every raw sample is always in
             // that regime for now — the markers are drawn unconditionally.
+            let points: Vec<[f64; 2]> = segments.into_iter().flatten().collect();
             plot_ui.points(
                 Points::new(PlotPoints::new(points))
                     .name(series.name())
@@ -116,18 +126,36 @@ fn x_axis_seconds(time: &TimeAxis) -> Vec<f64> {
     }
 }
 
-/// The `[x, y]` points `egui_plot` draws for one series: `x` paired with
-/// every raw sample of `values` that has a plottable `f64` reading (SPEC
-/// §1.4: NaN/missing values are preserved as gaps, never interpolated — a
-/// sample with no numeric reading is simply omitted from the line here
-/// rather than connected across, though f64 NaN values still round-trip
-/// through since `f64::partial_cmp`-based plotting already breaks the line
-/// at them).
-fn series_points(x: &[f64], values: &SeriesValues) -> Vec<[f64; 2]> {
-    x.iter()
-        .enumerate()
-        .filter_map(|(index, &xi)| value_as_f64(values, index).map(|y| [xi, y]))
-        .collect()
+/// `x` paired with every raw sample of `values`, split into one or more
+/// contiguous runs that break wherever a sample is NaN or has no numeric
+/// reading at all (SPEC §1.3: "NaN / missing values ... rendered as a
+/// visible discontinuity ... never interpolated"). Each returned run is
+/// drawn as its own `egui_plot::Line` by [`show`], so a NaN sample can never
+/// end up connected across by a single continuous line, regardless of how
+/// the plotting library itself would tessellate a NaN vertex — the
+/// discontinuity is guaranteed by this split, not by an assumption about
+/// library internals.
+///
+/// An infinite (non-NaN) reading does *not* break a run: SPEC §1.4 /
+/// corpus case 44 treat an explicit `Infinity`/`-Infinity` value as valid,
+/// non-anomalous data, not a gap — only NaN means "no reading here".
+fn series_segments(x: &[f64], values: &SeriesValues) -> Vec<Vec<[f64; 2]>> {
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    for (index, &xi) in x.iter().enumerate() {
+        match value_as_f64(values, index) {
+            Some(y) if !y.is_nan() => current.push([xi, y]),
+            _ => {
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
 }
 
 /// The axis-aligned bounding box of `x` and every plottable value across
@@ -349,6 +377,58 @@ mod render_tests {
             "the surrounding UI must still draw"
         );
     }
+
+    // Review finding on this PR: the NaN-discontinuity claim in
+    // `series_segments`'s doc comment was previously untested end to end —
+    // no test actually drove a NaN-bearing series through `show`. This loads
+    // the real torture-corpus case 43 fixture (a 3-sample NaN run in the
+    // middle of an otherwise clean series) through the same
+    // `glyde_core::ingest::load` the app uses, and proves the full pipeline
+    // — real ingestion into a `Dataset`, then `show` — renders it without
+    // panicking, with the NaN run correctly excluded from what gets plotted.
+    #[test]
+    fn show_renders_a_real_nan_run_corpus_file_without_panicking() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("testdata")
+            .join("corpus")
+            .join("case-43-nan-runs.csv");
+        let dataset = glyde_core::ingest::load(&path).expect("case 43 must load");
+
+        // Sanity check on the fixture itself before trusting the render
+        // assertion below: 7 samples, 3 of them NaN in the middle.
+        let nan_count = match dataset.columns[0].values() {
+            SeriesValues::F64(values) => values.iter().filter(|v| v.is_nan()).count(),
+            other => panic!("expected an f64 column, got {other:?}"),
+        };
+        assert_eq!(nan_count, 3);
+
+        let x = x_axis_seconds(&dataset.time);
+        let segments = series_segments(&x, dataset.columns[0].values());
+        assert_eq!(
+            segments.len(),
+            2,
+            "the NaN run must split the line into exactly two segments"
+        );
+        assert_eq!(
+            segments.iter().map(Vec::len).sum::<usize>(),
+            4,
+            "the 3 NaN samples must be excluded from both segments"
+        );
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, &dataset);
+            });
+        });
+
+        assert!(
+            !output.shapes.is_empty(),
+            "must draw something around a NaN run without panicking"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -478,10 +558,61 @@ mod tests {
     }
 
     #[test]
-    fn series_points_skips_samples_with_no_numeric_reading() {
+    fn series_segments_of_a_non_numeric_series_is_empty() {
         let x = vec![0.0, 1.0];
-        let points = series_points(&x, &SeriesValues::Bool(vec![true, false]));
+        let segments = series_segments(&x, &SeriesValues::Bool(vec![true, false]));
 
-        assert!(points.is_empty());
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn series_segments_is_one_run_for_a_series_with_no_nan() {
+        let x = vec![0.0, 1.0, 2.0];
+        let segments = series_segments(&x, &SeriesValues::F64(vec![1.0, 2.0, 3.0]));
+
+        assert_eq!(segments, vec![vec![[0.0, 1.0], [1.0, 2.0], [2.0, 3.0]]]);
+    }
+
+    // The exact bug flagged in review: a NaN sample in the middle of a
+    // series must split the line into two separate runs, with the NaN
+    // sample itself excluded from both — never a single run that silently
+    // carries a NaN vertex through to the plotting library (SPEC §1.3).
+    #[test]
+    fn series_segments_breaks_into_separate_runs_at_a_nan_sample() {
+        let x = vec![0.0, 1.0, 2.0, 3.0];
+        let values = SeriesValues::F64(vec![1.0, f64::NAN, 3.0, 4.0]);
+
+        let segments = series_segments(&x, &values);
+
+        assert_eq!(
+            segments,
+            vec![vec![[0.0, 1.0]], vec![[2.0, 3.0], [3.0, 4.0]]]
+        );
+    }
+
+    #[test]
+    fn series_segments_breaks_at_a_leading_and_trailing_nan_run() {
+        let x = vec![0.0, 1.0, 2.0, 3.0, 4.0];
+        let values = SeriesValues::F64(vec![f64::NAN, f64::NAN, 1.0, 2.0, f64::NAN]);
+
+        let segments = series_segments(&x, &values);
+
+        assert_eq!(segments, vec![vec![[2.0, 1.0], [3.0, 2.0]]]);
+    }
+
+    // SPEC §1.4 / corpus case 44: an explicit `Infinity` is valid data, not
+    // a gap — it must stay in the same run as its finite neighbors, unlike
+    // a NaN sample.
+    #[test]
+    fn series_segments_does_not_break_at_an_infinite_value() {
+        let x = vec![0.0, 1.0, 2.0];
+        let values = SeriesValues::F64(vec![1.0, f64::INFINITY, 2.0]);
+
+        let segments = series_segments(&x, &values);
+
+        assert_eq!(
+            segments,
+            vec![vec![[0.0, 1.0], [1.0, f64::INFINITY], [2.0, 2.0]]]
+        );
     }
 }
