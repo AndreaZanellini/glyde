@@ -77,7 +77,7 @@ them, so CI stays green while honoring "written first."
 - [x] Excel serial + LabVIEW epoch + multi-year/second-res + picosecond-res index → SPEC §2.1 · proven by: corpus 33, 34, 42, 41 + ns/ps precision golden (un-ignore)
 - [x] Sampling classification `Uniform` / `SegmentedUniform` / `Irregular` at index time (needs gap detection `Δt > 10× median`) → SPEC §2.2–2.3 · proven by: corpus 38, 39, 40 + gap-detection golden (un-ignore)
 - [x] Non-monotonic + duplicate timestamp detection (counted, flagged, never reordered) → SPEC §2.1 · proven by: corpus 36, 37
-- [ ] Activate corpus open→compare gate for all cases handled so far → QUALITY §1
+- [x] Activate corpus open→compare gate for all cases handled so far → QUALITY §1
 - [ ] `glyde-app`: single egui window, File→Open + drag-drop, background indexer thread + channels (UI never blocks/does I/O) → SPEC §6, ARCH §Threading · proven by: manual (window opens a file off-thread)
 - [ ] Time-domain view v1: render raw samples (small files, pre-pyramid), pan / zoom / fit-to-data, cursor readout of exact raw value + timestamp → SPEC §4.1 · proven by: manual + headless render snapshot (`insta`)
 

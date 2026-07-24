@@ -43,6 +43,12 @@ pub enum GlydeError {
     #[error("empty file: no data to read")]
     EmptyFile,
 
+    /// The input has only its time-index column and no data series to plot
+    /// (corpus case 18, docs/QUALITY.md §1.18: "must fail with a clear
+    /// message, not a crash").
+    #[error("single-column file: only the time index is present, no data series to plot")]
+    SingleColumnFile,
+
     /// `input` did not parse as a valid timestamp under `format` (SPEC §2.1).
     #[error("invalid timestamp {input:?} for format {format:?}: {reason}")]
     InvalidTimestamp {
