@@ -16,6 +16,7 @@ glyde-core = { path = "../glyde-core" }
 
 eframe.workspace = true
 egui.workspace = true
+egui_plot.workspace = true
 rfd.workspace = true
 
 tracing.workspace = true
@@ -26,6 +27,7 @@ directories.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+insta.workspace = true
 
 [[bin]]
 name = "glyde"

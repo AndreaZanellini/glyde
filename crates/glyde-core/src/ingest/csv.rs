@@ -84,7 +84,7 @@ pub struct CsvParseOutcome {
 /// a `panic!`; an empty input is the only rejected input, reported as
 /// [`GlydeError::EmptyFile`].
 pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
-    parse_impl(bytes, None).map(|(outcome, _)| outcome)
+    parse_impl(bytes, Capture::None).map(|(outcome, _)| outcome)
 }
 
 /// Parses `bytes` exactly like [`parse`], additionally capturing every kept
@@ -99,13 +99,37 @@ pub(crate) fn parse_capturing_column(
     bytes: &[u8],
     column_index: usize,
 ) -> Result<(CsvParseOutcome, Vec<String>)> {
-    parse_impl(bytes, Some(column_index))
+    let (outcome, mut columns) = parse_impl(bytes, Capture::Column(column_index))?;
+    Ok((outcome, columns.pop().unwrap_or_default()))
 }
 
-fn parse_impl(
+/// Parses `bytes` exactly like [`parse`], additionally capturing every kept
+/// row's raw text for *every* column, one `Vec<String>` per column in header
+/// order (docs/ROADMAP.md M2 "Time-domain view v1": `ingest::dataset::load`
+/// needs every data series' raw values, not just the time index's). Same
+/// "small files only" deferral as [`parse_capturing_column`]: this holds the
+/// whole table in memory at once, which is exactly what
+/// [`CsvParseOutcome`]'s doc comment flags as docs/ROADMAP.md M3's job to
+/// bound for arbitrary-size files.
+pub(crate) fn parse_capturing_all_columns(
     bytes: &[u8],
-    capture_column: Option<usize>,
-) -> Result<(CsvParseOutcome, Vec<String>)> {
+) -> Result<(CsvParseOutcome, Vec<Vec<String>>)> {
+    parse_impl(bytes, Capture::All)
+}
+
+/// What [`parse_impl`] should hold onto per kept row, alongside the tallies
+/// every capture mode needs regardless.
+enum Capture {
+    /// Tallies only ([`parse`]) — no row text is retained.
+    None,
+    /// One column's raw text ([`parse_capturing_column`]).
+    Column(usize),
+    /// Every column's raw text, one `Vec<String>` per column
+    /// ([`parse_capturing_all_columns`]).
+    All,
+}
+
+fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Vec<String>>)> {
     if bytes.is_empty() {
         return Err(GlydeError::EmptyFile);
     }
@@ -127,7 +151,11 @@ fn parse_impl(
 
     let mut row_count = 0u64;
     let mut skipped_row_count = 0u64;
-    let mut captured = Vec::new();
+    let mut captured: Vec<Vec<String>> = match capture {
+        Capture::None => Vec::new(),
+        Capture::Column(_) => vec![Vec::new()],
+        Capture::All => vec![Vec::new(); expected_field_count],
+    };
 
     for (row_index, record) in stream_records(&text, delimiter).enumerate() {
         if row_index < data_start_row {
@@ -136,9 +164,17 @@ fn parse_impl(
         match record {
             Ok(fields) if fields.len() == expected_field_count => {
                 row_count += 1;
-                if let Some(index) = capture_column {
-                    if let Some(field) = fields.get(index) {
-                        captured.push(field.clone());
+                match capture {
+                    Capture::None => {}
+                    Capture::Column(index) => {
+                        if let Some(field) = fields.get(index) {
+                            captured[0].push(field.clone());
+                        }
+                    }
+                    Capture::All => {
+                        for (column, field) in captured.iter_mut().zip(fields) {
+                            column.push(field);
+                        }
                     }
                 }
             }
@@ -198,6 +234,15 @@ pub(crate) fn open_path_capturing_column(
 ) -> Result<(CsvParseOutcome, Vec<String>)> {
     let mmap = map_file(path)?;
     parse_capturing_column(&mmap, column_index)
+}
+
+/// [`open_path`], additionally capturing every column's raw text (see
+/// [`parse_capturing_all_columns`]).
+pub(crate) fn open_path_capturing_all_columns(
+    path: &Path,
+) -> Result<(CsvParseOutcome, Vec<Vec<String>>)> {
+    let mmap = map_file(path)?;
+    parse_capturing_all_columns(&mmap)
 }
 
 /// Memory-maps `path` read-only. The mapping only backs the caller's parse;
@@ -348,6 +393,29 @@ mod tests {
         assert_eq!(outcome.column_names, vec!["timestamp", "value", "pressure"]);
         assert_eq!(outcome.row_count, 3);
         assert_eq!(outcome.skipped_row_count, 2);
+    }
+
+    // Same fixture, capturing every column: proves the multi-column capture
+    // path (docs/ROADMAP.md M2 "Time-domain view v1") skips exactly the same
+    // two ragged rows as the tally-only path, and that every captured
+    // column ends up with the same length (one entry per *kept* row, in the
+    // same row order) rather than drifting out of alignment with each other.
+    #[test]
+    fn parse_capturing_all_columns_skips_ragged_rows_and_keeps_columns_aligned() {
+        let bytes = corpus_bytes("case-21-ragged-rows.csv");
+
+        let (outcome, columns) = parse_capturing_all_columns(&bytes).expect("case 21 must parse");
+
+        assert_eq!(outcome.column_names, vec!["timestamp", "value", "pressure"]);
+        assert_eq!(outcome.row_count, 3);
+        assert_eq!(outcome.skipped_row_count, 2);
+        assert_eq!(columns.len(), 3, "one captured Vec per column");
+        for column in &columns {
+            assert_eq!(column.len(), 3, "one entry per kept row");
+        }
+        assert_eq!(columns[0][0], "2026-01-01T00:00:00Z");
+        assert_eq!(columns[1][0], "1.0");
+        assert_eq!(columns[2][0], "101.3");
     }
 
     // Corpus case 22 (QUALITY.md §1.22): the file ends mid-row (no trailing

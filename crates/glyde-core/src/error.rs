@@ -56,6 +56,15 @@ pub enum GlydeError {
         format: crate::time::TimestampFormat,
         reason: String,
     },
+
+    /// The time-index column matched no known absolute timestamp format
+    /// (SPEC §2.1), so [`crate::ingest::dataset::load`] fell back to reading
+    /// it as a progressive numeric index (SPEC §2.1 "progressive numeric" —
+    /// "monotonic integer/float sequence with no absolute time meaning") —
+    /// but `input` is not a number either, so there is no valid time axis to
+    /// plot at all.
+    #[error("time index {input:?} is neither a recognized timestamp nor a plain number")]
+    NonNumericTimeIndex { input: String },
 }
 
 /// The `Result` alias every fallible `glyde-core` function returns.
