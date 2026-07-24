@@ -12,6 +12,40 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Glyde now has an actual window. Launching the app opens a single window
+  (`docs/SPEC.md` §6) with a "File → Open…" menu and support for dragging a
+  file straight onto the window. Either way, opening runs entirely on a
+  background thread — the window keeps redrawing and never freezes while a
+  file is being read, even before there's a plot to show for it
+  (`docs/ARCHITECTURE.md` §Threading model). Once a file finishes opening,
+  the window shows its path, row count, any skipped-row count, and its
+  detected sampling class as plain text. Opening a file the engine doesn't
+  recognize (e.g. a `.parquet` file — not supported until `docs/ROADMAP.md`
+  M7) or a file that fails to open shows a clear message instead of doing
+  nothing or crashing. Opening a second file while an earlier one is still
+  being read (e.g. a quick drag-drop right after another) correctly shows
+  the second file once it's ready — the first file's result can no longer
+  arrive late and silently replace what's on screen, even though both were
+  reading in the background at once. There is no time plot yet — rendering
+  the data itself is the next `docs/ROADMAP.md` M2 item; this is only the
+  window, the File→Open/drag-drop entry points, and the background-thread
+  plumbing connecting them to the engine.
+
+  **Assumptions made:**
+  - This is a headless container with no display server, so the window
+    itself could not be visually verified by launching it in this session —
+    only the background-thread plumbing (`crates/glyde-app/src/plumbing`)
+    was exercised by automated tests against real torture-corpus files. The
+    roadmap item's checkbox is deliberately left unticked until someone runs
+    the manual click-through (File→Open, drag-drop, and opening a file the
+    engine doesn't recognize) on a real desktop per this milestone's own
+    "proven by: manual" note, so a green roadmap line never implies more
+    than CI actually proved.
+  - The native "Open…" file dialog (`rfd`) has no headless test backend, so
+    it is exercised only by code review and the manual check above, not by
+    an automated test.
+
+### Added
 - Internal groundwork: the engine can now actually open a delimited-text file
   end to end and report what it inferred — encoding, delimiter, decimal
   separator, which column is the time index, its timestamp format, row
