@@ -165,7 +165,14 @@ fn utf8_invalid_byte_fraction(bytes: &[u8]) -> f64 {
 /// are replaced with U+FFFD rather than failing (SPEC §1.3: malformed data
 /// must never block the user). Replacement is logged at `warn`, never
 /// silent (CLAUDE.md Golden Rule 2).
-pub fn decode(bytes: &[u8], inference: &EncodingInference) -> String {
+///
+/// Returns a borrowed [`Cow`] rather than an owned `String`: `encoding_rs`
+/// already avoids copying when `bytes` is valid UTF-8 for the UTF-8
+/// encoding, which is the common case (SPEC §5.1 "the full file is never
+/// loaded" — an unconditional `.into_owned()` here used to throw that away
+/// and duplicate the entire memory-mapped file onto the heap regardless,
+/// see issue #58).
+pub fn decode<'a>(bytes: &'a [u8], inference: &EncodingInference) -> Cow<'a, str> {
     let (text, _, had_errors) = inference.encoding.decode(bytes);
     if had_errors {
         warn!(
@@ -173,7 +180,7 @@ pub fn decode(bytes: &[u8], inference: &EncodingInference) -> String {
             "invalid byte sequences encountered; replaced with U+FFFD"
         );
     }
-    text.into_owned()
+    text
 }
 
 /// A field delimiter candidate (SPEC §1.2.2).
@@ -802,6 +809,7 @@ mod tests {
     #[test]
     fn plain_ascii_with_no_bom_infers_utf8() {
         let bytes = b"timestamp,value\n2026-01-01T00:00:00Z,1.5\n".to_vec();
+        let expected = String::from_utf8(bytes.clone()).unwrap();
 
         let inference = detect_encoding(&bytes);
 
@@ -809,7 +817,39 @@ mod tests {
         assert_eq!(inference.source, EncodingSource::Heuristic);
 
         let text = decode(&bytes, &inference);
-        assert_eq!(text, String::from_utf8(bytes).unwrap());
+        assert_eq!(text, expected);
+    }
+
+    // Issue #58: `decode` used to unconditionally `.into_owned()` the `Cow`
+    // `encoding_rs` returns, duplicating the entire input even when it was
+    // already valid UTF-8 (the common case). A clean UTF-8 file must decode
+    // as a borrow of `bytes`, not a fresh allocation.
+    #[test]
+    fn decode_borrows_valid_utf8_without_copying() {
+        let bytes = b"timestamp,value\n2026-01-01T00:00:00Z,1.5\n".to_vec();
+        let inference = detect_encoding(&bytes);
+
+        let text = decode(&bytes, &inference);
+
+        assert!(
+            matches!(text, Cow::Borrowed(_)),
+            "clean UTF-8 input must decode without allocating a copy"
+        );
+    }
+
+    // A non-UTF-8 encoding (or invalid UTF-8 needing replacement) cannot
+    // avoid the copy — `encoding_rs` must build new text — but it must still
+    // produce correct output via the owned path.
+    #[test]
+    fn decode_owns_the_result_when_transcoding_is_required() {
+        let bytes = corpus_bytes("case-08-latin1-degree-micro.csv");
+        let inference = detect_encoding(&bytes);
+        assert_eq!(inference.label(), "windows-1252");
+
+        let text = decode(&bytes, &inference);
+
+        assert!(matches!(text, Cow::Owned(_)));
+        assert!(text.contains("temperature [°C]"));
     }
 
     #[test]
@@ -887,7 +927,7 @@ mod tests {
     fn corpus_sample(file_name: &str) -> String {
         let bytes = corpus_bytes(file_name);
         let inference = detect_encoding(&bytes);
-        decode(&bytes, &inference)
+        decode(&bytes, &inference).into_owned()
     }
 
     #[test]

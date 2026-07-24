@@ -11,6 +11,32 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Opening a file uses noticeably less memory and CPU time than before,
+  especially for a clean UTF-8 file (the common case): the ingestion path
+  no longer needlessly duplicates the whole file into memory during
+  decoding, and opening a file no longer re-reads and re-parses it twice in
+  a row (issue #58). Peak memory use while opening a file is still well
+  above what `docs/SPEC.md` §5's budget ultimately requires — the biggest
+  remaining cost, capturing every field as its own text allocation before
+  it is typed, is tracked in a follow-up issue for `docs/ROADMAP.md` M3 to
+  finish. A new (Linux-only, for now) test asserts peak memory use while
+  opening a file stays within a generous bound of the file's own size, so a
+  regression back toward "many full copies of the file" is caught in CI
+  ahead of M3's proper memory-budget gate.
+
+  **Assumptions made:**
+  - Issue #58 named five sub-tasks; this PR completes two of them
+    (bounding the decode copy, and collapsing the app's two full parses
+    into one) plus a coarse version of a third (a peak-RSS test, item 5).
+    The remaining, larger structural change — replacing the per-field
+    `Vec<String>` capture and the separate typed-`Series` build with
+    bounded/streaming accumulation — is filed as its own
+    `blocking-autonomous` follow-up (#62) rather than folded into this PR,
+    per CLAUDE.md's "scope is sacred" and "one item per PR": it is a
+    bigger, riskier change that deserves its own review and its own golden
+    tests, not a drive-by addition here.
+
 ### Changed
 - Roadmap bookkeeping only, no app behavior change: ticked the "Time-domain
   view v1" box in `docs/ROADMAP.md`'s M2 milestone. It was left unticked

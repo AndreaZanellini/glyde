@@ -27,7 +27,7 @@
 //! that is docs/ROADMAP.md M3's job (see [`super::csv::CsvParseOutcome`]'s
 //! own doc comment, which flags the same deferral for row data in general).
 
-use super::csv::open_path_capturing_all_columns;
+use super::csv::{open_path_capturing_all_columns, CsvParseOutcome};
 use super::infer::{infer_column, normalize_decimal_field};
 use crate::series::Series;
 use crate::time::{infer_timestamp_format, parse_timestamp, Timestamp, TimestampFormat};
@@ -82,6 +82,17 @@ pub struct Dataset {
 /// series to plot and is rejected as [`GlydeError::SingleColumnFile`],
 /// exactly like `inspect`.
 pub fn load(path: &Path) -> Result<Dataset> {
+    load_with_outcome(path).map(|(_outcome, dataset)| dataset)
+}
+
+/// [`load`], additionally returning the [`CsvParseOutcome`] the single parse
+/// pass already produced (encoding, delimiter, decimal separator, row
+/// counts). `ingest::report::open_dataset` uses this so that materializing a
+/// [`Dataset`] and reporting an [`super::OpenSummary`] for it share one parse
+/// of the file instead of two independent ones (issue #58: the app used to
+/// call `inspect()` and `load()` back to back, each re-reading and
+/// re-decoding the whole file).
+pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset)> {
     let (outcome, mut columns_text) = open_path_capturing_all_columns(path)?;
 
     if outcome.column_names.len() < 2 {
@@ -133,11 +144,14 @@ pub fn load(path: &Path) -> Result<Dataset> {
         })
         .collect();
 
-    Ok(Dataset {
-        time,
-        time_column_name,
-        columns,
-    })
+    Ok((
+        outcome,
+        Dataset {
+            time,
+            time_column_name,
+            columns,
+        },
+    ))
 }
 
 #[cfg(test)]

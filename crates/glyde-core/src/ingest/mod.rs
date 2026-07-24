@@ -36,7 +36,7 @@ pub use infer::{
     DecimalSeparator, DecimalSeparatorInference, Delimiter, DelimiterInference, DtypeInference,
     EncodingInference, EncodingSource, HeaderInference, HEAD_SAMPLE_BYTES,
 };
-pub use report::{inspect, OpenSummary, SamplingClass};
+pub use report::{inspect, open_dataset, OpenSummary, SamplingClass};
 
 use crate::{GlydeError, Result};
 use std::path::Path;
