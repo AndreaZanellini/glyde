@@ -79,7 +79,7 @@ them, so CI stays green while honoring "written first."
 - [x] Non-monotonic + duplicate timestamp detection (counted, flagged, never reordered) → SPEC §2.1 · proven by: corpus 36, 37
 - [x] Activate corpus open→compare gate for all cases handled so far → QUALITY §1
 - [x] `glyde-app`: single egui window, File→Open + drag-drop, background indexer thread + channels (UI never blocks/does I/O) → SPEC §6, ARCH §Threading · proven by: manual (window opens a file off-thread)
-- [ ] Time-domain view v1: render raw samples (small files, pre-pyramid), pan / zoom / fit-to-data, cursor readout of exact raw value + timestamp → SPEC §4.1 · proven by: manual + headless render snapshot (`insta`)
+- [x] Time-domain view v1: render raw samples (small files, pre-pyramid), pan / zoom / fit-to-data, cursor readout of exact raw value + timestamp → SPEC §4.1 · proven by: manual + headless render snapshot (`insta`)
 
 > **MAINTAINER TEST — M2**
 > - Open corpus case 1 **and** one of your own small, clean CSVs → a time plot appears in
