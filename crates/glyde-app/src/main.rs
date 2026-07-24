@@ -17,8 +17,12 @@
 //! Thin shell: renders state and forwards user intent. If a behavior can be
 //! tested without a window, it belongs in glyde-core. See docs/ARCHITECTURE.md.
 
+mod app;
 mod error_boundary;
 mod logging;
+mod plumbing;
+
+use app::GlydeApp;
 
 fn main() -> anyhow::Result<()> {
     // Keep the guard alive for the whole process: dropping it stops the
@@ -26,8 +30,16 @@ fn main() -> anyhow::Result<()> {
     let _logging_guard = logging::init()?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "glyde starting");
 
-    // The eframe shell (window, File->Open, drag-drop) arrives with M2 —
-    // see docs/ROADMAP.md. Until then this stub proves logging works.
-    println!("glyde: scaffolding stub");
-    Ok(())
+    // SPEC §6: single window, single file at a time.
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_title("Glyde"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Glyde",
+        native_options,
+        Box::new(|_creation_context| Ok(Box::new(GlydeApp::new()))),
+    )
+    .map_err(|err| anyhow::anyhow!("glyde window failed: {err}"))
 }
