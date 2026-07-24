@@ -845,53 +845,7 @@ fn epoch_seconds_labview_epoch_overlap(format: TimestampFormat, fields: &[String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
-
-    fn corpus_path(file_name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("testdata")
-            .join("corpus")
-            .join(file_name)
-    }
-
-    /// Every raw-text field of `column_name` in `file_name`'s data rows, in
-    /// row order — mirrors `ingest::infer`'s own corpus-driven tests (this
-    /// module exercises `infer_timestamp_format`/`parse_timestamp` against
-    /// real corpus text, not a hand-picked `Vec<String>`). Every corpus case
-    /// used here is a plain comma-delimited file with no quoted fields, so a
-    /// straightforward split on the inferred delimiter is sufficient (the
-    /// quote-aware tokenizer lives in `ingest::infer` and is exercised by
-    /// that module's own tests).
-    fn corpus_column(file_name: &str, column_name: &str) -> Vec<String> {
-        let bytes = std::fs::read(corpus_path(file_name))
-            .unwrap_or_else(|e| panic!("read {file_name}: {e}"));
-        let encoding = crate::ingest::detect_encoding(&bytes);
-        let text = crate::ingest::decode(&bytes, &encoding);
-        let delimiter = crate::ingest::infer_delimiter(&text).delimiter;
-        let header = crate::ingest::infer_header(&text, delimiter);
-        let column_index = header
-            .column_names
-            .iter()
-            .position(|name| name == column_name)
-            .unwrap_or_else(|| panic!("column '{column_name}' not found in {file_name}"));
-        let data_start = header
-            .header_row_index
-            .map_or(header.skipped_preamble_rows, |index| index + 1);
-
-        text.lines()
-            .skip(data_start)
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                line.split(delimiter.as_str())
-                    .nth(column_index)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string()
-            })
-            .collect()
-    }
+    use crate::time::corpus_fixture::corpus_column;
 
     fn assert_monotonically_increasing(timestamps: &[Timestamp]) {
         assert!(

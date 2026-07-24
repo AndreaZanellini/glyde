@@ -223,7 +223,6 @@ fn picosecond_ticks_are_never_representable_exactly_as_f64_over_a_multi_year_spa
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M2: gap detection not implemented yet"]
 fn gap_detection_matches_hand_computed_gaps_on_a_synthetic_series() {
     const STEP: i128 = 1_000;
     const RUN_LEN: usize = 10;

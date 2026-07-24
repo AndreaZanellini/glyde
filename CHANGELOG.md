@@ -12,6 +12,30 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Internal groundwork: for a timestamp column, the engine now classifies the
+  sampling pattern per `docs/SPEC.md` §2.2 — `Uniform` (evenly spaced, full
+  signal processing available later), `SegmentedUniform` (evenly spaced in
+  bursts separated by gaps, e.g. a logger that pauses between measurement
+  windows), or `Irregular` (neither, e.g. an event log). This also lands gap
+  detection itself (`docs/SPEC.md` §2.2–2.3: a gap is a spacing more than 10×
+  the typical spacing), which the eventual gap view and PSD (`docs/ROADMAP.md`
+  M5/M8) will build on. Proven against the three relevant torture-corpus
+  cases (a uniform series with realistic millisecond jitter, an irregular
+  event log, and a three-burst segmented series) plus a hand-computed
+  golden test. There is nothing to see in the app yet — this plugs into the
+  CSV reader once the rest of `docs/ROADMAP.md` M2 lands.
+
+  **Assumptions made:**
+  - `docs/SPEC.md` §2.2 defines "uniform" as "jitter (robust CV of Δt) ≤ 1% of
+    median Δt" but does not name the robust-CV formula. This uses median
+    absolute deviation divided by the median (a standard robust dispersion
+    measure, and the same "robust MAD-based rule" language `docs/SPEC.md`
+    §1.3 already uses for outlier detection) — worth a veto if a different
+    formula was intended.
+  - A single-sample segment (the tail end of a series right after a gap) and
+    a series with fewer than two samples have no spacing to judge jitter
+    against, so both are treated as vacuously uniform rather than flagged.
+
 - Internal groundwork: the engine can now also read two more absolute-timestamp
   formats named in `docs/SPEC.md` §2.1 — Excel serial dates (days since
   1899-12-30, e.g. `46023`) and the LabVIEW/NI epoch (seconds since
