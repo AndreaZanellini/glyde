@@ -75,7 +75,7 @@ them, so CI stays green while honoring "written first."
 - [x] Time index: progressive numeric + core timestamp formats (ISO 8601 ±tz, epoch s/ms/µs/ns); internal `i128` ns or `(i64, TimeUnit)`, never `f64` seconds → SPEC §2.1 · proven by: corpus 24, 25, 29–32, 35 + time golden round-trip (un-ignore subset)
 - [x] `DD/MM` vs `MM/DD` disambiguation by scanning for a field > 12; fully ambiguous → low confidence → SPEC §2.1 ambiguity rule · proven by: corpus 26, 27, 28
 - [x] Excel serial + LabVIEW epoch + multi-year/second-res + picosecond-res index → SPEC §2.1 · proven by: corpus 33, 34, 42, 41 + ns/ps precision golden (un-ignore)
-- [ ] Sampling classification `Uniform` / `SegmentedUniform` / `Irregular` at index time (needs gap detection `Δt > 10× median`) → SPEC §2.2–2.3 · proven by: corpus 38, 39, 40 + gap-detection golden (un-ignore)
+- [x] Sampling classification `Uniform` / `SegmentedUniform` / `Irregular` at index time (needs gap detection `Δt > 10× median`) → SPEC §2.2–2.3 · proven by: corpus 38, 39, 40 + gap-detection golden (un-ignore)
 - [ ] Non-monotonic + duplicate timestamp detection (counted, flagged, never reordered) → SPEC §2.1 · proven by: corpus 36, 37
 - [ ] Activate corpus open→compare gate for all cases handled so far → QUALITY §1
 - [ ] `glyde-app`: single egui window, File→Open + drag-drop, background indexer thread + channels (UI never blocks/does I/O) → SPEC §6, ARCH §Threading · proven by: manual (window opens a file off-thread)
