@@ -50,6 +50,16 @@ pub struct OpenSummary {
     pub skipped_row_count: u64,
     pub sampling_class: SamplingClass,
     pub gap_count: u64,
+    /// SPEC §2.1: "non-monotonic timestamps: detected, counted, logged."
+    /// Defaults to 0 so the 54 cases unrelated to this check need no update;
+    /// only case 36 (docs/QUALITY.md §1.36) sets it explicitly.
+    #[serde(default)]
+    pub non_monotonic_count: u64,
+    /// SPEC §2.1: "duplicate timestamps: preserved, flagged." Defaults to 0
+    /// for the same reason as `non_monotonic_count`; only case 37
+    /// (docs/QUALITY.md §1.37) sets it explicitly.
+    #[serde(default)]
+    pub duplicate_timestamp_count: u64,
 }
 
 /// A single field disagreement between an actual open() and its expectation.
@@ -86,6 +96,8 @@ pub fn compare(actual: &OpenSummary, expected: &OpenSummary) -> Vec<Mismatch> {
     check!(skipped_row_count);
     check!(sampling_class);
     check!(gap_count);
+    check!(non_monotonic_count);
+    check!(duplicate_timestamp_count);
 
     mismatches
 }
@@ -187,6 +199,8 @@ mod tests {
             skipped_row_count: 0,
             sampling_class: SamplingClass::Uniform,
             gap_count: 0,
+            non_monotonic_count: 0,
+            duplicate_timestamp_count: 0,
         }
     }
 
@@ -236,6 +250,44 @@ mod tests {
         };
         assert_eq!(summary.encoding, "utf-8");
         assert_eq!(summary.sampling_class, SamplingClass::Uniform);
+        assert_eq!(
+            summary.non_monotonic_count, 0,
+            "a file with no non_monotonic_count key must default to 0, not fail to parse"
+        );
+        assert_eq!(
+            summary.duplicate_timestamp_count, 0,
+            "a file with no duplicate_timestamp_count key must default to 0, not fail to parse"
+        );
+    }
+
+    #[test]
+    fn load_expected_parses_explicit_non_monotonic_and_duplicate_counts() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("case.expected.json");
+        fs::write(
+            &path,
+            r#"{
+                "encoding": "utf-8",
+                "delimiter": ",",
+                "decimal_separator": ".",
+                "time_column": "timestamp",
+                "timestamp_format": "iso8601",
+                "row_count": 6,
+                "skipped_row_count": 0,
+                "sampling_class": "uniform",
+                "gap_count": 0,
+                "non_monotonic_count": 1,
+                "duplicate_timestamp_count": 1
+            }"#,
+        )
+        .expect("write expected.json");
+
+        let expected = load_expected(&path).expect("valid expected.json must parse");
+        let ExpectedOutcome::Open(summary) = expected else {
+            panic!("expected the Open variant, got {expected:?}");
+        };
+        assert_eq!(summary.non_monotonic_count, 1);
+        assert_eq!(summary.duplicate_timestamp_count, 1);
     }
 
     #[test]

@@ -24,7 +24,9 @@
 //! the day-vs-month ambiguity per SPEC §2.1 — landed with earlier
 //! docs/ROADMAP.md M2 items. [`detect_gaps`] and [`classify_sampling`] (SPEC
 //! §2.2–2.3) land with M2's "Sampling classification" item.
-//! [`TimestampFormat::DateTimeSpace`] is a separate, not-yet-started M2
+//! [`detect_monotonicity`] (SPEC §2.1: non-monotonic and duplicate timestamp
+//! detection) lands with M2's "Non-monotonic + duplicate timestamp detection"
+//! item. [`TimestampFormat::DateTimeSpace`] is a separate, not-yet-started M2
 //! roadmap item and stays `todo!()`. Never widen a golden test's tolerance or
 //! change its expectations to make an implementation pass — if one looks
 //! wrong, that is a `blocking-decision` issue, not an edit.
@@ -36,12 +38,14 @@
 
 mod format;
 mod gap;
+mod monotonic;
 
 pub use format::{
     format_timestamp, infer_timestamp_format, parse_timestamp, TimeUnit, Timestamp,
     TimestampFormat, TimestampFormatInference,
 };
 pub use gap::{classify_sampling, detect_gaps, Gap, SamplingClass};
+pub use monotonic::{detect_monotonicity, MonotonicityReport};
 
 /// Reads a `testdata/corpus/` fixture's raw column text, shared by this
 /// module's own test suites (`format.rs`'s timestamp-format tests and
@@ -90,6 +94,27 @@ pub(crate) mod corpus_fixture {
                     .unwrap_or_default()
                     .trim()
                     .to_string()
+            })
+            .collect()
+    }
+
+    /// Parses every raw field of `column_name` in `file_name` under whatever
+    /// format `infer_timestamp_format` picks, returning the `i128` ticks in
+    /// row order — the shape `detect_gaps`/`classify_sampling`/
+    /// `detect_monotonicity` all consume. Shared by `gap.rs`'s and
+    /// `monotonic.rs`'s own test suites.
+    pub(crate) fn corpus_ticks(file_name: &str, column_name: &str) -> Vec<i128> {
+        use crate::time::{infer_timestamp_format, parse_timestamp};
+
+        let fields = corpus_column(file_name, column_name);
+        let inference = infer_timestamp_format(&fields)
+            .unwrap_or_else(|| panic!("{file_name}: must infer a timestamp format"));
+        fields
+            .iter()
+            .map(|field| {
+                parse_timestamp(field, inference.format)
+                    .unwrap_or_else(|err| panic!("{file_name}: {field:?} must parse: {err}"))
+                    .ticks
             })
             .collect()
     }

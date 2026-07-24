@@ -29,7 +29,10 @@
 //! only once its implementation makes it pass — never loosen an assertion to
 //! make that happen.
 
-use glyde_core::time::{detect_gaps, format_timestamp, parse_timestamp, Gap, TimeUnit, Timestamp};
+use glyde_core::time::{
+    detect_gaps, detect_monotonicity, format_timestamp, parse_timestamp, Gap, MonotonicityReport,
+    TimeUnit, Timestamp,
+};
 
 /// Asserts `parse_timestamp` then `format_timestamp` reproduces `input`
 /// byte-for-byte (docs/QUALITY.md §2 Time: format round-trip) — the shared
@@ -271,5 +274,34 @@ fn gap_detection_matches_hand_computed_gaps_on_a_synthetic_series() {
         ],
         "detect_gaps must report exactly the two hand-inserted gaps, at their exact indices and \
          deltas, and nothing else from the otherwise-uniform runs"
+    );
+}
+
+#[test]
+fn monotonicity_detection_matches_hand_computed_counts_on_a_synthetic_series() {
+    // Six otherwise-uniform 1-second ticks with one backward step (index 3,
+    // 2 -> 1) and one exact repeat (index 5, 4 -> 4) hand-inserted among
+    // them. SPEC §2.1: "non-monotonic timestamps: detected, counted,
+    // logged... rows out of order are not reordered silently" and
+    // "duplicate timestamps: preserved, flagged" — this asserts both counts
+    // against a series small enough to verify by hand, with the input
+    // sequence itself asserted unchanged afterwards (never reordered).
+    let timestamps: Vec<i128> = vec![0, 1, 2, 1, 3, 4, 4, 5];
+
+    let report = detect_monotonicity(&timestamps);
+
+    assert_eq!(
+        report,
+        MonotonicityReport {
+            non_monotonic_count: 1,
+            duplicate_count: 1,
+        },
+        "must report exactly the one hand-inserted backward step and the one hand-inserted exact \
+         repeat, and nothing else from the otherwise-uniform run"
+    );
+    assert_eq!(
+        timestamps,
+        vec![0, 1, 2, 1, 3, 4, 4, 5],
+        "detection must never reorder or deduplicate the input"
     );
 }

@@ -157,25 +157,7 @@ pub fn classify_sampling(timestamps: &[i128]) -> SamplingClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::time::corpus_fixture::corpus_column;
-    use crate::time::{infer_timestamp_format, parse_timestamp};
-
-    /// Parses every raw field of `column_name` in `file_name` under whatever
-    /// format `infer_timestamp_format` picks, returning the `i128` ticks in
-    /// row order — the shape `detect_gaps`/`classify_sampling` consume.
-    fn corpus_ticks(file_name: &str, column_name: &str) -> Vec<i128> {
-        let fields = corpus_column(file_name, column_name);
-        let inference = infer_timestamp_format(&fields)
-            .unwrap_or_else(|| panic!("{file_name}: must infer a timestamp format"));
-        fields
-            .iter()
-            .map(|field| {
-                parse_timestamp(field, inference.format)
-                    .unwrap_or_else(|err| panic!("{file_name}: {field:?} must parse: {err}"))
-                    .ticks
-            })
-            .collect()
-    }
+    use crate::time::corpus_fixture::corpus_ticks;
 
     // Corpus case 38 (docs/QUALITY.md §1.38): six samples nominally 1s apart
     // with a few milliseconds of jitter on each Δt. SPEC §2.2's 1%-of-median

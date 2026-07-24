@@ -12,6 +12,32 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Internal groundwork: for a timestamp column, the engine now detects rows
+  that are out of order (a timestamp earlier than the one before it) and
+  rows that repeat the exact same timestamp as the one before them
+  (`docs/SPEC.md` §2.1). Both are only counted and reported, never acted on:
+  an out-of-order row is **not** silently sorted, and a repeated timestamp is
+  **not** silently dropped or merged — the eventual inference bar
+  (`docs/ROADMAP.md` M4) is what will offer a one-click "Sort" / "Keep as-is"
+  choice once it exists. Proven against the two relevant torture-corpus cases
+  (one hand-inserted out-of-order row, one hand-inserted exact repeat) plus a
+  hand-computed golden test. There is nothing to see in the app yet — this
+  plugs into the CSV reader once the rest of `docs/ROADMAP.md` M2 lands.
+
+  **Assumptions made:**
+  - `docs/SPEC.md` §2.1 doesn't define "duplicate timestamp" precisely. This
+    counts an *immediately consecutive* exact repeat (`timestamps[i] ==
+    timestamps[i-1]`), matching how the corpus case for it is shaped and how
+    the existing sampling-classification code already reasons about
+    duplicate Δt. A value that reappears later in the series without being
+    adjacent to its earlier occurrence is not counted as a duplicate today;
+    worth a veto if the intended meaning is "appears more than once
+    anywhere," not just "repeats its immediate predecessor."
+  - The corpus `.expected.json` schema gained two new fields
+    (`non_monotonic_count`, `duplicate_timestamp_count`), defaulted to 0 so
+    the 54 existing corpus cases unrelated to this check did not need to be
+    individually edited — only the two cases this item is proven against
+    (36, 37) set them explicitly.
 - Internal groundwork: for a timestamp column, the engine now classifies the
   sampling pattern per `docs/SPEC.md` §2.2 — `Uniform` (evenly spaced, full
   signal processing available later), `SegmentedUniform` (evenly spaced in
