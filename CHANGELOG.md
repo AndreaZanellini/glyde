@@ -11,6 +11,22 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Roadmap bookkeeping only, no app behavior change: ticked the "Time-domain
+  view v1" box in `docs/ROADMAP.md`'s M2 milestone. It was left unticked
+  when the feature landed because this is a headless container with no
+  display server, so the manual click-through the milestone's own
+  "proven by: manual" note requires couldn't be run in that session. It has
+  since been run by hand (pan, wheel-zoom, box-zoom via right-click-drag,
+  fit-to-data, cursor readout, the European-locale file, the
+  metadata-preamble file, and a NaN-run file all behave as specified) —
+  see the manual test report on issue #54. M2 is now fully ticked. Two
+  small, non-blocking follow-ups were filed from that pass rather than
+  fixed inline: NaN-split line segments render in inconsistent colors per
+  series (#55), and the x-axis ticks show raw epoch numbers instead of a
+  formatted date/time, unlike the cursor readout which already formats
+  correctly (#56).
+
 ### Added
 - Opening a file now shows an actual plot, not just a text summary. Every
   numeric column renders as a line with visible sample markers on a shared
