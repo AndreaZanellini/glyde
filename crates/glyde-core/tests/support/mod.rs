@@ -13,54 +13,20 @@
 // limitations under the License.
 
 //! Torture-corpus loader and open-vs-expected comparison harness
-//! (docs/QUALITY.md §1, docs/ROADMAP.md M1).
+//! (docs/QUALITY.md §1, docs/ROADMAP.md M1/M2).
 //!
 //! Each corpus case is a data file (or, for partitioned Parquet, a directory)
 //! in `testdata/corpus/` paired with a `<name>.expected.json` describing what
-//! a correct `open()` must produce. [`OpenSummary`] is that schema; it is
-//! also the shape a future `glyde_core::ingest::open()` (docs/ROADMAP.md M2)
-//! will return, so [`compare`] can gate real ingestion once that lands.
+//! a correct open must produce. [`OpenSummary`]/[`SamplingClass`] are
+//! `glyde_core::ingest`'s own types (re-exported here, not redefined): the
+//! product's `ingest::inspect` and this harness's `.expected.json` parsing
+//! share one schema (ARCH hard rule 4, "one canonical implementation per
+//! concept") rather than keeping two structs in sync by hand.
 
+use glyde_core::ingest::{OpenSummary, SamplingClass};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-/// SPEC §2.2-2.3 sampling classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SamplingClass {
-    Uniform,
-    SegmentedUniform,
-    Irregular,
-    /// A progressive integer index with no absolute time (corpus case 35).
-    ProgressiveIndex,
-}
-
-/// What a correct `open()` of a corpus file produces. Mirrors QUALITY.md §1's
-/// list verbatim: "inferred encoding/delimiter/decimal/time column/format,
-/// row count, skipped-row count, sampling class, gap count."
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct OpenSummary {
-    pub encoding: String,
-    pub delimiter: Option<String>,
-    pub decimal_separator: Option<String>,
-    pub time_column: Option<String>,
-    pub timestamp_format: Option<String>,
-    pub row_count: u64,
-    pub skipped_row_count: u64,
-    pub sampling_class: SamplingClass,
-    pub gap_count: u64,
-    /// SPEC §2.1: "non-monotonic timestamps: detected, counted, logged."
-    /// Defaults to 0 so the 54 cases unrelated to this check need no update;
-    /// only case 36 (docs/QUALITY.md §1.36) sets it explicitly.
-    #[serde(default)]
-    pub non_monotonic_count: u64,
-    /// SPEC §2.1: "duplicate timestamps: preserved, flagged." Defaults to 0
-    /// for the same reason as `non_monotonic_count`; only case 37
-    /// (docs/QUALITY.md §1.37) sets it explicitly.
-    #[serde(default)]
-    pub duplicate_timestamp_count: u64,
-}
 
 /// A single field disagreement between an actual open() and its expectation.
 #[derive(Debug, Clone, PartialEq, Eq)]

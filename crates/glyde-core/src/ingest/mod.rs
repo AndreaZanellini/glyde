@@ -15,12 +15,16 @@
 //! Readers and the format registry (docs/ARCHITECTURE.md §Hard rule 5,
 //! docs/SPEC.md §1.1, docs/ROADMAP.md M2).
 //!
-//! This is routing only: which registered [`Reader`] claims a path. Actual
-//! streaming parse, encoding/delimiter/decimal inference, and dtype detection
-//! land with each reader's own module as their own roadmap items.
+//! [`open`] is routing only: which registered [`Reader`] claims a path.
+//! [`report::inspect`] is the actual delimited-text pipeline — encoding,
+//! delimiter, header, decimal separator, and time-index inference wired
+//! together into one [`OpenSummary`] (docs/ROADMAP.md M2 "Activate corpus
+//! open→compare gate"). Dtype inference is landed ([`infer_column`]) but not
+//! yet wired into either pipeline.
 
 mod csv;
 mod infer;
+mod report;
 
 pub use csv::{open_path, parse, CsvParseOutcome, CsvReader};
 pub use infer::{
@@ -28,6 +32,7 @@ pub use infer::{
     DecimalSeparator, DecimalSeparatorInference, Delimiter, DelimiterInference, DtypeInference,
     EncodingInference, EncodingSource, HeaderInference, HEAD_SAMPLE_BYTES,
 };
+pub use report::{inspect, OpenSummary, SamplingClass};
 
 use crate::{GlydeError, Result};
 use std::path::Path;

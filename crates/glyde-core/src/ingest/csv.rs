@@ -25,7 +25,7 @@
 //! later docs/ROADMAP.md M2 items — for now every field is carried as its
 //! raw source text (Golden Rule 1: never degrade the raw data).
 
-use super::infer::{self, Delimiter};
+use super::infer::{self, DecimalSeparator, Delimiter};
 use crate::{GlydeError, Result};
 use std::fs::File;
 use std::path::Path;
@@ -67,6 +67,10 @@ pub struct CsvParseOutcome {
     pub column_names: Vec<String>,
     pub row_count: u64,
     pub skipped_row_count: u64,
+    /// The lowercase WHATWG encoding label (SPEC §1.2.1), e.g. `"utf-8"`.
+    pub encoding_label: String,
+    pub delimiter: Delimiter,
+    pub decimal_separator: DecimalSeparator,
 }
 
 /// Parses `bytes` as delimited text (SPEC §1.1) in one streaming pass:
@@ -80,6 +84,28 @@ pub struct CsvParseOutcome {
 /// a `panic!`; an empty input is the only rejected input, reported as
 /// [`GlydeError::EmptyFile`].
 pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
+    parse_impl(bytes, None).map(|(outcome, _)| outcome)
+}
+
+/// Parses `bytes` exactly like [`parse`], additionally capturing every kept
+/// row's raw text for `column_index` (docs/ROADMAP.md M2 "Activate corpus
+/// open→compare gate": `ingest::report::inspect` needs the time-index
+/// column's raw values to run `time::infer_timestamp_format` and friends
+/// against). This is bounded by `row_count` strings from *one* column, not
+/// the whole table — genuinely bounded/chunked reading for arbitrary-size
+/// files is still docs/ROADMAP.md M3's job, the same deferral
+/// [`CsvParseOutcome`]'s original doc comment noted for row data in general.
+pub(crate) fn parse_capturing_column(
+    bytes: &[u8],
+    column_index: usize,
+) -> Result<(CsvParseOutcome, Vec<String>)> {
+    parse_impl(bytes, Some(column_index))
+}
+
+fn parse_impl(
+    bytes: &[u8],
+    capture_column: Option<usize>,
+) -> Result<(CsvParseOutcome, Vec<String>)> {
     if bytes.is_empty() {
         return Err(GlydeError::EmptyFile);
     }
@@ -89,6 +115,7 @@ pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
 
     let sample = bounded_head_sample(&text);
     let delimiter = infer::infer_delimiter(sample).delimiter;
+    let decimal_separator = infer::infer_decimal_separator(sample, delimiter).separator;
     let header = infer::infer_header(sample, delimiter);
 
     let expected_field_count = header.column_names.len();
@@ -100,13 +127,21 @@ pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
 
     let mut row_count = 0u64;
     let mut skipped_row_count = 0u64;
+    let mut captured = Vec::new();
 
     for (row_index, record) in stream_records(&text, delimiter).enumerate() {
         if row_index < data_start_row {
             continue;
         }
         match record {
-            Ok(fields) if fields.len() == expected_field_count => row_count += 1,
+            Ok(fields) if fields.len() == expected_field_count => {
+                row_count += 1;
+                if let Some(index) = capture_column {
+                    if let Some(field) = fields.get(index) {
+                        captured.push(field.clone());
+                    }
+                }
+            }
             Ok(fields) => {
                 warn!(
                     row_index,
@@ -133,11 +168,17 @@ pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
         "CSV parsed in one streaming pass"
     );
 
-    Ok(CsvParseOutcome {
-        column_names: header.column_names,
-        row_count,
-        skipped_row_count,
-    })
+    Ok((
+        CsvParseOutcome {
+            column_names: header.column_names,
+            row_count,
+            skipped_row_count,
+            encoding_label: encoding.label(),
+            delimiter,
+            decimal_separator,
+        },
+        captured,
+    ))
 }
 
 /// Memory-maps `path` and parses it in one streaming pass (ARCH §deps: "CSV
@@ -145,6 +186,23 @@ pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
 /// memory-mapped file"). The mapping only backs the parse; it is dropped
 /// once this returns.
 pub fn open_path(path: &Path) -> Result<CsvParseOutcome> {
+    let mmap = map_file(path)?;
+    parse(&mmap)
+}
+
+/// [`open_path`], additionally capturing `column_index`'s raw text per kept
+/// row (see [`parse_capturing_column`]).
+pub(crate) fn open_path_capturing_column(
+    path: &Path,
+    column_index: usize,
+) -> Result<(CsvParseOutcome, Vec<String>)> {
+    let mmap = map_file(path)?;
+    parse_capturing_column(&mmap, column_index)
+}
+
+/// Memory-maps `path` read-only. The mapping only backs the caller's parse;
+/// it is dropped once that returns.
+fn map_file(path: &Path) -> Result<memmap2::Mmap> {
     let file = File::open(path).map_err(|source| GlydeError::Io {
         path: path.to_path_buf(),
         source,
@@ -152,11 +210,10 @@ pub fn open_path(path: &Path) -> Result<CsvParseOutcome> {
     // Safety: the mapping is read-only and used synchronously within this
     // call; concurrent external truncation of `path` is the same class of
     // risk every memory-mapped reader accepts (ARCH §deps).
-    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|source| GlydeError::Io {
+    unsafe { memmap2::Mmap::map(&file) }.map_err(|source| GlydeError::Io {
         path: path.to_path_buf(),
         source,
-    })?;
-    parse(&mmap)
+    })
 }
 
 /// SPEC §1.2's bounded head sample ([`infer::HEAD_SAMPLE_BYTES`]), cut at a
