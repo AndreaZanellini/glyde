@@ -42,6 +42,20 @@ Versioning: [Semantic Versioning](https://semver.org/).
     LabVIEW/Excel fractional round trip already is one file above this in
     `crates/glyde-core/src/time/format.rs`.
 
+  **Caught and fixed by maintainer review before merge:** a pre-1970
+  (negative Unix epoch) timestamp with a fractional part parsed to the wrong
+  instant — `"-100.25"` came out as -99.75s, and `"-0.5"` lost its sign
+  entirely and came out *positive*, with nothing flagged (exactly the
+  "wrong-but-silent" failure CLAUDE.md Golden Rule 2 forbids). The bug was
+  reachable through ordinary automatic inference, not just a manual format
+  override: a column of pre-1970 fractional epoch-seconds values would have
+  been auto-detected and silently mis-parsed. The formatter had the mirror
+  problem for negative values (its `div_euclid`/`rem_euclid` decomposition
+  produced non-canonical text, e.g. -100.25s formatting back as "-101.75").
+  Both now decompose sign and magnitude separately; new tests cover a
+  negative fractional value, the `-0.x` sign-loss case specifically, and
+  detection through inference.
+
 ### Added
 - No visible app behavior change: gap detection and sampling classification
   (used to decide whether a file's time index is `Uniform`,

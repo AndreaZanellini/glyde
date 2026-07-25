@@ -479,8 +479,9 @@ fn parse_epoch_integer(
     unit: TimeUnit,
     format: TimestampFormat,
 ) -> crate::Result<Timestamp> {
+    let trimmed = input.trim();
     let (whole, frac) =
-        split_decimal(input).ok_or_else(|| crate::GlydeError::InvalidTimestamp {
+        split_decimal(trimmed).ok_or_else(|| crate::GlydeError::InvalidTimestamp {
             input: input.to_string(),
             format,
             reason: "not an integer or decimal number of epoch ticks".to_string(),
@@ -490,7 +491,22 @@ fn parse_epoch_integer(
     }
     let fine_unit = finer_unit_for_epoch_fraction(unit);
     let ticks_per_whole = fine_unit.ticks_per_second() / unit.ticks_per_second();
-    let ticks = whole * ticks_per_whole + frac_str_to_ticks(frac, ticks_per_whole);
+    // A negative value like "-100.25" must combine as -(100 + 0.25), never
+    // `whole + frac` directly: `whole` here is the *signed* integer part
+    // (-100), and adding a positive fractional magnitude to it would move
+    // the result *toward* zero instead of away from it (a sign-flipped
+    // fractional component). Worse, "-0.5" parses `whole` as a sign-less
+    // `0` (`"-0"` has no negative `i128` representation), so the sign must
+    // be read from the trimmed text itself, not inferred from `whole`'s
+    // sign, or the entire value would silently come out positive (the
+    // Golden Rule 2 failure flagged in review on this PR).
+    let negative = trimmed.starts_with('-');
+    let magnitude_ticks = whole.abs() * ticks_per_whole + frac_str_to_ticks(frac, ticks_per_whole);
+    let ticks = if negative {
+        -magnitude_ticks
+    } else {
+        magnitude_ticks
+    };
     Ok(Timestamp::new(ticks, fine_unit))
 }
 
@@ -503,14 +519,25 @@ fn format_epoch(timestamp: &Timestamp, unit: TimeUnit) -> String {
         return timestamp.ticks.to_string();
     }
     let ticks_per_whole = timestamp.unit.ticks_per_second() / unit.ticks_per_second();
-    let whole = timestamp.ticks.div_euclid(ticks_per_whole);
-    let frac_ticks = timestamp.ticks.rem_euclid(ticks_per_whole);
+    // Decompose the *magnitude* and prefix the sign separately, mirroring
+    // `parse_epoch_integer`'s fix for the same class of bug: `div_euclid`/
+    // `rem_euclid` decompose a negative tick count by rounding the whole
+    // part *down* (e.g. -100.25s -> whole -101, frac +0.75s), which is a
+    // mathematically valid decomposition but not conventional decimal
+    // notation — "-101.75" does not mean -100.25 to a reader or to this same
+    // function's own parser, so a round trip through text would silently
+    // change the value (review finding on this PR).
+    let negative = timestamp.ticks < 0;
+    let magnitude = timestamp.ticks.abs();
+    let whole = magnitude / ticks_per_whole;
+    let frac_ticks = magnitude % ticks_per_whole;
+    let sign = if negative { "-" } else { "" };
     if frac_ticks == 0 {
-        return whole.to_string();
+        return format!("{sign}{whole}");
     }
     let max_digits = ticks_per_whole.ilog10();
     let frac_digits = fraction_to_decimal_digits(frac_ticks, ticks_per_whole, max_digits);
-    format!("{whole}.{frac_digits}")
+    format!("{sign}{whole}.{frac_digits}")
 }
 
 /// Seconds between the LabVIEW/NI epoch (1904-01-01T00:00:00Z) and the Unix
@@ -1244,6 +1271,68 @@ mod tests {
         let parsed =
             parse_timestamp("1770000000", TimestampFormat::EpochSeconds).expect("must parse");
         assert_eq!(parsed, Timestamp::new(1_770_000_000, TimeUnit::Seconds));
+    }
+
+    // Review finding on this PR: a negative whole part combined naively with
+    // a positive fractional magnitude (`whole * ticks_per_whole +
+    // frac_ticks`) moves the result *toward* zero instead of away from it —
+    // "-100.25" must mean -(100 + 0.25), not -100 + 0.25. A pre-1970
+    // (negative Unix epoch) timestamp with a fractional part is a real,
+    // reachable input, not just a hypothetical corner (CLAUDE.md Golden Rule
+    // 2: never silently produce the wrong instant).
+    #[test]
+    fn epoch_seconds_negative_fractional_value_parses_to_the_more_negative_instant() {
+        let parsed = parse_timestamp("-100.25", TimestampFormat::EpochSeconds).expect("must parse");
+        assert_eq!(parsed.unit, TimeUnit::Nanoseconds);
+        assert_eq!(parsed.ticks, -100_250_000_000);
+    }
+
+    #[test]
+    fn epoch_seconds_negative_fractional_value_round_trips() {
+        let parsed = parse_timestamp("-100.25", TimestampFormat::EpochSeconds).expect("must parse");
+        assert_eq!(
+            format_timestamp(&parsed, TimestampFormat::EpochSeconds),
+            "-100.25"
+        );
+    }
+
+    // The sharpest case from review: `"-0"` has no negative `i128`
+    // representation, so a naive implementation that infers sign from the
+    // parsed whole part (rather than the original text) silently drops the
+    // sign entirely and produces a *positive* result for "-0.5" — not just
+    // an off-by-a-bit error, a full sign inversion with nothing surfaced.
+    #[test]
+    fn epoch_seconds_negative_value_smaller_than_one_second_preserves_sign() {
+        let parsed = parse_timestamp("-0.5", TimestampFormat::EpochSeconds).expect("must parse");
+        assert_eq!(
+            parsed.ticks, -500_000_000,
+            "sign must survive a -0 whole part"
+        );
+        assert_eq!(
+            format_timestamp(&parsed, TimestampFormat::EpochSeconds),
+            "-0.5"
+        );
+    }
+
+    // `infer_timestamp_format`'s plausibility window uses `whole.abs()`
+    // (SPEC §2.1's magnitude heuristic doesn't care about sign), so a column
+    // of pre-1970 fractional epoch-seconds values must still be recognized —
+    // this is the reachable-through-inference path review flagged, not just
+    // a manual-override corner.
+    #[test]
+    fn infer_timestamp_format_detects_a_negative_fractional_epoch_seconds_column() {
+        let fields = vec!["-1770000000.25".to_string(), "-1770000001.5".to_string()];
+
+        let inference = infer_timestamp_format(&fields).expect("must infer a format");
+        assert_eq!(inference.format, TimestampFormat::EpochSeconds);
+        assert!(!inference.ambiguous);
+
+        let timestamps: Vec<Timestamp> = fields
+            .iter()
+            .map(|field| parse_timestamp(field, inference.format).expect("must parse"))
+            .collect();
+        assert_eq!(timestamps[0].ticks, -1_770_000_000_250_000_000);
+        assert_eq!(timestamps[1].ticks, -1_770_000_001_500_000_000);
     }
 
     // `infer_timestamp_format` must recognize a float epoch column as
