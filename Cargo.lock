@@ -1757,6 +1757,7 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "arrow",
+ "bytemuck",
  "chardetng",
  "chrono",
  "chrono-tz",

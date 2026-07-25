@@ -57,6 +57,40 @@ Versioning: [Semantic Versioning](https://semver.org/).
   detection through inference.
 
 ### Added
+- No visible app behavior change yet (this lands the rendering engine, not
+  the plot itself — that follow-up wires it into `glyde-app`): the min/max
+  decimation pyramid used to render any file, of any size, as it's zoomed
+  and panned is implemented and locked by its golden tests
+  (`docs/ROADMAP.md` M3, `docs/SPEC.md` §3.1). A one-sample spike stays
+  visible no matter how far you zoom out; zooming in far enough always shows
+  the true individual samples.
+
+  This also resolves a `blocking-decision` issue (#59) on *where the raw
+  samples a large file's viewport queries read from actually live*, since
+  CSV data exists only as text and cannot be memory-mapped as typed numbers
+  the way a Parquet file can. Decided: a typed cache of each opened file's
+  decoded samples is written once, streaming, to a small cache folder on
+  your machine (the OS-standard cache location, next to where Glyde already
+  planned to keep its index); reopening a file you've opened before reads
+  straight from that cache instead of re-reading the original file. This
+  cache uses noticeably more disk space than the original file while it
+  exists — the maintainer should weigh in via issue #59 if that trade-off
+  needs revisiting before large real files are opened through it.
+
+  **Assumptions made:**
+  - Only the raw samples are cached on disk so far; the pyramid itself is
+    still rebuilt (quickly, from the cache) each time a file is reopened
+    rather than also being loaded from disk. Full "reopen is instant for
+    everything" is tracked as a follow-up, not silently treated as done.
+  - The cache is never cleaned up automatically yet (no size cap, no
+    least-recently-used eviction) — it only grows. Flagged as a known gap,
+    not a silent limitation.
+  - This PR does not yet change how `glyde-app` reads a file end to end for
+    files too large to fit in memory (that still needs a streaming CSV
+    reader feeding the new cache row by row); it lands the storage layer and
+    the rendering engine issue #59 was blocking, both proven by tests,
+    ready for that follow-up to build on.
+
 - Opening a file now shows an inference bar above the plot with everything
   Glyde inferred about it: encoding, delimiter, decimal separator, time
   column, timestamp format, sample count, and sampling classification

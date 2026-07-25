@@ -66,6 +66,22 @@ pub enum GlydeError {
     #[error("time index {input:?} is neither a recognized timestamp nor a plain number")]
     NonNumericTimeIndex { input: String },
 
+    /// The OS-standard cache directory could not be determined (no valid
+    /// home directory found — `directories::ProjectDirs` returned `None`).
+    /// Callers fall back to an in-memory-only path rather than failing the
+    /// whole operation (docs/ARCHITECTURE.md §The index: the cache is an
+    /// optimization, never a requirement to open a file).
+    #[error("could not determine the OS-standard cache directory")]
+    CacheDirUnavailable,
+
+    /// A Level-0 spill cache file (`crate::index::level0`, issue #59) exists
+    /// but its header, size, or the two files' sample counts are
+    /// inconsistent — truncated write, disk corruption, or a cache format
+    /// from a different `glyde` version. Never trusted; callers treat this
+    /// exactly like a cache miss and rebuild.
+    #[error("corrupt Level-0 cache at {path}: {reason}")]
+    CorruptCache { path: PathBuf, reason: String },
+
     /// A prospective action would need more memory than
     /// [`crate::budget::RamBudget`] allows (SPEC §5.1: refuse before
     /// acting, never after). Callers surface this as "a clear explanation
