@@ -39,6 +39,19 @@ Versioning: [Semantic Versioning](https://semver.org/).
     `docs/SPEC.md` §5/§5.1, not invented.
 
 ### Fixed
+- Time-domain view: the x-axis tick labels now show a formatted date/time
+  (e.g. `2026-01-01T00:00:00Z`) instead of the raw seconds-since-epoch number
+  (e.g. `1767225600`) for files with an absolute timestamp column. The
+  cursor readout already formatted timestamps correctly; only the axis tick
+  labels themselves were showing the raw number (issue #56). A progressive
+  numeric index (no calendar meaning) still shows its plain number, matching
+  prior behavior.
+
+  **Assumptions made:**
+  - None beyond what the issue already specified: the axis reuses the same
+    `format_timestamp`/format/offset the cursor readout already uses, so the
+    two stay consistent.
+
 - Opening a delimited-text file (`.csv`/`.tsv`/`.txt`) uses meaningfully
   less memory than before: measured on a synthetic fixture, peak memory use
   while opening a file dropped from ~12.75x the file's own size to ~7x
