@@ -30,10 +30,10 @@
 //! they route to the state timeline (SPEC §4.3, docs/ROADMAP.md M6), not
 //! yet built.
 
-use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoints, Points};
+use egui_plot::{GridMark, Legend, Line, Plot, PlotBounds, PlotPoints, Points};
 use glyde_core::ingest::{Dataset, TimeAxis};
 use glyde_core::series::{Series, SeriesValues, ViewKind};
-use glyde_core::time::format_timestamp;
+use glyde_core::time::{format_timestamp, Timestamp};
 
 /// Renders `dataset`'s numeric columns as a time-domain plot (SPEC §4.1)
 /// into `ui`: pan (drag), zoom (scroll wheel and box-select), a "Fit to
@@ -49,7 +49,8 @@ pub fn show(ui: &mut egui::Ui, dataset: &Dataset) {
         .allow_zoom(true)
         .allow_scroll(true)
         .allow_drag(true)
-        .allow_boxed_zoom(true);
+        .allow_boxed_zoom(true)
+        .x_axis_formatter(|mark, _range| format_x_axis_tick(&x, mark, &dataset.time));
 
     let response = plot.show(ui, |plot_ui| {
         if fit_clicked {
@@ -123,6 +124,54 @@ fn x_axis_seconds(time: &TimeAxis) -> Vec<f64> {
             .map(|timestamp| timestamp.ticks as f64 / timestamp.unit.ticks_per_second() as f64)
             .collect(),
         TimeAxis::Progressive { values } => values.clone(),
+    }
+}
+
+/// The x-axis tick label for `mark` (SPEC §4.1's timestamp fidelity applied
+/// to the axis, not just the cursor readout — issue #56). For
+/// [`TimeAxis::Absolute`] this reuses [`format_timestamp`] with the same
+/// format/unit as the dataset's own samples, so the axis reads identically to
+/// the cursor readout ([`format_cursor_time`]) instead of the raw
+/// seconds-since-epoch number [`x_axis_seconds`] uses for plotting.
+///
+/// `mark.value` is a grid position, not necessarily an existing sample's
+/// tick, so its *tick count* is derived by inverting [`x_axis_seconds`]'s
+/// tick-to-seconds conversion — a pure display transform, not a new
+/// inference. Its UTC *offset*, however, is taken from `x`'s nearest real
+/// sample ([`nearest_index`]) rather than always the first one: SPEC §2.1
+/// honors whatever offset each source row carried, and
+/// [`crate::time::format::parse_iso8601_with_offset`]-parsed columns can
+/// carry a different offset per row (e.g. a DST transition partway through
+/// the file), so anchoring every tick to the first sample's offset would
+/// mislabel ticks elsewhere in such a file even though their underlying
+/// instant is unaffected. `glyde_core`'s ISO 8601 parser reads each row's
+/// offset independently, so this is a real, not merely hypothetical, case.
+///
+/// A [`TimeAxis::Progressive`] index has no calendar meaning, so its tick is
+/// shown as a plain number, matching `egui_plot`'s own default axis
+/// formatting.
+fn format_x_axis_tick(x: &[f64], mark: GridMark, time: &TimeAxis) -> String {
+    match time {
+        TimeAxis::Absolute { timestamps, format } => {
+            let Some(index) = nearest_index(x, mark.value) else {
+                return String::new();
+            };
+            let Some(nearest) = timestamps.get(index) else {
+                return String::new();
+            };
+            let ticks_per_second = nearest.unit.ticks_per_second() as f64;
+            let ticks = (mark.value * ticks_per_second).round() as i128;
+            let timestamp = Timestamp {
+                ticks,
+                unit: nearest.unit,
+                offset_seconds: nearest.offset_seconds,
+            };
+            format_timestamp(&timestamp, *format)
+        }
+        TimeAxis::Progressive { .. } => {
+            let num_decimals = (-mark.step_size.log10().round()) as usize;
+            egui::emath::format_with_decimals_in_range(mark.value, num_decimals..=num_decimals)
+        }
     }
 }
 
@@ -529,6 +578,86 @@ mod tests {
         };
 
         assert_eq!(format_cursor_time(&time, 1), "1");
+    }
+
+    // Issue #56: the axis must show the same human-readable timestamp the
+    // cursor readout does, not the raw seconds-since-epoch `x_axis_seconds`
+    // coordinate.
+    #[test]
+    fn format_x_axis_tick_formats_an_absolute_axis_like_the_cursor_readout() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::with_offset(0, TimeUnit::Nanoseconds, 2 * 3600)],
+            format: TimestampFormat::Iso8601WithOffset,
+        };
+        let x = x_axis_seconds(&time);
+        let mark = GridMark {
+            value: 0.0,
+            step_size: 1.0,
+        };
+
+        let text = format_x_axis_tick(&x, mark, &time);
+
+        assert!(text.contains("02:00"), "must honor the offset: {text}");
+    }
+
+    // A tick between two sample instants must still convert to a real
+    // timestamp at that grid position, not the nearest sample's tick.
+    #[test]
+    fn format_x_axis_tick_converts_a_grid_value_that_is_not_an_existing_sample() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)],
+            format: TimestampFormat::EpochSeconds,
+        };
+        let x = x_axis_seconds(&time);
+        let mark = GridMark {
+            value: 1.4,
+            step_size: 1.0,
+        };
+
+        assert_eq!(format_x_axis_tick(&x, mark, &time), "1");
+    }
+
+    // A source column can carry a different UTC offset per row (e.g. a DST
+    // transition partway through the file, SPEC §2.1's "honor it and display
+    // it" applied per row). A tick far from the first sample must use the
+    // offset of the sample nearest to it, not always the first sample's —
+    // otherwise ticks after the transition would show a stale offset even
+    // though their underlying instant is unaffected.
+    #[test]
+    fn format_x_axis_tick_uses_the_nearest_samples_own_offset_not_the_first_samples() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![
+                Timestamp::with_offset(0, TimeUnit::Seconds, 3600),
+                Timestamp::with_offset(3600, TimeUnit::Seconds, 2 * 3600),
+            ],
+            format: TimestampFormat::Iso8601WithOffset,
+        };
+        let x = x_axis_seconds(&time);
+        let mark = GridMark {
+            value: 3600.0,
+            step_size: 1.0,
+        };
+
+        let text = format_x_axis_tick(&x, mark, &time);
+
+        assert!(
+            text.contains("02:00"),
+            "must use the second sample's own offset, not the first's: {text}"
+        );
+    }
+
+    #[test]
+    fn format_x_axis_tick_of_a_progressive_index_shows_a_plain_number() {
+        let time = TimeAxis::Progressive {
+            values: vec![0.0, 1.0, 2.0],
+        };
+        let x = x_axis_seconds(&time);
+        let mark = GridMark {
+            value: 1.5,
+            step_size: 0.1,
+        };
+
+        assert_eq!(format_x_axis_tick(&x, mark, &time), "1.5");
     }
 
     #[test]
