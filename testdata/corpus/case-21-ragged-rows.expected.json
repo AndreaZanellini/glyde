@@ -6,6 +6,6 @@
   "timestamp_format": "iso8601",
   "row_count": 3,
   "skipped_row_count": 2,
-  "sampling_class": "uniform",
+  "sampling_class": "irregular",
   "gap_count": 0
 }

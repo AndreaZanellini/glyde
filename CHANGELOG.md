@@ -11,6 +11,19 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Resolves the `blocking-decision` issue (#48) left by the torture-corpus
+  gate's discovery that one file's answer key ("ragged rows", corpus case
+  21) disagreed with the real sampling-classification statistic. Checked the
+  arithmetic myself: after this file's two malformed rows are correctly
+  skipped, the 3 surviving samples have a genuine 3x swing between
+  consecutive intervals (1s, then 3s) — a real irregularity, not a formula
+  artifact of the statistic. The sampling-classification code (already
+  reviewed, and still correct on every other corpus case) is unchanged; the
+  file's answer key is corrected from "uniform" to "irregular", and the
+  torture-corpus gate now checks this file like every other one instead of
+  skipping it.
+
 ### Added
 - No visible app behavior change yet: resolves a `blocking-decision` issue
   (#60) on how a file's time axis maps into the min/max decimation pyramid
