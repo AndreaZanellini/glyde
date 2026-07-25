@@ -15,6 +15,8 @@
 //! Gap detection and sampling classification over a timestamp series
 //! (docs/SPEC.md §2.2–2.3, docs/ROADMAP.md M2).
 
+use tracing::info;
+
 /// A detected gap between two consecutive samples in a timestamp series
 /// (SPEC §2.2–2.3: `gap = Δt > 10 × median Δt`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +83,7 @@ pub fn detect_gaps(timestamps: &[i128]) -> Vec<Gap> {
     let mut deltas_f64: Vec<f64> = deltas.iter().map(|&delta| delta as f64).collect();
     let threshold = 10.0 * median(&mut deltas_f64);
 
-    deltas
+    let gaps: Vec<Gap> = deltas
         .iter()
         .enumerate()
         .filter(|&(_, &delta)| delta as f64 > threshold)
@@ -90,7 +92,17 @@ pub fn detect_gaps(timestamps: &[i128]) -> Vec<Gap> {
             after_index: index + 1,
             delta,
         })
-        .collect()
+        .collect();
+
+    if !gaps.is_empty() {
+        info!(
+            gap_count = gaps.len(),
+            threshold_ticks = threshold,
+            "gaps detected (Δt > 10× median Δt, SPEC §2.2–2.3)"
+        );
+    }
+
+    gaps
 }
 
 /// Robust CV of `timestamps`' Δt (SPEC §2.2: MAD / median) is at most 1% of
@@ -130,28 +142,35 @@ pub fn classify_sampling(timestamps: &[i128]) -> SamplingClass {
     }
 
     let gaps = detect_gaps(timestamps);
-    if gaps.is_empty() {
-        return if is_uniform(timestamps) {
+    let class = if gaps.is_empty() {
+        if is_uniform(timestamps) {
             SamplingClass::Uniform
         } else {
             SamplingClass::Irregular
-        };
-    }
-
-    let mut boundaries: Vec<usize> = Vec::with_capacity(gaps.len() + 2);
-    boundaries.push(0);
-    boundaries.extend(gaps.iter().map(|gap| gap.after_index));
-    boundaries.push(timestamps.len());
-
-    let every_segment_uniform = boundaries
-        .windows(2)
-        .all(|pair| is_uniform(&timestamps[pair[0]..pair[1]]));
-
-    if every_segment_uniform {
-        SamplingClass::SegmentedUniform
+        }
     } else {
-        SamplingClass::Irregular
-    }
+        let mut boundaries: Vec<usize> = Vec::with_capacity(gaps.len() + 2);
+        boundaries.push(0);
+        boundaries.extend(gaps.iter().map(|gap| gap.after_index));
+        boundaries.push(timestamps.len());
+
+        let every_segment_uniform = boundaries
+            .windows(2)
+            .all(|pair| is_uniform(&timestamps[pair[0]..pair[1]]));
+
+        if every_segment_uniform {
+            SamplingClass::SegmentedUniform
+        } else {
+            SamplingClass::Irregular
+        }
+    };
+
+    info!(
+        sampling_class = ?class,
+        gap_count = gaps.len(),
+        "sampling classified (SPEC §2.2)"
+    );
+    class
 }
 
 #[cfg(test)]
