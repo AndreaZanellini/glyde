@@ -20,6 +20,9 @@ tracing-subscriber.workspace = true
 sysinfo.workspace = true
 rand = "0.8"
 
+[dev-dependencies]
+tempfile.workspace = true
+
 # Generates the multi-GB synthetic fixtures used by benchmarks.
 # Never committed to git (docs/QUALITY.md §3).
 [[bin]]

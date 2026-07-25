@@ -12,10 +12,62 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Generates the multi-GB synthetic fixtures used by benchmarks.
-//! Output is never committed (docs/QUALITY.md §3).
+//! Generates the multi-GB synthetic fixture used by the `memory_gate` CI job
+//! (docs/QUALITY.md §3). Output is never committed — see `.gitignore` and
+//! `testdata/generated/`.
 
-fn main() {
-    // TODO(scaffold): --size-gb <N>, emit CSV + Parquet fixtures.
-    println!("generate_fixtures: scaffolding stub");
+use anyhow::{Context, Result};
+use clap::Parser;
+use glyde_devtools::{fixture_path, write_csv_fixture};
+use tracing::info;
+
+/// Generates a synthetic CSV fixture at a given size for the CI performance
+/// gates (docs/QUALITY.md §3).
+#[derive(Parser)]
+struct Args {
+    /// Target fixture size in GB (decimal, e.g. `8` or `0.5`).
+    #[arg(long)]
+    size_gb: f64,
+
+    /// Deterministic seed for the pseudo-random column values, so repeated
+    /// runs of the same size produce byte-identical fixtures.
+    #[arg(long, default_value_t = 0xF1CDA7A)]
+    seed: u64,
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let args = Args::parse();
+    anyhow::ensure!(args.size_gb > 0.0, "--size-gb must be positive");
+
+    let target_bytes = (args.size_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+    let path = fixture_path(args.size_gb);
+
+    info!(
+        size_gb = args.size_gb,
+        target_bytes,
+        path = %path.display(),
+        "generating synthetic CSV fixture"
+    );
+
+    let row_count = write_csv_fixture(&path, target_bytes, args.seed)
+        .with_context(|| format!("writing fixture to {}", path.display()))?;
+
+    let actual_bytes = std::fs::metadata(&path)
+        .with_context(|| format!("reading back fixture metadata for {}", path.display()))?
+        .len();
+
+    info!(
+        row_count,
+        actual_bytes,
+        path = %path.display(),
+        "generate_fixtures: done"
+    );
+    println!(
+        "generate_fixtures: wrote {row_count} rows ({actual_bytes} bytes) to {}",
+        path.display()
+    );
+
+    Ok(())
 }

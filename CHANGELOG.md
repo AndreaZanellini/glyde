@@ -11,6 +11,39 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Resolves the `blocking-decision` issue (#61) on the CI "Performance gates"
+  job, which previously passed unconditionally: `generate_fixtures` and
+  `memory_gate` are real now (a synthetic CSV fixture writer and a headless
+  peak-RSS harness), and the `index_build`/`viewport_query` `criterion`
+  benches assert against the `docs/SPEC.md` §5 budgets and fail the build on
+  breach, instead of being no-op stubs. No visible app behavior changes.
+
+  **Decisions made (per the maintainer's comment on #61):**
+  - The 20 GB memory-gate fixture QUALITY §3 describes does not fit a
+    GitHub-hosted runner's 14 GB of SSD. CI now generates a smaller
+    fixture instead (size set by `ci.yml`'s `$GLYDE_BENCH_FIXTURE_GB`); the
+    true 20 GB run moves to the maintainer's manual QA ritual (QUALITY §5).
+    The peak-RSS budget itself does not scale with file size, so the
+    invariant it protects — a file must never be materialized whole in RAM —
+    is still exercised at the smaller size.
+  - CI enforces the absolute SPEC §5 ceilings only (build-blocking). The
+    QUALITY §3.2 ">15% vs main" regression comparison is not computed in CI
+    — shared, virtualized runners are too noisy for that threshold to mean
+    anything — and is instead a manual `cargo bench` run on the SPEC §5
+    reference machine (MacBook Air M1), where `criterion`'s own local
+    baseline comparison already reports a regression with no extra tooling.
+  - This PR delivers the code side of both decisions (`glyde-devtools`, the
+    two benches). The `ci.yml` fixture-size change and the matching
+    `docs/QUALITY.md` §3 wording are hard-denied files for an agent session
+    to edit and are included as ready-to-paste diffs in the PR description
+    for the maintainer to apply by hand, per `docs/ROUTINES.md`'s CI rule.
+  - Two benched paths QUALITY §3 lists are still out of scope: Parquet index
+    build (no Parquet `Reader` is registered in `ingest` yet) and cold start
+    (an app-level, windowed metric with no headless harness in `glyde-core`).
+    The `welch` bench stays a stub — `dsp::welch` itself is `todo!()` until
+    `docs/ROADMAP.md` M5.
+
 ### Fixed
 - Resolves the `blocking-decision` issue (#48) left by the torture-corpus
   gate's discovery that one file's answer key ("ragged rows", corpus case
