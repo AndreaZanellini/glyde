@@ -11,6 +11,51 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- A timestamp column using a fractional (decimal) epoch value — e.g.
+  `1770000000.5` seconds, or the millisecond/microsecond/nanosecond
+  equivalents — is now recognized and read correctly, matching
+  `docs/SPEC.md` §2.1's "integer or float" epoch formats. Previously only a
+  whole-number epoch column opened; a file with even one fractional epoch
+  value in its time column failed to open at all. Every fractional digit is
+  preserved exactly (never rounded through a floating-point number), the
+  same fidelity guarantee the LabVIEW-epoch and Excel-serial-date formats
+  already have (issue #41).
+
+  **Assumptions made:**
+  - A fractional epoch value upconverts to nanosecond precision (or
+    picosecond, for a fractional nanosecond value) internally, mirroring
+    the precision ceiling every other textual timestamp format in this
+    codebase already uses — not a new convention invented for this fix.
+  - A field whose fraction is all zeros (e.g. `3850027200.0`) is treated the
+    same as a bare integer for the purpose of telling a genuine epoch-seconds
+    column apart from a LabVIEW-epoch column written with a trailing `.0` —
+    torture-corpus case 34 is exactly this shape, and this is what already
+    let it be told apart from epoch-seconds before this fix. A column
+    written with a meaningless-but-nonzero fraction on every row (unlikely
+    in practice) is now read as float epoch seconds rather than LabVIEW
+    epoch; worth a veto if a real file's export tool does something like
+    that.
+  - No new torture-corpus case was added for this (the existing 56-case
+    corpus is a fixed, numbered set); instead, dedicated unit tests exercise
+    the fractional epoch parse/format round trip directly, the same way the
+    LabVIEW/Excel fractional round trip already is one file above this in
+    `crates/glyde-core/src/time/format.rs`.
+
+  **Caught and fixed by maintainer review before merge:** a pre-1970
+  (negative Unix epoch) timestamp with a fractional part parsed to the wrong
+  instant — `"-100.25"` came out as -99.75s, and `"-0.5"` lost its sign
+  entirely and came out *positive*, with nothing flagged (exactly the
+  "wrong-but-silent" failure CLAUDE.md Golden Rule 2 forbids). The bug was
+  reachable through ordinary automatic inference, not just a manual format
+  override: a column of pre-1970 fractional epoch-seconds values would have
+  been auto-detected and silently mis-parsed. The formatter had the mirror
+  problem for negative values (its `div_euclid`/`rem_euclid` decomposition
+  produced non-canonical text, e.g. -100.25s formatting back as "-101.75").
+  Both now decompose sign and magnitude separately; new tests cover a
+  negative fractional value, the `-0.x` sign-loss case specifically, and
+  detection through inference.
+
 ### Added
 - No visible app behavior change: gap detection and sampling classification
   (used to decide whether a file's time index is `Uniform`,
