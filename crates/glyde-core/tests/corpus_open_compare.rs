@@ -29,12 +29,13 @@
 //! not part of "so far" and are explicitly skipped here, not asserted, until
 //! M7 lands a Parquet `Reader`.
 //!
-//! Case 21 is also skipped, for a different reason: it is a genuine
-//! disagreement this gate uncovered between two already-existing,
-//! independently-authored pieces (`time::classify_sampling`'s robust-CV
-//! statistic and case 21's `.expected.json`), not something this PR should
-//! resolve by quietly editing either one — see issue #48 for the root cause
-//! and the maintainer decision it's waiting on.
+//! Case 21 previously disagreed with `time::classify_sampling`'s robust-CV
+//! statistic (issue #48): its `.expected.json` said `"uniform"`, predating
+//! the real classifier, but the honest post-ragged-row-skip Δt (3s, 1s) is a
+//! genuine 3x spread that the classifier correctly reports as `"irregular"`.
+//! The maintainer resolved #48 by fixing the stale `.expected.json` rather
+//! than the (already-reviewed, correct) classifier, so case 21 is now part
+//! of the asserted set below.
 
 #![cfg(feature = "corpus-open-compare")]
 
@@ -52,25 +53,17 @@ const NOT_YET_IMPLEMENTED: &[&str] = &[
     "case-56-parquet-dictionary-strings",
 ];
 
-/// Issue #48: `classify_sampling`'s robust-CV is degenerate for the 2-delta
-/// segment case 21's ragged-row salvage leaves behind, so it disagrees with
-/// case 21's already-committed `.expected.json`. Awaiting a maintainer
-/// decision, not something to silently paper over here.
-const AWAITING_MAINTAINER_DECISION: &[&str] = &["case-21-ragged-rows"];
-
 #[test]
 fn every_implemented_corpus_case_opens_and_matches_its_expected_json() {
     let dir = corpus_dir();
     let cases = discover_cases(&dir).expect("read testdata/corpus");
     assert!(!cases.is_empty(), "the corpus must be discoverable");
 
-    let skipped = NOT_YET_IMPLEMENTED.len() + AWAITING_MAINTAINER_DECISION.len();
+    let skipped = NOT_YET_IMPLEMENTED.len();
     let mut checked = 0usize;
     let mut failures = Vec::new();
     for case in &cases {
-        if NOT_YET_IMPLEMENTED.contains(&case.name.as_str())
-            || AWAITING_MAINTAINER_DECISION.contains(&case.name.as_str())
-        {
+        if NOT_YET_IMPLEMENTED.contains(&case.name.as_str()) {
             continue;
         }
         checked += 1;
