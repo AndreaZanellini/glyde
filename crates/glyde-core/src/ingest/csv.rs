@@ -189,14 +189,16 @@ fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Co
             header_row_index + 1
         });
 
-    let mut row_count = 0u64;
-    let mut skipped_row_count = 0u64;
-    let mut captured: Vec<ColumnText> = match capture {
-        Capture::None => Vec::new(),
-        Capture::Column(_) => vec![ColumnText::default()],
-        Capture::All => (0..expected_field_count)
-            .map(|_| ColumnText::default())
-            .collect(),
+    let mut acc = ParseAccumulator {
+        captured: match capture {
+            Capture::None => Vec::new(),
+            Capture::Column(_) => vec![ColumnText::default()],
+            Capture::All => (0..expected_field_count)
+                .map(|_| ColumnText::default())
+                .collect(),
+        },
+        row_count: 0,
+        skipped_row_count: 0,
     };
 
     match delimiter.as_csv_byte() {
@@ -218,9 +220,7 @@ fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Co
                                 record.len(),
                                 expected_field_count,
                                 &capture,
-                                &mut captured,
-                                &mut row_count,
-                                &mut skipped_row_count,
+                                &mut acc,
                             );
                         }
                         row_index += 1;
@@ -233,7 +233,7 @@ fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Co
                                 %reason,
                                 "row skipped: could not be parsed (SPEC §1.3 truncated-tail tolerance)"
                             );
-                            skipped_row_count += 1;
+                            acc.skipped_row_count += 1;
                         }
                         row_index += 1;
                     }
@@ -254,9 +254,7 @@ fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Co
                         fields.len(),
                         expected_field_count,
                         &capture,
-                        &mut captured,
-                        &mut row_count,
-                        &mut skipped_row_count,
+                        &mut acc,
                     );
                 }
                 row_index += 1;
@@ -265,8 +263,8 @@ fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Co
     }
 
     info!(
-        row_count,
-        skipped_row_count,
+        row_count = acc.row_count,
+        skipped_row_count = acc.skipped_row_count,
         column_count = expected_field_count,
         "CSV parsed in one streaming pass"
     );
@@ -274,42 +272,50 @@ fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Co
     Ok((
         CsvParseOutcome {
             column_names: header.column_names,
-            row_count,
-            skipped_row_count,
+            row_count: acc.row_count,
+            skipped_row_count: acc.skipped_row_count,
             encoding_label: encoding.label(),
             delimiter,
             decimal_separator,
         },
-        captured,
+        acc.captured,
     ))
 }
 
+/// Mutable state threaded through the row loop: what's been captured per
+/// column so far, plus the running kept/skipped row tallies. Bundled into
+/// one struct so [`record_kept_or_ragged`] takes one accumulator parameter
+/// instead of three, keeping it under clippy's too-many-arguments threshold
+/// without silencing the lint (PR #64 review).
+struct ParseAccumulator {
+    captured: Vec<ColumnText>,
+    row_count: u64,
+    skipped_row_count: u64,
+}
+
 /// Applies SPEC §1.3's ragged-row salvage to one already-tokenized row and,
-/// if kept, appends its fields into `captured` per `capture` — borrowing
+/// if kept, appends its fields into `acc.captured` per `capture` — borrowing
 /// straight from `fields` into each column's [`ColumnText`] arena rather
 /// than allocating an owned `String` per field (issue #62).
-#[allow(clippy::too_many_arguments)]
 fn record_kept_or_ragged<'a>(
     row_index: usize,
     fields: impl Iterator<Item = &'a str>,
     field_count: usize,
     expected_field_count: usize,
     capture: &Capture,
-    captured: &mut [ColumnText],
-    row_count: &mut u64,
-    skipped_row_count: &mut u64,
+    acc: &mut ParseAccumulator,
 ) {
     if field_count == expected_field_count {
-        *row_count += 1;
+        acc.row_count += 1;
         match *capture {
             Capture::None => {}
             Capture::Column(index) => {
                 if let Some(field) = fields.into_iter().nth(index) {
-                    captured[0].push(field);
+                    acc.captured[0].push(field);
                 }
             }
             Capture::All => {
-                for (column, field) in captured.iter_mut().zip(fields) {
+                for (column, field) in acc.captured.iter_mut().zip(fields) {
                     column.push(field);
                 }
             }
@@ -321,7 +327,7 @@ fn record_kept_or_ragged<'a>(
             expected_field_count,
             "row skipped: field count does not match the header (SPEC §1.3 ragged-row salvage)"
         );
-        *skipped_row_count += 1;
+        acc.skipped_row_count += 1;
     }
 }
 
