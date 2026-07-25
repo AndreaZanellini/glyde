@@ -39,6 +39,23 @@ Versioning: [Semantic Versioning](https://semver.org/).
     `docs/SPEC.md` §5/§5.1, not invented.
 
 ### Fixed
+- Time-domain view: a series with a gap (a NaN run in the middle) now stays
+  one consistent color across the gap instead of switching to a different
+  color on the other side, which made a single series with a gap look like
+  two different series (issue #55). Each series is assigned one color, shared
+  by every line segment on either side of a gap and by that series' point
+  markers.
+
+  **Assumptions made:**
+  - The assigned colors reuse `egui_plot`'s own default per-item palette
+    formula (equally spaced hues via the golden ratio), but stepped once per
+    series rather than once per draw call as `egui_plot` itself does — so
+    this does *not* leave a gap-free series looking exactly as before: today,
+    a series' line and its point markers already get two different
+    auto-assigned colors, even with no gap. Every series' color shifts
+    relative to before, and a series' line now finally matches its own point
+    markers, which it never did previously.
+
 - Time-domain view: the x-axis tick labels now show a formatted date/time
   (e.g. `2026-01-01T00:00:00Z`) instead of the raw seconds-since-epoch number
   (e.g. `1767225600`) for files with an absolute timestamp column. The
