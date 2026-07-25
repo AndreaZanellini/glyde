@@ -12,6 +12,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- No visible app behavior change: gap detection and sampling classification
+  (used to decide whether a file's time index is `Uniform`,
+  `SegmentedUniform`, or `Irregular`, `docs/SPEC.md` §2.2–2.3) now write to
+  the log file, matching every other ingestion decision Glyde already logs.
+  Previously these two decisions were silent, which meant support couldn't
+  see them in a bug report's logs (issue #47).
+
+  **Assumptions made:**
+  - Logged at `info`, not `warn`: `CLAUDE.md` names "detected gaps" among the
+    decisions logged at `info`, and a classification is a routine decision
+    rather than a recoverable anomaly, so both new log lines use `info!`.
+
 - Internal only, no visible app behavior change yet: Glyde now computes a RAM
   budget from the machine's total memory at the point it's asked for (`min(25%
   of system RAM, 4 GB)`, `docs/SPEC.md` §5's "Peak RSS" cap), and offers a
