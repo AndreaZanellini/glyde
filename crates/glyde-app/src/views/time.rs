@@ -194,11 +194,16 @@ fn format_x_axis_tick(x: &[f64], mark: GridMark, time: &TimeAxis) -> String {
 /// The color for the `index`-th plotted [`ViewKind::TimeDomain`] series
 /// (issue #55), shared by every `Line` segment and the `Points` overlay
 /// drawn for that series so a NaN-delimited gap never reads as a second
-/// series. Reimplements `egui_plot::PlotUi`'s own (private) auto-color
-/// stepping — equal-saturation/value HSV hues spaced by the golden ratio,
-/// which is what gives `egui_plot`'s default per-item palette its visually
-/// distinct, non-repeating look — so a series without any NaN gap still
-/// looks exactly as it would have under the library's own auto-assignment.
+/// series. Reuses the same hue-stepping formula as `egui_plot::PlotUi`'s own
+/// (private) auto-color assignment — equal-saturation/value HSV hues spaced
+/// by the golden ratio — for a similarly distinct, non-repeating palette,
+/// but stepped once per *series* here rather than once per *draw call*:
+/// `egui_plot`'s own auto-assignment bumps its counter on every `line()`/
+/// `points()` call, so even a gap-free series previously got a different
+/// color for its line than for its point markers. This is not merely a
+/// gap fix, then — every series' color shifts relative to before, and a
+/// series' line and points now finally match, which they never did under
+/// the library's own auto-assignment.
 fn series_color(index: usize) -> egui::Color32 {
     let golden_ratio = (5.0_f32.sqrt() - 1.0) / 2.0; // 0.61803398875
     let hue = index as f32 * golden_ratio;

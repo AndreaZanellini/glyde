@@ -47,10 +47,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
   markers.
 
   **Assumptions made:**
-  - None beyond what the issue already specified: the assigned colors
-    reproduce `egui_plot`'s own default per-item palette formula (equally
-    spaced hues via the golden ratio) so a series with no gap still looks
-    exactly as it did before.
+  - The assigned colors reuse `egui_plot`'s own default per-item palette
+    formula (equally spaced hues via the golden ratio), but stepped once per
+    series rather than once per draw call as `egui_plot` itself does — so
+    this does *not* leave a gap-free series looking exactly as before: today,
+    a series' line and its point markers already get two different
+    auto-assigned colors, even with no gap. Every series' color shifts
+    relative to before, and a series' line now finally matches its own point
+    markers, which it never did previously.
 
 - Time-domain view: the x-axis tick labels now show a formatted date/time
   (e.g. `2026-01-01T00:00:00Z`) instead of the raw seconds-since-epoch number
