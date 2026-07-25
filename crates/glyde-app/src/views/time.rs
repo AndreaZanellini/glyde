@@ -62,10 +62,20 @@ pub fn show(ui: &mut egui::Ui, dataset: &Dataset) {
             }
         }
 
+        let mut next_color_index = 0usize;
         for series in &dataset.columns {
             if series.view_kind() != ViewKind::TimeDomain {
                 continue;
             }
+            // Issue #55: one color per series, assigned here rather than
+            // left to `egui_plot`'s own per-draw-call auto-assignment —
+            // `egui_plot` would otherwise hand out a new color to every
+            // `line()`/`points()` call, so a series with a NaN-delimited gap
+            // (split into multiple `Line`s below) rendered as several
+            // differently-colored segments instead of one consistent color.
+            let color = series_color(next_color_index);
+            next_color_index += 1;
+
             let segments = series_segments(&x, series.values());
             // SPEC §1.3: "NaN / missing values ... rendered as a visible
             // discontinuity ... never interpolated." Each NaN-delimited run
@@ -73,9 +83,14 @@ pub fn show(ui: &mut egui::Ui, dataset: &Dataset) {
             // across a NaN sample by construction — not by relying on
             // whatever `egui_plot`'s own tessellation happens to do with a
             // NaN vertex. Every segment shares `series.name()` so they group
-            // under a single legend entry instead of one per run.
+            // under a single legend entry instead of one per run, and now
+            // `color` so they also share one color instead of one per run.
             for segment in &segments {
-                plot_ui.line(Line::new(PlotPoints::new(segment.clone())).name(series.name()));
+                plot_ui.line(
+                    Line::new(PlotPoints::new(segment.clone()))
+                        .name(series.name())
+                        .color(color),
+                );
             }
             // SPEC §3.1: "when the visible range contains fewer samples than
             // pixels, draw the raw samples with visible point markers ... the
@@ -86,7 +101,8 @@ pub fn show(ui: &mut egui::Ui, dataset: &Dataset) {
             plot_ui.points(
                 Points::new(PlotPoints::new(points))
                     .name(series.name())
-                    .radius(2.0_f32),
+                    .radius(2.0_f32)
+                    .color(color),
             );
         }
 
@@ -173,6 +189,20 @@ fn format_x_axis_tick(x: &[f64], mark: GridMark, time: &TimeAxis) -> String {
             egui::emath::format_with_decimals_in_range(mark.value, num_decimals..=num_decimals)
         }
     }
+}
+
+/// The color for the `index`-th plotted [`ViewKind::TimeDomain`] series
+/// (issue #55), shared by every `Line` segment and the `Points` overlay
+/// drawn for that series so a NaN-delimited gap never reads as a second
+/// series. Reimplements `egui_plot::PlotUi`'s own (private) auto-color
+/// stepping — equal-saturation/value HSV hues spaced by the golden ratio,
+/// which is what gives `egui_plot`'s default per-item palette its visually
+/// distinct, non-repeating look — so a series without any NaN gap still
+/// looks exactly as it would have under the library's own auto-assignment.
+fn series_color(index: usize) -> egui::Color32 {
+    let golden_ratio = (5.0_f32.sqrt() - 1.0) / 2.0; // 0.61803398875
+    let hue = index as f32 * golden_ratio;
+    egui::epaint::Hsva::new(hue, 0.85, 0.5, 1.0).into()
 }
 
 /// `x` paired with every raw sample of `values`, split into one or more
@@ -485,6 +515,29 @@ mod tests {
     use super::*;
     use glyde_core::series::Series;
     use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
+
+    // Issue #55: every segment of a NaN-split series (and its points
+    // overlay) must reuse the same color rather than one per draw call —
+    // this is what `series_color` being a pure function of the series'
+    // index, called once per series in `show`, guarantees.
+    #[test]
+    fn series_color_is_stable_for_the_same_index() {
+        assert_eq!(series_color(0), series_color(0));
+        assert_eq!(series_color(3), series_color(3));
+    }
+
+    #[test]
+    fn series_color_differs_across_indices() {
+        let colors: Vec<_> = (0..5).map(series_color).collect();
+        for i in 0..colors.len() {
+            for j in (i + 1)..colors.len() {
+                assert_ne!(
+                    colors[i], colors[j],
+                    "series {i} and {j} must not share a color"
+                );
+            }
+        }
+    }
 
     #[test]
     fn x_axis_seconds_converts_nanosecond_ticks_to_seconds() {
