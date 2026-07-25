@@ -751,10 +751,10 @@ fn leading_day_month_groups(field: &str) -> Option<(u32, u32)> {
 /// match" (`None`) rather than guessed either way, the same fidelity-first
 /// default `field_matches_format`'s epoch-magnitude window applies to
 /// implausible epoch values.
-fn infer_day_month_format(fields: &[String]) -> Option<TimestampFormatInference> {
+fn infer_day_month_format<S: AsRef<str>>(fields: &[S]) -> Option<TimestampFormatInference> {
     let groups: Vec<(u32, u32)> = fields
         .iter()
-        .map(|field| leading_day_month_groups(field))
+        .map(|field| leading_day_month_groups(field.as_ref()))
         .collect::<Option<Vec<_>>>()?;
 
     let day_first_evidence = groups.iter().any(|&(first, _)| first > 12);
@@ -769,7 +769,7 @@ fn infer_day_month_format(fields: &[String]) -> Option<TimestampFormatInference>
 
     if !fields
         .iter()
-        .all(|field| parse_timestamp(field, format).is_ok())
+        .all(|field| parse_timestamp(field.as_ref(), format).is_ok())
     {
         return None;
     }
@@ -799,7 +799,7 @@ fn infer_day_month_format(fields: &[String]) -> Option<TimestampFormatInference>
 /// every field — the signal a caller uses to fall back to a
 /// progressive-numeric index (corpus case 35) rather than mis-detecting an
 /// absolute timestamp.
-pub fn infer_timestamp_format(fields: &[String]) -> Option<TimestampFormatInference> {
+pub fn infer_timestamp_format<S: AsRef<str>>(fields: &[S]) -> Option<TimestampFormatInference> {
     if fields.is_empty() {
         return None;
     }
@@ -807,7 +807,7 @@ pub fn infer_timestamp_format(fields: &[String]) -> Option<TimestampFormatInfere
     if let Some(format) = IN_SCOPE_FORMATS.into_iter().find(|&format| {
         fields
             .iter()
-            .all(|field| field_matches_format(field, format))
+            .all(|field| field_matches_format(field.as_ref(), format))
     }) {
         let ambiguous = epoch_seconds_labview_epoch_overlap(format, fields);
         if ambiguous {
@@ -835,11 +835,14 @@ pub fn infer_timestamp_format(fields: &[String]) -> Option<TimestampFormatInfere
 /// it here already means every field failed `EpochSeconds`'s pure-integer
 /// match (almost always because of a decimal point, e.g. corpus case 34's
 /// `.0`), which is itself the disambiguating evidence.
-fn epoch_seconds_labview_epoch_overlap(format: TimestampFormat, fields: &[String]) -> bool {
+fn epoch_seconds_labview_epoch_overlap<S: AsRef<str>>(
+    format: TimestampFormat,
+    fields: &[S],
+) -> bool {
     format == TimestampFormat::EpochSeconds
         && fields
             .iter()
-            .all(|field| field_matches_format(field, TimestampFormat::LabViewEpoch))
+            .all(|field| field_matches_format(field.as_ref(), TimestampFormat::LabViewEpoch))
 }
 
 #[cfg(test)]
@@ -1245,7 +1248,7 @@ mod tests {
 
     #[test]
     fn infer_timestamp_format_of_empty_fields_is_none() {
-        assert_eq!(infer_timestamp_format(&[]), None);
+        assert_eq!(infer_timestamp_format::<String>(&[]), None);
     }
 
     #[test]

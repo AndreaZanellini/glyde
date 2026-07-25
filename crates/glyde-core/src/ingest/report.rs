@@ -123,13 +123,14 @@ fn timestamp_format_label(format: TimestampFormat) -> &'static str {
 /// `glyde-app`'s indexer does) should call [`open_dataset`] instead, which
 /// produces both from a single parse (issue #58).
 pub fn inspect(path: &Path) -> Result<OpenSummary> {
-    let (outcome, time_fields) = open_path_capturing_column(path, 0)?;
+    let (outcome, time_column_text) = open_path_capturing_column(path, 0)?;
 
     if outcome.column_names.len() < 2 {
         return Err(GlydeError::SingleColumnFile);
     }
 
     let time_column_name = outcome.column_names[0].clone();
+    let time_fields: Vec<&str> = time_column_text.iter().collect();
 
     let (
         time_column,

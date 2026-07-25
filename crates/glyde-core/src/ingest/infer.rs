@@ -580,8 +580,11 @@ pub struct DtypeInference {
 /// convention (trimmed) — the one spelling [`parse_bool_field`] accepts that
 /// an integer parse would *also* accept, making the bool-vs-integer choice
 /// genuinely ambiguous rather than a confident dtype match.
-fn is_ambiguous_numeric_bool_column(fields: &[String]) -> bool {
-    !fields.is_empty() && fields.iter().all(|field| matches!(field.trim(), "0" | "1"))
+fn is_ambiguous_numeric_bool_column<S: AsRef<str>>(fields: &[S]) -> bool {
+    !fields.is_empty()
+        && fields
+            .iter()
+            .all(|field| matches!(field.as_ref().trim(), "0" | "1"))
 }
 
 /// Infers a column's dtype from its raw source-text fields (SPEC §1.4) and
@@ -603,7 +606,7 @@ fn is_ambiguous_numeric_bool_column(fields: &[String]) -> bool {
 /// lossless signed/floating representation is the safe default; narrower
 /// integer widths (`i8`..`i32`, `u8`..`u64`) and `f32` are a later item's
 /// job, not required by any corpus case this one is proven against.
-pub fn infer_column(name: impl Into<String>, fields: &[String]) -> DtypeInference {
+pub fn infer_column<S: AsRef<str>>(name: impl Into<String>, fields: &[S]) -> DtypeInference {
     if let Some(values) = parse_every(fields, parse_bool_field) {
         let ambiguous = is_ambiguous_numeric_bool_column(fields);
         if ambiguous {
@@ -670,7 +673,15 @@ pub fn infer_column(name: impl Into<String>, fields: &[String]) -> DtypeInferenc
          integer, or float (SPEC §1.4)"
     );
     DtypeInference {
-        series: Series::new(name, SeriesValues::String(fields.to_vec())),
+        series: Series::new(
+            name,
+            SeriesValues::String(
+                fields
+                    .iter()
+                    .map(|field| field.as_ref().to_string())
+                    .collect(),
+            ),
+        ),
         ambiguous: false,
     }
 }
@@ -679,8 +690,11 @@ pub fn infer_column(name: impl Into<String>, fields: &[String]) -> DtypeInferenc
 /// `?`-style short-circuiting via `Option<Vec<_>>`'s `FromIterator` impl, so
 /// a single field that doesn't fit the candidate dtype rejects the whole
 /// column rather than partially parsing it.
-fn parse_every<T>(fields: &[String], parse: impl Fn(&str) -> Option<T>) -> Option<Vec<T>> {
-    fields.iter().map(|field| parse(field)).collect()
+fn parse_every<T, S: AsRef<str>>(
+    fields: &[S],
+    parse: impl Fn(&str) -> Option<T>,
+) -> Option<Vec<T>> {
+    fields.iter().map(|field| parse(field.as_ref())).collect()
 }
 
 /// SPEC §1.4 / corpus case 47: the boolean spellings the torture corpus

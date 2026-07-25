@@ -50,6 +50,46 @@ impl super::Reader for CsvReader {
     }
 }
 
+/// One column's captured raw text across every kept row: every field is
+/// appended to a single arena buffer, with a `(start, len)` entry per field
+/// recording where it lives, instead of one heap-allocated `String` per
+/// field (issue #62 — that per-field allocation, times millions of rows,
+/// was measured driving peak RSS to ~12.75x the source file's size).
+/// [`ColumnText::iter`] hands back borrowed `&str` slices into the arena, so
+/// a caller that only needs to inspect or type the text (SPEC §1.4's dtype
+/// inference, `time::infer_timestamp_format`) never pays for an owned copy.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ColumnText {
+    arena: String,
+    ranges: Vec<(usize, usize)>,
+}
+
+impl ColumnText {
+    fn push(&mut self, field: &str) {
+        let start = self.arena.len();
+        self.arena.push_str(field);
+        self.ranges.push((start, field.len()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    /// Every captured field, in row order, borrowed from the arena.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &str> + '_ {
+        self.ranges
+            .iter()
+            .map(move |&(start, len)| &self.arena[start..start + len])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&self, index: usize) -> Option<&str> {
+        let &(start, len) = self.ranges.get(index)?;
+        Some(&self.arena[start..start + len])
+    }
+}
+
 /// The result of a full single-pass parse: the header's column names, how
 /// many rows were salvaged after ragged-row / truncated-tail tolerance
 /// (SPEC §1.3), and how many were skipped along the way. This intentionally
@@ -98,7 +138,7 @@ pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
 pub(crate) fn parse_capturing_column(
     bytes: &[u8],
     column_index: usize,
-) -> Result<(CsvParseOutcome, Vec<String>)> {
+) -> Result<(CsvParseOutcome, ColumnText)> {
     let (outcome, mut columns) = parse_impl(bytes, Capture::Column(column_index))?;
     Ok((outcome, columns.pop().unwrap_or_default()))
 }
@@ -113,7 +153,7 @@ pub(crate) fn parse_capturing_column(
 /// bound for arbitrary-size files.
 pub(crate) fn parse_capturing_all_columns(
     bytes: &[u8],
-) -> Result<(CsvParseOutcome, Vec<Vec<String>>)> {
+) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
     parse_impl(bytes, Capture::All)
 }
 
@@ -129,7 +169,7 @@ enum Capture {
     All,
 }
 
-fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Vec<String>>)> {
+fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
     if bytes.is_empty() {
         return Err(GlydeError::EmptyFile);
     }
@@ -151,48 +191,75 @@ fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Ve
 
     let mut row_count = 0u64;
     let mut skipped_row_count = 0u64;
-    let mut captured: Vec<Vec<String>> = match capture {
+    let mut captured: Vec<ColumnText> = match capture {
         Capture::None => Vec::new(),
-        Capture::Column(_) => vec![Vec::new()],
-        Capture::All => vec![Vec::new(); expected_field_count],
+        Capture::Column(_) => vec![ColumnText::default()],
+        Capture::All => (0..expected_field_count)
+            .map(|_| ColumnText::default())
+            .collect(),
     };
 
-    for (row_index, record) in stream_records(&text, delimiter).enumerate() {
-        if row_index < data_start_row {
-            continue;
-        }
-        match record {
-            Ok(fields) if fields.len() == expected_field_count => {
-                row_count += 1;
-                match capture {
-                    Capture::None => {}
-                    Capture::Column(index) => {
-                        if let Some(field) = fields.get(index) {
-                            captured[0].push(field.clone());
+    match delimiter.as_csv_byte() {
+        Some(byte) => {
+            let mut reader = csv::ReaderBuilder::new()
+                .delimiter(byte)
+                .has_headers(false)
+                .flexible(true)
+                .from_reader(text.as_bytes());
+            let mut record = csv::StringRecord::new();
+            let mut row_index = 0usize;
+            loop {
+                match reader.read_record(&mut record) {
+                    Ok(true) => {
+                        if row_index >= data_start_row {
+                            record_kept_or_ragged(
+                                row_index,
+                                record.iter(),
+                                record.len(),
+                                expected_field_count,
+                                &capture,
+                                &mut captured,
+                                &mut row_count,
+                                &mut skipped_row_count,
+                            );
                         }
+                        row_index += 1;
                     }
-                    Capture::All => {
-                        for (column, field) in captured.iter_mut().zip(fields) {
-                            column.push(field);
+                    Ok(false) => break,
+                    Err(reason) => {
+                        if row_index >= data_start_row {
+                            warn!(
+                                row_index,
+                                %reason,
+                                "row skipped: could not be parsed (SPEC §1.3 truncated-tail tolerance)"
+                            );
+                            skipped_row_count += 1;
                         }
+                        row_index += 1;
                     }
                 }
             }
-            Ok(fields) => {
-                warn!(
-                    row_index,
-                    field_count = fields.len(),
-                    expected_field_count,
-                    "row skipped: field count does not match the header (SPEC §1.3 ragged-row salvage)"
-                );
-                skipped_row_count += 1;
-            }
-            Err(reason) => {
-                warn!(
-                    row_index,
-                    reason, "row skipped: could not be parsed (SPEC §1.3 truncated-tail tolerance)"
-                );
-                skipped_row_count += 1;
+        }
+        None => {
+            let mut row_index = 0usize;
+            for line in text.lines() {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.is_empty() {
+                    continue;
+                }
+                if row_index >= data_start_row {
+                    record_kept_or_ragged(
+                        row_index,
+                        fields.iter().copied(),
+                        fields.len(),
+                        expected_field_count,
+                        &capture,
+                        &mut captured,
+                        &mut row_count,
+                        &mut skipped_row_count,
+                    );
+                }
+                row_index += 1;
             }
         }
     }
@@ -217,6 +284,47 @@ fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Ve
     ))
 }
 
+/// Applies SPEC §1.3's ragged-row salvage to one already-tokenized row and,
+/// if kept, appends its fields into `captured` per `capture` — borrowing
+/// straight from `fields` into each column's [`ColumnText`] arena rather
+/// than allocating an owned `String` per field (issue #62).
+#[allow(clippy::too_many_arguments)]
+fn record_kept_or_ragged<'a>(
+    row_index: usize,
+    fields: impl Iterator<Item = &'a str>,
+    field_count: usize,
+    expected_field_count: usize,
+    capture: &Capture,
+    captured: &mut [ColumnText],
+    row_count: &mut u64,
+    skipped_row_count: &mut u64,
+) {
+    if field_count == expected_field_count {
+        *row_count += 1;
+        match *capture {
+            Capture::None => {}
+            Capture::Column(index) => {
+                if let Some(field) = fields.into_iter().nth(index) {
+                    captured[0].push(field);
+                }
+            }
+            Capture::All => {
+                for (column, field) in captured.iter_mut().zip(fields) {
+                    column.push(field);
+                }
+            }
+        }
+    } else {
+        warn!(
+            row_index,
+            field_count,
+            expected_field_count,
+            "row skipped: field count does not match the header (SPEC §1.3 ragged-row salvage)"
+        );
+        *skipped_row_count += 1;
+    }
+}
+
 /// Memory-maps `path` and parses it in one streaming pass (ARCH §deps: "CSV
 /// ingestion | `csv` / `csv-core` — streaming, single-pass over a
 /// memory-mapped file"). The mapping only backs the parse; it is dropped
@@ -231,7 +339,7 @@ pub fn open_path(path: &Path) -> Result<CsvParseOutcome> {
 pub(crate) fn open_path_capturing_column(
     path: &Path,
     column_index: usize,
-) -> Result<(CsvParseOutcome, Vec<String>)> {
+) -> Result<(CsvParseOutcome, ColumnText)> {
     let mmap = map_file(path)?;
     parse_capturing_column(&mmap, column_index)
 }
@@ -240,7 +348,7 @@ pub(crate) fn open_path_capturing_column(
 /// [`parse_capturing_all_columns`]).
 pub(crate) fn open_path_capturing_all_columns(
     path: &Path,
-) -> Result<(CsvParseOutcome, Vec<Vec<String>>)> {
+) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
     let mmap = map_file(path)?;
     parse_capturing_all_columns(&mmap)
 }
@@ -282,42 +390,6 @@ fn bounded_head_sample(text: &str) -> &str {
     match budget.rfind('\n') {
         Some(last_newline) => &text[..=last_newline],
         None => budget,
-    }
-}
-
-/// Tokenizes every row of `text` under `delimiter`, one record at a time —
-/// the streaming counterpart to `infer`'s bounded-sample tokenizer. A field
-/// count is not checked here; [`parse`] decides per row what to keep.
-/// Blank lines produce no record at all (verified against the `csv` crate:
-/// consecutive newlines are silently skipped, never surfaced as an
-/// empty-field row) so they can never be miscounted as ragged or skipped.
-fn stream_records(
-    text: &str,
-    delimiter: Delimiter,
-) -> Box<dyn Iterator<Item = std::result::Result<Vec<String>, String>> + '_> {
-    match delimiter.as_csv_byte() {
-        Some(byte) => {
-            let reader = csv::ReaderBuilder::new()
-                .delimiter(byte)
-                .has_headers(false)
-                .flexible(true)
-                .from_reader(text.as_bytes());
-            Box::new(reader.into_records().map(|result| {
-                result
-                    .map(|record| record.iter().map(str::to_string).collect())
-                    .map_err(|e| e.to_string())
-            }))
-        }
-        None => Box::new(
-            text.lines()
-                .map(|line| {
-                    line.split_whitespace()
-                        .map(str::to_string)
-                        .collect::<Vec<String>>()
-                })
-                .filter(|fields| !fields.is_empty())
-                .map(Ok),
-        ),
     }
 }
 
@@ -413,9 +485,9 @@ mod tests {
         for column in &columns {
             assert_eq!(column.len(), 3, "one entry per kept row");
         }
-        assert_eq!(columns[0][0], "2026-01-01T00:00:00Z");
-        assert_eq!(columns[1][0], "1.0");
-        assert_eq!(columns[2][0], "101.3");
+        assert_eq!(columns[0].get(0), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(columns[1].get(0), Some("1.0"));
+        assert_eq!(columns[2].get(0), Some("101.3"));
     }
 
     // Corpus case 22 (QUALITY.md §1.22): the file ends mid-row (no trailing

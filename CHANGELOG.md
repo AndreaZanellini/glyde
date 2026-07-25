@@ -12,6 +12,31 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- Opening a delimited-text file (`.csv`/`.tsv`/`.txt`) uses meaningfully
+  less memory than before: measured on a synthetic fixture, peak memory use
+  while opening a file dropped from ~12.75x the file's own size to ~7x
+  (issue #62, the still-open third root cause of issue #58). The
+  ingestion path used to capture every field of every row as its own
+  small text allocation before deciding each column's type (numbers,
+  booleans, text); it now appends each column's raw text into one shared
+  buffer per column instead, with typing reading straight from that
+  buffer rather than from a copy of it. No visible behavior change — the
+  same values, same dtype decisions, same skipped-row handling as before,
+  just materially less memory spent getting there. `docs/SPEC.md` §5's
+  full memory budget is still not met (that needs `docs/ROADMAP.md` M3's
+  chunked/bounded reader); this is a real step toward it, and the peak-RSS
+  regression test's threshold has been tightened to lock in the
+  improvement.
+
+  **Assumptions made:**
+  - This closes out issue #62 in full and, with it, issue #58 (whose
+    remaining scope was exactly #62's). No product behavior changed, so
+    nothing here is a decision the maintainer needs to veto — flagged only
+    because CLAUDE.md asks every assumption to be named: the exact
+    "how much better" number (~7x vs. the ~12.75x baseline) is a
+    measurement of one synthetic fixture shape (400,000 rows, three
+    numeric columns), not a guarantee for every file shape.
+
 - Opening a file uses noticeably less memory and CPU time than before,
   especially for a clean UTF-8 file (the common case): the ingestion path
   no longer needlessly duplicates the whole file into memory during
