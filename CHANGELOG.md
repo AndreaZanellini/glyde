@@ -49,8 +49,12 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
   **Assumptions made:**
   - None beyond what the issue already specified: the axis reuses the same
-    `format_timestamp`/format/offset the cursor readout already uses, so the
-    two stay consistent.
+    `format_timestamp`/format the cursor readout already uses, so the two
+    stay consistent. Each tick's displayed UTC offset is taken from the
+    nearest real sample rather than always the file's first sample, since a
+    source column can carry a different offset per row (e.g. a DST
+    transition partway through the file) — this was caught in self-review
+    before push, not part of the original issue's text.
 
 - Opening a delimited-text file (`.csv`/`.tsv`/`.txt`) uses meaningfully
   less memory than before: measured on a synthetic fixture, peak memory use
