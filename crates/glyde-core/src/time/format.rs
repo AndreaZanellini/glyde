@@ -168,10 +168,10 @@ pub fn format_timestamp(timestamp: &Timestamp, format: TimestampFormat) -> Strin
         TimestampFormat::Iso8601Naive => format_iso8601_naive(timestamp),
         TimestampFormat::DayFirst => format_naive_with_pattern(timestamp, "%d/%m/%Y %H:%M:%S"),
         TimestampFormat::MonthFirst => format_naive_with_pattern(timestamp, "%m/%d/%Y %H:%M:%S"),
-        TimestampFormat::EpochSeconds
-        | TimestampFormat::EpochMillis
-        | TimestampFormat::EpochMicros
-        | TimestampFormat::EpochNanos => timestamp.ticks.to_string(),
+        TimestampFormat::EpochSeconds => format_epoch(timestamp, TimeUnit::Seconds),
+        TimestampFormat::EpochMillis => format_epoch(timestamp, TimeUnit::Milliseconds),
+        TimestampFormat::EpochMicros => format_epoch(timestamp, TimeUnit::Microseconds),
+        TimestampFormat::EpochNanos => format_epoch(timestamp, TimeUnit::Nanoseconds),
         TimestampFormat::LabViewEpoch => format_labview_epoch(timestamp),
         TimestampFormat::ExcelSerial => format_excel_serial(timestamp),
         TimestampFormat::DateTimeSpace => {
@@ -456,22 +456,61 @@ fn utc_datetime_from_ticks(timestamp: &Timestamp) -> chrono::DateTime<chrono::Ut
     .expect("a valid (secs, nanos) pair from an already-parsed timestamp always builds")
 }
 
+/// The unit a fractional epoch value upconverts to so its sub-unit digits
+/// survive exactly (SPEC §2.1: "integer or float ... seconds/milliseconds/
+/// microseconds/nanoseconds"; Golden Rule 1: never round a raw value away).
+/// `EpochSeconds`/`Millis`/`Micros` upconvert to this codebase's general
+/// textual-format precision ceiling, `TimeUnit::Nanoseconds` (the same unit
+/// [`TimestampFormat::LabViewEpoch`]/[`TimestampFormat::ExcelSerial`] always
+/// parse into); `EpochNanos` is already at that ceiling, so its own
+/// fractional part means sub-nanosecond precision and upconverts one step
+/// further, to `TimeUnit::Picoseconds` — the same fallback
+/// [`parse_subnanosecond_iso8601`] uses for an ISO 8601 fraction finer than
+/// `chrono` can hold.
+fn finer_unit_for_epoch_fraction(unit: TimeUnit) -> TimeUnit {
+    match unit {
+        TimeUnit::Nanoseconds => TimeUnit::Picoseconds,
+        _ => TimeUnit::Nanoseconds,
+    }
+}
+
 fn parse_epoch_integer(
     input: &str,
     unit: TimeUnit,
     format: TimestampFormat,
 ) -> crate::Result<Timestamp> {
-    let ticks: i128 = input
-        .trim()
-        .parse()
-        .map_err(
-            |source: std::num::ParseIntError| crate::GlydeError::InvalidTimestamp {
-                input: input.to_string(),
-                format,
-                reason: source.to_string(),
-            },
-        )?;
-    Ok(Timestamp::new(ticks, unit))
+    let (whole, frac) =
+        split_decimal(input).ok_or_else(|| crate::GlydeError::InvalidTimestamp {
+            input: input.to_string(),
+            format,
+            reason: "not an integer or decimal number of epoch ticks".to_string(),
+        })?;
+    if frac.is_empty() {
+        return Ok(Timestamp::new(whole, unit));
+    }
+    let fine_unit = finer_unit_for_epoch_fraction(unit);
+    let ticks_per_whole = fine_unit.ticks_per_second() / unit.ticks_per_second();
+    let ticks = whole * ticks_per_whole + frac_str_to_ticks(frac, ticks_per_whole);
+    Ok(Timestamp::new(ticks, fine_unit))
+}
+
+/// The inverse of [`parse_epoch_integer`]'s fractional path: `timestamp.unit`
+/// is `unit` itself for a whole-number epoch value (unchanged from before
+/// this upconversion existed) or the [`finer_unit_for_epoch_fraction`] it
+/// upconverted to when the original text had a fractional part.
+fn format_epoch(timestamp: &Timestamp, unit: TimeUnit) -> String {
+    if timestamp.unit == unit {
+        return timestamp.ticks.to_string();
+    }
+    let ticks_per_whole = timestamp.unit.ticks_per_second() / unit.ticks_per_second();
+    let whole = timestamp.ticks.div_euclid(ticks_per_whole);
+    let frac_ticks = timestamp.ticks.rem_euclid(ticks_per_whole);
+    if frac_ticks == 0 {
+        return whole.to_string();
+    }
+    let max_digits = ticks_per_whole.ilog10();
+    let frac_digits = fraction_to_decimal_digits(frac_ticks, ticks_per_whole, max_digits);
+    format!("{whole}.{frac_digits}")
 }
 
 /// Seconds between the LabVIEW/NI epoch (1904-01-01T00:00:00Z) and the Unix
@@ -702,9 +741,21 @@ fn field_matches_format(field: &str, format: TimestampFormat) -> bool {
     match epoch_unit(format) {
         Some(unit) => {
             let (min, max) = plausible_epoch_magnitude(unit);
-            field
-                .parse::<i128>()
-                .is_ok_and(|value| (min..max).contains(&value.abs()))
+            // A field with an all-zero fraction (e.g. corpus case 34's
+            // "3850027200.0") carries no real sub-unit information and is
+            // deliberately left unmatched here so it falls through to
+            // `TimestampFormat::LabViewEpoch`/`ExcelSerial` below — the same
+            // disambiguating role a bare decimal point played before float
+            // epoch text was accepted at all (see
+            // `epoch_seconds_labview_epoch_overlap`'s doc comment). Only a
+            // fraction with a genuine nonzero digit is real evidence of a
+            // float epoch value (SPEC §2.1).
+            match split_decimal(field) {
+                Some((whole, frac)) if frac.is_empty() || frac.bytes().any(|b| b != b'0') => {
+                    (min..max).contains(&whole.abs())
+                }
+                _ => false,
+            }
         }
         None => match format {
             TimestampFormat::LabViewEpoch => {
@@ -1116,6 +1167,94 @@ mod tests {
             format_timestamp(&parsed, TimestampFormat::LabViewEpoch),
             "3850027200.25"
         );
+    }
+
+    // Issue #41: SPEC §2.1 lists the four epoch formats as "integer or float
+    // seconds/milliseconds/microseconds/nanoseconds since the Unix epoch",
+    // but until now `parse_epoch_integer` only accepted whole numbers. A
+    // fractional epoch value carries sub-unit precision no integer tick in
+    // the format's own [`TimeUnit`] can represent exactly, so it must
+    // upconvert — the same pattern already used for
+    // [`TimestampFormat::LabViewEpoch`] / [`TimestampFormat::ExcelSerial`]
+    // above, computed by exact `i128` digit arithmetic, never `f64`
+    // (Golden Rule 1). `EpochSeconds`/`Millis`/`Micros` upconvert to
+    // `TimeUnit::Nanoseconds` (this codebase's general textual-format
+    // precision ceiling); `EpochNanos` upconverts to `TimeUnit::Picoseconds`,
+    // mirroring [`parse_subnanosecond_iso8601`]'s sub-nanosecond fallback.
+    #[test]
+    fn epoch_seconds_fractional_value_parses_at_nanosecond_precision() {
+        let parsed =
+            parse_timestamp("1770000000.5", TimestampFormat::EpochSeconds).expect("must parse");
+        assert_eq!(parsed.unit, TimeUnit::Nanoseconds);
+        assert_eq!(parsed.ticks, 1_770_000_000_500_000_000);
+    }
+
+    #[test]
+    fn epoch_seconds_fractional_value_round_trips() {
+        let parsed =
+            parse_timestamp("1770000000.5", TimestampFormat::EpochSeconds).expect("must parse");
+        assert_eq!(
+            format_timestamp(&parsed, TimestampFormat::EpochSeconds),
+            "1770000000.5"
+        );
+    }
+
+    #[test]
+    fn epoch_milliseconds_fractional_value_round_trips() {
+        let parsed =
+            parse_timestamp("1770000000123.25", TimestampFormat::EpochMillis).expect("must parse");
+        assert_eq!(parsed.unit, TimeUnit::Nanoseconds);
+        assert_eq!(
+            format_timestamp(&parsed, TimestampFormat::EpochMillis),
+            "1770000000123.25"
+        );
+    }
+
+    #[test]
+    fn epoch_microseconds_fractional_value_round_trips() {
+        let parsed = parse_timestamp("1770000000123456.5", TimestampFormat::EpochMicros)
+            .expect("must parse");
+        assert_eq!(parsed.unit, TimeUnit::Nanoseconds);
+        assert_eq!(
+            format_timestamp(&parsed, TimestampFormat::EpochMicros),
+            "1770000000123456.5"
+        );
+    }
+
+    // `EpochNanos`'s own declared unit is already `TimeUnit::Nanoseconds`, so
+    // a fractional value here means sub-nanosecond (picosecond) precision —
+    // the same case `parse_subnanosecond_iso8601` handles for ISO 8601.
+    #[test]
+    fn epoch_nanoseconds_fractional_value_parses_at_picosecond_precision() {
+        let parsed = parse_timestamp("1770000000123456789.5", TimestampFormat::EpochNanos)
+            .expect("must parse");
+        assert_eq!(parsed.unit, TimeUnit::Picoseconds);
+        assert_eq!(
+            format_timestamp(&parsed, TimestampFormat::EpochNanos),
+            "1770000000123456789.5"
+        );
+    }
+
+    // A whole-number epoch value must keep parsing straight into the
+    // format's own native `TimeUnit`, exactly as before — the fractional
+    // path must be additive, never change the existing integer behavior
+    // corpus cases 29-32 already lock in.
+    #[test]
+    fn epoch_seconds_integer_value_still_parses_at_its_native_unit() {
+        let parsed =
+            parse_timestamp("1770000000", TimestampFormat::EpochSeconds).expect("must parse");
+        assert_eq!(parsed, Timestamp::new(1_770_000_000, TimeUnit::Seconds));
+    }
+
+    // `infer_timestamp_format` must recognize a float epoch column as
+    // `EpochSeconds`, not reject it for not being a bare integer.
+    #[test]
+    fn infer_timestamp_format_detects_a_float_epoch_seconds_column() {
+        let fields = vec!["1770000000.25".to_string(), "1770000001.5".to_string()];
+
+        let inference = infer_timestamp_format(&fields).expect("must infer a format");
+        assert_eq!(inference.format, TimestampFormat::EpochSeconds);
+        assert!(!inference.ambiguous);
     }
 
     // Corpus case 26 (docs/QUALITY.md §1.26): every day field is 25, which
