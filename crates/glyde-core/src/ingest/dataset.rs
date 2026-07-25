@@ -82,17 +82,20 @@ pub struct Dataset {
 /// series to plot and is rejected as [`GlydeError::SingleColumnFile`],
 /// exactly like `inspect`.
 pub fn load(path: &Path) -> Result<Dataset> {
-    load_with_outcome(path).map(|(_outcome, dataset)| dataset)
+    load_with_outcome(path).map(|(_outcome, dataset, _timestamp_format_ambiguous)| dataset)
 }
 
 /// [`load`], additionally returning the [`CsvParseOutcome`] the single parse
 /// pass already produced (encoding, delimiter, decimal separator, row
-/// counts). `ingest::report::open_dataset` uses this so that materializing a
-/// [`Dataset`] and reporting an [`super::OpenSummary`] for it share one parse
-/// of the file instead of two independent ones (issue #58: the app used to
-/// call `inspect()` and `load()` back to back, each re-reading and
-/// re-decoding the whole file).
-pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset)> {
+/// counts) and whether the time column's timestamp format was an SPEC §2.1
+/// ambiguity-rule fallback rather than a confident match (`false` for a
+/// [`TimeAxis::Progressive`] index, which has no timestamp format to be
+/// ambiguous about). `ingest::report::open_dataset` uses this so that
+/// materializing a [`Dataset`] and reporting an [`super::OpenSummary`] /
+/// [`super::InferenceReport`] for it share one parse of the file instead of
+/// independent ones (issue #58: the app used to call `inspect()` and
+/// `load()` back to back, each re-reading and re-decoding the whole file).
+pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset, bool)> {
     let (outcome, mut columns_text) = open_path_capturing_all_columns(path)?;
 
     if outcome.column_names.len() < 2 {
@@ -103,17 +106,20 @@ pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset
     let time_column = columns_text.remove(0);
     let time_fields: Vec<&str> = time_column.iter().collect();
 
-    let time =
+    let (time, timestamp_format_ambiguous) =
         match infer_timestamp_format(&time_fields) {
             Some(format_inference) => {
                 let mut timestamps = Vec::with_capacity(time_fields.len());
                 for field in &time_fields {
                     timestamps.push(parse_timestamp(field, format_inference.format)?);
                 }
-                TimeAxis::Absolute {
-                    timestamps,
-                    format: format_inference.format,
-                }
+                (
+                    TimeAxis::Absolute {
+                        timestamps,
+                        format: format_inference.format,
+                    },
+                    format_inference.ambiguous,
+                )
             }
             // SPEC §2.1: no recognized absolute-timestamp format matched every
             // field, so this is a progressive numeric index (corpus case 35) —
@@ -129,7 +135,7 @@ pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset
                     })?;
                     values.push(value);
                 }
-                TimeAxis::Progressive { values }
+                (TimeAxis::Progressive { values }, false)
             }
         };
 
@@ -156,6 +162,7 @@ pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset
             time_column_name,
             columns,
         },
+        timestamp_format_ambiguous,
     ))
 }
 

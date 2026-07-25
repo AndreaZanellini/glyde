@@ -25,7 +25,7 @@
 //! later docs/ROADMAP.md M2 items — for now every field is carried as its
 //! raw source text (Golden Rule 1: never degrade the raw data).
 
-use super::infer::{self, DecimalSeparator, Delimiter};
+use super::infer::{self, Confidence, DecimalSeparator, Delimiter};
 use crate::{GlydeError, Result};
 use std::fs::File;
 use std::path::Path;
@@ -111,6 +111,18 @@ pub struct CsvParseOutcome {
     pub encoding_label: String,
     pub delimiter: Delimiter,
     pub decimal_separator: DecimalSeparator,
+    /// SPEC §1.2 "confidence is tracked per inference" — [`InferenceReport`]
+    /// (docs/ROADMAP.md M4) surfaces these to the UI.
+    ///
+    /// [`InferenceReport`]: super::report::InferenceReport
+    pub encoding_confidence: Confidence,
+    pub delimiter_confidence: Confidence,
+    pub decimal_separator_confidence: Confidence,
+    /// [`infer::HeaderInference::ambiguous`]: a leading preamble existed but
+    /// no header candidate could be confidently identified, so the column
+    /// names (including the time column's) are a guess, not a resolved
+    /// reading.
+    pub header_ambiguous: bool,
 }
 
 /// Parses `bytes` as delimited text (SPEC §1.1) in one streaming pass:
@@ -175,11 +187,16 @@ fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Co
     }
 
     let encoding = infer::detect_encoding(bytes);
+    let encoding_confidence = encoding.confidence();
     let text = infer::decode(bytes, &encoding);
 
     let sample = bounded_head_sample(&text);
-    let delimiter = infer::infer_delimiter(sample).delimiter;
-    let decimal_separator = infer::infer_decimal_separator(sample, delimiter).separator;
+    let delimiter_inference = infer::infer_delimiter(sample);
+    let delimiter = delimiter_inference.delimiter;
+    let delimiter_confidence = delimiter_inference.confidence();
+    let decimal_inference = infer::infer_decimal_separator(sample, delimiter);
+    let decimal_separator = decimal_inference.separator;
+    let decimal_separator_confidence = decimal_inference.confidence();
     let header = infer::infer_header(sample, delimiter);
 
     let expected_field_count = header.column_names.len();
@@ -277,6 +294,10 @@ fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Co
             encoding_label: encoding.label(),
             delimiter,
             decimal_separator,
+            encoding_confidence,
+            delimiter_confidence,
+            decimal_separator_confidence,
+            header_ambiguous: header.ambiguous,
         },
         acc.captured,
     ))

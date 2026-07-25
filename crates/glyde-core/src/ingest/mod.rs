@@ -33,10 +33,12 @@ pub use csv::{open_path, parse, CsvParseOutcome, CsvReader};
 pub use dataset::{load, Dataset, TimeAxis};
 pub use infer::{
     decode, detect_encoding, infer_column, infer_decimal_separator, infer_delimiter, infer_header,
-    DecimalSeparator, DecimalSeparatorInference, Delimiter, DelimiterInference, DtypeInference,
-    EncodingInference, EncodingSource, HeaderInference, HEAD_SAMPLE_BYTES,
+    Confidence, DecimalSeparator, DecimalSeparatorInference, Delimiter, DelimiterInference,
+    DtypeInference, EncodingInference, EncodingSource, HeaderInference, HEAD_SAMPLE_BYTES,
 };
-pub use report::{inspect, open_dataset, OpenSummary, SamplingClass};
+pub use report::{
+    inspect, open_dataset, InferenceReport, InferredField, OpenSummary, SamplingClass,
+};
 
 use crate::{GlydeError, Result};
 use std::path::Path;

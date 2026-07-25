@@ -23,11 +23,14 @@
 //! `time::infer_timestamp_format` → sampling classification, gap detection,
 //! and monotonicity.
 //!
-//! This is deliberately a smaller, single-purpose pipeline, not
-//! docs/ARCHITECTURE.md's future `InferenceReport` (docs/ROADMAP.md M4): no
-//! per-field confidence, no dtype, no pyramid/index build. It exists to
-//! satisfy QUALITY.md §1's corpus gate for the inference already implemented;
-//! Parquet (M7) and the richer M4 report are separate, later items.
+//! This is deliberately a smaller, single-purpose pipeline than
+//! docs/ARCHITECTURE.md's [`InferenceReport`] (docs/ROADMAP.md M4 "surfaced
+//! to the UI"): no per-field confidence, no dtype, no pyramid/index build. It
+//! exists to satisfy QUALITY.md §1's corpus gate for the inference already
+//! implemented; Parquet (M7) is a separate, later item. [`open_dataset`]
+//! builds both [`OpenSummary`] and [`InferenceReport`] from the one parse it
+//! already performs, since the two serve different callers (the corpus gate
+//! vs. `glyde-app`'s UI) rather than one superseding the other.
 //!
 //! Every torture-corpus case names or positions its time index as the first
 //! column; none exercises a file where the time column sits elsewhere, so
@@ -37,6 +40,7 @@
 
 use super::csv::open_path_capturing_column;
 use super::dataset::{self, Dataset, TimeAxis};
+use super::infer::Confidence;
 use crate::time::{
     classify_sampling, detect_gaps, detect_monotonicity, infer_timestamp_format, parse_timestamp,
     TimestampFormat,
@@ -91,6 +95,33 @@ pub struct OpenSummary {
     /// for the same reason as `non_monotonic_count`.
     #[serde(default)]
     pub duplicate_timestamp_count: u64,
+}
+
+/// SPEC §1.2 "Confidence is tracked per inference": one inferred value,
+/// paired with how confidently it was chosen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferredField<T> {
+    pub value: T,
+    pub confidence: Confidence,
+}
+
+/// docs/ARCHITECTURE.md's `InferenceReport` (docs/ROADMAP.md M4 "surfaced to
+/// the UI"): the SPEC §1.2 mandatory inference-bar fields — encoding,
+/// delimiter, decimal separator, time column, timestamp format, sample
+/// count, sampling classification — each paired with its own confidence
+/// where SPEC §1.2/§2.1 define a real ambiguity signal for it.
+/// `sample_count` and `sampling_class` are facts derived from the
+/// already-parsed data, not guesses among competing readings, so they carry
+/// no separate confidence field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceReport {
+    pub encoding: InferredField<String>,
+    pub delimiter: InferredField<Option<String>>,
+    pub decimal_separator: InferredField<Option<String>>,
+    pub time_column: InferredField<Option<String>>,
+    pub timestamp_format: InferredField<Option<String>>,
+    pub sample_count: u64,
+    pub sampling_class: SamplingClass,
 }
 
 /// The `.expected.json` vocabulary name for `format` (docs/QUALITY.md §1's
@@ -178,16 +209,17 @@ pub fn inspect(path: &Path) -> Result<OpenSummary> {
     })
 }
 
-/// Parses `path` once and returns both the [`OpenSummary`] [`inspect`]
-/// reports and the materialized [`Dataset`] [`super::dataset::load`]
-/// produces (issue #58: `glyde-app`'s indexer used to call `inspect` then
-/// `load` back to back, each independently memory-mapping, decoding, and
-/// streaming the whole file — twice the I/O and CPU work for one open).
-/// `Dataset::time`'s already-parsed ticks feed the same sampling
-/// classification, gap detection, and monotonicity checks `inspect` runs, so
-/// the two summaries agree by construction rather than by re-derivation.
-pub fn open_dataset(path: &Path) -> Result<(OpenSummary, Dataset)> {
-    let (outcome, dataset) = dataset::load_with_outcome(path)?;
+/// Parses `path` once and returns the [`OpenSummary`] [`inspect`] reports,
+/// the [`InferenceReport`] `glyde-app`'s UI surfaces (docs/ROADMAP.md M4),
+/// and the materialized [`Dataset`] [`super::dataset::load`] produces (issue
+/// #58: `glyde-app`'s indexer used to call `inspect` then `load` back to
+/// back, each independently memory-mapping, decoding, and streaming the
+/// whole file — twice the I/O and CPU work for one open). `Dataset::time`'s
+/// already-parsed ticks feed the same sampling classification, gap
+/// detection, and monotonicity checks `inspect` runs, so the two summaries
+/// agree by construction rather than by re-derivation.
+pub fn open_dataset(path: &Path) -> Result<(OpenSummary, InferenceReport, Dataset)> {
+    let (outcome, dataset, timestamp_format_ambiguous) = dataset::load_with_outcome(path)?;
 
     let (
         time_column,
@@ -217,11 +249,11 @@ pub fn open_dataset(path: &Path) -> Result<(OpenSummary, Dataset)> {
     };
 
     let summary = OpenSummary {
-        encoding: outcome.encoding_label,
+        encoding: outcome.encoding_label.clone(),
         delimiter: Some(outcome.delimiter.as_str().to_string()),
         decimal_separator: Some(outcome.decimal_separator.as_str().to_string()),
-        time_column,
-        timestamp_format,
+        time_column: time_column.clone(),
+        timestamp_format: timestamp_format.clone(),
         row_count: outcome.row_count,
         skipped_row_count: outcome.skipped_row_count,
         sampling_class,
@@ -230,7 +262,48 @@ pub fn open_dataset(path: &Path) -> Result<(OpenSummary, Dataset)> {
         duplicate_timestamp_count,
     };
 
-    Ok((summary, dataset))
+    // SPEC §2.1: a column's *name* is only as trustworthy as the header
+    // detection that produced it (`HeaderInference::ambiguous`) — an
+    // ambiguous header means `time_column`'s value is itself a guess.
+    let time_column_confidence = if outcome.header_ambiguous {
+        Confidence::Low
+    } else {
+        Confidence::High
+    };
+    // A progressive index has no timestamp format to be ambiguous about, so
+    // it is reported with full confidence rather than inheriting whatever
+    // `timestamp_format_ambiguous` happened to default to.
+    let timestamp_format_confidence = match &dataset.time {
+        TimeAxis::Absolute { .. } if timestamp_format_ambiguous => Confidence::Low,
+        _ => Confidence::High,
+    };
+
+    let report = InferenceReport {
+        encoding: InferredField {
+            value: outcome.encoding_label,
+            confidence: outcome.encoding_confidence,
+        },
+        delimiter: InferredField {
+            value: Some(outcome.delimiter.as_str().to_string()),
+            confidence: outcome.delimiter_confidence,
+        },
+        decimal_separator: InferredField {
+            value: Some(outcome.decimal_separator.as_str().to_string()),
+            confidence: outcome.decimal_separator_confidence,
+        },
+        time_column: InferredField {
+            value: time_column,
+            confidence: time_column_confidence,
+        },
+        timestamp_format: InferredField {
+            value: timestamp_format,
+            confidence: timestamp_format_confidence,
+        },
+        sample_count: outcome.row_count,
+        sampling_class,
+    };
+
+    Ok((summary, report, dataset))
 }
 
 #[cfg(test)]
@@ -256,7 +329,7 @@ mod tests {
     fn open_dataset_agrees_with_inspect_and_load_for_an_absolute_timestamp_file() {
         let path = corpus_path("case-01-comma-clean.csv");
 
-        let (summary, dataset) = open_dataset(&path).expect("case 1 must open");
+        let (summary, _report, dataset) = open_dataset(&path).expect("case 1 must open");
         let expected_summary = inspect(&path).expect("case 1 must inspect");
         let expected_dataset = load(&path).expect("case 1 must load");
 
@@ -268,7 +341,7 @@ mod tests {
     fn open_dataset_agrees_with_inspect_and_load_for_a_progressive_index_file() {
         let path = corpus_path("case-35-progressive-integer-index.csv");
 
-        let (summary, dataset) = open_dataset(&path).expect("case 35 must open");
+        let (summary, _report, dataset) = open_dataset(&path).expect("case 35 must open");
         let expected_summary = inspect(&path).expect("case 35 must inspect");
         let expected_dataset = load(&path).expect("case 35 must load");
 
@@ -282,12 +355,95 @@ mod tests {
     fn open_dataset_agrees_with_inspect_and_load_for_ragged_rows() {
         let path = corpus_path("case-21-ragged-rows.csv");
 
-        let (summary, dataset) = open_dataset(&path).expect("case 21 must open");
+        let (summary, _report, dataset) = open_dataset(&path).expect("case 21 must open");
         let expected_summary = inspect(&path).expect("case 21 must inspect");
         let expected_dataset = load(&path).expect("case 21 must load");
 
         assert_eq!(summary, expected_summary);
         assert_eq!(dataset, expected_dataset);
+    }
+
+    // docs/ROADMAP.md M4 "InferenceReport surfaced to the UI ... proven by:
+    // report-struct snapshot". A stable, real-fixture snapshot of every
+    // field `InferenceReport` carries, so an unintended change to any of
+    // them (a field silently dropped, a confidence rule silently changed)
+    // shows up as a diff a reviewer must explicitly accept.
+    #[test]
+    fn inference_report_snapshot_for_a_clean_comma_file() {
+        let path = corpus_path("case-01-comma-clean.csv");
+
+        let (_summary, report, _dataset) = open_dataset(&path).expect("case 1 must open");
+
+        insta::assert_debug_snapshot!("inference_report_case_01_comma_clean", report);
+    }
+
+    // Corpus case 8 exercises a real, low-confidence encoding guess
+    // (windows-1252 via `chardetng`, not a BOM or the tolerant-UTF-8 fast
+    // path) so the snapshot captures a `Confidence::Low` field, not only the
+    // all-`High` shape of a clean file.
+    #[test]
+    fn inference_report_snapshot_for_a_low_confidence_encoding_file() {
+        let path = corpus_path("case-08-latin1-degree-micro.csv");
+
+        let (_summary, report, _dataset) = open_dataset(&path).expect("case 8 must open");
+
+        assert_eq!(report.encoding.confidence, Confidence::Low);
+        insta::assert_debug_snapshot!("inference_report_case_08_low_confidence_encoding", report);
+    }
+
+    // Corpus case 28: every row's date is genuinely ambiguous (no field > 12
+    // in either slash position), so SPEC §2.1's ambiguity rule falls back to
+    // the ISO-leaning `DD/MM` default — this is the exact case
+    // `TimestampFormatInference::ambiguous` exists to flag, and it must
+    // reach `InferenceReport::timestamp_format`, not stop at `OpenSummary`
+    // (review follow-up on PR #70: this path had only lower-level
+    // `TimestampFormatInference` unit-test coverage before).
+    #[test]
+    fn inference_report_reports_low_confidence_timestamp_format_for_fully_ambiguous_dates() {
+        let path = corpus_path("case-28-fully-ambiguous-dates.csv");
+
+        let (_summary, report, _dataset) = open_dataset(&path).expect("case 28 must open");
+
+        assert_eq!(
+            report.timestamp_format.value,
+            Some("dd_mm_yyyy".to_string())
+        );
+        assert_eq!(report.timestamp_format.confidence, Confidence::Low);
+        // Every other field in this file is unambiguous; only the date
+        // format itself is a guess.
+        assert_eq!(report.encoding.confidence, Confidence::High);
+        assert_eq!(report.delimiter.confidence, Confidence::High);
+        assert_eq!(report.time_column.confidence, Confidence::High);
+    }
+
+    // No corpus case (the fixed 56-case set) exercises a header preamble
+    // that never matches the data rows' field count (`HeaderInference::
+    // ambiguous`), so this builds one inline via a real temp file — the same
+    // review follow-up as above, for `InferenceReport::time_column`. A
+    // single-field preamble line ("notes") above two-field ISO-timestamp
+    // data rows can never match the data field count, which is exactly
+    // `infer_header`'s `ambiguous` condition.
+    #[test]
+    fn inference_report_reports_low_confidence_time_column_for_an_ambiguous_header() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        std::io::Write::write_all(
+            &mut file,
+            b"notes\n\
+              2026-01-01T00:00:00Z,1.5\n\
+              2026-01-01T00:00:01Z,1.6\n\
+              2026-01-01T00:00:02Z,1.7\n",
+        )
+        .expect("write temp file");
+
+        let (_summary, report, dataset) =
+            open_dataset(file.path()).expect("ambiguous-header file must open");
+
+        assert_eq!(dataset.time_column_name, "column_0");
+        assert_eq!(report.time_column.value, Some("column_0".to_string()));
+        assert_eq!(report.time_column.confidence, Confidence::Low);
+        // The timestamp values themselves are unambiguous ISO 8601 — only
+        // the column *name* is a guess here.
+        assert_eq!(report.timestamp_format.confidence, Confidence::High);
     }
 
     #[test]

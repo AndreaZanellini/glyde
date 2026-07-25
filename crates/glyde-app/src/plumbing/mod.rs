@@ -42,7 +42,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::thread;
 
-use glyde_core::ingest::{Dataset, OpenSummary};
+use glyde_core::ingest::{Dataset, InferenceReport, OpenSummary};
 
 /// Progress emitted by a background indexing job, polled by the UI thread.
 /// `generation` identifies which open request this message belongs to (see
@@ -52,12 +52,15 @@ use glyde_core::ingest::{Dataset, OpenSummary};
 pub enum IndexingMessage {
     /// The indexer thread started work on `path`.
     Started { generation: u64, path: PathBuf },
-    /// `path` opened successfully; `summary` is what was inferred and
-    /// `dataset` is every sample, ready for [`crate::views::time::show`].
+    /// `path` opened successfully; `summary` is what was inferred, `report`
+    /// is the same inference surfaced as SPEC §1.2's mandatory UX fields
+    /// (docs/ROADMAP.md M4), and `dataset` is every sample, ready for
+    /// [`crate::views::time::show`].
     Completed {
         generation: u64,
         path: PathBuf,
         summary: Box<OpenSummary>,
+        report: Box<InferenceReport>,
         dataset: Box<Dataset>,
     },
     /// `path` failed to open; `message` is the human-readable reason.
@@ -140,7 +143,7 @@ fn run_index_job(generation: u64, path: PathBuf, tx: &Sender<IndexingMessage>) {
     // `GlydeError::NonNumericTimeIndex`) still has nothing to show, so it is
     // reported as a failed open rather than a summary with no plot.
     match glyde_core::ingest::open_dataset(&path) {
-        Ok((summary, dataset)) => {
+        Ok((summary, report, dataset)) => {
             tracing::info!(
                 path = %path.display(),
                 row_count = summary.row_count,
@@ -151,6 +154,7 @@ fn run_index_job(generation: u64, path: PathBuf, tx: &Sender<IndexingMessage>) {
                 generation,
                 path,
                 summary: Box::new(summary),
+                report: Box::new(report),
                 dataset: Box::new(dataset),
             });
         }
@@ -203,12 +207,14 @@ mod tests {
                 generation,
                 path: completed_path,
                 summary,
+                report,
                 dataset,
             } => {
                 assert_eq!(generation, 7);
                 assert_eq!(completed_path, path);
                 assert_eq!(summary.row_count, 6);
                 assert_eq!(summary.skipped_row_count, 0);
+                assert_eq!(report.sample_count, 6);
                 assert_eq!(dataset.time.len(), 6);
                 assert_eq!(dataset.columns.len(), 2);
             }

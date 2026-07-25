@@ -57,6 +57,39 @@ Versioning: [Semantic Versioning](https://semver.org/).
   detection through inference.
 
 ### Added
+- Opening a file now shows an inference bar above the plot with everything
+  Glyde inferred about it: encoding, delimiter, decimal separator, time
+  column, timestamp format, sample count, and sampling classification
+  (`docs/SPEC.md` §1.2's mandatory transparency rule, `docs/ROADMAP.md` M4).
+  Any field Glyde could not resolve with full confidence — e.g. a genuinely
+  ambiguous encoding guess, or a header row that could not be confidently
+  located — is now labeled "(low confidence)" right next to it, instead of
+  being presented the same as a confident inference.
+
+  **Assumptions made:** `docs/SPEC.md` §1.2 says "confidence is tracked per
+  inference" but does not define what makes an inference confident, so this
+  PR picks concrete rules per field, each worth a veto if it doesn't match
+  intent:
+  - Encoding: a byte-order mark, or a sample that decodes cleanly as UTF-8, is
+    "High"; only a real statistical guess among competing encodings (e.g. a
+    genuine Windows-1252 file) is "Low".
+  - Delimiter: "High" only if every sampled line agreed on the column count
+    under the winning delimiter.
+  - Decimal separator: "High" only if one separator (`.`/`,`) strictly
+    outvoted the other in the sample; a tie, including no numeric evidence at
+    all, is "Low".
+  - Time column name: tied to whether the header row itself was confidently
+    located.
+  - Timestamp format: "Low" exactly when SPEC §2.1's day/month or
+    epoch-seconds/LabVIEW-epoch ambiguity rule had to fall back to a default.
+  - Sample count and sampling classification are reported facts, not guesses,
+    so they carry no confidence label.
+
+  This is the first of two `docs/ROADMAP.md` M4 items: the bar is currently
+  always-expanded and read-only. A later item makes it collapse by default,
+  auto-expand only when something is low-confidence, and offer one-click
+  correction.
+
 - No visible app behavior change: gap detection and sampling classification
   (used to decide whether a file's time index is `Uniform`,
   `SegmentedUniform`, or `Irregular`, `docs/SPEC.md` §2.2–2.3) now write to

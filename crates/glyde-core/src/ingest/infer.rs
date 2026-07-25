@@ -66,11 +66,37 @@ pub struct EncodingInference {
     pub source: EncodingSource,
 }
 
+/// SPEC §1.2 "Confidence is tracked per inference": whether an inference was
+/// settled unambiguously or is the best guess among competing readings that
+/// SPEC §1.2/§2.1's ambiguity rules could not fully resolve. `Low` is what
+/// the inference bar (docs/ROADMAP.md M4) opens expanded for, instead of
+/// collapsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    High,
+    Low,
+}
+
 impl EncodingInference {
     /// The lowercase WHATWG label shown in the inference bar and recorded in
     /// logs (e.g. `"utf-8"`, `"windows-1252"`, `"utf-16le"`).
     pub fn label(&self) -> String {
         self.encoding.name().to_ascii_lowercase()
+    }
+
+    /// A byte-order mark is a structural fact, not a guess: always `High`.
+    /// Absent one, decoding as UTF-8 because the sample tolerates only
+    /// isolated invalid bytes (SPEC §1.3) is the overwhelmingly common,
+    /// well-evidenced case and is also `High`; only when `chardetng`'s
+    /// statistical heuristic actually had to choose among competing
+    /// multi-candidate encodings (the sample failed that UTF-8 tolerance
+    /// check) is the result `Low`.
+    pub fn confidence(&self) -> Confidence {
+        match self.source {
+            EncodingSource::Bom => Confidence::High,
+            EncodingSource::Heuristic if self.encoding.name() == "UTF-8" => Confidence::High,
+            EncodingSource::Heuristic => Confidence::Low,
+        }
     }
 }
 
@@ -247,6 +273,20 @@ pub struct DelimiterInference {
     pub consistency: f64,
 }
 
+impl DelimiterInference {
+    /// `High` only when every sampled line agreed on the winning delimiter's
+    /// dominant field count; anything less means at least one sampled line
+    /// tokenized differently under it, so the choice is reported with a
+    /// caveat (SPEC §1.2).
+    pub fn confidence(&self) -> Confidence {
+        if self.consistency >= 1.0 {
+            Confidence::High
+        } else {
+            Confidence::Low
+        }
+    }
+}
+
 /// Splits `sample` into fields per line for `delimiter`. Byte delimiters are
 /// tokenized with a quote-aware CSV reader (`flexible`, so ragged lines don't
 /// error out) — this is what keeps a comma inside a quoted field, or a
@@ -366,6 +406,19 @@ pub struct DecimalSeparatorInference {
     pub dot_votes: usize,
     /// How many sampled fields looked like a comma-decimal number.
     pub comma_votes: usize,
+}
+
+impl DecimalSeparatorInference {
+    /// `High` only when one separator strictly outvoted the other; a tie —
+    /// including `0`-`0`, i.e. no numeric evidence at all in the sample — is
+    /// a guess, not a resolved reading (SPEC §1.2).
+    pub fn confidence(&self) -> Confidence {
+        if self.dot_votes == self.comma_votes {
+            Confidence::Low
+        } else {
+            Confidence::High
+        }
+    }
 }
 
 /// Whether `field` is entirely `<digits><separator><digits>` (an optional
@@ -834,6 +887,29 @@ mod tests {
         assert_eq!(text, expected);
     }
 
+    // SPEC §1.2 confidence signal: a BOM is a structural fact (case 10/11),
+    // and the tolerant-UTF-8 fast path (plain ASCII, case 12) is also
+    // well-evidenced — both must report `High`. Only a real statistical
+    // guess among competing encodings (case 8/9's windows-1252 files) is a
+    // genuine guess and must report `Low`.
+    #[test]
+    fn encoding_confidence_is_high_for_a_bom() {
+        let bytes = corpus_bytes("case-10-utf8-bom.csv");
+        assert_eq!(detect_encoding(&bytes).confidence(), Confidence::High);
+    }
+
+    #[test]
+    fn encoding_confidence_is_high_for_the_tolerant_utf8_fast_path() {
+        let bytes = b"timestamp,value\n2026-01-01T00:00:00Z,1.5\n".to_vec();
+        assert_eq!(detect_encoding(&bytes).confidence(), Confidence::High);
+    }
+
+    #[test]
+    fn encoding_confidence_is_low_for_a_real_heuristic_guess() {
+        let bytes = corpus_bytes("case-08-latin1-degree-micro.csv");
+        assert_eq!(detect_encoding(&bytes).confidence(), Confidence::Low);
+    }
+
     // Issue #58: `decode` used to unconditionally `.into_owned()` the `Cow`
     // `encoding_rs` returns, duplicating the entire input even when it was
     // already valid UTF-8 (the common case). A clean UTF-8 file must decode
@@ -1080,6 +1156,42 @@ mod tests {
     #[test]
     fn infer_delimiter_on_empty_sample_falls_back_to_comma_without_panicking() {
         assert_eq!(infer_delimiter("").delimiter.as_str(), ",");
+    }
+
+    // SPEC §1.2 confidence signal: every sampled line agreeing on the
+    // dominant field count (a clean, well-formed file) must report `High`;
+    // anything less agreement must report `Low`.
+    #[test]
+    fn delimiter_confidence_is_high_when_every_line_agrees() {
+        let sample = "a,b,c\n1,2,3\n4,5,6\n";
+        assert_eq!(infer_delimiter(sample).confidence(), Confidence::High);
+    }
+
+    #[test]
+    fn delimiter_confidence_is_low_when_lines_disagree() {
+        let sample = "a,b,c\n1,2,3\n4,5\n";
+        let inference = infer_delimiter(sample);
+        assert!(inference.consistency < 1.0, "fixture must be inconsistent");
+        assert_eq!(inference.confidence(), Confidence::Low);
+    }
+
+    // SPEC §1.2 confidence signal: one separator strictly outvoting the
+    // other is a resolved reading (`High`); a tie — including no numeric
+    // evidence at all — is a guess (`Low`).
+    #[test]
+    fn decimal_separator_confidence_is_high_when_one_side_outvotes_the_other() {
+        let sample = "a,b\n1.5,2.5\n1.6,2.6\n";
+        let inference = infer_decimal_separator(sample, Delimiter::Comma);
+        assert_eq!(inference.confidence(), Confidence::High);
+    }
+
+    #[test]
+    fn decimal_separator_confidence_is_low_with_no_numeric_evidence() {
+        let sample = "a,b\nx,y\n";
+        let inference = infer_decimal_separator(sample, Delimiter::Comma);
+        assert_eq!(inference.dot_votes, 0);
+        assert_eq!(inference.comma_votes, 0);
+        assert_eq!(inference.confidence(), Confidence::Low);
     }
 
     #[test]
