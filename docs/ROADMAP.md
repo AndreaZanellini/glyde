@@ -98,7 +98,7 @@ them, so CI stays green while honoring "written first."
 - [ ] Background progressive build emitting partial levels → first meaningful plot ≤ 2 s while indexing continues → SPEC §5 (first-plot), ARCH §pipeline · proven by: first-plot bench + manual
 - [ ] Decimation query `viewport(range, pixels) → min/max per column`; raw samples + point markers when samples < pixels; convergence to true samples → SPEC §3.1 · proven by: decimation golden — spike, convergence, no-alias (un-ignore)
 - [ ] Pyramid spill to OS app-data cache keyed by path + size + mtime; reopen is instant → ARCH §Index, SPEC §5.1 · proven by: spill round-trip unit test + manual reopen
-- [ ] RAM budget module (`sysinfo`): compute `min(25% RAM, 4 GB)`, affordability check *before* acting → SPEC §5.1, ARCH §budget · proven by: budget-math unit tests
+- [x] RAM budget module (`sysinfo`): compute `min(25% RAM, 4 GB)`, affordability check *before* acting → SPEC §5.1, ARCH §budget · proven by: budget-math unit tests
 - [ ] `glyde-devtools`: synthetic fixture generator + `memory_gate` headless peak-RSS harness → QUALITY §3, ARCH §devtools · proven by: memory gate under cap on the 20 GB fixture in CI
 - [ ] `criterion` benches: index build (CSV 1 GB), viewport query per pyramid level, cold start, peak RSS during scripted 20 GB open; absolute ceilings + >15% regression gate → QUALITY §3, SPEC §5 · proven by: benches within ceilings in CI
 

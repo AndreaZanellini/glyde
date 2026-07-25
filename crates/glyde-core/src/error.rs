@@ -65,6 +65,19 @@ pub enum GlydeError {
     /// plot at all.
     #[error("time index {input:?} is neither a recognized timestamp nor a plain number")]
     NonNumericTimeIndex { input: String },
+
+    /// A prospective action would need more memory than
+    /// [`crate::budget::RamBudget`] allows (SPEC §5.1: refuse before
+    /// acting, never after). Callers surface this as "a clear explanation
+    /// and the affordable alternative", never a silent attempt that could
+    /// OOM the machine.
+    #[error(
+        "operation needs {requested_bytes} bytes, over the {cap_bytes}-byte RAM budget (min(25% of system RAM, 4 GB))"
+    )]
+    BudgetExceeded {
+        requested_bytes: u64,
+        cap_bytes: u64,
+    },
 }
 
 /// The `Result` alias every fallible `glyde-core` function returns.
