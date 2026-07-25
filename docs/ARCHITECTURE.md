@@ -183,6 +183,48 @@ Resolved as follows:
   `index::level0::Level0CacheWriter` row-by-row during ingestion instead of
   through the whole-slice `build`/`build_or_open` convenience wrapper.
 
+### Progressive-axis tick mapping and `TimeUnit` placement (decision, issue #60)
+
+`Bucket`'s `first_ts`/`last_ts` and `build_pyramid`/`decimate_viewport`'s
+`timestamps`/`range` are bare `i128` ticks with no unit attached, and SPEC
+§2.1's two time-axis kinds (`Absolute` timestamps, `Progressive` numeric
+index) don't obviously share one tick space — `Absolute` ticks come from
+`Timestamp`, `Progressive` values are unitless `f64`.
+
+Resolved as follows:
+
+- **`Absolute` ticks pass through unchanged.** Every `Timestamp` in one axis
+  was parsed against the same detected `TimestampFormat`, hence already
+  shares one `TimeUnit` — `Timestamp::ticks` is handed to the pyramid
+  verbatim (`TimeAxis::to_pyramid_ticks`, `glyde_core::ingest::dataset`).
+- **`Progressive` values are fixed-point scaled**, by a documented ×10⁹
+  factor (`ingest::PROGRESSIVE_TICK_SCALE`), into the same `i128` tick
+  space. This is chosen over using the sample *ordinal* as the tick: scaling
+  preserves true x-distance between samples, so an unevenly-spaced
+  progressive axis decimates the same way an absolute-time axis with
+  identical physical spacing would, matching the pyramid's exactness
+  guarantee instead of degrading to "aggregate by sample count" for one of
+  the two axis kinds. The ×10⁹ factor is an assumption (SPEC §2.1 does not
+  name one): it caps exact representation at magnitudes below
+  `i128::MAX / 1e9` (~1.7×10²⁹) and nine fractional digits, which no
+  realistic progressive numeric index is expected to exceed.
+- **`Bucket` carries no `TimeUnit` field.** `dsp::decimation` stays exactly
+  what its own module doc already describes: a pure engine over opaque
+  `i128` ticks, unaware of calendar time or which axis kind produced them.
+  The caller — which already knows the `TimeAxis` variant it built the
+  pyramid from — owns converting ticks back to a display value
+  (`Timestamp::unit` for `Absolute`, `ingest::progressive_tick_to_value` for
+  `Progressive`). This was chosen over adding `unit: Option<TimeUnit>` to
+  every `Bucket` (redundant per-bucket state within one homogeneous
+  pyramid) and over making the pyramid generic over the tick type (the
+  Level-0 on-disk spill cache is tightly typed to fixed `i128`/`f64` byte
+  layouts today; genericizing it is a much larger change for the less
+  common of the two axis kinds).
+- **Not yet wired into the app.** `TimeAxis::to_pyramid_ticks` exists and is
+  tested, but nothing yet calls `build_pyramid`/`index::level0::build` from
+  `Dataset` — that lands with the ROADMAP M3 "background progressive build"
+  item, which will use this conversion at the call site.
+
 ## Threading model
 
 - **UI thread**: render loop, input, state. Never blocks.
