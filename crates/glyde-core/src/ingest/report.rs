@@ -391,6 +391,61 @@ mod tests {
         insta::assert_debug_snapshot!("inference_report_case_08_low_confidence_encoding", report);
     }
 
+    // Corpus case 28: every row's date is genuinely ambiguous (no field > 12
+    // in either slash position), so SPEC §2.1's ambiguity rule falls back to
+    // the ISO-leaning `DD/MM` default — this is the exact case
+    // `TimestampFormatInference::ambiguous` exists to flag, and it must
+    // reach `InferenceReport::timestamp_format`, not stop at `OpenSummary`
+    // (review follow-up on PR #70: this path had only lower-level
+    // `TimestampFormatInference` unit-test coverage before).
+    #[test]
+    fn inference_report_reports_low_confidence_timestamp_format_for_fully_ambiguous_dates() {
+        let path = corpus_path("case-28-fully-ambiguous-dates.csv");
+
+        let (_summary, report, _dataset) = open_dataset(&path).expect("case 28 must open");
+
+        assert_eq!(
+            report.timestamp_format.value,
+            Some("dd_mm_yyyy".to_string())
+        );
+        assert_eq!(report.timestamp_format.confidence, Confidence::Low);
+        // Every other field in this file is unambiguous; only the date
+        // format itself is a guess.
+        assert_eq!(report.encoding.confidence, Confidence::High);
+        assert_eq!(report.delimiter.confidence, Confidence::High);
+        assert_eq!(report.time_column.confidence, Confidence::High);
+    }
+
+    // No corpus case (the fixed 56-case set) exercises a header preamble
+    // that never matches the data rows' field count (`HeaderInference::
+    // ambiguous`), so this builds one inline via a real temp file — the same
+    // review follow-up as above, for `InferenceReport::time_column`. A
+    // single-field preamble line ("notes") above two-field ISO-timestamp
+    // data rows can never match the data field count, which is exactly
+    // `infer_header`'s `ambiguous` condition.
+    #[test]
+    fn inference_report_reports_low_confidence_time_column_for_an_ambiguous_header() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        std::io::Write::write_all(
+            &mut file,
+            b"notes\n\
+              2026-01-01T00:00:00Z,1.5\n\
+              2026-01-01T00:00:01Z,1.6\n\
+              2026-01-01T00:00:02Z,1.7\n",
+        )
+        .expect("write temp file");
+
+        let (_summary, report, dataset) =
+            open_dataset(file.path()).expect("ambiguous-header file must open");
+
+        assert_eq!(dataset.time_column_name, "column_0");
+        assert_eq!(report.time_column.value, Some("column_0".to_string()));
+        assert_eq!(report.time_column.confidence, Confidence::Low);
+        // The timestamp values themselves are unambiguous ISO 8601 — only
+        // the column *name* is a guess here.
+        assert_eq!(report.timestamp_format.confidence, Confidence::High);
+    }
+
     #[test]
     fn open_dataset_reports_a_missing_file_instead_of_panicking() {
         let err = open_dataset(Path::new("/nonexistent/glyde-report-test.csv"))
