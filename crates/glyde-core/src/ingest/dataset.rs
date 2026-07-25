@@ -62,6 +62,66 @@ impl TimeAxis {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Converts this axis into the `i128` tick space
+    /// [`crate::dsp::decimation::build_pyramid`]/
+    /// [`crate::dsp::decimation::decimate_viewport`] operate on (issue #60
+    /// decision, docs/ARCHITECTURE.md §The index).
+    ///
+    /// `Absolute` ticks are each [`Timestamp`]'s own `ticks` field verbatim —
+    /// every timestamp in one axis was parsed against the same detected
+    /// [`TimestampFormat`], hence shares one [`crate::time::TimeUnit`], so
+    /// the values are already on one consistent scale. `Progressive` values
+    /// have no calendar meaning or unit of their own, so they are mapped
+    /// through [`progressive_value_to_tick`] fixed-point scaling — this
+    /// preserves true x-distance between samples, so an unevenly-spaced
+    /// progressive axis decimates the same way an absolute-time axis with
+    /// identical physical spacing would, rather than aggregating by sample
+    /// ordinal.
+    ///
+    /// `dsp::decimation` never interprets the ticks it is handed; only the
+    /// caller (via [`progressive_tick_to_value`] for `Progressive`, or a
+    /// `Timestamp`'s own `unit` for `Absolute`) knows how to convert them
+    /// back to a display value.
+    pub fn to_pyramid_ticks(&self) -> Vec<i128> {
+        match self {
+            TimeAxis::Absolute { timestamps, .. } => timestamps.iter().map(|t| t.ticks).collect(),
+            TimeAxis::Progressive { values } => values
+                .iter()
+                .copied()
+                .map(progressive_value_to_tick)
+                .collect(),
+        }
+    }
+}
+
+/// Fixed-point scale applied to a [`TimeAxis::Progressive`] axis's `f64`
+/// values to obtain pyramid ticks (issue #60 decision, recorded in
+/// docs/ARCHITECTURE.md §The index). Matches the finest resolution already
+/// carried by absolute timestamps (`TimeUnit::Nanoseconds`'s ×10⁹), chosen so
+/// realistic progressive-index magnitudes and fractional precision survive
+/// the round trip; values whose magnitude approaches `i128::MAX / 1e9`
+/// (~1.7×10²⁹) or whose meaningful precision exceeds nine fractional digits
+/// are outside what this scale can represent exactly. Progressive numeric
+/// indices are not expected to reach either extreme in practice (SPEC
+/// §2.1); this is an assumption flagged in `CHANGELOG.md`, not something
+/// SPEC.md names.
+pub const PROGRESSIVE_TICK_SCALE: f64 = 1e9;
+
+/// Scales one [`TimeAxis::Progressive`] value into a pyramid tick (see
+/// [`PROGRESSIVE_TICK_SCALE`]). Rounds to the nearest tick; the float-to-int
+/// cast saturates rather than panicking on out-of-range input (Rust's
+/// defined `as` semantics), which only matters for the extreme magnitudes
+/// documented on [`PROGRESSIVE_TICK_SCALE`].
+pub fn progressive_value_to_tick(value: f64) -> i128 {
+    (value * PROGRESSIVE_TICK_SCALE).round() as i128
+}
+
+/// Inverse of [`progressive_value_to_tick`]: recovers a pyramid tick's
+/// original `Progressive` axis value for display (e.g. an axis tick label or
+/// cursor readout).
+pub fn progressive_tick_to_value(tick: i128) -> f64 {
+    tick as f64 / PROGRESSIVE_TICK_SCALE
 }
 
 /// A fully materialized small delimited-text file: its time axis plus every
@@ -257,6 +317,85 @@ mod tests {
                 assert_eq!(values, &vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
             }
             TimeAxis::Absolute { .. } => panic!("case 35 has no absolute timestamp"),
+        }
+    }
+
+    // Issue #60 decision (solution B): `Absolute` ticks pass through
+    // untouched — every timestamp in an axis already shares one `TimeUnit`
+    // from the detected format, so there is nothing to scale.
+    #[test]
+    fn to_pyramid_ticks_on_absolute_axis_returns_each_timestamps_own_ticks() {
+        use crate::time::TimeUnit;
+
+        let time = TimeAxis::Absolute {
+            timestamps: vec![
+                Timestamp::new(0, TimeUnit::Nanoseconds),
+                Timestamp::new(1_500_000_000, TimeUnit::Nanoseconds),
+                Timestamp::new(3_000_000_000, TimeUnit::Nanoseconds),
+            ],
+            format: TimestampFormat::EpochNanos,
+        };
+
+        assert_eq!(
+            time.to_pyramid_ticks(),
+            vec![0, 1_500_000_000, 3_000_000_000]
+        );
+    }
+
+    // Issue #60 decision: `Progressive` values are scaled by
+    // `PROGRESSIVE_TICK_SCALE` (×1e9) so the pyramid aggregates by true
+    // x-distance, not by sample ordinal.
+    #[test]
+    fn to_pyramid_ticks_on_progressive_axis_scales_by_the_fixed_point_factor() {
+        let time = TimeAxis::Progressive {
+            values: vec![0.0, 1.0, 2.5, -3.25],
+        };
+
+        assert_eq!(
+            time.to_pyramid_ticks(),
+            vec![0, 1_000_000_000, 2_500_000_000, -3_250_000_000]
+        );
+    }
+
+    // Corpus case 35's real progressive values, run through the same
+    // conversion the future pyramid-building call site will use — ticks
+    // must stay non-decreasing (`build_pyramid`/`decimate_viewport`'s
+    // precondition on their `timestamps` argument).
+    #[test]
+    fn to_pyramid_ticks_on_progressive_axis_preserves_monotonicity() {
+        let dataset =
+            load(&corpus_path("case-35-progressive-integer-index.csv")).expect("case 35 must load");
+
+        let ticks = dataset.time.to_pyramid_ticks();
+        assert_eq!(
+            ticks,
+            vec![
+                0,
+                1_000_000_000,
+                2_000_000_000,
+                3_000_000_000,
+                4_000_000_000,
+                5_000_000_000
+            ]
+        );
+        assert!(
+            ticks.windows(2).all(|pair| pair[0] <= pair[1]),
+            "a monotonic progressive axis must scale into a non-decreasing tick sequence"
+        );
+    }
+
+    // `progressive_tick_to_value` must exactly invert
+    // `progressive_value_to_tick` for values representable at the fixed
+    // ×1e9 resolution (issue #60's documented scale limits).
+    #[test]
+    fn progressive_value_and_tick_round_trip() {
+        for value in [0.0, 1.0, -1.0, 0.1, 123.456, -9_999.5, 1e6, -1e-6] {
+            let tick = progressive_value_to_tick(value);
+            let recovered = progressive_tick_to_value(tick);
+            assert!(
+                (recovered - value).abs() < 1e-6,
+                "value {value} round-tripped to {recovered} through tick {tick}"
+            );
         }
     }
 

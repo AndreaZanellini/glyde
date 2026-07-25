@@ -30,7 +30,10 @@ mod infer;
 mod report;
 
 pub use csv::{open_path, parse, CsvParseOutcome, CsvReader};
-pub use dataset::{load, Dataset, TimeAxis};
+pub use dataset::{
+    load, progressive_tick_to_value, progressive_value_to_tick, Dataset, TimeAxis,
+    PROGRESSIVE_TICK_SCALE,
+};
 pub use infer::{
     decode, detect_encoding, infer_column, infer_decimal_separator, infer_delimiter, infer_header,
     Confidence, DecimalSeparator, DecimalSeparatorInference, Delimiter, DelimiterInference,

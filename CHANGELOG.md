@@ -11,6 +11,28 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- No visible app behavior change yet: resolves a `blocking-decision` issue
+  (#60) on how a file's time axis maps into the min/max decimation pyramid
+  from `docs/ROADMAP.md` M3. A file with a real calendar timestamp column
+  and a file with a plain progressive numeric index (e.g. a bare row
+  counter) are Glyde's two supported time-axis kinds; the pyramid needed one
+  consistent way to represent both. Decided: a timestamp column's own
+  internal representation is used as-is, and a progressive numeric column is
+  converted using a fixed, documented scale factor chosen to preserve its
+  precision — so zooming and panning aggregate by true position along the
+  axis, not by row count, the same way for either kind of file. This lands
+  the conversion, tested directly; it is not yet wired into the plot itself
+  (that follow-up work is `docs/ROADMAP.md` M3's remaining pyramid items).
+
+  **Assumptions made:**
+  - The progressive-axis scale factor is invented (`docs/SPEC.md` §2.1 does
+    not specify one): it is precise to nine fractional digits and exact for
+    values well below ~10²⁹ in magnitude. No realistic progressive index
+    (a row counter, a sample number, a simple elapsed-time float) is
+    expected to exceed either limit; flagged here in case a real file
+    proves otherwise.
+
 ### Fixed
 - A timestamp column using a fractional (decimal) epoch value — e.g.
   `1770000000.5` seconds, or the millisecond/microsecond/nanosecond
