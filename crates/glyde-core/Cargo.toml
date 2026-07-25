@@ -18,6 +18,7 @@ csv-core.workspace = true
 parquet.workspace = true
 arrow.workspace = true
 memmap2.workspace = true
+bytemuck.workspace = true
 encoding_rs.workspace = true
 chardetng.workspace = true
 

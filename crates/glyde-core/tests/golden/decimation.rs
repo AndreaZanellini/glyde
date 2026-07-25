@@ -13,12 +13,11 @@
 // limitations under the License.
 
 //! Decimation golden tests (docs/QUALITY.md §2 Decimation, docs/ROADMAP.md
-//! M1/M3). Every test here is `#[ignore]`d because
-//! `glyde_core::dsp::decimation::{build_pyramid, decimate_viewport}` are not
-//! implemented yet (`todo!()` — docs/ROADMAP.md M3); `cargo test -- --ignored
-//! --list` is the M1 maintainer proof that the full golden-test set exists.
-//! Un-ignore each test only once the implementation makes it pass — never
-//! loosen an assertion to make that happen.
+//! M1/M3). Written before `glyde_core::dsp::decimation::{build_pyramid,
+//! decimate_viewport}` existed (`#[ignore]`d through M1/M2 while both were
+//! `todo!()`); un-ignored now that docs/ROADMAP.md M3 lands the real bodies.
+//! Never loosen an assertion here to make an implementation pass — if one
+//! looks wrong, that is a `blocking-decision` issue, not an edit.
 
 use glyde_core::dsp::decimation::{build_pyramid, decimate_viewport, Bucket, PYRAMID_FACTOR};
 
@@ -64,7 +63,6 @@ fn brute_force_min_max(samples: &[f64], timestamps: &[i128], range: (i128, i128)
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M3: pyramid/decimation not implemented yet"]
 fn spike_preservation_survives_decimation_to_800_columns() {
     const SAMPLE_COUNT: usize = 10_000_000;
     const SPIKE_INDEX: usize = 4_012_345;
@@ -105,7 +103,6 @@ fn spike_preservation_survives_decimation_to_800_columns() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M3: pyramid/decimation not implemented yet"]
 fn envelope_exactness_matches_brute_force_min_max_at_every_level() {
     // 8^4, so every pyramid level (span 8, 64, 512, 4096) divides the
     // fixture evenly and there is no partial/remainder bucket to reason
@@ -146,7 +143,6 @@ fn envelope_exactness_matches_brute_force_min_max_at_every_level() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M3: pyramid/decimation not implemented yet"]
 fn pyramid_consistency_level_k_plus_1_is_the_exact_aggregation_of_level_k() {
     const SAMPLE_COUNT: usize = 4096;
 
@@ -222,7 +218,6 @@ fn pyramid_consistency_level_k_plus_1_is_the_exact_aggregation_of_level_k() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M3: pyramid/decimation not implemented yet"]
 fn convergence_to_raw_samples_when_the_viewport_has_fewer_samples_than_pixels() {
     const SAMPLE_COUNT: usize = 50;
     const PIXEL_COLUMNS: usize = 200;
@@ -257,7 +252,6 @@ fn convergence_to_raw_samples_when_the_viewport_has_fewer_samples_than_pixels() 
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M3: pyramid/decimation not implemented yet"]
 fn no_aliasing_1khz_sine_at_100khz_decimated_to_500_columns_shows_a_constant_envelope() {
     const SAMPLE_RATE_HZ: f64 = 100_000.0;
     const SIGNAL_FREQ_HZ: f64 = 1_000.0;

@@ -12,18 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Glyde engine: ingestion, time indexing, multi-resolution index, and DSP.
-//!
-//! This crate contains ALL product logic and has NO GUI dependencies, so every
-//! behavior is testable headlessly. See docs/ARCHITECTURE.md.
-//!
-//! Scaffolding stub: modules are created by the first implementation task.
+//! The multi-resolution index: where "Level 0" (raw samples) lives for files
+//! too large to keep fully in memory, and the on-disk cache that makes
+//! reopening a known file instant (docs/ARCHITECTURE.md §The index, issue
+//! #59).
 
-pub mod budget;
-pub mod dsp;
-mod error;
-pub mod index;
-pub mod ingest;
-pub mod series;
-pub mod time;
-pub use error::{GlydeError, Result};
+pub mod level0;
+
+pub use level0::{CacheKey, Level0Cache, Level0CacheWriter};

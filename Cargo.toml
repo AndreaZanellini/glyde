@@ -35,6 +35,12 @@ arrow = { version = "54", default-features = false }
 memmap2 = "0.9"
 encoding_rs = "0.8"
 chardetng = "0.1"
+# Safe, audited casting between the Level-0 spill cache's memory-mapped bytes
+# and typed &[f64]/&[i128] slices (docs/ARCHITECTURE.md §The index, issue
+# #59) — already a transitive dependency via the wgpu/eframe tree, so this
+# adds no new supply-chain surface, only a direct `glyde-core` use of code
+# already vetted for the workspace.
+bytemuck = "1.25"
 
 # --- Time ------------------------------------------------------------------
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

@@ -14,12 +14,7 @@
 
 //! Property-test scaffolding (docs/QUALITY.md §2 Property tests,
 //! docs/ROADMAP.md M1): invariants that must hold across the whole input
-//! space, not just the fixed golden-test cases. The decimation property
-//! below is still `#[ignore]`d because `dsp::decimation`'s pyramid lands in
-//! docs/ROADMAP.md M3; `cargo test -- --ignored --list` is the M1
-//! maintainer proof this scaffolding exists. Un-ignore each one only once
-//! its implementation makes it pass — never loosen an assertion to make
-//! that happen.
+//! space, not just the fixed golden-test cases.
 
 use glyde_core::dsp::decimation::{build_pyramid, decimate_viewport};
 use glyde_core::ingest;
@@ -33,7 +28,6 @@ proptest! {
     /// own `[min, max]` range, for any random valid series and any pixel
     /// width.
     #[test]
-    #[ignore = "docs/ROADMAP.md M3: pyramid/decimation not implemented yet"]
     fn rendering_never_panics_and_never_invents_values_outside_the_series_range(
         samples in prop::collection::vec(
             any::<f64>().prop_filter("finite", |v| v.is_finite()),

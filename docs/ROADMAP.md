@@ -94,10 +94,11 @@ them, so CI stays green while honoring "written first."
 
 ## M3 — Index pyramid + large files (fluid navigation, the performance contract)
 
-- [ ] Min/max pyramid: level-k `(min, max, first_ts, last_ts, nan_count)`, factor-8 buckets, level *k+1* exactly from level *k* → ARCH §Index, SPEC §3.1 · proven by: decimation golden — pyramid consistency + envelope exactness (un-ignore)
+- [x] Min/max pyramid: level-k `(min, max, first_ts, last_ts, nan_count)`, factor-8 buckets, level *k+1* exactly from level *k* → ARCH §Index, SPEC §3.1 · proven by: decimation golden — pyramid consistency + envelope exactness (un-ignore)
 - [ ] Background progressive build emitting partial levels → first meaningful plot ≤ 2 s while indexing continues → SPEC §5 (first-plot), ARCH §pipeline · proven by: first-plot bench + manual
-- [ ] Decimation query `viewport(range, pixels) → min/max per column`; raw samples + point markers when samples < pixels; convergence to true samples → SPEC §3.1 · proven by: decimation golden — spike, convergence, no-alias (un-ignore)
-- [ ] Pyramid spill to OS app-data cache keyed by path + size + mtime; reopen is instant → ARCH §Index, SPEC §5.1 · proven by: spill round-trip unit test + manual reopen
+- [x] Decimation query `viewport(range, pixels) → min/max per column`; raw samples + point markers when samples < pixels; convergence to true samples → SPEC §3.1 · proven by: decimation golden — spike, convergence, no-alias (un-ignore)
+- [x] Level-0 typed spill cache to OS cache dir keyed by path + size + mtime; reopen is instant → ARCH §Index (issue #59), SPEC §5.1 · proven by: `index::level0` round-trip/reopen unit tests + level0/decimation integration test
+- [ ] Pyramid *level* spill (only Level 0 is spilled so far; reopening rebuilds the pyramid from cached Level 0 rather than loading it too) → ARCH §Index · proven by: spill round-trip unit test + manual reopen
 - [x] RAM budget module (`sysinfo`): compute `min(25% RAM, 4 GB)`, affordability check *before* acting → SPEC §5.1, ARCH §budget · proven by: budget-math unit tests
 - [ ] `glyde-devtools`: synthetic fixture generator + `memory_gate` headless peak-RSS harness → QUALITY §3, ARCH §devtools · proven by: memory gate under cap on the 20 GB fixture in CI
 - [ ] `criterion` benches: index build (CSV 1 GB), viewport query per pyramid level, cold start, peak RSS during scripted 20 GB open; absolute ceilings + >15% regression gate → QUALITY §3, SPEC §5 · proven by: benches within ceilings in CI

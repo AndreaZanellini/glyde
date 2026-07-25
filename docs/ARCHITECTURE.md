@@ -142,6 +142,47 @@ The multi-resolution min/max pyramid is the heart of the performance contract.
 - Bounded by the RAM budget; spills to a cache file in the OS app-data dir, keyed by file path + size + mtime, so reopening a known file is instant.
 - The pyramid serves **rendering only**. DSP never reads it.
 
+### Where Level 0 actually lives (decision, issue #59)
+
+"In file, memory-mapped" above is literally true for Parquet — the file
+already is typed binary data. It is not true for CSV/TSV: raw samples exist
+only as text, and reaching sample *n* means re-parsing from the start, while
+`decimate_viewport`'s exactness requirement (every pixel column's min/max
+must match a brute-force scan of the raw samples, not an approximation)
+needs random access to individual raw samples at the edges of every column,
+not just a streaming pass.
+
+Resolved as follows:
+
+- **Typed Level-0 spill cache** (`glyde_core::index::level0`). At index time,
+  decoded `(timestamp, value)` pairs are written once, streaming (one sample
+  at a time — no `Vec` ever holds the whole column), to a fixed-width typed
+  cache file pair in the OS cache directory, keyed by source path + size +
+  mtime — the same scheme already used for the pyramid above. Reopening a
+  known file memory-maps the existing cache directly instead of re-parsing.
+  Cost: roughly the size of the raw numeric data again on disk (16
+  bytes/sample for timestamps, 8 bytes/sample for values) per opened file.
+  Rejected alternatives: re-parsing raw text on every edge-bucket read (too
+  slow against the pan/zoom frame budget, and doesn't extend to Parquet);
+  caching only the current viewport window (loses the "reopening a known
+  file is instant" property and still doesn't give exact edge buckets when
+  the user jumps around).
+- **The locked golden-test API is the engine for every file size**, not a
+  small-file-only façade. `dsp::decimation::{build_pyramid,
+  decimate_viewport}` keep exactly the `&[f64]`/`&[i128]` signatures the
+  golden tests were written against; the large-file path memory-maps the
+  Level-0 cache and hands these functions a real slice over the mapped
+  bytes, rather than introducing a second implementation or a generic
+  `RawSamples` trait for one call site.
+- **Deferred, tracked separately:** the pyramid levels themselves are not
+  yet spilled to disk (only Level 0 is) — reopening a large file today
+  rebuilds the pyramid from the cached Level 0 (fast: one in-memory pass
+  over memory-mapped data, no re-parsing) rather than being instant. Also
+  deferred: cache eviction (the cache directory only ever grows) and the
+  streaming/chunked large-CSV reader that would call
+  `index::level0::Level0CacheWriter` row-by-row during ingestion instead of
+  through the whole-slice `build`/`build_or_open` convenience wrapper.
+
 ## Threading model
 
 - **UI thread**: render loop, input, state. Never blocks.
