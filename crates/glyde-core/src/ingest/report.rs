@@ -36,6 +36,7 @@
 //! ever puts the time column anywhere else.
 
 use super::csv::open_path_capturing_column;
+use super::dataset::{self, Dataset, TimeAxis};
 use crate::time::{
     classify_sampling, detect_gaps, detect_monotonicity, infer_timestamp_format, parse_timestamp,
     TimestampFormat,
@@ -116,6 +117,11 @@ fn timestamp_format_label(format: TimestampFormat) -> &'static str {
 /// at `path`. A single-column file has only a time index and no data series
 /// to plot, and is rejected as [`GlydeError::SingleColumnFile`] (corpus case
 /// 18) rather than silently "succeeding" with nothing to show.
+///
+/// This parses `path` on its own, independently of [`super::dataset::load`].
+/// A caller that also needs the materialized [`Dataset`] (as
+/// `glyde-app`'s indexer does) should call [`open_dataset`] instead, which
+/// produces both from a single parse (issue #58).
 pub fn inspect(path: &Path) -> Result<OpenSummary> {
     let (outcome, time_fields) = open_path_capturing_column(path, 0)?;
 
@@ -169,4 +175,125 @@ pub fn inspect(path: &Path) -> Result<OpenSummary> {
         non_monotonic_count,
         duplicate_timestamp_count,
     })
+}
+
+/// Parses `path` once and returns both the [`OpenSummary`] [`inspect`]
+/// reports and the materialized [`Dataset`] [`super::dataset::load`]
+/// produces (issue #58: `glyde-app`'s indexer used to call `inspect` then
+/// `load` back to back, each independently memory-mapping, decoding, and
+/// streaming the whole file — twice the I/O and CPU work for one open).
+/// `Dataset::time`'s already-parsed ticks feed the same sampling
+/// classification, gap detection, and monotonicity checks `inspect` runs, so
+/// the two summaries agree by construction rather than by re-derivation.
+pub fn open_dataset(path: &Path) -> Result<(OpenSummary, Dataset)> {
+    let (outcome, dataset) = dataset::load_with_outcome(path)?;
+
+    let (
+        time_column,
+        timestamp_format,
+        sampling_class,
+        gap_count,
+        non_monotonic_count,
+        duplicate_timestamp_count,
+    ) = match &dataset.time {
+        TimeAxis::Absolute { timestamps, format } => {
+            let ticks: Vec<i128> = timestamps.iter().map(|timestamp| timestamp.ticks).collect();
+            let sampling_class: SamplingClass = classify_sampling(&ticks).into();
+            let gap_count = detect_gaps(&ticks).len() as u64;
+            let monotonicity = detect_monotonicity(&ticks);
+            (
+                Some(dataset.time_column_name.clone()),
+                Some(timestamp_format_label(*format).to_string()),
+                sampling_class,
+                gap_count,
+                monotonicity.non_monotonic_count as u64,
+                monotonicity.duplicate_count as u64,
+            )
+        }
+        // SPEC §2.1: a progressive numeric index has no absolute-time
+        // meaning (corpus case 35) — same as `inspect`'s `None` arm above.
+        TimeAxis::Progressive { .. } => (None, None, SamplingClass::ProgressiveIndex, 0, 0, 0),
+    };
+
+    let summary = OpenSummary {
+        encoding: outcome.encoding_label,
+        delimiter: Some(outcome.delimiter.as_str().to_string()),
+        decimal_separator: Some(outcome.decimal_separator.as_str().to_string()),
+        time_column,
+        timestamp_format,
+        row_count: outcome.row_count,
+        skipped_row_count: outcome.skipped_row_count,
+        sampling_class,
+        gap_count,
+        non_monotonic_count,
+        duplicate_timestamp_count,
+    };
+
+    Ok((summary, dataset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ingest::dataset::load;
+    use std::path::PathBuf;
+
+    fn corpus_path(file_name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("testdata")
+            .join("corpus")
+            .join(file_name)
+    }
+
+    // Issue #58: `open_dataset` must agree with calling `inspect` and `load`
+    // separately, for both an absolute-timestamp file (case 1) and a
+    // progressive-index one (case 35) — the two code paths must never
+    // silently drift apart now that they share one parse.
+    #[test]
+    fn open_dataset_agrees_with_inspect_and_load_for_an_absolute_timestamp_file() {
+        let path = corpus_path("case-01-comma-clean.csv");
+
+        let (summary, dataset) = open_dataset(&path).expect("case 1 must open");
+        let expected_summary = inspect(&path).expect("case 1 must inspect");
+        let expected_dataset = load(&path).expect("case 1 must load");
+
+        assert_eq!(summary, expected_summary);
+        assert_eq!(dataset, expected_dataset);
+    }
+
+    #[test]
+    fn open_dataset_agrees_with_inspect_and_load_for_a_progressive_index_file() {
+        let path = corpus_path("case-35-progressive-integer-index.csv");
+
+        let (summary, dataset) = open_dataset(&path).expect("case 35 must open");
+        let expected_summary = inspect(&path).expect("case 35 must inspect");
+        let expected_dataset = load(&path).expect("case 35 must load");
+
+        assert_eq!(summary, expected_summary);
+        assert_eq!(dataset, expected_dataset);
+    }
+
+    // Corpus case 21: ragged rows are skipped on both paths; the unified
+    // parse must still land on the same summary and dataset as before.
+    #[test]
+    fn open_dataset_agrees_with_inspect_and_load_for_ragged_rows() {
+        let path = corpus_path("case-21-ragged-rows.csv");
+
+        let (summary, dataset) = open_dataset(&path).expect("case 21 must open");
+        let expected_summary = inspect(&path).expect("case 21 must inspect");
+        let expected_dataset = load(&path).expect("case 21 must load");
+
+        assert_eq!(summary, expected_summary);
+        assert_eq!(dataset, expected_dataset);
+    }
+
+    #[test]
+    fn open_dataset_reports_a_missing_file_instead_of_panicking() {
+        let err = open_dataset(Path::new("/nonexistent/glyde-report-test.csv"))
+            .expect_err("a missing file must be a reported error");
+
+        assert!(matches!(err, GlydeError::Io { .. }));
+    }
 }

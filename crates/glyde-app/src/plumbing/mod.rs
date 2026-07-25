@@ -29,11 +29,14 @@
 //!
 //! This is deliberately the M2 "single egui window" / "Time-domain view v1"
 //! slice, not the M3 index pyramid: [`spawn_index_job`] wires up the channel
-//! plumbing and reuses [`glyde_core::ingest::inspect`] (the same pipeline the
-//! torture-corpus gate already exercises) for the summary, plus
-//! [`glyde_core::ingest::load`] for the actual samples the time-domain view
-//! plots. Streaming a full pyramid build in the background, instead of
-//! loading the whole file at once, is M3's job.
+//! plumbing and reuses [`glyde_core::ingest::open_dataset`] (built on the
+//! same inference pipeline the torture-corpus gate exercises through
+//! `inspect`) to get both the summary and the actual samples the
+//! time-domain view plots from a single parse of the file (issue #58 —
+//! this used to be two independent calls, `inspect` then `load`, each
+//! re-reading and re-decoding the whole file). Streaming a full pyramid
+//! build in the background, instead of loading the whole file at once, is
+//! M3's job.
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -129,29 +132,15 @@ fn run_index_job(generation: u64, path: PathBuf, tx: &Sender<IndexingMessage>) {
         return;
     }
 
-    let summary = match glyde_core::ingest::inspect(&path) {
-        Ok(summary) => summary,
-        Err(err) => {
-            tracing::error!(path = %path.display(), error = %err, "failed to open file");
-            let _ = tx.send(IndexingMessage::Failed {
-                generation,
-                path,
-                message: err.to_string(),
-            });
-            return;
-        }
-    };
-
-    // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1": the summary alone
-    // has no samples to plot, so the same background pass also materializes
-    // the full dataset `views::time::show` renders. Both calls re-parse the
-    // file today (M3's pyramid/index build is what makes this a single
-    // pass); an open that produces a summary but fails to load as a dataset
-    // (e.g. a progressive-index column whose fields aren't actually numeric,
+    // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1": one parse
+    // produces both the inference summary and the materialized dataset
+    // `views::time::show` renders (issue #58). An open that produces a
+    // summary but fails to materialize as a dataset (e.g. a
+    // progressive-index column whose fields aren't actually numeric,
     // `GlydeError::NonNumericTimeIndex`) still has nothing to show, so it is
     // reported as a failed open rather than a summary with no plot.
-    match glyde_core::ingest::load(&path) {
-        Ok(dataset) => {
+    match glyde_core::ingest::open_dataset(&path) {
+        Ok((summary, dataset)) => {
             tracing::info!(
                 path = %path.display(),
                 row_count = summary.row_count,
@@ -166,7 +155,7 @@ fn run_index_job(generation: u64, path: PathBuf, tx: &Sender<IndexingMessage>) {
             });
         }
         Err(err) => {
-            tracing::error!(path = %path.display(), error = %err, "failed to load dataset");
+            tracing::error!(path = %path.display(), error = %err, "failed to open file");
             let _ = tx.send(IndexingMessage::Failed {
                 generation,
                 path,
