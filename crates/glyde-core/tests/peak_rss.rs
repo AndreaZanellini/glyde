@@ -18,17 +18,20 @@
 //! yet).
 //!
 //! Issue #58 measured `ingest::inspect()` + `ingest::load()` peaking at
-//! **~11x** a 124 MB source file's size. This PR fixes two of its three
-//! named root causes (`decode()` no longer copies a clean UTF-8 file, and
-//! the app's indexer no longer parses the file twice), but peak RSS for a
-//! single `load()` is, measured here, still **~12x** the file size: most of
-//! it is `ingest::csv::Capture::All` capturing every field as its own owned
-//! `String` and `dataset::load`'s typed-`Series` build on top of that — the
-//! issue's still-open third root cause, filed as its own follow-up (#62).
-//! Never disguise that as fixed: this test's budget is set with headroom
-//! *above* the current ~12x baseline, so it fails only on a regression that
-//! makes things measurably worse (e.g. `decode()` losing its
-//! `Cow::Borrowed` fast path again), not as proof of a met SPEC §5 budget.
+//! **~11x** a 124 MB source file's size; a follow-up PR fixed two of its
+//! three named root causes (`decode()` no longer copies a clean UTF-8 file,
+//! and the app's indexer no longer parses the file twice) but left peak RSS
+//! at **~12.75x**, dominated by `ingest::csv::Capture::All` capturing every
+//! field as its own owned `String` before `dataset::load` ever gets to type
+//! it — tracked as issue #62. This PR closes #62: `Capture::All`/`Capture::
+//! Column` now accumulate each column's raw text in one arena buffer
+//! (`ColumnText`) with a lightweight offset table instead of one heap
+//! allocation per field, and `dataset::load`/`ingest::report::inspect` type
+//! straight from borrowed `&str` slices into that arena rather than an
+//! owned `Vec<String>` per column. `MAX_RATIO` is tightened accordingly,
+//! still with headroom above the measured post-fix ratio (this is a coarse
+//! regression gate, not proof of the SPEC §5 budget itself — that needs
+//! docs/ROADMAP.md M3's chunked/bounded reader).
 //!
 //! This is its own file (a separate test binary, one test) so the RSS
 //! measurement isn't polluted by unrelated tests sharing the process.
@@ -90,15 +93,15 @@ fn write_synthetic_csv(path: &std::path::Path) -> u64 {
     file.metadata().expect("stat fixture").len()
 }
 
-// Measured on this fixture shape at ROWS=400_000 (~7.8 MB) and again at
-// 2_000_000 rows (~40 MB): both land around 12x, so this is a real
-// proportional cost, not a small file's fixed-overhead artifact. MAX_RATIO
-// is set with real headroom above that measured baseline: it does not
-// claim SPEC §5 is met (it isn't — see the module docs), only that a
-// regression which pushes the ratio measurably higher is caught.
+// Pre-#62, this fixture shape measured ~12.75x at ROWS=400_000 (~7.8 MB);
+// post-#62 (release build, same fixture) it measures ~7.0x. MAX_RATIO is set
+// with headroom above that measured post-fix ratio, not a claim that SPEC §5
+// is met (see module docs) — only that a regression which pushes the ratio
+// measurably higher (e.g. `ColumnText` losing its arena and falling back to
+// one `String` per field) is caught.
 #[test]
 fn loading_a_synthetic_csv_keeps_peak_rss_within_a_generous_multiple_of_file_size() {
-    const MAX_RATIO: u64 = 16;
+    const MAX_RATIO: u64 = 9;
     const FIXED_OVERHEAD_BYTES: u64 = 8 * 1024 * 1024; // test harness baseline
 
     let dir = tempfile::tempdir().expect("create temp dir");

@@ -100,7 +100,8 @@ pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset
     }
 
     let time_column_name = outcome.column_names[0].clone();
-    let time_fields = columns_text.remove(0);
+    let time_column = columns_text.remove(0);
+    let time_fields: Vec<&str> = time_column.iter().collect();
 
     let time =
         match infer_timestamp_format(&time_fields) {
@@ -123,7 +124,7 @@ pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset
                 for field in &time_fields {
                     let value = field.trim().parse::<f64>().map_err(|_| {
                         GlydeError::NonNumericTimeIndex {
-                            input: field.clone(),
+                            input: field.to_string(),
                         }
                     })?;
                     values.push(value);
@@ -135,10 +136,14 @@ pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset
     let columns = outcome.column_names[1..]
         .iter()
         .zip(columns_text)
-        .map(|(name, fields)| {
-            let normalized: Vec<String> = fields
+        .map(|(name, column_text)| {
+            // `normalize_decimal_field` keeps `Cow::Borrowed` when the field
+            // needs no rewrite (the common dot-decimal case): `infer_column`
+            // is generic over `AsRef<str>`, so this never forces an owned
+            // copy just to satisfy its signature (issue #62).
+            let normalized: Vec<std::borrow::Cow<'_, str>> = column_text
                 .iter()
-                .map(|field| normalize_decimal_field(field, outcome.decimal_separator).into_owned())
+                .map(|field| normalize_decimal_field(field, outcome.decimal_separator))
                 .collect();
             infer_column(name.clone(), &normalized).series
         })
