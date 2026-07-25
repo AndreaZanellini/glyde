@@ -1,0 +1,37 @@
+---
+source: crates/glyde-core/src/ingest/report.rs
+assertion_line: 377
+expression: report
+---
+InferenceReport {
+    encoding: InferredField {
+        value: "utf-8",
+        confidence: High,
+    },
+    delimiter: InferredField {
+        value: Some(
+            ",",
+        ),
+        confidence: High,
+    },
+    decimal_separator: InferredField {
+        value: Some(
+            ".",
+        ),
+        confidence: High,
+    },
+    time_column: InferredField {
+        value: Some(
+            "timestamp",
+        ),
+        confidence: High,
+    },
+    timestamp_format: InferredField {
+        value: Some(
+            "iso8601",
+        ),
+        confidence: High,
+    },
+    sample_count: 6,
+    sampling_class: Uniform,
+}

@@ -28,10 +28,10 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use glyde_core::ingest::{Dataset, OpenSummary};
+use glyde_core::ingest::{Dataset, InferenceReport, OpenSummary};
 
 use crate::plumbing::{spawn_index_job, spawn_open_dialog, IndexingMessage};
-use crate::views;
+use crate::{inference_bar, views};
 
 /// What the central panel currently shows, driven by [`IndexingMessage`]s
 /// polled from the background indexer thread.
@@ -43,6 +43,7 @@ enum Status {
     Loaded {
         path: PathBuf,
         summary: Box<OpenSummary>,
+        report: Box<InferenceReport>,
         dataset: Box<Dataset>,
     },
     Failed {
@@ -110,11 +111,13 @@ impl GlydeApp {
                 IndexingMessage::Completed {
                     path,
                     summary,
+                    report,
                     dataset,
                     ..
                 } => Status::Loaded {
                     path,
                     summary,
+                    report,
                     dataset,
                 },
                 IndexingMessage::Failed { path, message, .. } => Status::Failed { path, message },
@@ -170,16 +173,16 @@ impl eframe::App for GlydeApp {
             Status::Loaded {
                 path,
                 summary,
+                report,
                 dataset,
             } => {
                 ui.heading(path.display().to_string());
-                ui.horizontal(|ui| {
-                    ui.label(format!("{} rows", summary.row_count));
-                    if summary.skipped_row_count > 0 {
-                        ui.label(format!("{} rows skipped", summary.skipped_row_count));
-                    }
-                    ui.label(format!("sampling: {:?}", summary.sampling_class));
-                });
+                // SPEC §1.2 mandatory UX / docs/ROADMAP.md M4 "InferenceReport
+                // surfaced to the UI".
+                inference_bar::show(ui, report);
+                if summary.skipped_row_count > 0 {
+                    ui.label(format!("{} rows skipped", summary.skipped_row_count));
+                }
                 // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1".
                 views::time::show(ui, dataset);
             }
@@ -196,7 +199,7 @@ impl eframe::App for GlydeApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glyde_core::ingest::{SamplingClass, TimeAxis};
+    use glyde_core::ingest::{Confidence, InferredField, SamplingClass, TimeAxis};
     use glyde_core::series::{Series, SeriesValues};
     use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
 
@@ -213,6 +216,33 @@ mod tests {
             gap_count: 0,
             non_monotonic_count: 0,
             duplicate_timestamp_count: 0,
+        })
+    }
+
+    fn sample_report() -> Box<InferenceReport> {
+        Box::new(InferenceReport {
+            encoding: InferredField {
+                value: "utf-8".to_string(),
+                confidence: Confidence::High,
+            },
+            delimiter: InferredField {
+                value: Some(",".to_string()),
+                confidence: Confidence::High,
+            },
+            decimal_separator: InferredField {
+                value: Some(".".to_string()),
+                confidence: Confidence::High,
+            },
+            time_column: InferredField {
+                value: Some("timestamp".to_string()),
+                confidence: Confidence::High,
+            },
+            timestamp_format: InferredField {
+                value: Some("iso8601".to_string()),
+                confidence: Confidence::High,
+            },
+            sample_count: 1,
+            sampling_class: SamplingClass::Uniform,
         })
     }
 
@@ -245,6 +275,7 @@ mod tests {
                 generation: 1, // file A's generation, superseded by B's (2)
                 path: PathBuf::from("a.csv"),
                 summary: sample_summary(),
+                report: sample_report(),
                 dataset: sample_dataset(),
             })
             .expect("channel send");
@@ -272,6 +303,7 @@ mod tests {
                 generation: 1,
                 path: path.clone(),
                 summary: sample_summary(),
+                report: sample_report(),
                 dataset: sample_dataset(),
             })
             .expect("channel send");

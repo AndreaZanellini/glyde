@@ -19,6 +19,7 @@
 
 mod app;
 mod error_boundary;
+mod inference_bar;
 mod logging;
 mod plumbing;
 mod views;
