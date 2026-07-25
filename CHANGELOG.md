@@ -11,6 +11,21 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Internal only, no visible app behavior change yet: Glyde now computes a RAM
+  budget from the machine's total memory at the point it's asked for (`min(25%
+  of system RAM, 4 GB)`, `docs/SPEC.md` §5's "Peak RSS" cap), and offers a
+  reusable "does this fit?" check ahead of any single action. Nothing in the
+  app calls it yet — the index build and PSD paths that will actually refuse
+  an oversized action and offer an affordable alternative (`docs/SPEC.md`
+  §5.1) are later `docs/ROADMAP.md` M3/M5 items. This lands the foundation
+  those depend on (`docs/ROADMAP.md` M3 "RAM budget module").
+
+  **Assumptions made:**
+  - None beyond what M3's roadmap line already specifies — the `min(25% RAM,
+    4 GB)` formula and "check before acting" behavior are taken verbatim from
+    `docs/SPEC.md` §5/§5.1, not invented.
+
 ### Fixed
 - Opening a delimited-text file (`.csv`/`.tsv`/`.txt`) uses meaningfully
   less memory than before: measured on a synthetic fixture, peak memory use
