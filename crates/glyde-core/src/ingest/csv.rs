@@ -136,7 +136,7 @@ pub struct CsvParseOutcome {
 /// a `panic!`; an empty input is the only rejected input, reported as
 /// [`GlydeError::EmptyFile`].
 pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
-    parse_impl(bytes, Capture::None).map(|(outcome, _)| outcome)
+    parse_impl(bytes, Capture::None, None).map(|(outcome, _)| outcome)
 }
 
 /// Parses `bytes` exactly like [`parse`], additionally capturing every kept
@@ -151,7 +151,7 @@ pub(crate) fn parse_capturing_column(
     bytes: &[u8],
     column_index: usize,
 ) -> Result<(CsvParseOutcome, ColumnText)> {
-    let (outcome, mut columns) = parse_impl(bytes, Capture::Column(column_index))?;
+    let (outcome, mut columns) = parse_impl(bytes, Capture::Column(column_index), None)?;
     Ok((outcome, columns.pop().unwrap_or_default()))
 }
 
@@ -166,8 +166,36 @@ pub(crate) fn parse_capturing_column(
 pub(crate) fn parse_capturing_all_columns(
     bytes: &[u8],
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
-    parse_impl(bytes, Capture::All)
+    parse_impl(bytes, Capture::All, None)
 }
+
+/// [`parse_capturing_all_columns`], additionally invoking `on_chunk` with a
+/// snapshot of the parse-so-far (a [`CsvParseOutcome`] whose `row_count`/
+/// `skipped_row_count` reflect only the rows kept up to that point, and the
+/// matching prefix of each column's captured text) at a geometrically
+/// growing row-count schedule (docs/ROADMAP.md M3 "Background progressive
+/// build emitting partial levels"): first at [`FIRST_PROGRESS_CHECKPOINT_ROWS`]
+/// kept rows, then doubling. Doubling — rather than a fixed interval — bounds
+/// the *total* extra work every checkpoint costs a caller that re-derives a
+/// typed dataset from the snapshot (as [`super::dataset::load_with_outcome_progressive`]
+/// does): re-deriving from scratch at row counts `C, 2C, 4C, ...` costs
+/// `O(n)` in total (a geometric series), the same asymptotic cost as the
+/// final parse alone, rather than the `O(n²)` a fixed-interval schedule would
+/// cost on a huge file. A file with fewer than
+/// [`FIRST_PROGRESS_CHECKPOINT_ROWS`] kept rows never checkpoints — it is
+/// fast enough end to end that a progress update would have nothing useful
+/// to add.
+pub(crate) fn parse_capturing_all_columns_with_progress(
+    bytes: &[u8],
+    mut on_chunk: impl FnMut(&CsvParseOutcome, &[ColumnText]),
+) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
+    parse_impl(bytes, Capture::All, Some(&mut on_chunk))
+}
+
+/// The first checkpoint [`parse_capturing_all_columns_with_progress`] fires
+/// at, in kept rows (not skipped/ragged ones) — see that function's doc
+/// comment for the doubling schedule this seeds.
+const FIRST_PROGRESS_CHECKPOINT_ROWS: u64 = 20_000;
 
 /// What [`parse_impl`] should hold onto per kept row, alongside the tallies
 /// every capture mode needs regardless.
@@ -181,7 +209,17 @@ enum Capture {
     All,
 }
 
-fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
+/// A progress checkpoint callback (see
+/// [`parse_capturing_all_columns_with_progress`]), named so
+/// [`parse_impl`]/[`maybe_checkpoint`] don't repeat this trait-object type
+/// inline (clippy `type_complexity`).
+type ChunkCallback<'a> = &'a mut dyn FnMut(&CsvParseOutcome, &[ColumnText]);
+
+fn parse_impl(
+    bytes: &[u8],
+    capture: Capture,
+    mut on_chunk: Option<ChunkCallback>,
+) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
     if bytes.is_empty() {
         return Err(GlydeError::EmptyFile);
     }
@@ -218,6 +256,24 @@ fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Co
         skipped_row_count: 0,
     };
 
+    // Built once, only when a checkpoint callback is actually installed: the
+    // fields of `CsvParseOutcome` known before the row loop starts, cloned
+    // fresh into each checkpoint snapshot with that snapshot's own
+    // `row_count`/`skipped_row_count` (see `maybe_checkpoint`).
+    let outcome_template = on_chunk.is_some().then(|| CsvParseOutcome {
+        column_names: header.column_names.clone(),
+        row_count: 0,
+        skipped_row_count: 0,
+        encoding_label: encoding.label(),
+        delimiter,
+        decimal_separator,
+        encoding_confidence,
+        delimiter_confidence,
+        decimal_separator_confidence,
+        header_ambiguous: header.ambiguous,
+    });
+    let mut next_checkpoint_rows = FIRST_PROGRESS_CHECKPOINT_ROWS;
+
     match delimiter.as_csv_byte() {
         Some(byte) => {
             let mut reader = csv::ReaderBuilder::new()
@@ -238,6 +294,12 @@ fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Co
                                 expected_field_count,
                                 &capture,
                                 &mut acc,
+                            );
+                            maybe_checkpoint(
+                                &mut on_chunk,
+                                &outcome_template,
+                                &mut next_checkpoint_rows,
+                                &acc,
                             );
                         }
                         row_index += 1;
@@ -272,6 +334,12 @@ fn parse_impl(bytes: &[u8], capture: Capture) -> Result<(CsvParseOutcome, Vec<Co
                         expected_field_count,
                         &capture,
                         &mut acc,
+                    );
+                    maybe_checkpoint(
+                        &mut on_chunk,
+                        &outcome_template,
+                        &mut next_checkpoint_rows,
+                        &acc,
                     );
                 }
                 row_index += 1;
@@ -352,6 +420,35 @@ fn record_kept_or_ragged<'a>(
     }
 }
 
+/// Fires `on_chunk` with a snapshot of `acc` once `acc.row_count` reaches
+/// `next_checkpoint_rows`, then doubles `next_checkpoint_rows` for the next
+/// call (see [`parse_capturing_all_columns_with_progress`]'s doc comment for
+/// why doubling). A no-op whenever `on_chunk`/`outcome_template` are `None`
+/// (the ordinary, non-progressive parse paths) or the threshold hasn't been
+/// reached yet.
+fn maybe_checkpoint(
+    on_chunk: &mut Option<ChunkCallback>,
+    outcome_template: &Option<CsvParseOutcome>,
+    next_checkpoint_rows: &mut u64,
+    acc: &ParseAccumulator,
+) {
+    let (Some(on_chunk), Some(template)) = (on_chunk.as_deref_mut(), outcome_template.as_ref())
+    else {
+        return;
+    };
+    if acc.row_count < *next_checkpoint_rows {
+        return;
+    }
+
+    let snapshot = CsvParseOutcome {
+        row_count: acc.row_count,
+        skipped_row_count: acc.skipped_row_count,
+        ..template.clone()
+    };
+    on_chunk(&snapshot, &acc.captured);
+    *next_checkpoint_rows = next_checkpoint_rows.saturating_mul(2);
+}
+
 /// Memory-maps `path` and parses it in one streaming pass (ARCH §deps: "CSV
 /// ingestion | `csv` / `csv-core` — streaming, single-pass over a
 /// memory-mapped file"). The mapping only backs the parse; it is dropped
@@ -378,6 +475,16 @@ pub(crate) fn open_path_capturing_all_columns(
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
     let mmap = map_file(path)?;
     parse_capturing_all_columns(&mmap)
+}
+
+/// [`open_path_capturing_all_columns`], additionally checkpointing progress
+/// (see [`parse_capturing_all_columns_with_progress`]).
+pub(crate) fn open_path_capturing_all_columns_with_progress(
+    path: &Path,
+    on_chunk: impl FnMut(&CsvParseOutcome, &[ColumnText]),
+) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
+    let mmap = map_file(path)?;
+    parse_capturing_all_columns_with_progress(&mmap, on_chunk)
 }
 
 /// Memory-maps `path` read-only. The mapping only backs the caller's parse;
@@ -648,5 +755,104 @@ mod tests {
         let outcome = parse(text.as_bytes()).expect("valid UTF-8 must never be rejected");
 
         assert_eq!(outcome.column_names, vec!["value"]);
+    }
+
+    /// A synthetic CSV with more kept rows than [`FIRST_PROGRESS_CHECKPOINT_ROWS`]
+    /// (docs/ROADMAP.md M3 "Background progressive build emitting partial
+    /// levels"), so the doubling schedule fires more than once.
+    fn many_rows_csv(row_count: u64) -> Vec<u8> {
+        let mut text = String::from("timestamp,value\n");
+        for i in 0..row_count {
+            text.push_str(&format!("{i},{}\n", i as f64 * 0.5));
+        }
+        text.into_bytes()
+    }
+
+    #[test]
+    fn progress_checkpoints_follow_the_doubling_schedule_and_report_a_growing_row_count() {
+        let bytes = many_rows_csv(70_000);
+        let mut checkpoints: Vec<u64> = Vec::new();
+
+        let (outcome, _columns) =
+            parse_capturing_all_columns_with_progress(&bytes, |snapshot, _columns| {
+                checkpoints.push(snapshot.row_count);
+            })
+            .expect("many-row CSV must parse");
+
+        assert_eq!(outcome.row_count, 70_000);
+        assert_eq!(
+            checkpoints,
+            vec![
+                FIRST_PROGRESS_CHECKPOINT_ROWS,
+                FIRST_PROGRESS_CHECKPOINT_ROWS * 2
+            ],
+            "checkpoints must fire at 20k then 40k kept rows, not again before 80k \
+             (which the 70k-row fixture never reaches)"
+        );
+    }
+
+    #[test]
+    fn a_file_smaller_than_the_first_checkpoint_never_checkpoints() {
+        let bytes = many_rows_csv(10);
+        let mut checkpoint_count = 0;
+
+        parse_capturing_all_columns_with_progress(&bytes, |_snapshot, _columns| {
+            checkpoint_count += 1;
+        })
+        .expect("small CSV must parse");
+
+        assert_eq!(
+            checkpoint_count, 0,
+            "a file with fewer kept rows than the first checkpoint threshold \
+             finishes before any progress update would be useful"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_snapshot_is_a_true_prefix_of_the_final_parse() {
+        let bytes = many_rows_csv(70_000);
+        let mut first_checkpoint: Option<(CsvParseOutcome, Vec<ColumnText>)> = None;
+
+        let (final_outcome, final_columns) =
+            parse_capturing_all_columns_with_progress(&bytes, |snapshot, columns| {
+                if first_checkpoint.is_none() {
+                    first_checkpoint = Some((snapshot.clone(), columns.to_vec()));
+                }
+            })
+            .expect("many-row CSV must parse");
+
+        let (checkpoint_outcome, checkpoint_columns) =
+            first_checkpoint.expect("at least one checkpoint must have fired");
+
+        assert_eq!(checkpoint_outcome.row_count, FIRST_PROGRESS_CHECKPOINT_ROWS);
+        assert_eq!(checkpoint_outcome.column_names, final_outcome.column_names);
+        assert_eq!(checkpoint_outcome.delimiter, final_outcome.delimiter);
+
+        // Every field captured so far must equal the same-index field in the
+        // final, complete columns — a checkpoint is a true prefix, never a
+        // resampled or otherwise different reading of the same rows.
+        for (checkpoint_column, final_column) in checkpoint_columns.iter().zip(&final_columns) {
+            assert_eq!(checkpoint_column.len() as u64, checkpoint_outcome.row_count);
+            for i in 0..checkpoint_column.len() {
+                assert_eq!(checkpoint_column.get(i), final_column.get(i));
+            }
+        }
+    }
+
+    #[test]
+    fn progress_checkpoints_do_not_change_the_final_parse_result() {
+        let bytes = many_rows_csv(70_000);
+
+        let (outcome_without_progress, columns_without_progress) =
+            parse_capturing_all_columns(&bytes).expect("parse without progress");
+        let (outcome_with_progress, columns_with_progress) =
+            parse_capturing_all_columns_with_progress(&bytes, |_snapshot, _columns| {})
+                .expect("parse with progress");
+
+        assert_eq!(outcome_without_progress, outcome_with_progress);
+        assert_eq!(columns_without_progress.len(), columns_with_progress.len());
+        for (a, b) in columns_without_progress.iter().zip(&columns_with_progress) {
+            assert_eq!(a.iter().collect::<Vec<_>>(), b.iter().collect::<Vec<_>>());
+        }
     }
 }

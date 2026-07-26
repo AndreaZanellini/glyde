@@ -27,16 +27,19 @@
 //! state when it eventually arrives late — the generation is how the caller
 //! tells a current message from a stale, superseded one.
 //!
-//! This is deliberately the M2 "single egui window" / "Time-domain view v1"
-//! slice, not the M3 index pyramid: [`spawn_index_job`] wires up the channel
-//! plumbing and reuses [`glyde_core::ingest::open_dataset`] (built on the
-//! same inference pipeline the torture-corpus gate exercises through
-//! `inspect`) to get both the summary and the actual samples the
-//! time-domain view plots from a single parse of the file (issue #58 —
-//! this used to be two independent calls, `inspect` then `load`, each
-//! re-reading and re-decoding the whole file). Streaming a full pyramid
-//! build in the background, instead of loading the whole file at once, is
-//! M3's job.
+//! This started as the M2 "single egui window" / "Time-domain view v1"
+//! slice: [`spawn_index_job`] wires up the channel plumbing and reuses
+//! [`glyde_core::ingest::open_dataset`] (built on the same inference
+//! pipeline the torture-corpus gate exercises through `inspect`) to get both
+//! the summary and the actual samples the time-domain view plots from a
+//! single parse of the file (issue #58 — this used to be two independent
+//! calls, `inspect` then `load`, each re-reading and re-decoding the whole
+//! file). [`run_index_job`] now calls
+//! [`glyde_core::ingest::open_dataset_progressive`] instead, so a large
+//! file's plot fills in while indexing continues rather than staying a bare
+//! spinner until the whole file has been read (docs/ROADMAP.md M3
+//! "Background progressive build emitting partial levels", SPEC §5 "first
+//! meaningful plot ... ≤ 2s").
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -52,6 +55,18 @@ use glyde_core::ingest::{Dataset, InferenceReport, OpenSummary};
 pub enum IndexingMessage {
     /// The indexer thread started work on `path`.
     Started { generation: u64, path: PathBuf },
+    /// A background progress checkpoint (docs/ROADMAP.md M3 "Background
+    /// progressive build emitting partial levels"): `dataset` is every
+    /// sample read so far, renderable exactly like a [`Self::Completed`]
+    /// dataset, just with fewer rows — `views::time::show` needs no special
+    /// case for a partial dataset. `rows_read` is how many rows are reflected
+    /// in it, for a "N rows so far" progress readout.
+    Progress {
+        generation: u64,
+        path: PathBuf,
+        dataset: Box<Dataset>,
+        rows_read: u64,
+    },
     /// `path` opened successfully; `summary` is what was inferred, `report`
     /// is the same inference surfaced as SPEC §1.2's mandatory UX fields
     /// (docs/ROADMAP.md M4), and `dataset` is every sample, ready for
@@ -77,6 +92,7 @@ impl IndexingMessage {
     pub fn generation(&self) -> u64 {
         match self {
             IndexingMessage::Started { generation, .. }
+            | IndexingMessage::Progress { generation, .. }
             | IndexingMessage::Completed { generation, .. }
             | IndexingMessage::Failed { generation, .. } => *generation,
         }
@@ -142,7 +158,19 @@ fn run_index_job(generation: u64, path: PathBuf, tx: &Sender<IndexingMessage>) {
     // progressive-index column whose fields aren't actually numeric,
     // `GlydeError::NonNumericTimeIndex`) still has nothing to show, so it is
     // reported as a failed open rather than a summary with no plot.
-    match glyde_core::ingest::open_dataset(&path) {
+    //
+    // docs/ROADMAP.md M3 "Background progressive build emitting partial
+    // levels": every checkpoint along the way is forwarded as its own
+    // `Progress` message, so the UI thread can render a growing plot instead
+    // of only a spinner while a large file is still being read.
+    match glyde_core::ingest::open_dataset_progressive(&path, |checkpoint| {
+        let _ = tx.send(IndexingMessage::Progress {
+            generation,
+            path: path.clone(),
+            dataset: Box::new(checkpoint.dataset),
+            rows_read: checkpoint.rows_read,
+        });
+    }) {
         Ok((summary, report, dataset)) => {
             tracing::info!(
                 path = %path.display(),
@@ -222,6 +250,69 @@ mod tests {
         }
     }
 
+    /// docs/ROADMAP.md M3 "Background progressive build emitting partial
+    /// levels": a file large enough to cross `glyde_core::ingest`'s first
+    /// progress checkpoint must report one or more `Progress` messages,
+    /// each with a growing, real, renderable dataset — between `Started`
+    /// and `Completed`, tagged with the same generation as both.
+    #[test]
+    fn spawn_index_job_reports_progress_for_a_large_csv() {
+        // `Registry::find` recognizes files by extension (docs/ARCHITECTURE.md
+        // §Two classes of inference), so the fixture needs a real `.csv` name
+        // rather than `NamedTempFile`'s default extensionless one.
+        let mut file = tempfile::Builder::new()
+            .suffix(".csv")
+            .tempfile()
+            .expect("create temp file");
+        let mut text = String::from("index,value\n");
+        for i in 0..70_000u64 {
+            text.push_str(&format!("{i},{}\n", i as f64 * 0.5));
+        }
+        std::io::Write::write_all(&mut file, text.as_bytes()).expect("write temp file");
+        let path = file.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+
+        spawn_index_job(3, path.clone(), tx);
+
+        let _started = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected a Started message");
+
+        let mut progress_rows_read: Vec<u64> = Vec::new();
+        loop {
+            match rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("expected a Progress or Completed message")
+            {
+                IndexingMessage::Progress {
+                    generation,
+                    path: progress_path,
+                    dataset,
+                    rows_read,
+                } => {
+                    assert_eq!(generation, 3);
+                    assert_eq!(progress_path, path);
+                    assert_eq!(dataset.time.len(), rows_read as usize);
+                    progress_rows_read.push(rows_read);
+                }
+                IndexingMessage::Completed { generation, .. } => {
+                    assert_eq!(generation, 3);
+                    break;
+                }
+                other => panic!("expected Progress or Completed, got {other:?}"),
+            }
+        }
+
+        assert!(
+            !progress_rows_read.is_empty(),
+            "a 70k-row file must cross at least one progress checkpoint"
+        );
+        assert!(
+            progress_rows_read.windows(2).all(|pair| pair[0] < pair[1]),
+            "rows_read must strictly increase across checkpoints: {progress_rows_read:?}"
+        );
+    }
+
     /// A path with no registered reader (docs/ARCHITECTURE.md §Two classes
     /// of inference — format recognition is stable, checked up front) must
     /// report `Failed`, never panic the indexer thread.
@@ -290,6 +381,19 @@ mod tests {
             }
             .generation(),
             3
+        );
+        assert_eq!(
+            IndexingMessage::Progress {
+                generation: 5,
+                path: path.clone(),
+                dataset: Box::new(
+                    glyde_core::ingest::load(&corpus_path("case-01-comma-clean.csv"))
+                        .expect("corpus case 1 must load")
+                ),
+                rows_read: 6,
+            }
+            .generation(),
+            5
         );
         assert_eq!(
             IndexingMessage::Failed {

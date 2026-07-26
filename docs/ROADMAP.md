@@ -95,7 +95,7 @@ them, so CI stays green while honoring "written first."
 ## M3 — Index pyramid + large files (fluid navigation, the performance contract)
 
 - [x] Min/max pyramid: level-k `(min, max, first_ts, last_ts, nan_count)`, factor-8 buckets, level *k+1* exactly from level *k* → ARCH §Index, SPEC §3.1 · proven by: decimation golden — pyramid consistency + envelope exactness (un-ignore)
-- [ ] Background progressive build emitting partial levels → first meaningful plot ≤ 2 s while indexing continues → SPEC §5 (first-plot), ARCH §pipeline · proven by: first-plot bench + manual
+- [x] Background progressive build emitting partial levels → first meaningful plot ≤ 2 s while indexing continues → SPEC §5 (first-plot), ARCH §pipeline · proven by: first-plot bench + manual
 - [x] Decimation query `viewport(range, pixels) → min/max per column`; raw samples + point markers when samples < pixels; convergence to true samples → SPEC §3.1 · proven by: decimation golden — spike, convergence, no-alias (un-ignore)
 - [x] Level-0 typed spill cache to OS cache dir keyed by path + size + mtime; reopen is instant → ARCH §Index (issue #59), SPEC §5.1 · proven by: `index::level0` round-trip/reopen unit tests + level0/decimation integration test
 - [ ] Pyramid *level* spill (only Level 0 is spilled so far; reopening rebuilds the pyramid from cached Level 0 rather than loading it too) → ARCH §Index · proven by: spill round-trip unit test + manual reopen

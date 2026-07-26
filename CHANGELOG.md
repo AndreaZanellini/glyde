@@ -12,6 +12,42 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Opening a large file now shows a growing plot within a couple of seconds
+  instead of a bare spinner for the whole open: the background indexer reads
+  the file in progressively larger chunks and sends each chunk's data to the
+  window as soon as it's ready, so the plot fills in — more rows, further out
+  on the time axis — while the rest of the file keeps loading in the
+  background. Nothing about the final result changes; this only affects how
+  quickly *something* appears on screen for a file too big to open instantly.
+  Small files (a few tens of thousands of rows or fewer) open exactly as
+  before — they finish before the first progress update would even fire.
+  (`docs/ROADMAP.md` M3 "Background progressive build emitting partial
+  levels".)
+
+  **Assumptions made:** the background build also computes each chunk's own
+  min/max index ("pyramid") over the rows read so far, matching what the
+  final, complete file's index would show for that same prefix — this is
+  tested in `glyde-core`, but the on-screen plot itself still draws every raw
+  point directly (as it has since M2) rather than the aggregated index, since
+  no roadmap item yet asks the time view to switch to index-based rendering.
+  Progress checkpoints are spaced at a doubling row-count schedule (20,000,
+  40,000, 80,000, ...) rather than a fixed interval or a wall-clock timer, so
+  that re-deriving each checkpoint's data never costs more in total than
+  reading the file once — this keeps the ≤30s/10GB full-build budget intact
+  even on a file with many checkpoints.
+
+  This is also the first code path that runs real ingested integer columns
+  through the min/max pyramid, which surfaced a pre-existing gap (review
+  finding on this PR): a whole-number column value larger than about 9
+  quadrillion (2⁵³, `f64`'s exact-integer limit) loses precision when
+  converted for the pyramid, the same way it already silently does for the
+  on-screen plot line (SPEC §1.4's mandatory flagging for this case,
+  `docs/ROADMAP.md` M8, was never implemented for either). This PR adds a
+  `warn`-level log line when that happens, so the loss is at least visible
+  in the log file even though the inference-bar warning M8 also promises
+  still doesn't exist — flagging this now rather than letting a second
+  silent call site accumulate on top of the first.
+
 - Resolves the `blocking-decision` issue (#61) on the CI "Performance gates"
   job, which previously passed unconditionally: `generate_fixtures` and
   `memory_gate` are real now (a synthetic CSV fixture writer and a headless

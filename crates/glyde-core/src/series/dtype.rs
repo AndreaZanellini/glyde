@@ -91,6 +91,28 @@ fn all_equal_bits<T: Copy, B: PartialEq>(values: &[T], bits: impl Fn(T) -> B) ->
     values.windows(2).all(|pair| bits(pair[0]) == bits(pair[1]))
 }
 
+/// The largest integer magnitude an `f64` represents exactly: 2^53, the
+/// width of its mantissa plus the implicit leading bit (SPEC §1.4,
+/// docs/ROADMAP.md M8).
+const MAX_EXACT_F64_MAGNITUDE: u128 = 1u128 << 53;
+
+/// Logs (at `warn`) when `magnitude` — an `i64`/`u64` value's absolute
+/// value, widened to `u128` so both signed and unsigned callers share one
+/// comparison with no risk of overflow — exceeds what `f64` can represent
+/// exactly (see [`SeriesValues::to_f64_vec`]'s doc comment). `original` is
+/// the source value, reported so the log line names the actual reading that
+/// lost precision, not just the fact that some value did.
+fn warn_if_precision_loss(magnitude: u128, original: impl std::fmt::Display) {
+    if magnitude > MAX_EXACT_F64_MAGNITUDE {
+        tracing::warn!(
+            value = %original,
+            "integer value exceeds f64's exact range (±2^53); converting to f64 \
+             for plotting/pyramid building loses precision (SPEC §1.4, \
+             docs/ROADMAP.md M8 owns surfacing this in the inference bar too)"
+        );
+    }
+}
+
 impl SeriesValues {
     /// The [`Dtype`] this variant represents.
     pub fn dtype(&self) -> Dtype {
@@ -130,6 +152,53 @@ impl SeriesValues {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Every sample promoted to `f64` (`None` for `Bool`/`String` — the two
+    /// dtypes that route to the state timeline, not a numeric plot or
+    /// pyramid), for feeding [`crate::dsp::decimation::build_pyramid`]
+    /// (docs/ROADMAP.md M3 "Background progressive build emitting partial
+    /// levels") without every call site re-deriving the same dtype match.
+    ///
+    /// `i8`/`i16`/`i32`/`u8`/`u16`/`u32`/`f32` always convert losslessly —
+    /// none of their ranges exceed `f64`'s 53-bit exact-integer mantissa. An
+    /// `i64`/`u64` magnitude beyond [`MAX_EXACT_F64_MAGNITUDE`] does not
+    /// convert losslessly; SPEC §1.4 requires that to be "flagged in the log
+    /// and in the inference bar" — this only does the log half
+    /// ([`docs/ROADMAP.md`] M8 owns the inference-bar surfacing this
+    /// pyramid/plotting path shares with `glyde-app`'s existing
+    /// `views::time::value_as_f64`, which has carried the same gap since
+    /// M2). Never silently dropping the `warn` here, even though the UI half
+    /// is still pending, is the "flag what was inferred, make it visible"
+    /// half of Golden Rule 2 this module can do on its own.
+    pub fn to_f64_vec(&self) -> Option<Vec<f64>> {
+        match self {
+            SeriesValues::I8(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::I16(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::I32(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::I64(v) => Some(
+                v.iter()
+                    .map(|&n| {
+                        warn_if_precision_loss(n.unsigned_abs() as u128, n);
+                        n as f64
+                    })
+                    .collect(),
+            ),
+            SeriesValues::U8(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::U16(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::U32(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::U64(v) => Some(
+                v.iter()
+                    .map(|&n| {
+                        warn_if_precision_loss(n as u128, n);
+                        n as f64
+                    })
+                    .collect(),
+            ),
+            SeriesValues::F32(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::F64(v) => Some(v.clone()),
+            SeriesValues::Bool(_) | SeriesValues::String(_) => None,
+        }
     }
 
     /// SPEC §1.4: "Constant or single-sample series are valid inputs and
@@ -219,5 +288,65 @@ mod tests {
     fn is_constant_treats_identically_bit_patterned_nan_as_equal() {
         let nan = f64::NAN;
         assert!(SeriesValues::F64(vec![nan, nan, nan]).is_constant());
+    }
+
+    #[test]
+    fn to_f64_vec_promotes_every_numeric_dtype_losslessly() {
+        assert_eq!(
+            SeriesValues::I64(vec![-1, 0, 42]).to_f64_vec(),
+            Some(vec![-1.0, 0.0, 42.0])
+        );
+        assert_eq!(
+            SeriesValues::U8(vec![0, 255]).to_f64_vec(),
+            Some(vec![0.0, 255.0])
+        );
+        assert_eq!(
+            SeriesValues::F32(vec![1.5]).to_f64_vec(),
+            Some(vec![1.5_f32 as f64])
+        );
+        assert_eq!(
+            SeriesValues::F64(vec![1.5, 2.5]).to_f64_vec(),
+            Some(vec![1.5, 2.5])
+        );
+    }
+
+    #[test]
+    fn to_f64_vec_is_none_for_bool_and_string() {
+        assert_eq!(SeriesValues::Bool(vec![true]).to_f64_vec(), None);
+        assert_eq!(
+            SeriesValues::String(vec!["on".to_string()]).to_f64_vec(),
+            None
+        );
+    }
+
+    // SPEC §1.4 / docs/ROADMAP.md M8: an i64/u64 magnitude beyond f64's
+    // exact-integer range (2^53) must still convert (never panic) — the
+    // value it produces is unchanged from before `warn_if_precision_loss`
+    // existed, only a `warn` log is now emitted alongside it.
+    #[test]
+    fn to_f64_vec_of_i64_beyond_the_exact_range_still_converts_without_panicking() {
+        let huge = (1i64 << 53) + 1;
+        let result = SeriesValues::I64(vec![huge, -huge])
+            .to_f64_vec()
+            .expect("i64 must convert");
+        assert_eq!(result, vec![huge as f64, -huge as f64]);
+    }
+
+    #[test]
+    fn to_f64_vec_of_u64_beyond_the_exact_range_still_converts_without_panicking() {
+        let huge = (1u64 << 53) + 1;
+        let result = SeriesValues::U64(vec![huge])
+            .to_f64_vec()
+            .expect("u64 must convert");
+        assert_eq!(result, vec![huge as f64]);
+    }
+
+    #[test]
+    fn to_f64_vec_of_i64_at_or_within_the_exact_range_is_unaffected() {
+        let boundary = 1i64 << 53;
+        let result = SeriesValues::I64(vec![boundary, -boundary])
+            .to_f64_vec()
+            .expect("i64 must convert");
+        assert_eq!(result, vec![boundary as f64, -boundary as f64]);
     }
 }

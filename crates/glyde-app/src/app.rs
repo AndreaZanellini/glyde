@@ -33,12 +33,25 @@ use glyde_core::ingest::{Dataset, InferenceReport, OpenSummary};
 use crate::plumbing::{spawn_index_job, spawn_open_dialog, IndexingMessage};
 use crate::{inference_bar, views};
 
+/// The most recent background progress checkpoint for a file still being
+/// indexed (docs/ROADMAP.md M3 "Background progressive build emitting
+/// partial levels"): a real, renderable [`Dataset`] with fewer rows than the
+/// final one, plus how many rows it reflects.
+struct PartialLoad {
+    dataset: Box<Dataset>,
+    rows_read: u64,
+}
+
 /// What the central panel currently shows, driven by [`IndexingMessage`]s
 /// polled from the background indexer thread.
 enum Status {
     Idle,
     Loading {
         path: PathBuf,
+        /// `Some` once at least one [`IndexingMessage::Progress`] has
+        /// arrived for the current open — SPEC §5 "first meaningful plot ...
+        /// render what is indexed, keep indexing in background".
+        partial: Option<PartialLoad>,
     },
     Loaded {
         path: PathBuf,
@@ -86,7 +99,10 @@ impl GlydeApp {
     fn open(&mut self, path: PathBuf) {
         tracing::info!(path = %path.display(), "user requested to open file");
         self.generation += 1;
-        self.status = Status::Loading { path: path.clone() };
+        self.status = Status::Loading {
+            path: path.clone(),
+            partial: None,
+        };
         spawn_index_job(self.generation, path, self.tx.clone());
     }
 
@@ -107,7 +123,19 @@ impl GlydeApp {
                 continue;
             }
             self.status = match message {
-                IndexingMessage::Started { path, .. } => Status::Loading { path },
+                IndexingMessage::Started { path, .. } => Status::Loading {
+                    path,
+                    partial: None,
+                },
+                IndexingMessage::Progress {
+                    path,
+                    dataset,
+                    rows_read,
+                    ..
+                } => Status::Loading {
+                    path,
+                    partial: Some(PartialLoad { dataset, rows_read }),
+                },
                 IndexingMessage::Completed {
                     path,
                     summary,
@@ -161,11 +189,31 @@ impl eframe::App for GlydeApp {
                     ui.label("Drop a file here, or use File → Open");
                 });
             }
-            Status::Loading { path } => {
-                ui.centered_and_justified(|ui| {
-                    ui.spinner();
-                    ui.label(format!("Opening {}…", path.display()));
-                });
+            Status::Loading { path, partial } => {
+                match partial {
+                    // SPEC §5 "first meaningful plot ... render what is
+                    // indexed, keep indexing in background": a background
+                    // progress checkpoint has already arrived, so render its
+                    // dataset like a normal (if still-growing) plot instead
+                    // of a bare spinner.
+                    Some(partial) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!(
+                                "Indexing {}… {} rows so far",
+                                path.display(),
+                                partial.rows_read
+                            ));
+                        });
+                        views::time::show(ui, &partial.dataset);
+                    }
+                    None => {
+                        ui.centered_and_justified(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Opening {}…", path.display()));
+                        });
+                    }
+                }
                 // Nothing else drives repaint while waiting on the indexer
                 // thread's channel message, so poll for it explicitly.
                 ctx.request_repaint_after(Duration::from_millis(50));
@@ -268,6 +316,7 @@ mod tests {
         app.generation = 2;
         app.status = Status::Loading {
             path: path_b.clone(),
+            partial: None,
         };
 
         app.tx
@@ -283,10 +332,77 @@ mod tests {
         app.drain_indexing_messages();
 
         match &app.status {
-            Status::Loading { path } => assert_eq!(path, &path_b),
+            Status::Loading { path, .. } => assert_eq!(path, &path_b),
             _ => {
                 panic!("a message from a superseded generation must not change the current status")
             }
+        }
+    }
+
+    /// docs/ROADMAP.md M3 "Background progressive build emitting partial
+    /// levels": a `Progress` message tagged with the current generation must
+    /// switch the status to `Loading` with a partial dataset attached, so the
+    /// UI can render a growing plot instead of only a spinner.
+    #[test]
+    fn a_progress_message_attaches_a_partial_dataset_to_the_loading_status() {
+        let mut app = GlydeApp::new();
+        app.generation = 1;
+        let path = PathBuf::from("a.csv");
+
+        app.tx
+            .send(IndexingMessage::Progress {
+                generation: 1,
+                path: path.clone(),
+                dataset: sample_dataset(),
+                rows_read: 1,
+            })
+            .expect("channel send");
+
+        app.drain_indexing_messages();
+
+        match &app.status {
+            Status::Loading {
+                path: loading_path,
+                partial: Some(partial),
+            } => {
+                assert_eq!(loading_path, &path);
+                assert_eq!(partial.rows_read, 1);
+            }
+            _ => panic!("expected a Loading status with a partial dataset attached"),
+        }
+    }
+
+    /// The same generation guard that protects `Completed` must protect
+    /// `Progress`: a checkpoint from a superseded open must not resurrect a
+    /// stale partial dataset over whatever the current open has already
+    /// shown.
+    #[test]
+    fn a_stale_progress_message_does_not_overwrite_the_current_status() {
+        let mut app = GlydeApp::new();
+        let path_b = PathBuf::from("b.csv");
+        app.generation = 2;
+        app.status = Status::Loading {
+            path: path_b.clone(),
+            partial: None,
+        };
+
+        app.tx
+            .send(IndexingMessage::Progress {
+                generation: 1,
+                path: PathBuf::from("a.csv"),
+                dataset: sample_dataset(),
+                rows_read: 1,
+            })
+            .expect("channel send");
+
+        app.drain_indexing_messages();
+
+        match &app.status {
+            Status::Loading { path, partial } => {
+                assert_eq!(path, &path_b);
+                assert!(partial.is_none());
+            }
+            _ => panic!("a stale Progress message must not change the current status"),
         }
     }
 

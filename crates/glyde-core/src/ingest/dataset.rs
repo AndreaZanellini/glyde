@@ -27,8 +27,12 @@
 //! that is docs/ROADMAP.md M3's job (see [`super::csv::CsvParseOutcome`]'s
 //! own doc comment, which flags the same deferral for row data in general).
 
-use super::csv::{open_path_capturing_all_columns, CsvParseOutcome};
+use super::csv::{
+    open_path_capturing_all_columns, open_path_capturing_all_columns_with_progress, ColumnText,
+    CsvParseOutcome,
+};
 use super::infer::{infer_column, normalize_decimal_field};
+use crate::dsp::decimation::{build_pyramid, Bucket};
 use crate::series::Series;
 use crate::time::{infer_timestamp_format, parse_timestamp, Timestamp, TimestampFormat};
 use crate::{GlydeError, Result};
@@ -156,15 +160,28 @@ pub fn load(path: &Path) -> Result<Dataset> {
 /// independent ones (issue #58: the app used to call `inspect()` and
 /// `load()` back to back, each re-reading and re-decoding the whole file).
 pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset, bool)> {
-    let (outcome, mut columns_text) = open_path_capturing_all_columns(path)?;
+    let (outcome, columns_text) = open_path_capturing_all_columns(path)?;
+    let (dataset, timestamp_format_ambiguous) = build_dataset(&outcome, &columns_text)?;
+    Ok((outcome, dataset, timestamp_format_ambiguous))
+}
 
+/// The typed-conversion half of [`load_with_outcome`]: every column's raw
+/// captured text, already fully read by [`super::csv`], into a [`Dataset`].
+/// Split out so [`load_with_outcome_progressive`] can run the exact same
+/// conversion against a growing prefix of `columns_text` at each checkpoint,
+/// rather than a second, drifting implementation of the same logic
+/// (docs/ROADMAP.md M3 "Background progressive build emitting partial
+/// levels").
+fn build_dataset(
+    outcome: &CsvParseOutcome,
+    columns_text: &[ColumnText],
+) -> Result<(Dataset, bool)> {
     if outcome.column_names.len() < 2 {
         return Err(GlydeError::SingleColumnFile);
     }
 
     let time_column_name = outcome.column_names[0].clone();
-    let time_column = columns_text.remove(0);
-    let time_fields: Vec<&str> = time_column.iter().collect();
+    let time_fields: Vec<&str> = columns_text[0].iter().collect();
 
     let (time, timestamp_format_ambiguous) =
         match infer_timestamp_format(&time_fields) {
@@ -201,7 +218,7 @@ pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset
 
     let columns = outcome.column_names[1..]
         .iter()
-        .zip(columns_text)
+        .zip(&columns_text[1..])
         .map(|(name, column_text)| {
             // `normalize_decimal_field` keeps `Cow::Borrowed` when the field
             // needs no rewrite (the common dot-decimal case): `infer_column`
@@ -216,7 +233,6 @@ pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset
         .collect();
 
     Ok((
-        outcome,
         Dataset {
             time,
             time_column_name,
@@ -224,6 +240,91 @@ pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset
         },
         timestamp_format_ambiguous,
     ))
+}
+
+/// One progress update from [`load_with_outcome_progressive`]: a real
+/// [`Dataset`] built from the rows read so far, plus that dataset's own
+/// min/max pyramid for every numeric column (docs/ROADMAP.md M3 "Background
+/// progressive build emitting partial levels", docs/ARCHITECTURE.md
+/// §pipeline: "first level ready → first plot"). `pyramids` is parallel to
+/// `dataset.columns` — `None` at an index whose column is `Bool`/`String`
+/// (state-timeline dtypes have no numeric pyramid, SPEC §4.3), `Some` for
+/// every numeric one, built by the same golden-tested
+/// [`build_pyramid`](crate::dsp::decimation::build_pyramid) the final,
+/// complete dataset would use — a checkpoint's pyramid is a real, exact
+/// pyramid over the samples read so far, never an approximation.
+pub struct Checkpoint {
+    pub dataset: Dataset,
+    pub pyramids: Vec<Option<Vec<Vec<Bucket>>>>,
+    pub rows_read: u64,
+}
+
+/// [`load_with_outcome`], additionally invoking `on_checkpoint` with a
+/// [`Checkpoint`] at each progress update `super::csv`'s row-count-doubling
+/// schedule fires (docs/ROADMAP.md M3 "Background progressive build emitting
+/// partial levels", SPEC §5 "first meaningful plot ... ≤ 2s ... render what
+/// is indexed, keep indexing in background"). Every checkpoint is a real
+/// [`Dataset`] built by the same [`build_dataset`] conversion the final
+/// result uses — never a resampled or approximated preview — so a caller can
+/// render it exactly like a completed open, just with fewer rows.
+///
+/// A checkpoint whose prefix does not itself build into a valid `Dataset`
+/// (e.g. too few progressive-index rows parsed as `f64` for
+/// [`infer_timestamp_format`] to have committed to an absolute format yet) is
+/// not treated as a hard error — only the final, complete parse's result is
+/// ever returned as one; a transient mid-stream checkpoint failure just skips
+/// that one progress update, logged at `warn` (docs/CLAUDE.md "never `panic!`
+/// on malformed user data", applied here to a checkpoint's own internal
+/// consistency rather than the source file).
+pub(crate) fn load_with_outcome_progressive(
+    path: &Path,
+    mut on_checkpoint: impl FnMut(Checkpoint),
+) -> Result<(CsvParseOutcome, Dataset, bool)> {
+    let (outcome, columns_text) = open_path_capturing_all_columns_with_progress(
+        path,
+        |partial_outcome, partial_columns| match build_dataset(partial_outcome, partial_columns) {
+            Ok((dataset, _ambiguous)) => {
+                let pyramids = pyramids_for(&dataset);
+                on_checkpoint(Checkpoint {
+                    rows_read: partial_outcome.row_count,
+                    pyramids,
+                    dataset,
+                });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    rows_read = partial_outcome.row_count,
+                    "progressive checkpoint could not be materialized as a dataset yet, skipping this progress update"
+                );
+            }
+        },
+    )?;
+
+    let (dataset, timestamp_format_ambiguous) = build_dataset(&outcome, &columns_text)?;
+    Ok((outcome, dataset, timestamp_format_ambiguous))
+}
+
+/// [`load`], additionally reporting progress like [`load_with_outcome_progressive`].
+pub fn load_progressive(path: &Path, on_checkpoint: impl FnMut(Checkpoint)) -> Result<Dataset> {
+    load_with_outcome_progressive(path, on_checkpoint)
+        .map(|(_outcome, dataset, _ambiguous)| dataset)
+}
+
+/// `dataset`'s own min/max pyramid, one entry per column in `dataset.columns`
+/// order (see [`Checkpoint::pyramids`]).
+fn pyramids_for(dataset: &Dataset) -> Vec<Option<Vec<Vec<Bucket>>>> {
+    let ticks = dataset.time.to_pyramid_ticks();
+    dataset
+        .columns
+        .iter()
+        .map(|series| {
+            series
+                .values()
+                .to_f64_vec()
+                .map(|samples| build_pyramid(&samples, &ticks))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -416,5 +517,133 @@ mod tests {
             .expect_err("a missing file must be a reported error");
 
         assert!(matches!(err, GlydeError::Io { .. }));
+    }
+
+    /// A synthetic progressive-index CSV large enough to cross
+    /// `super::csv`'s first progress checkpoint at least once.
+    fn many_rows_temp_csv(row_count: u64) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        let mut text = String::from("index,value\n");
+        for i in 0..row_count {
+            text.push_str(&format!("{i},{}\n", i as f64 * 0.5));
+        }
+        std::io::Write::write_all(&mut file, text.as_bytes()).expect("write temp file");
+        file
+    }
+
+    // docs/ROADMAP.md M3 "Background progressive build emitting partial
+    // levels": every checkpoint's dataset must be a true prefix of the final
+    // dataset — same values, just fewer rows — and the final result returned
+    // by `load_with_outcome_progressive` must equal plain `load_with_outcome`
+    // on the same file (progress reporting must never change the outcome).
+    #[test]
+    fn load_with_outcome_progressive_checkpoints_are_true_prefixes_of_the_final_dataset() {
+        let file = many_rows_temp_csv(70_000);
+        let mut checkpoints: Vec<Checkpoint> = Vec::new();
+
+        let (_outcome, final_dataset, _ambiguous) =
+            load_with_outcome_progressive(file.path(), |checkpoint| checkpoints.push(checkpoint))
+                .expect("progressive load must succeed");
+        let (_outcome2, expected_dataset, _ambiguous2) =
+            load_with_outcome(file.path()).expect("non-progressive load must succeed");
+
+        assert_eq!(
+            final_dataset, expected_dataset,
+            "progress reporting must not change the final dataset"
+        );
+        assert!(
+            checkpoints.len() >= 2,
+            "a 70k-row fixture must cross the first two checkpoints (20k, 40k)"
+        );
+
+        for checkpoint in &checkpoints {
+            assert_eq!(checkpoint.dataset.time.len(), checkpoint.rows_read as usize);
+            assert_eq!(
+                checkpoint.dataset.time,
+                {
+                    let TimeAxis::Progressive { values } = &final_dataset.time else {
+                        panic!("expected a progressive index");
+                    };
+                    TimeAxis::Progressive {
+                        values: values[..checkpoint.rows_read as usize].to_vec(),
+                    }
+                },
+                "a checkpoint's time axis must be an exact prefix of the final one"
+            );
+            assert_eq!(
+                checkpoint.dataset.columns.len(),
+                final_dataset.columns.len()
+            );
+            for (checkpoint_col, final_col) in checkpoint
+                .dataset
+                .columns
+                .iter()
+                .zip(&final_dataset.columns)
+            {
+                let SeriesValues::F64(checkpoint_values) = checkpoint_col.values() else {
+                    panic!("expected f64 columns");
+                };
+                let SeriesValues::F64(final_values) = final_col.values() else {
+                    panic!("expected f64 columns");
+                };
+                assert_eq!(checkpoint_values, &final_values[..checkpoint_values.len()]);
+            }
+        }
+    }
+
+    // The pyramid attached to each checkpoint must be exactly what
+    // `build_pyramid` would compute directly over that checkpoint's own
+    // samples — a real, exact aggregation of the rows read so far, not an
+    // approximation (docs/ROADMAP.md M3 "emitting partial levels").
+    #[test]
+    fn load_with_outcome_progressive_checkpoint_pyramids_match_build_pyramid_on_the_same_prefix() {
+        let file = many_rows_temp_csv(70_000);
+        let mut checkpoints: Vec<Checkpoint> = Vec::new();
+
+        load_with_outcome_progressive(file.path(), |checkpoint| checkpoints.push(checkpoint))
+            .expect("progressive load must succeed");
+
+        assert!(!checkpoints.is_empty());
+        for checkpoint in &checkpoints {
+            let ticks = checkpoint.dataset.time.to_pyramid_ticks();
+            assert_eq!(checkpoint.pyramids.len(), checkpoint.dataset.columns.len());
+            for (pyramid, column) in checkpoint.pyramids.iter().zip(&checkpoint.dataset.columns) {
+                let samples = column.values().to_f64_vec().expect("numeric column");
+                let expected = crate::dsp::decimation::build_pyramid(&samples, &ticks);
+                assert_eq!(pyramid.as_ref(), Some(&expected));
+            }
+        }
+    }
+
+    // A file too small to ever cross the first checkpoint must still load
+    // correctly via the progressive path, simply never invoking the
+    // callback.
+    #[test]
+    fn load_with_outcome_progressive_never_checkpoints_a_small_file() {
+        let file = many_rows_temp_csv(5);
+        let mut checkpoint_count = 0;
+
+        let (_outcome, dataset, _ambiguous) =
+            load_with_outcome_progressive(file.path(), |_checkpoint| checkpoint_count += 1)
+                .expect("progressive load of a small file must succeed");
+
+        assert_eq!(checkpoint_count, 0);
+        assert_eq!(dataset.time.len(), 5);
+    }
+
+    // `load_progressive` is the public entry point mirroring `load`; proves
+    // it returns the same dataset `load` would for the same file, with
+    // checkpoints observed along the way.
+    #[test]
+    fn load_progressive_agrees_with_load_and_reports_checkpoints() {
+        let file = many_rows_temp_csv(70_000);
+        let mut checkpoint_count = 0;
+
+        let dataset = load_progressive(file.path(), |_checkpoint| checkpoint_count += 1)
+            .expect("load_progressive must succeed");
+        let expected = load(file.path()).expect("load must succeed");
+
+        assert_eq!(dataset, expected);
+        assert!(checkpoint_count >= 1);
     }
 }
