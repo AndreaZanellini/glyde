@@ -18,5 +18,6 @@
 //! #59).
 
 pub mod level0;
+pub mod pyramid;
 
 pub use level0::{CacheKey, Level0Cache, Level0CacheWriter};

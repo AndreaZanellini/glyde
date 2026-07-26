@@ -12,6 +12,32 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Internal groundwork, no visible app behavior change: reopening a large file
+  no longer has to recompute its min/max zoom index ("pyramid") from the
+  cached raw samples every time — the pyramid itself is now also written to
+  a small cache file the first time a file is opened, keyed the same way as
+  the raw-sample cache (source path + size + modification time), so a
+  reopen reads the already-computed index straight back instead of
+  redoing that work (`docs/ROADMAP.md` M3 "Pyramid level spill",
+  `docs/ARCHITECTURE.md` §The index). This closes the last gap that section
+  flagged as deferred. Nothing in `glyde-app` calls this yet — like the
+  raw-sample cache before it, this lands the storage layer, proven by tests,
+  not the wiring into the running app (that follow-up is a chunked/streaming
+  large-file reader, tracked separately, `docs/ARCHITECTURE.md` §The index).
+
+  **Assumptions made:**
+  - This cache is a plain file read/written sequentially, not
+    memory-mapped like the raw-sample cache: the pyramid query engine's
+    locked signature takes an owned pyramid, not a borrowed cache view, so a
+    hit here copies the already-computed bucket data back into memory rather
+    than mapping it in place. The saving is skipping the recomputation (and
+    not needing the raw-sample cache open at all to do it), not a zero-copy
+    reopen. Worth a veto if a fully zero-copy pyramid reopen is expected
+    instead.
+  - Same known gap as the raw-sample cache before it: nothing prunes old
+    cache files yet (no size cap, no eviction) — tracked as a pre-existing,
+    not new, limitation.
+
 - Opening a large file now shows a growing plot within a couple of seconds
   instead of a bare spinner for the whole open: the background indexer reads
   the file in progressively larger chunks and sends each chunk's data to the
