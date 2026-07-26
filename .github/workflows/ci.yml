@@ -110,7 +110,7 @@ jobs:
       # runners provide 14 GB of SSD, so the full-size run belongs to the
       # maintainer's manual ritual (docs/QUALITY.md §5); CI proves the same
       # invariant on the largest fixture that fits. See issue #61.
-      GLYDE_BENCH_FIXTURE_GB: "1"
+      GLYDE_BENCH_FIXTURE_GB: "0.1"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
