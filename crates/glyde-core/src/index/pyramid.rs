@@ -38,6 +38,21 @@
 //! about 8 bytes per raw sample on top of Level 0's 24 bytes/sample.
 //! **Cache eviction is not implemented**, same as Level 0 (the cache
 //! directory only ever grows).
+//!
+//! **Byte order.** Every multi-byte field is written native-endian
+//! (`to_ne_bytes`/`from_ne_bytes`), the same choice [`crate::index::level0`]
+//! already makes: this cache never leaves the machine that wrote it, so
+//! there is no cross-platform-portability requirement to justify a fixed
+//! endianness.
+//!
+//! **Trust boundary.** Unlike [`Level0Cache`](crate::index::level0::Level0Cache),
+//! which is mmap-backed and so gets every offset bounds-checked against the
+//! real file length for free, this reader parses `level_count` and each
+//! level's `bucket_count` as plain integers from the file. Both are
+//! validated against the file's actual size *before* being trusted to size
+//! a `Vec::with_capacity` — a corrupted or hand-edited cache claiming an
+//! enormous count must be rejected as a cache miss, never trusted into an
+//! unbounded allocation.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -117,6 +132,13 @@ pub fn try_open(cache_dir: &Path, key: &CacheKey) -> Result<Option<Vec<Vec<Bucke
             })
         }
     };
+    let file_len = file
+        .metadata()
+        .map_err(|source| GlydeError::Io {
+            path: final_path.clone(),
+            source,
+        })?
+        .len();
     let mut reader = BufReader::new(file);
 
     let mut header = [0u8; HEADER_LEN];
@@ -137,21 +159,73 @@ pub fn try_open(cache_dir: &Path, key: &CacheKey) -> Result<Option<Vec<Vec<Bucke
         );
         return Ok(None);
     }
-    let level_count = u32::from_ne_bytes(header[12..16].try_into().expect("4-byte slice")) as usize;
+    let level_count = u32::from_ne_bytes(header[12..16].try_into().expect("4-byte slice"));
 
-    let mut level_lengths = Vec::with_capacity(level_count);
+    // Bound `level_count` against the file's real, on-disk size before
+    // trusting it to size an allocation: a corrupted/hand-edited file can
+    // claim any u32 here, and Level 0's mmap-backed cache gets this check for
+    // free from the OS while this sequential reader has to do it explicitly.
+    // Each level-table entry is 8 bytes, so the table alone can never
+    // legitimately exceed the bytes actually on disk.
+    let level_table_len = u64::from(level_count) * 8;
+    let Some(after_level_table) = (HEADER_LEN as u64).checked_add(level_table_len) else {
+        tracing::warn!(path = %final_path.display(), level_count, "pyramid cache level count overflows, rebuilding");
+        return Ok(None);
+    };
+    if after_level_table > file_len {
+        tracing::warn!(
+            path = %final_path.display(),
+            level_count,
+            file_len,
+            "pyramid cache level count exceeds the file's actual size, rebuilding"
+        );
+        return Ok(None);
+    }
+
+    let mut level_lengths = Vec::with_capacity(level_count as usize);
     for _ in 0..level_count {
         let mut buf = [0u8; 8];
         if reader.read_exact(&mut buf).is_err() {
             tracing::warn!(path = %final_path.display(), "pyramid cache level table truncated, rebuilding");
             return Ok(None);
         }
-        level_lengths.push(u64::from_ne_bytes(buf) as usize);
+        level_lengths.push(u64::from_ne_bytes(buf));
     }
 
-    let mut levels = Vec::with_capacity(level_count);
+    // Likewise bound the bucket data every level's declared `bucket_count`
+    // implies against the bytes actually remaining, before trusting any
+    // individual count to size a `Vec::with_capacity` — this is the same
+    // "never let an untrusted length field drive an allocation" rule applied
+    // to the bucket data as was just applied to the level table above.
+    let mut total_bucket_bytes: u64 = 0;
+    for &bucket_count in &level_lengths {
+        let record_bytes = bucket_count.checked_mul(BUCKET_RECORD_LEN as u64);
+        let running_total = record_bytes.and_then(|b| total_bucket_bytes.checked_add(b));
+        let Some(running_total) = running_total else {
+            tracing::warn!(path = %final_path.display(), bucket_count, "pyramid cache bucket count overflows, rebuilding");
+            return Ok(None);
+        };
+        total_bucket_bytes = running_total;
+    }
+    let Some(expected_file_len) = after_level_table.checked_add(total_bucket_bytes) else {
+        tracing::warn!(path = %final_path.display(), "pyramid cache bucket count overflows, rebuilding");
+        return Ok(None);
+    };
+    if expected_file_len != file_len {
+        tracing::warn!(
+            path = %final_path.display(),
+            expected_file_len,
+            file_len,
+            "pyramid cache declared bucket counts do not match the file's actual size, rebuilding"
+        );
+        return Ok(None);
+    }
+
+    let mut levels = Vec::with_capacity(level_count as usize);
     for bucket_count in level_lengths {
-        let mut level = Vec::with_capacity(bucket_count);
+        // Safe to preallocate now: `bucket_count` was validated above against
+        // the file's real, on-disk length, exactly like `level_count` was.
+        let mut level = Vec::with_capacity(bucket_count as usize);
         for _ in 0..bucket_count {
             let mut record = [0u8; BUCKET_RECORD_LEN];
             if reader.read_exact(&mut record).is_err() {
@@ -404,6 +478,50 @@ mod tests {
         assert!(
             result.is_none(),
             "a truncated cache file must be treated as a cache miss, never partially misread"
+        );
+    }
+
+    #[test]
+    fn a_corrupted_level_count_field_is_rejected_not_misread() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key = temp_key(dir.path(), "corrupt-level-count");
+        build(dir.path(), &key, &[1.0, 2.0], &[0, 1]).expect("build must succeed");
+
+        let (final_path, _) = cache_paths(dir.path(), &key);
+        let mut bytes = std::fs::read(&final_path).expect("read cache file");
+        // Claim an enormous level count the file's real (tiny) size cannot
+        // back — this must be rejected as corrupt, never trusted to size a
+        // `Vec::with_capacity` (that used to panic/OOM on exactly this).
+        bytes[12..16].copy_from_slice(&u32::MAX.to_ne_bytes());
+        std::fs::write(&final_path, bytes)
+            .expect("rewrite cache file with a corrupted level count");
+
+        let result = try_open(dir.path(), &key).expect("must not error, only miss");
+        assert!(
+            result.is_none(),
+            "a level count the file's real size cannot back must be rejected, never used to preallocate"
+        );
+    }
+
+    #[test]
+    fn a_corrupted_bucket_count_field_is_rejected_not_misread() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key = temp_key(dir.path(), "corrupt-bucket-count");
+        let (samples, timestamps) = sine_wave(5_000);
+        build(dir.path(), &key, &samples, &timestamps).expect("build must succeed");
+
+        let (final_path, _) = cache_paths(dir.path(), &key);
+        let mut bytes = std::fs::read(&final_path).expect("read cache file");
+        // The first level-table entry starts right after the 16-byte header;
+        // claim an enormous bucket count the file's real size cannot back.
+        bytes[16..24].copy_from_slice(&u64::MAX.to_ne_bytes());
+        std::fs::write(&final_path, bytes)
+            .expect("rewrite cache file with a corrupted bucket count");
+
+        let result = try_open(dir.path(), &key).expect("must not error, only miss");
+        assert!(
+            result.is_none(),
+            "a bucket count the file's real size cannot back must be rejected, never used to preallocate"
         );
     }
 
