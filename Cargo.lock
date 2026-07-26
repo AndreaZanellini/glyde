@@ -1789,6 +1789,7 @@ dependencies = [
  "glyde-core",
  "rand 0.8.7",
  "sysinfo",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
