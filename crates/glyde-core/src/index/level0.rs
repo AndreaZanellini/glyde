@@ -100,11 +100,12 @@ impl CacheKey {
         })
     }
 
-    /// A filesystem-safe, content-addressed stem shared by both cache files
-    /// for this key. Any change to path, size, or mtime hashes to a
-    /// different stem, so a stale cache is simply never found under the new
-    /// key's name (no explicit invalidation step needed).
-    fn cache_stem(&self) -> String {
+    /// A filesystem-safe, content-addressed stem shared by every cache file
+    /// for this key — Level 0's pair and `index::pyramid`'s cache alike. Any
+    /// change to path, size, or mtime hashes to a different stem, so a stale
+    /// cache is simply never found under the new key's name (no explicit
+    /// invalidation step needed).
+    pub(crate) fn cache_stem(&self) -> String {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
