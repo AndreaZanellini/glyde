@@ -174,14 +174,20 @@ Resolved as follows:
   Level-0 cache and hands these functions a real slice over the mapped
   bytes, rather than introducing a second implementation or a generic
   `RawSamples` trait for one call site.
-- **Deferred, tracked separately:** the pyramid levels themselves are not
-  yet spilled to disk (only Level 0 is) — reopening a large file today
-  rebuilds the pyramid from the cached Level 0 (fast: one in-memory pass
-  over memory-mapped data, no re-parsing) rather than being instant. Also
-  deferred: cache eviction (the cache directory only ever grows) and the
-  streaming/chunked large-CSV reader that would call
-  `index::level0::Level0CacheWriter` row-by-row during ingestion instead of
-  through the whole-slice `build`/`build_or_open` convenience wrapper.
+- **Pyramid levels are also spilled to disk** (`glyde_core::index::pyramid`,
+  `docs/ROADMAP.md` M3 "Pyramid level spill"): reopening a large file reads
+  the already-computed `Vec<Vec<Bucket>>` back from a cache file, keyed the
+  same way as Level 0, instead of rebuilding it from the cached Level 0.
+  Unlike Level 0, this cache is not memory-mapped — `dsp::decimation`'s
+  locked query API takes an owned `&[Vec<Bucket>]`, not a borrowed cache
+  view, so a hit materializes an owned pyramid from the cache file rather
+  than mapping it in place. The win is skipping the aggregation pass (and
+  not needing Level 0 open at all to redo it), not a zero-copy reopen.
+- **Deferred, tracked separately:** cache eviction (the cache directory only
+  ever grows, for both Level 0 and the pyramid) and the streaming/chunked
+  large-CSV reader that would call `index::level0::Level0CacheWriter`
+  row-by-row during ingestion instead of through the whole-slice
+  `build`/`build_or_open` convenience wrapper.
 
 ### Progressive-axis tick mapping and `TimeUnit` placement (decision, issue #60)
 
