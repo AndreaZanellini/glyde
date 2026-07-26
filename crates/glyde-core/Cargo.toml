@@ -62,6 +62,10 @@ name = "index_build"
 harness = false
 
 [[bench]]
+name = "first_plot"
+harness = false
+
+[[bench]]
 name = "viewport_query"
 harness = false
 

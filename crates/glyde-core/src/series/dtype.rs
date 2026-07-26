@@ -132,6 +132,31 @@ impl SeriesValues {
         self.len() == 0
     }
 
+    /// Every sample promoted losslessly to `f64` (SPEC §1.4: every integer
+    /// dtype fits `f64`'s 53-bit mantissa for realistic magnitudes;
+    /// `docs/ROADMAP.md` M8 owns flagging the rare `i64`/`u64` value that
+    /// doesn't), or `None` for `Bool`/`String` — the two dtypes that route to
+    /// the state timeline, not a numeric plot or pyramid
+    /// (docs/ROADMAP.md M3 "Background progressive build emitting partial
+    /// levels": this is what lets a checkpoint compute a
+    /// [`crate::dsp::decimation::build_pyramid`] input from any numeric
+    /// series without each call site re-deriving the same dtype match).
+    pub fn to_f64_vec(&self) -> Option<Vec<f64>> {
+        match self {
+            SeriesValues::I8(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::I16(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::I32(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::I64(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::U8(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::U16(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::U32(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::U64(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::F32(v) => Some(v.iter().map(|&n| n as f64).collect()),
+            SeriesValues::F64(v) => Some(v.clone()),
+            SeriesValues::Bool(_) | SeriesValues::String(_) => None,
+        }
+    }
+
     /// SPEC §1.4: "Constant or single-sample series are valid inputs and
     /// must render." A single sample is vacuously constant (there is no
     /// neighbor for it to disagree with).
@@ -219,5 +244,34 @@ mod tests {
     fn is_constant_treats_identically_bit_patterned_nan_as_equal() {
         let nan = f64::NAN;
         assert!(SeriesValues::F64(vec![nan, nan, nan]).is_constant());
+    }
+
+    #[test]
+    fn to_f64_vec_promotes_every_numeric_dtype_losslessly() {
+        assert_eq!(
+            SeriesValues::I64(vec![-1, 0, 42]).to_f64_vec(),
+            Some(vec![-1.0, 0.0, 42.0])
+        );
+        assert_eq!(
+            SeriesValues::U8(vec![0, 255]).to_f64_vec(),
+            Some(vec![0.0, 255.0])
+        );
+        assert_eq!(
+            SeriesValues::F32(vec![1.5]).to_f64_vec(),
+            Some(vec![1.5_f32 as f64])
+        );
+        assert_eq!(
+            SeriesValues::F64(vec![1.5, 2.5]).to_f64_vec(),
+            Some(vec![1.5, 2.5])
+        );
+    }
+
+    #[test]
+    fn to_f64_vec_is_none_for_bool_and_string() {
+        assert_eq!(SeriesValues::Bool(vec![true]).to_f64_vec(), None);
+        assert_eq!(
+            SeriesValues::String(vec!["on".to_string()]).to_f64_vec(),
+            None
+        );
     }
 }

@@ -38,8 +38,8 @@
 //! searching for a candidate among several. Worth revisiting if a real file
 //! ever puts the time column anywhere else.
 
-use super::csv::open_path_capturing_column;
-use super::dataset::{self, Dataset, TimeAxis};
+use super::csv::{open_path_capturing_column, CsvParseOutcome};
+use super::dataset::{self, Checkpoint, Dataset, TimeAxis};
 use super::infer::Confidence;
 use crate::time::{
     classify_sampling, detect_gaps, detect_monotonicity, infer_timestamp_format, parse_timestamp,
@@ -220,7 +220,46 @@ pub fn inspect(path: &Path) -> Result<OpenSummary> {
 /// agree by construction rather than by re-derivation.
 pub fn open_dataset(path: &Path) -> Result<(OpenSummary, InferenceReport, Dataset)> {
     let (outcome, dataset, timestamp_format_ambiguous) = dataset::load_with_outcome(path)?;
+    Ok(build_summary_and_report(
+        outcome,
+        dataset,
+        timestamp_format_ambiguous,
+    ))
+}
 
+/// [`open_dataset`], additionally invoking `on_checkpoint` with a
+/// [`Checkpoint`] as the background parse progresses (docs/ROADMAP.md M3
+/// "Background progressive build emitting partial levels") — see
+/// [`dataset::load_with_outcome_progressive`], which this wraps the same way
+/// [`open_dataset`] wraps [`dataset::load_with_outcome`]. The
+/// [`OpenSummary`]/[`InferenceReport`] pair is only ever built once, from the
+/// final, complete parse: a checkpoint's own [`Checkpoint::dataset`] is
+/// already a real, renderable `Dataset` on its own, and re-deriving a full
+/// sampling-classification/gap-detection summary at every checkpoint (as
+/// opposed to only computing the pyramid, which [`dataset::load_with_outcome_progressive`]
+/// already does per checkpoint) is not something any caller needs yet — SPEC
+/// §1.2's inference bar is driven by the completed open, not a moving target.
+pub fn open_dataset_progressive(
+    path: &Path,
+    on_checkpoint: impl FnMut(Checkpoint),
+) -> Result<(OpenSummary, InferenceReport, Dataset)> {
+    let (outcome, dataset, timestamp_format_ambiguous) =
+        dataset::load_with_outcome_progressive(path, on_checkpoint)?;
+    Ok(build_summary_and_report(
+        outcome,
+        dataset,
+        timestamp_format_ambiguous,
+    ))
+}
+
+/// The summary/report-building half of [`open_dataset`], shared with
+/// [`open_dataset_progressive`] so the two never independently (and
+/// possibly divergently) derive the same fields from a parsed [`Dataset`].
+fn build_summary_and_report(
+    outcome: CsvParseOutcome,
+    dataset: Dataset,
+    timestamp_format_ambiguous: bool,
+) -> (OpenSummary, InferenceReport, Dataset) {
     let (
         time_column,
         timestamp_format,
@@ -303,7 +342,7 @@ pub fn open_dataset(path: &Path) -> Result<(OpenSummary, InferenceReport, Datase
         sampling_class,
     };
 
-    Ok((summary, report, dataset))
+    (summary, report, dataset)
 }
 
 #[cfg(test)]

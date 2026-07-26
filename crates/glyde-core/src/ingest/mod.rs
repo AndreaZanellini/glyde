@@ -31,8 +31,8 @@ mod report;
 
 pub use csv::{open_path, parse, CsvParseOutcome, CsvReader};
 pub use dataset::{
-    load, progressive_tick_to_value, progressive_value_to_tick, Dataset, TimeAxis,
-    PROGRESSIVE_TICK_SCALE,
+    load, load_progressive, progressive_tick_to_value, progressive_value_to_tick, Checkpoint,
+    Dataset, TimeAxis, PROGRESSIVE_TICK_SCALE,
 };
 pub use infer::{
     decode, detect_encoding, infer_column, infer_decimal_separator, infer_delimiter, infer_header,
@@ -40,7 +40,8 @@ pub use infer::{
     DtypeInference, EncodingInference, EncodingSource, HeaderInference, HEAD_SAMPLE_BYTES,
 };
 pub use report::{
-    inspect, open_dataset, InferenceReport, InferredField, OpenSummary, SamplingClass,
+    inspect, open_dataset, open_dataset_progressive, InferenceReport, InferredField, OpenSummary,
+    SamplingClass,
 };
 
 use crate::{GlydeError, Result};
