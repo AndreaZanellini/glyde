@@ -36,6 +36,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
   reading the file once — this keeps the ≤30s/10GB full-build budget intact
   even on a file with many checkpoints.
 
+  This is also the first code path that runs real ingested integer columns
+  through the min/max pyramid, which surfaced a pre-existing gap (review
+  finding on this PR): a whole-number column value larger than about 9
+  quadrillion (2⁵³, `f64`'s exact-integer limit) loses precision when
+  converted for the pyramid, the same way it already silently does for the
+  on-screen plot line (SPEC §1.4's mandatory flagging for this case,
+  `docs/ROADMAP.md` M8, was never implemented for either). This PR adds a
+  `warn`-level log line when that happens, so the loss is at least visible
+  in the log file even though the inference-bar warning M8 also promises
+  still doesn't exist — flagging this now rather than letting a second
+  silent call site accumulate on top of the first.
+
 - Resolves the `blocking-decision` issue (#61) on the CI "Performance gates"
   job, which previously passed unconditionally: `generate_fixtures` and
   `memory_gate` are real now (a synthetic CSV fixture writer and a headless
