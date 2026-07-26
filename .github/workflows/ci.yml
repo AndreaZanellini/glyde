@@ -105,25 +105,29 @@ jobs:
   bench:
     name: Performance gates
     runs-on: macos-14
+    env:
+      # docs/QUALITY.md §3 asks for a 20 GB memory-gate fixture. GitHub-hosted
+      # runners provide 14 GB of SSD, so the full-size run belongs to the
+      # maintainer's manual ritual (docs/QUALITY.md §5); CI proves the same
+      # invariant on the largest fixture that fits. See issue #61.
+      GLYDE_BENCH_FIXTURE_GB: "8"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Report free disk before fixture generation
+        run: df -h .
       # Large fixtures are generated, never committed. See docs/QUALITY.md §3.
       - name: Generate large synthetic fixtures
-        run: cargo run --release -p glyde-devtools --bin generate_fixtures -- --size-gb 1
-      # Benchmarks are stubs until docs/ROADMAP.md M3 lands the real criterion
-      # harnesses; today they compile and run as no-ops. Run them WITHOUT
-      # masking a nonzero exit so that, once M3 arrives, a measurement that
-      # breaches a docs/SPEC.md §5 budget fails the build. (Previously this piped
-      # `cargo bench` into `tee`, which -- with no pipefail -- discarded cargo's
-      # exit code and stayed green even while `cargo bench` was erroring on an
-      # unrecognized `--output-format` option. See #29. `cargo-criterion` is what
-      # understands that flag; it returns with the real benches in M3.)
+        run: cargo run --release -p glyde-devtools --bin generate_fixtures -- --size-gb "$GLYDE_BENCH_FIXTURE_GB"
+      # Absolute SPEC §5 ceilings are asserted inside each bench and fail the
+      # build when breached. The QUALITY §3.2 ">15% vs main" comparison is NOT
+      # run here: hosted runners are too noisy for a 15% threshold to mean
+      # anything. It belongs on the SPEC §5 reference machine. See issue #61.
       - name: Criterion benchmarks (build-blocking budgets)
         run: cargo bench -p glyde-core
       - name: Peak memory gate
-        run: cargo run --release -p glyde-devtools --bin memory_gate
+        run: cargo run --release -p glyde-devtools --bin memory_gate -- --size-gb "$GLYDE_BENCH_FIXTURE_GB"
 
   deny:
     name: Licenses & advisories
