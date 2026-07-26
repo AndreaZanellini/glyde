@@ -12,6 +12,24 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- The inference bar (the row above the plot showing what Glyde detected about
+  a file — encoding, delimiter, decimal separator, time column, timestamp
+  format, sample count, sampling class) is now collapsed by default instead
+  of always taking up space, and opens itself automatically the moment any
+  one of those detections is low-confidence — e.g. a file with a genuinely
+  ambiguous date column. A clean, unambiguous file now shows a single
+  discreet header line; nothing is hidden that needs your attention
+  (`docs/SPEC.md` §1.2, `docs/ROADMAP.md` M4 "Inference bar widget"). One-click
+  correction of an individual field is still a separate, later item.
+
+  **Assumptions made:**
+  - The collapsed/expanded state is remembered per file (keyed by its path),
+    so opening a different low-confidence file always opens expanded even if
+    you'd previously collapsed a different file's bar, and re-opening a file
+    you'd manually expanded stays expanded. Nothing in `docs/SPEC.md` §1.2
+    specifies this precisely; worth a veto if "one collapsed/expanded
+    preference for the whole app" was intended instead.
+
 - Internal groundwork, no visible app behavior change: reopening a large file
   no longer has to recompute its min/max zoom index ("pyramid") from the
   cached raw samples every time — the pyramid itself is now also written to
