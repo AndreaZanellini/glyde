@@ -242,10 +242,21 @@ caps it at a flat `min(25% RAM, 4 GB)`. Resolved as follows (the maintainer's
   heap-backed values they would have been, element for element, so no consumer
   has to know which it holds (Golden Rule 1: a storage change, not a data
   change).
-- **Still outstanding:** peak RSS is ~0.42× file size rather than flat. The
-  residual is `time::gap`'s `O(rows)` Δt temporaries and the resident tick
-  pages the SPEC §2.2 statistics scan — derived statistics, not sample data —
-  tracked as issue #85.
+- **The derived statistics are bounded too.** SPEC §2.2's rules are defined over
+  the *median* of the whole Δt distribution, and an exact median cannot be
+  computed in one bounded pass — so `time::gap` reads its ticks through
+  `time::TickSource`, which is replayable and hands them over in bounded chunks
+  (a spilled axis reads them back through a fixed-size buffer rather than
+  through the mapping, so scanning does not make the column resident), and
+  selects each order statistic by iterative histogram refinement: one pass for
+  the key range, then at most eight passes each narrowing the surviving range by
+  2¹⁶, with 512 KiB of counters. The result is the value a full sort would have
+  picked — exact, not approximate, so no golden test or corpus expectation
+  changes — and `ingest::report` derives the gap count, the sampling class and
+  the monotonicity counts from *one* median and *one* Δt pass instead of three
+  independent scans (issue #85). Peak RSS is now flat: `memory_gate` measures
+  10.7 MB on a 2 GB fixture and 10.3 MB on an 8 GB one, against the 0.42× it
+  cost before.
 
 ### Progressive-axis tick mapping and `TimeUnit` placement (decision, issue #60)
 

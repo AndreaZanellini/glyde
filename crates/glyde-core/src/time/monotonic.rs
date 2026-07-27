@@ -18,6 +18,10 @@
 use std::cmp::Ordering;
 use tracing::warn;
 
+use super::gap::SLICE_SCAN_IS_INFALLIBLE;
+use super::ticks::{for_each_delta, TickSource};
+use crate::Result;
+
 /// SPEC §2.1: how many consecutive samples ran backwards, and how many were
 /// an exact repeat of the sample before them. Counting only — the input
 /// order itself is never touched by this or any caller: "rows out of order
@@ -31,37 +35,61 @@ pub struct MonotonicityReport {
     pub duplicate_count: usize,
 }
 
-/// Scans `timestamps` in their original, unmodified order (non-decreasing or
-/// not — this makes no assumption either way, unlike [`super::detect_gaps`])
-/// and counts every backward step and every exact repeat (SPEC §2.1). Never
-/// reorders or deduplicates `timestamps`; logs a `warn!` for each anomaly
-/// actually found, matching the ingestion-decision logging convention used
-/// elsewhere in this crate (e.g. `ingest::infer`'s NaN-run flagging).
-pub fn detect_monotonicity(timestamps: &[i128]) -> MonotonicityReport {
-    let mut report = MonotonicityReport::default();
-
-    for pair in timestamps.windows(2) {
-        match pair[1].cmp(&pair[0]) {
-            Ordering::Less => report.non_monotonic_count += 1,
-            Ordering::Equal => report.duplicate_count += 1,
+impl MonotonicityReport {
+    /// Accounts one consecutive Δt: a negative one is a backward step, a zero
+    /// one an exact repeat (SPEC §2.1). The single definition of both counts —
+    /// [`super::summarize_ticks`] feeds this from the same Δt pass it uses for
+    /// gaps, so the two can never disagree about a series.
+    pub(super) fn observe_delta(&mut self, delta: i128) {
+        match delta.cmp(&0) {
+            Ordering::Less => self.non_monotonic_count += 1,
+            Ordering::Equal => self.duplicate_count += 1,
             Ordering::Greater => {}
         }
     }
 
-    if report.non_monotonic_count > 0 {
-        warn!(
-            non_monotonic_count = report.non_monotonic_count,
-            "timestamps not monotonic — rows out of order are preserved, not reordered (SPEC §2.1)"
-        );
+    /// Logs a `warn!` for each anomaly actually counted, matching the
+    /// ingestion-decision logging convention used elsewhere in this crate
+    /// (e.g. `ingest::infer`'s NaN-run flagging). SPEC §2.1's "detected,
+    /// counted, **logged**" — split from the counting so a caller that
+    /// accumulated the counts itself still reports them exactly once.
+    pub(super) fn log_anomalies(&self) {
+        if self.non_monotonic_count > 0 {
+            warn!(
+                non_monotonic_count = self.non_monotonic_count,
+                "timestamps not monotonic — rows out of order are preserved, not reordered (SPEC §2.1)"
+            );
+        }
+        if self.duplicate_count > 0 {
+            warn!(
+                duplicate_count = self.duplicate_count,
+                "duplicate timestamps detected and preserved (SPEC §2.1)"
+            );
+        }
     }
-    if report.duplicate_count > 0 {
-        warn!(
-            duplicate_count = report.duplicate_count,
-            "duplicate timestamps detected and preserved (SPEC §2.1)"
-        );
-    }
+}
 
-    report
+/// Scans `timestamps` in their original, unmodified order (non-decreasing or
+/// not — this makes no assumption either way, unlike [`super::detect_gaps`])
+/// and counts every backward step and every exact repeat (SPEC §2.1). Never
+/// reorders or deduplicates `timestamps`.
+///
+/// A caller that also needs SPEC §2.2's gap and sampling verdicts should use
+/// [`super::summarize_ticks`], which derives all three from one pass.
+pub fn detect_monotonicity(timestamps: &[i128]) -> MonotonicityReport {
+    detect_monotonicity_from(timestamps).expect(SLICE_SCAN_IS_INFALLIBLE)
+}
+
+/// [`detect_monotonicity`] over any [`TickSource`] — the bounded-memory form,
+/// for a time axis too large to hold as one slice (issue #85).
+fn detect_monotonicity_from<S: TickSource + ?Sized>(source: &S) -> Result<MonotonicityReport> {
+    let mut report = MonotonicityReport::default();
+    for_each_delta(source, 0..source.tick_count(), &mut |delta| {
+        report.observe_delta(delta);
+        Ok(())
+    })?;
+    report.log_anomalies();
+    Ok(report)
 }
 
 #[cfg(test)]

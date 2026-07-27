@@ -288,6 +288,29 @@ fn open_dataset_reports_the_same_summary_whichever_storage_it_chose() {
         "the corpus-gate summary must not depend on where the samples were stored"
     );
     assert_eq!(spilled_report, memory_report);
+
+    // Issue #85: the two paths now derive the SPEC §2.1–2.2 statistics through
+    // different readers — the spilled axis reads its ticks back through a
+    // fixed-size buffer, the in-memory one borrows them — so assert the
+    // statistics they agreed on are non-trivial ones — an equality between two
+    // all-zero summaries would prove nothing. This fixture's seconds field wraps
+    // every 60 rows (a backward step each time) and every 500th row carries a
+    // different UTC offset, which moves that row two hours back in UTC and so
+    // opens a real gap on the row after it. Most Δt are nonetheless exactly
+    // equal, so each between-gap segment has a zero MAD and is uniform: SPEC
+    // §2.2's `SegmentedUniform`.
+    assert_eq!(
+        spilled_summary.sampling_class,
+        ingest::SamplingClass::SegmentedUniform
+    );
+    assert!(
+        spilled_summary.gap_count > 0,
+        "the offset-shifting fixture must have gaps for this comparison to be meaningful"
+    );
+    assert!(
+        spilled_summary.non_monotonic_count > 0,
+        "the wrapping fixture must run backwards for this comparison to be meaningful"
+    );
 }
 
 // SPEC §5's "first meaningful plot, **any file size**: ≤ 2 s (progressive:

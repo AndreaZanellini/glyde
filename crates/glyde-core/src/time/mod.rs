@@ -26,7 +26,9 @@
 //! §2.2–2.3) land with M2's "Sampling classification" item.
 //! [`detect_monotonicity`] (SPEC §2.1: non-monotonic and duplicate timestamp
 //! detection) lands with M2's "Non-monotonic + duplicate timestamp detection"
-//! item. [`TimestampFormat::DateTimeSpace`] is a separate, not-yet-started M2
+//! item. [`summarize_ticks`] is all three at once over a [`TickSource`], in
+//! memory that does not grow with the series (issue #85) — what
+//! `ingest::report` uses when opening a file. [`TimestampFormat::DateTimeSpace`] is a separate, not-yet-started M2
 //! roadmap item and stays `todo!()`. Never widen a golden test's tolerance or
 //! change its expectations to make an implementation pass — if one looks
 //! wrong, that is a `blocking-decision` issue, not an edit.
@@ -39,13 +41,15 @@
 mod format;
 mod gap;
 mod monotonic;
+mod ticks;
 
 pub use format::{
     format_timestamp, infer_timestamp_format, parse_timestamp, TimeUnit, Timestamp,
     TimestampFormat, TimestampFormatInference, TimestampFormatScan,
 };
-pub use gap::{classify_sampling, detect_gaps, Gap, SamplingClass};
+pub use gap::{classify_sampling, detect_gaps, summarize_ticks, Gap, SamplingClass, TimeAxisStats};
 pub use monotonic::{detect_monotonicity, MonotonicityReport};
+pub use ticks::{TickSource, TICK_CHUNK_LEN};
 
 /// Reads a `testdata/corpus/` fixture's raw column text, shared by this
 /// module's own test suites (`format.rs`'s timestamp-format tests and
