@@ -11,6 +11,41 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Documentation
+- **New: `docs/M3-CLOSEOUT.md` — an honest status report on Milestone 3, plus a
+  plan to finish it.** No app behavior changes in this entry; it is analysis.
+
+  The short version: **M3's engine is built and tested, but it is not connected
+  to the app.** The min/max pyramid, the decimation query, the disk cache that
+  should make reopening a big file instant, and the memory-budget module all
+  exist in `glyde-core` and are covered by tests that pass. None of them are
+  called by the actual Glyde window. So if you run the M3 maintainer test today:
+
+  - "First plot within ~2 s while indexing continues" — **works.**
+  - "Scroll and zoom for 30 s without stutter" — **will not.** Every frame still
+    draws every single sample, and memory is still unbounded.
+  - "A one-sample spike stays visible at every zoom level" — happens only by
+    accident (because everything is drawn), not because decimation guarantees it.
+  - "Zoom in until it converges to individual points" — there is nothing to
+    converge *from* yet.
+  - "Close and reopen the big file → instant" — **will not.** The cache is never
+    written or read by the app; a reopen re-parses the whole file.
+
+  Nothing here is broken or a regression — the integration step was simply never
+  scheduled as its own item. Four new issues (#80, #81, #82, #83) now track it,
+  and `docs/M3-CLOSEOUT.md` lays out the order to do them in.
+
+  **One thing worth your attention right now, separate from M3:** a CSV whose
+  timestamps look like `2026-01-01 00:00:00` (space between date and time — one
+  of the most common exports there is) **does not open at all** today. It fails
+  with an error instead of a plot. That is issue #82, it is an M2 gap that was
+  missed, and it also blocks the "click to correct a field" work in M4.
+
+  **The one decision waiting on you** is issue #75 (how to bound memory when
+  reading a large file). Two of the four new issues depend on which way you go,
+  so it is the first domino. `docs/M3-CLOSEOUT.md` §R0 recommends going straight
+  for the real fix rather than the stopgap, and says why.
+
 ### Added
 - The inference bar (the row above the plot showing what Glyde detected about
   a file — encoding, delimiter, decimal separator, time column, timestamp

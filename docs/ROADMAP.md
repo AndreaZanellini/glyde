@@ -72,7 +72,7 @@ them, so CI stays green while honoring "written first."
 - [x] Joint delimiter / header / decimal-separator inference (column-count consistency; `1,5;2,3` = 2 cols) → SPEC §1.2.2–1.2.4 · proven by: corpus 1, 2, 3, 4, 5, 6, 7, 14, 15
 - [x] CSV reader: streaming single-pass over memmap; ragged-row salvage, skipped-row count, truncated-tail tolerance → SPEC §1.3, ARCH §CSV · proven by: corpus 20, 21, 22, 23
 - [x] Column dtype inference incl. NaN / infinity / mixed-column handling → SPEC §1.4 · proven by: corpus 43, 44, 46, 47, 48
-- [x] Time index: progressive numeric + core timestamp formats (ISO 8601 ±tz, epoch s/ms/µs/ns); internal `i128` ns or `(i64, TimeUnit)`, never `f64` seconds → SPEC §2.1 · proven by: corpus 24, 25, 29–32, 35 + time golden round-trip (un-ignore subset)
+- [x] Time index: progressive numeric + core timestamp formats (ISO 8601 ±tz, epoch s/ms/µs/ns); internal `i128` ns or `(i64, TimeUnit)`, never `f64` seconds → SPEC §2.1 · proven by: corpus 24, 25, 29–32, 35 + time golden round-trip (un-ignore subset) · **incomplete**: `YYYY-MM-DD HH:MM:SS[.fff…]` is a SPEC §2.1 minimum-support format and is still `todo!()`; such files fail to open entirely, and the stub is a panic landmine for M4's one-click format correction (issue #82)
 - [x] `DD/MM` vs `MM/DD` disambiguation by scanning for a field > 12; fully ambiguous → low confidence → SPEC §2.1 ambiguity rule · proven by: corpus 26, 27, 28
 - [x] Excel serial + LabVIEW epoch + multi-year/second-res + picosecond-res index → SPEC §2.1 · proven by: corpus 33, 34, 42, 41 + ns/ps precision golden (un-ignore)
 - [x] Sampling classification `Uniform` / `SegmentedUniform` / `Irregular` at index time (needs gap detection `Δt > 10× median`) → SPEC §2.2–2.3 · proven by: corpus 38, 39, 40 + gap-detection golden (un-ignore)
@@ -95,13 +95,18 @@ them, so CI stays green while honoring "written first."
 ## M3 — Index pyramid + large files (fluid navigation, the performance contract)
 
 - [x] Min/max pyramid: level-k `(min, max, first_ts, last_ts, nan_count)`, factor-8 buckets, level *k+1* exactly from level *k* → ARCH §Index, SPEC §3.1 · proven by: decimation golden — pyramid consistency + envelope exactness (un-ignore)
-- [x] Background progressive build emitting partial levels → first meaningful plot ≤ 2 s while indexing continues → SPEC §5 (first-plot), ARCH §pipeline · proven by: first-plot bench + manual
-- [x] Decimation query `viewport(range, pixels) → min/max per column`; raw samples + point markers when samples < pixels; convergence to true samples → SPEC §3.1 · proven by: decimation golden — spike, convergence, no-alias (un-ignore)
-- [x] Level-0 typed spill cache to OS cache dir keyed by path + size + mtime; reopen is instant → ARCH §Index (issue #59), SPEC §5.1 · proven by: `index::level0` round-trip/reopen unit tests + level0/decimation integration test
-- [x] Pyramid *level* spill (only Level 0 is spilled so far; reopening rebuilds the pyramid from cached Level 0 rather than loading it too) → ARCH §Index · proven by: spill round-trip unit test + manual reopen
+- [x] Background progressive build emitting partial levels → first meaningful plot ≤ 2 s while indexing continues → SPEC §5 (first-plot), ARCH §pipeline · proven by: first-plot bench + manual · **core only**: pyramids are rebuilt at every checkpoint and then discarded by the app (issue #80); raw `Dataset` memory remains unbounded (issue #75)
+- [x] Decimation query `viewport(range, pixels) → min/max per column`; raw samples + point markers when samples < pixels; convergence to true samples → SPEC §3.1 · proven by: decimation golden — spike, convergence, no-alias (un-ignore) · **core only**: `decimate_viewport` has no caller in `glyde-app`; the time view still draws every raw sample with unconditional markers (issue #80)
+- [x] Level-0 typed spill cache to OS cache dir keyed by path + size + mtime; reopen is instant → ARCH §Index (issue #59), SPEC §5.1 · proven by: `index::level0` round-trip/reopen unit tests + level0/decimation integration test · **core only**: the open path never reads or writes the cache, so reopen is not instant (issue #81)
+- [x] Pyramid *level* spill (only Level 0 is spilled so far; reopening rebuilds the pyramid from cached Level 0 rather than loading it too) → ARCH §Index · proven by: spill round-trip unit test + manual reopen · **core only**: same unwired open path as above (issue #81)
 - [x] RAM budget module (`sysinfo`): compute `min(25% RAM, 4 GB)`, affordability check *before* acting → SPEC §5.1, ARCH §budget · proven by: budget-math unit tests
 - [x] `glyde-devtools`: synthetic fixture generator + `memory_gate` headless peak-RSS harness → QUALITY §3, ARCH §devtools · proven by: `memory_gate` opens the generated fixture and asserts peak RSS against `budget::RamBudget` (issue #61 decision 1: CI fixture is sized by `--size-gb`, not literally 20 GB — a GitHub-hosted runner's 14 GB SSD cannot hold that; the true 20 GB run is manual QA, QUALITY §5). Wiring the `ci.yml` fixture size to this is the maintainer-applied diff on issue #61 (hard-denied file).
 - [x] `criterion` benches: index build (CSV 1 GB), viewport query per pyramid level; absolute ceilings, no in-CI regression comparison → QUALITY §3, SPEC §5 (issue #61 decision 2) · proven by: `index_build`/`viewport_query` assert against the SPEC §5 ceiling and fail the build on breach; the >15% vs-`main` comparison is a manual `cargo bench` run on the SPEC §5 reference machine, using criterion's own local-baseline comparison — not computed in CI (too noisy on shared runners). Two items from QUALITY §3's general benched-path list are out of scope here: Parquet index build (no `Reader` registered yet) and cold start (an app-level, windowed metric — no headless harness exists in `glyde-core`). Welch bench stays a stub; `dsp::welch` itself is `todo!()` until M5.
+
+> **M3 is core-complete but not app-complete.** The pyramid, decimation query, and
+> spill caches are built and tested in `glyde-core`, but none of them are called by
+> `glyde-app`, so three of the five maintainer tests below cannot pass yet. Full gap
+> analysis and the plan to close it: **`docs/M3-CLOSEOUT.md`** (issues #75, #80, #81, #83).
 
 > **MAINTAINER TEST — M3**
 > - Open one of your own large CSVs (> 5 GB) → first plot within ~2 s, indexing visibly
