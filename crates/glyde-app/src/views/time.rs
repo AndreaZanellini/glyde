@@ -107,10 +107,24 @@ pub fn show(
         // once-per-open resampling (docs/ROADMAP.md M3, issue #80).
         let plot_bounds = plot_ui.plot_bounds();
         let pixel_columns = plot_ui.transform().frame().width().round().max(1.0) as usize;
-        let range = (
-            seconds_to_tick(&dataset.time, plot_bounds.min()[0]),
-            seconds_to_tick(&dataset.time, plot_bounds.max()[0]),
-        );
+        let range = query_range(&plot_bounds, ticks, &dataset.time);
+        // `egui_plot` computes axis gridlines from the *previous* frame's
+        // memory (same staleness `query_range` accounts for above), so the
+        // frame a "Fit to data" click changes the view still renders with
+        // the old gridlines for one frame. Request an immediate follow-up
+        // frame so that lag is never something the user has to nudge (e.g.
+        // a mouse move) their way out of.
+        if fit_clicked {
+            plot_ui.ctx().request_repaint();
+        }
+
+        // Whether this frame's samples-in-range fit one raw sample per
+        // pixel column or fewer (SPEC §3.1 convergence) — the same
+        // condition `decimate_viewport` itself branches on internally, but
+        // needed here too since the branches render differently: connected
+        // (SPEC §3.1's raw-samples-plus-markers regime, docs/ROADMAP.md M2)
+        // vs. separate per-column vertical bars ("and nothing else").
+        let converged = is_converged(ticks, range, pixel_columns);
 
         let mut next_color_index = 0usize;
         for (column_index, series) in dataset.columns.iter().enumerate() {
@@ -136,37 +150,65 @@ pub fn show(
             let samples = column_f64_samples(series.values(), cached);
             let buckets = decimate_viewport(pyramid, samples, ticks, range, pixel_columns);
 
-            // SPEC §3.1: one vertical extent (or, once fully converged, one
-            // point marker) per bucket — never a line connecting one pixel
-            // column to the next, and never interpolated across a gap bucket
-            // (SPEC §1.3).
-            let mut points: Vec<[f64; 2]> = Vec::new();
-            for bucket in &buckets {
-                if bucket_is_gap(bucket) {
-                    continue;
-                }
-                let bucket_x =
-                    tick_to_seconds(&dataset.time, (bucket.first_ts + bucket.last_ts) / 2);
-                if bucket.min == bucket.max {
-                    points.push([bucket_x, bucket.min]);
-                } else {
+            if converged {
+                // SPEC §3.1's raw-samples regime (docs/ROADMAP.md M2): a
+                // connected line through consecutive raw samples, broken at
+                // each gap bucket (SPEC §1.3), plus point markers on top so
+                // "the user must be able to reach the individual sample".
+                // A bug found from a real repro: this used to push every
+                // converged bucket into the point-markers list only, with
+                // no connecting line at all, rendering a small file as
+                // scattered disconnected dots instead of a line plot.
+                let segments = bucket_segments(&dataset.time, &buckets);
+                for segment in &segments {
                     plot_ui.line(
-                        Line::new(PlotPoints::new(vec![
-                            [bucket_x, bucket.min],
-                            [bucket_x, bucket.max],
-                        ]))
-                        .name(series.name())
-                        .color(color),
+                        Line::new(PlotPoints::new(segment.clone()))
+                            .name(series.name())
+                            .color(color),
                     );
                 }
-            }
-            if !points.is_empty() {
-                plot_ui.points(
-                    Points::new(PlotPoints::new(points))
-                        .name(series.name())
-                        .radius(2.0_f32)
-                        .color(color),
-                );
+                let points: Vec<[f64; 2]> = segments.into_iter().flatten().collect();
+                if !points.is_empty() {
+                    plot_ui.points(
+                        Points::new(PlotPoints::new(points))
+                            .name(series.name())
+                            .radius(2.0_f32)
+                            .color(color),
+                    );
+                }
+            } else {
+                // SPEC §3.1's aggregated regime: one vertical extent per
+                // pixel column — never a line connecting one pixel column
+                // to the next, and never interpolated across a gap bucket
+                // (SPEC §1.3).
+                let mut points: Vec<[f64; 2]> = Vec::new();
+                for bucket in &buckets {
+                    if bucket_is_gap(bucket) {
+                        continue;
+                    }
+                    let bucket_x =
+                        tick_to_seconds(&dataset.time, (bucket.first_ts + bucket.last_ts) / 2);
+                    if bucket.min == bucket.max {
+                        points.push([bucket_x, bucket.min]);
+                    } else {
+                        plot_ui.line(
+                            Line::new(PlotPoints::new(vec![
+                                [bucket_x, bucket.min],
+                                [bucket_x, bucket.max],
+                            ]))
+                            .name(series.name())
+                            .color(color),
+                        );
+                    }
+                }
+                if !points.is_empty() {
+                    plot_ui.points(
+                        Points::new(PlotPoints::new(points))
+                            .name(series.name())
+                            .radius(2.0_f32)
+                            .color(color),
+                    );
+                }
             }
         }
 
@@ -383,6 +425,67 @@ pub fn cache_column_samples(dataset: &Dataset) -> Vec<Option<Vec<f64>>> {
         .collect()
 }
 
+/// The decimation query range for this frame: `plot_bounds` converted to
+/// ticks, or the dataset's own full time range (`ticks`'s first and last
+/// entry) as a fallback when `plot_bounds` is either invalid or shares no
+/// overlap at all with the dataset's real tick range.
+///
+/// The invalid case: a brand-new `egui_plot::Plot`'s bounds start at
+/// `PlotBounds::NOTHING`, and `plot_ui.plot_bounds()` always reflects the
+/// *previous* frame's memory, read before this frame has drawn anything.
+///
+/// The no-overlap case is the one that actually matters in practice, found
+/// from a real repro (opening corpus case-01 rendered a permanently empty
+/// plot): `egui_plot::PlotTransform::new` *sanitizes* an invalid/`NOTHING`
+/// bounds into a small, arbitrary `[-1, 1]` window before this function ever
+/// sees it — which passes `PlotBounds::is_valid_x` (it is finite and has
+/// positive width), so checking validity alone does not detect the
+/// bootstrap case at all. Querying `[-1, 1]` against a file's real (e.g.
+/// epoch-second, ~1.7 billion) tick range returns nothing, and since
+/// `egui_plot`'s own auto-bounds only ever grows to fit whatever *was*
+/// drawn, an empty first frame stays empty forever: nothing to fit around.
+/// The same no-overlap check also recovers if `egui_plot`'s bounds memory
+/// (keyed by a fixed id, not the open file) is left over from a previously
+/// opened, unrelated file.
+///
+/// This does mean a deliberate pan/zoom to *just past* the data's edge — a
+/// real, valid, non-empty `plot_bounds` that happens to share no overlap
+/// with the data either — gets treated the same way and snapped back to the
+/// full range, rather than shown as empty space at the edge. Accepted
+/// tradeoff, flagged in `CHANGELOG.md`: recovering from the far more common
+/// "no real bounds established yet" case matters more than preserving that
+/// one interaction.
+fn query_range(plot_bounds: &PlotBounds, ticks: &[i128], time: &TimeAxis) -> (i128, i128) {
+    let Some((&first, &last)) = ticks.first().zip(ticks.last()) else {
+        return (0, 0);
+    };
+    if !plot_bounds.is_valid_x() {
+        return (first, last);
+    }
+    let requested = (
+        seconds_to_tick(time, plot_bounds.min()[0]),
+        seconds_to_tick(time, plot_bounds.max()[0]),
+    );
+    if requested.1 < first || requested.0 > last {
+        (first, last)
+    } else {
+        requested
+    }
+}
+
+/// Whether `range` contains at most one raw sample per pixel column — SPEC
+/// §3.1's convergence condition, the same one [`decimate_viewport`] branches
+/// on internally to decide between aggregating and returning individual
+/// samples. `show` needs to know it too, ahead of the query, since the two
+/// regimes render differently (connected line vs. separate bars) — computed
+/// via the identical binary-search-over-sorted-`ticks` approach
+/// `decimate_viewport` itself uses, so the two never disagree.
+fn is_converged(ticks: &[i128], range: (i128, i128), pixel_columns: usize) -> bool {
+    let lo = ticks.partition_point(|&tick| tick < range.0);
+    let hi_exclusive = ticks.partition_point(|&tick| tick <= range.1);
+    hi_exclusive.saturating_sub(lo) <= pixel_columns
+}
+
 /// A [`Bucket`] with no finite reading at all — SPEC §1.3's "never
 /// interpolated" applied to a decimated pixel column rather than a single
 /// raw sample. Two distinct shapes both count: a single raw NaN sample once
@@ -393,6 +496,34 @@ pub fn cache_column_samples(dataset: &Dataset) -> Vec<Option<Vec<f64>>> {
 /// (`min > max`) since nothing ever updated it.
 fn bucket_is_gap(bucket: &Bucket) -> bool {
     bucket.min.is_nan() || bucket.max.is_nan() || bucket.min > bucket.max
+}
+
+/// `buckets` (already one per raw sample — the SPEC §3.1 convergence
+/// regime, `show`'s `converged` branch) as `(x, value)` runs, split wherever
+/// a bucket is a gap ([`bucket_is_gap`]) — the same NaN-discontinuity shape
+/// `series_segments` had before decimation (SPEC §1.3: "never
+/// interpolated"), just over buckets instead of raw `(x, value)` pairs
+/// directly. Each run is drawn as its own connected `Line` by [`show`], so a
+/// gap can never be bridged by a single continuous line.
+fn bucket_segments(time: &TimeAxis, buckets: &[Bucket]) -> Vec<Vec<[f64; 2]>> {
+    let mut segments: Vec<Vec<[f64; 2]>> = Vec::new();
+    let mut current: Vec<[f64; 2]> = Vec::new();
+    for bucket in buckets {
+        if bucket_is_gap(bucket) {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let x = tick_to_seconds(time, (bucket.first_ts + bucket.last_ts) / 2);
+        // In the convergence regime every bucket is exactly one raw sample,
+        // so `min == max` is that sample's own value.
+        current.push([x, bucket.min]);
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
 }
 
 /// `time`'s own ticks-per-second, for converting a single synthesized pyramid
@@ -636,6 +767,64 @@ mod render_tests {
         );
     }
 
+    // Regression test for a real repro: opening corpus case-01 (a small,
+    // clean file — exactly what a user would open first) rendered a
+    // permanently empty plot until "Fit to data" was clicked. `query_range`
+    // has its own precise unit tests for the mechanism (this is the same
+    // check, end to end); the point of this one is to prove it against the
+    // real corpus fixture and the real `decimate_viewport` call `show`
+    // makes, rather than trust the two agree. `egui`'s own draw-call shape
+    // count turned out to be a bad signal here — it swung *either* direction
+    // between an empty dataset and this real one, dominated by how wide the
+    // (real vs. blank) axis-label text renders, not by whether real data
+    // was found — so this asserts on `decimate_viewport`'s own bucket count
+    // instead, which is what actually determines whether anything is drawn.
+    #[test]
+    fn show_finds_real_data_despite_egui_plots_sanitized_bootstrap_bounds() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("testdata")
+            .join("corpus")
+            .join("case-01-comma-clean.csv");
+        let dataset = glyde_core::ingest::load(&path).expect("case 1 must load");
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
+        let ticks = dataset.time.to_pyramid_ticks();
+
+        // The exact bounds a brand-new `egui_plot::Plot` presents on its
+        // first frame — verified via a temporary diagnostic print inside
+        // `show`'s real render path — not `PlotBounds::NOTHING` itself,
+        // which `egui_plot::PlotTransform::new` sanitizes away first.
+        let egui_plot_bootstrap_bounds = PlotBounds::from_min_max([-1.0, -1.0], [1.0, 1.0]);
+        let range = query_range(&egui_plot_bootstrap_bounds, &ticks, &dataset.time);
+
+        let samples = match dataset.columns[0].values() {
+            SeriesValues::F64(values) => values.clone(),
+            other => panic!("expected an f64 column, got {other:?}"),
+        };
+        let pyramid = pyramids[0].as_deref().unwrap_or(&[]);
+        let buckets = decimate_viewport(pyramid, &samples, &ticks, range, 800);
+
+        assert!(
+            !buckets.is_empty(),
+            "the very first frame must find real data even though egui_plot's \
+             own bounds start at a sanitized [-1, 1] window that shares no \
+             overlap with this file's real (epoch-second) tick range"
+        );
+
+        // Also drive the full `show` path once, on a brand-new `egui::Context`
+        // with no simulated interaction, purely as the crash-free check SPEC
+        // §6 asks for — the bucket assertion above is what actually proves
+        // the fix.
+        let sample_cache = cache_column_samples(&dataset);
+        let output = egui::Context::default().run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, &dataset, &pyramids, &ticks, &sample_cache);
+            });
+        });
+        assert!(!output.shapes.is_empty());
+    }
+
     // Review finding on the original M2 PR: the NaN-discontinuity claim was
     // previously untested end to end — no test actually drove a NaN-bearing
     // series through `show`. This loads the real torture-corpus case 43
@@ -863,6 +1052,181 @@ mod tests {
         let ticks = [0, 10];
 
         assert_eq!(nearest_tick_index(&ticks, 5), Some(0));
+    }
+
+    // The exact bug found from a real repro: opening a small, clean file
+    // (corpus case-01) showed a permanently empty plot. Root cause: a
+    // brand-new `egui_plot::Plot`'s bounds start at `PlotBounds::NOTHING`
+    // (`is_valid_x()` false), and querying that range returned nothing to
+    // draw — with nothing drawn, `egui_plot`'s own auto-bounds had nothing
+    // to expand around, so it stayed `NOTHING` forever. `query_range` must
+    // fall back to the dataset's own full tick range in exactly this case.
+    #[test]
+    fn query_range_falls_back_to_the_full_tick_range_when_plot_bounds_is_invalid() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        let ticks = [10, 20, 30];
+
+        assert_eq!(query_range(&PlotBounds::NOTHING, &ticks, &time), (10, 30));
+    }
+
+    #[test]
+    fn query_range_of_an_empty_tick_slice_falls_back_to_a_degenerate_zero_range() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+
+        assert_eq!(query_range(&PlotBounds::NOTHING, &[], &time), (0, 0));
+    }
+
+    // The actual, empirically-confirmed shape of the real repro: a fresh
+    // `egui_plot::Plot`'s `plot_bounds()` is not `PlotBounds::NOTHING`
+    // itself — `PlotTransform::new` sanitizes that into a small, arbitrary
+    // `[-1, 1]` window first, which passes `is_valid_x()`. Verified via a
+    // temporary diagnostic print inside `show`'s real render path against
+    // corpus case-01 (ticks around 1.767e18 for nanosecond-precision epoch
+    // timestamps): `plot_bounds` was exactly `[-1, 1]`, so a fallback keyed
+    // only on `is_valid_x()` (an earlier version of this function) never
+    // triggered, and `decimate_viewport` returned zero buckets for every
+    // column every frame — a plot that never draws anything, matching
+    // exactly what was reported: open a small clean file, see nothing.
+    #[test]
+    fn query_range_recovers_from_egui_plots_own_sanitized_bootstrap_bounds() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Nanoseconds)].into(),
+            format: TimestampFormat::EpochNanos,
+        };
+        let ticks = [1_767_225_600_000_000_000_i128, 1_767_225_605_000_000_000];
+        let egui_plot_bootstrap_bounds = PlotBounds::from_min_max([-1.0, -1.0], [1.0, 1.0]);
+
+        let range = query_range(&egui_plot_bootstrap_bounds, &ticks, &time);
+
+        assert_eq!(range, (ticks[0], ticks[1]));
+    }
+
+    // A deliberate pan/zoom to a region with no data snaps back to the full
+    // range too — the same no-overlap check that recovers the bootstrap
+    // case above can't tell "not yet established" apart from "genuinely
+    // panned away", and recovering the former matters more (see
+    // `query_range`'s own doc comment for the accepted tradeoff).
+    #[test]
+    fn query_range_snaps_back_to_the_full_range_when_bounds_are_valid_but_disjoint_from_the_data() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        let ticks = [0, 1, 2];
+        let bounds = PlotBounds::from_min_max([100.0, 0.0], [200.0, 1.0]);
+
+        assert_eq!(query_range(&bounds, &ticks, &time), (0, 2));
+    }
+
+    #[test]
+    fn query_range_uses_real_bounds_when_they_overlap_the_data() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        let ticks = [0, 1, 2, 3, 4, 5];
+        // Overlaps ticks 1..=3 but isn't identical to the full range —
+        // proves a real, in-range pan/zoom is used as-is, not overridden.
+        let bounds = PlotBounds::from_min_max([1.0, 0.0], [3.0, 1.0]);
+
+        assert_eq!(query_range(&bounds, &ticks, &time), (1, 3));
+    }
+
+    #[test]
+    fn is_converged_is_true_when_every_sample_fits_its_own_pixel_column() {
+        let ticks = [0, 1, 2, 3];
+
+        assert!(is_converged(&ticks, (0, 3), 10));
+        assert!(is_converged(&ticks, (0, 3), 4));
+    }
+
+    #[test]
+    fn is_converged_is_false_when_more_samples_than_pixel_columns_are_in_range() {
+        let ticks: Vec<i128> = (0..100).collect();
+
+        assert!(!is_converged(&ticks, (0, 99), 10));
+    }
+
+    #[test]
+    fn is_converged_of_an_empty_range_is_vacuously_true() {
+        let ticks = [0, 1, 2];
+
+        assert!(is_converged(&ticks, (10, 20), 1));
+    }
+
+    // The exact other half of the same real repro: after "Fit to data",
+    // every sample rendered as a disconnected point with no connecting
+    // line — `show`'s converged branch used to push every bucket straight
+    // into the point-markers list and never drew a `Line` between them.
+    #[test]
+    fn bucket_segments_connects_consecutive_non_gap_buckets_into_one_run() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        let buckets = vec![
+            Bucket {
+                min: 1.0,
+                max: 1.0,
+                first_ts: 0,
+                last_ts: 0,
+                nan_count: 0,
+            },
+            Bucket {
+                min: 2.0,
+                max: 2.0,
+                first_ts: 1,
+                last_ts: 1,
+                nan_count: 0,
+            },
+        ];
+
+        assert_eq!(
+            bucket_segments(&time, &buckets),
+            vec![vec![[0.0, 1.0], [1.0, 2.0]]]
+        );
+    }
+
+    #[test]
+    fn bucket_segments_breaks_into_separate_runs_at_a_gap_bucket() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        let buckets = vec![
+            Bucket {
+                min: 1.0,
+                max: 1.0,
+                first_ts: 0,
+                last_ts: 0,
+                nan_count: 0,
+            },
+            Bucket {
+                min: f64::NAN,
+                max: f64::NAN,
+                first_ts: 1,
+                last_ts: 1,
+                nan_count: 1,
+            },
+            Bucket {
+                min: 3.0,
+                max: 3.0,
+                first_ts: 2,
+                last_ts: 2,
+                nan_count: 0,
+            },
+        ];
+
+        assert_eq!(
+            bucket_segments(&time, &buckets),
+            vec![vec![[0.0, 1.0]], vec![[2.0, 3.0]]]
+        );
     }
 
     #[test]

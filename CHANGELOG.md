@@ -46,6 +46,27 @@ Versioning: [Semantic Versioning](https://semver.org/).
   to disk in the first place; a follow-up on making that instant too is
   tracked as its own issue (glyde-app issue #81).
 
+  **Assumption made:** a pan or zoom that lands entirely past the edge of
+  your data — nothing in view at all — now snaps the view back to show
+  everything, rather than showing an empty plot with no obvious way back.
+  Deliberate: the same rule is what makes the plot show your data the
+  instant a file opens (below), and there was no way to tell the two apart.
+
+  Two real bugs were caught and fixed before this shipped, both from
+  actually opening a file and looking at the result rather than only running
+  the test suite: opening a plain, ordinary file first showed a **completely
+  empty plot** until you clicked "Fit to data" — caused by the new per-frame
+  drawing logic asking "what's currently on screen?" before anything had
+  ever been put on screen, a chicken-and-egg gap the previous "draw
+  everything, always" approach never had. And once "Fit to data" was
+  clicked, a small file's points showed up **scattered and disconnected**
+  instead of joined by a line, because the new code only knew how to draw
+  either a connected line-plus-markers for zoomed-in data *or* isolated bars
+  for zoomed-out data, and had confused which one a small, fully-zoomed-in
+  file needed. Both are fixed and covered by tests that reproduce the exact
+  scenario (a real corpus file rendered on a brand-new plot, with no clicks
+  simulated) so they cannot silently come back.
+
 - **Opening a big file now costs the same memory whatever its size — about
   10 MB.** The previous entry got a 2 GB file down from 7.16 GB of memory to
   0.90 GB by keeping the sample data on disk, but the figure was still a
