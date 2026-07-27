@@ -43,16 +43,21 @@ type Pyramids = Vec<Option<Vec<Vec<Bucket>>>>;
 /// partial levels"): a real, renderable [`Dataset`] with fewer rows than the
 /// final one, plus how many rows it reflects and that checkpoint's own
 /// min/max pyramid (docs/ROADMAP.md M3, issue #80). `ticks` is
-/// `dataset.time`'s own pyramid ticks, computed once here rather than by
-/// [`views::time::show`] on every frame — `TimeAxis::to_pyramid_ticks`
-/// materializes a fresh `Vec` over every sample for an in-memory dataset, so
-/// computing it per frame instead of per status change is exactly the
+/// `dataset.time`'s own pyramid ticks, and `sample_cache` is every non-`f64`
+/// numeric column's converted samples (`views::time::cache_column_samples`),
+/// both computed once here rather than by [`views::time::show`] on every
+/// frame: `TimeAxis::to_pyramid_ticks` and `SeriesValues::to_f64_vec` each
+/// materialize a fresh `Vec` over every sample for an in-memory dataset, so
+/// computing either per frame instead of per status change is exactly the
 /// unconditional-per-frame-O(n) mistake issue #80's own frame-time bench
-/// (`crates/glyde-app/benches/time_view_render.rs`) was written to catch.
+/// (`crates/glyde-app/benches/time_view_render.rs`) was written to catch —
+/// `sample_cache` specifically was missed in that PR's first version (an
+/// `f64`-only bench fixture didn't exercise it) and added after review.
 struct PartialLoad {
     dataset: Box<Dataset>,
     pyramids: Pyramids,
     ticks: Vec<i128>,
+    sample_cache: Vec<Option<Vec<f64>>>,
     rows_read: u64,
 }
 
@@ -76,6 +81,8 @@ enum Status {
         /// See [`PartialLoad::ticks`] — the same once-per-status-change
         /// caching, for the completed dataset.
         ticks: Vec<i128>,
+        /// See [`PartialLoad::sample_cache`].
+        sample_cache: Vec<Option<Vec<f64>>>,
     },
     Failed {
         path: PathBuf,
@@ -153,12 +160,14 @@ impl GlydeApp {
                     ..
                 } => {
                     let ticks = dataset.time.to_pyramid_ticks().into_owned();
+                    let sample_cache = views::time::cache_column_samples(&dataset);
                     Status::Loading {
                         path,
                         partial: Some(PartialLoad {
                             dataset,
                             pyramids,
                             ticks,
+                            sample_cache,
                             rows_read,
                         }),
                     }
@@ -172,6 +181,7 @@ impl GlydeApp {
                     ..
                 } => {
                     let ticks = dataset.time.to_pyramid_ticks().into_owned();
+                    let sample_cache = views::time::cache_column_samples(&dataset);
                     Status::Loaded {
                         path,
                         summary,
@@ -179,6 +189,7 @@ impl GlydeApp {
                         dataset,
                         pyramids,
                         ticks,
+                        sample_cache,
                     }
                 }
                 IndexingMessage::Failed { path, message, .. } => Status::Failed { path, message },
@@ -238,7 +249,13 @@ impl eframe::App for GlydeApp {
                                 partial.rows_read
                             ));
                         });
-                        views::time::show(ui, &partial.dataset, &partial.pyramids, &partial.ticks);
+                        views::time::show(
+                            ui,
+                            &partial.dataset,
+                            &partial.pyramids,
+                            &partial.ticks,
+                            &partial.sample_cache,
+                        );
                     }
                     None => {
                         ui.centered_and_justified(|ui| {
@@ -258,6 +275,7 @@ impl eframe::App for GlydeApp {
                 dataset,
                 pyramids,
                 ticks,
+                sample_cache,
             } => {
                 ui.heading(path.display().to_string());
                 // SPEC §1.2 mandatory UX / docs/ROADMAP.md M4 "Inference bar
@@ -269,7 +287,7 @@ impl eframe::App for GlydeApp {
                 }
                 // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1"; SPEC
                 // §3.1 decimation via `pyramids` (docs/ROADMAP.md M3, issue #80).
-                views::time::show(ui, dataset, pyramids, ticks);
+                views::time::show(ui, dataset, pyramids, ticks, sample_cache);
             }
             Status::Failed { path, message } => {
                 ui.colored_label(

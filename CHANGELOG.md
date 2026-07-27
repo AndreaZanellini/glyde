@@ -32,7 +32,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
   Measured on a synthetic 8-million-sample file, one simulated pan/zoom
   frame: **4.75 seconds before → well under a tenth of a millisecond after**
-  (a new automated benchmark now fails the build if this ever regresses).
+  (a new automated benchmark now fails the build if this ever regresses,
+  checked for both a whole-number column and a decimal one — the first
+  version of this fix only measured a decimal column and missed that
+  whole-number columns still had to be re-converted on every single frame).
 
   **Assumption made:** for a very large file that had to be streamed from
   disk instead of held in memory (`docs/SPEC.md` §5.1's affordability check),

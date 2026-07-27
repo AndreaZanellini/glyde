@@ -38,8 +38,6 @@
 //! they route to the state timeline (SPEC §4.3, docs/ROADMAP.md M6), not
 //! yet built.
 
-use std::borrow::Cow;
-
 use egui_plot::{GridMark, Legend, Line, Plot, PlotBounds, PlotPoints, Points};
 use glyde_core::dsp::decimation::{decimate_viewport, Bucket};
 use glyde_core::ingest::{progressive_tick_to_value, progressive_value_to_tick, Dataset, TimeAxis};
@@ -60,12 +58,23 @@ use glyde_core::time::{format_timestamp, Timestamp};
 /// `Vec` over every raw sample, so calling it once per egui frame (as this
 /// function used to) reintroduced the same unconditional-per-frame-O(n) cost
 /// issue #80's own frame-time bench was written to catch — see
-/// `crate::app::PartialLoad::ticks`'s doc comment.
+/// `crate::app::PartialLoad::ticks`'s doc comment. `sample_cache` is the
+/// same once-per-status-change treatment applied to
+/// [`decimate_viewport`]'s other O(n) input: `dataset.columns`-parallel,
+/// `Some(converted)` for a numeric column whose native dtype is not already
+/// `f64` (built via [`cache_column_samples`]), `None` when the column is
+/// already `f64` (zero-copy from `dataset` directly) or non-numeric. Review
+/// finding on the PR that introduced `ticks` caching (issue #80): the same
+/// per-frame cost existed here too, just for `to_f64_vec()` instead of
+/// `to_pyramid_ticks()`, and was missed the first time because the PR's own
+/// bench fixture happened to use an `f64` column, the one dtype this cost
+/// doesn't apply to.
 pub fn show(
     ui: &mut egui::Ui,
     dataset: &Dataset,
     pyramids: &[Option<Vec<Vec<Bucket>>>],
     ticks: &[i128],
+    sample_cache: &[Option<Vec<f64>>],
 ) {
     let fit_clicked = ui.button("Fit to data").clicked();
 
@@ -123,8 +132,9 @@ pub fn show(
                 .and_then(Option::as_ref)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let samples = column_f64_samples(series.values());
-            let buckets = decimate_viewport(pyramid, &samples, ticks, range, pixel_columns);
+            let cached = sample_cache.get(column_index).and_then(Option::as_ref);
+            let samples = column_f64_samples(series.values(), cached);
+            let buckets = decimate_viewport(pyramid, samples, ticks, range, pixel_columns);
 
             // SPEC §3.1: one vertical extent (or, once fully converged, one
             // point marker) per bucket — never a line connecting one pixel
@@ -326,17 +336,51 @@ fn series_color(index: usize) -> egui::Color32 {
 /// `values` as an `f64` slice for [`decimate_viewport`] (which needs direct
 /// index access over the *whole* column, not just what is on screen):
 /// zero-copy via [`SeriesValues::as_f64_slice`] when the column is already
-/// `f64`, otherwise a real converted copy via
-/// [`SeriesValues::to_f64_vec`] — the same fast-path-or-convert split
-/// `glyde_core::ingest::pyramids_for_dataset` uses when it builds a
-/// checkpoint's pyramid over these same samples. `bool`/`string` columns
-/// never reach here (callers only invoke this for [`ViewKind::TimeDomain`]
-/// series, which excludes them by construction).
-fn column_f64_samples(values: &SeriesValues) -> Cow<'_, [f64]> {
+/// `f64`; otherwise `cached` — a converted copy [`cache_column_samples`]
+/// already built for this column once, at the last status change, not this
+/// frame. Never calls [`SeriesValues::to_f64_vec`] itself: doing the
+/// conversion here, inline, was the exact per-frame O(n) cost (worse still
+/// for `i64`/`u64`, which additionally run `warn_if_precision_loss` per
+/// element) a PR #91 review caught this function reintroducing for every
+/// non-`f64` numeric dtype, the same class of mistake `ticks`' own doc
+/// comment on [`show`] already covers for `TimeAxis::to_pyramid_ticks`.
+/// `bool`/`string` columns never reach here (callers only invoke this for
+/// [`ViewKind::TimeDomain`] series, which excludes them by construction) —
+/// `cached` being `None` for a numeric column would be a caller bug (the
+/// cache is dataset-columns-parallel), so this falls back to empty rather
+/// than panicking, matching Golden Rule 2's "never guess silently" only in
+/// spirit: an empty column draws nothing rather than crashing, which is the
+/// crash-free target SPEC §6 asks for even on a caller error.
+fn column_f64_samples<'a>(values: &'a SeriesValues, cached: Option<&'a Vec<f64>>) -> &'a [f64] {
     match values.as_f64_slice() {
-        Some(slice) => Cow::Borrowed(slice),
-        None => Cow::Owned(values.to_f64_vec().unwrap_or_default()),
+        Some(slice) => slice,
+        None => cached.map(Vec::as_slice).unwrap_or(&[]),
     }
+}
+
+/// Builds `sample_cache` for [`show`]: `dataset.columns`-parallel, `Some`
+/// with a real converted `f64` copy for a [`ViewKind::TimeDomain`] column
+/// whose native dtype is not already `f64`, `None` for an already-`f64`
+/// column (zero-copy from `dataset` itself covers it — see
+/// [`column_f64_samples`]) or a non-numeric one (never drawn by [`show`]).
+/// Callers compute this once per status change, mirroring
+/// `glyde_core::ingest::pyramids_for_dataset` and `TimeAxis::to_pyramid_ticks`
+/// — see `crate::app::PartialLoad::ticks`'s doc comment for why per-frame
+/// would be wrong.
+pub fn cache_column_samples(dataset: &Dataset) -> Vec<Option<Vec<f64>>> {
+    dataset
+        .columns
+        .iter()
+        .map(|series| {
+            if series.view_kind() != ViewKind::TimeDomain {
+                return None;
+            }
+            match series.values().as_f64_slice() {
+                Some(_) => None,
+                None => series.values().to_f64_vec(),
+            }
+        })
+        .collect()
 }
 
 /// A [`Bucket`] with no finite reading at all — SPEC §1.3's "never
@@ -548,11 +592,12 @@ mod render_tests {
         let dataset = sample_dataset();
         let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
         let ticks = dataset.time.to_pyramid_ticks();
+        let sample_cache = cache_column_samples(&dataset);
         let ctx = egui::Context::default();
 
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &pyramids, &ticks);
+                show(ui, &dataset, &pyramids, &ticks, &sample_cache);
             });
         });
 
@@ -581,7 +626,7 @@ mod render_tests {
 
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &[], &[]);
+                show(ui, &dataset, &[], &[], &[]);
             });
         });
 
@@ -639,10 +684,11 @@ mod render_tests {
         );
 
         let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
+        let sample_cache = cache_column_samples(&dataset);
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &pyramids, &ticks);
+                show(ui, &dataset, &pyramids, &ticks, &sample_cache);
             });
         });
 
@@ -660,31 +706,39 @@ mod render_tests {
     // small-dataset convergence branch every other test in this module
     // hits — the headless test harness's default viewport is large
     // (10,000 x 10,000 points, see `egui::input_state::InputState`'s
-    // fallback), but nowhere near this fixture's 200,000 samples.
+    // fallback), but nowhere near this fixture's 200,000 samples. Uses an
+    // `i64` column specifically (not `f64`) so this test actually exercises
+    // `cache_column_samples`'s conversion path — a PR #91 review found the
+    // original version of this test used `f64`, the one dtype that path
+    // doesn't apply to, so it never caught the per-frame `to_f64_vec()` bug
+    // the review flagged.
     #[test]
-    fn show_renders_a_large_dataset_without_panicking() {
+    fn show_renders_a_large_non_f64_dataset_without_panicking() {
         let sample_count = 200_000;
         let timestamps: Vec<Timestamp> = (0..sample_count)
             .map(|i| Timestamp::new(i as i128, TimeUnit::Seconds))
             .collect();
-        let values: Vec<f64> = (0..sample_count)
-            .map(|i| (i as f64 * 0.001).sin())
-            .collect();
+        let values: Vec<i64> = (0..sample_count as i64).collect();
         let dataset = Dataset {
             time: TimeAxis::Absolute {
                 timestamps: timestamps.into(),
                 format: TimestampFormat::EpochSeconds,
             },
             time_column_name: "timestamp".to_string(),
-            columns: vec![Series::new("value", SeriesValues::F64(values))],
+            columns: vec![Series::new("value", SeriesValues::I64(values))],
         };
         let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
         let ticks = dataset.time.to_pyramid_ticks();
+        let sample_cache = cache_column_samples(&dataset);
+        assert!(
+            sample_cache[0].is_some(),
+            "an i64 column must populate the sample cache, not rely on a zero-copy f64 slice"
+        );
 
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &pyramids, &ticks);
+                show(ui, &dataset, &pyramids, &ticks, &sample_cache);
             });
         });
 
@@ -965,34 +1019,87 @@ mod tests {
     }
 
     #[test]
-    fn column_f64_samples_is_zero_copy_for_an_f64_series() {
+    fn column_f64_samples_is_zero_copy_for_an_f64_series_even_with_no_cache() {
         let values = SeriesValues::F64(vec![1.0, 2.0, 3.0]);
 
-        let samples = column_f64_samples(&values);
+        let samples = column_f64_samples(&values, None);
 
-        assert!(
-            matches!(samples, Cow::Borrowed(_)),
-            "an already-f64 column must not be copied"
-        );
-        assert_eq!(&*samples, &[1.0, 2.0, 3.0]);
+        assert_eq!(samples, &[1.0, 2.0, 3.0]);
     }
 
     #[test]
-    fn column_f64_samples_converts_a_non_f64_dtype() {
+    fn column_f64_samples_of_a_non_f64_dtype_reads_the_cache_instead_of_converting() {
+        let values = SeriesValues::I64(vec![1, 2, 3]);
+        let cached = vec![1.0, 2.0, 3.0];
+
+        let samples = column_f64_samples(&values, Some(&cached));
+
+        // Not merely equal in value — this asserts it is `cached`'s own
+        // allocation, i.e. `column_f64_samples` never itself calls
+        // `to_f64_vec()` (PR #91 review: that per-frame call was the bug).
+        assert_eq!(samples.as_ptr(), cached.as_ptr());
+    }
+
+    #[test]
+    fn column_f64_samples_of_a_non_f64_dtype_with_no_cache_falls_back_to_empty() {
         let values = SeriesValues::I64(vec![1, 2, 3]);
 
-        let samples = column_f64_samples(&values);
+        let samples = column_f64_samples(&values, None);
 
-        assert!(matches!(samples, Cow::Owned(_)));
-        assert_eq!(&*samples, &[1.0, 2.0, 3.0]);
+        assert!(samples.is_empty());
     }
 
     #[test]
     fn column_f64_samples_of_a_non_numeric_series_is_empty() {
         let values = SeriesValues::Bool(vec![true, false]);
-        let samples = column_f64_samples(&values);
+        let samples = column_f64_samples(&values, None);
 
         assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn cache_column_samples_is_none_for_an_already_f64_column() {
+        let dataset = Dataset {
+            time: TimeAxis::Progressive {
+                values: vec![0.0, 1.0].into(),
+            },
+            time_column_name: "index".to_string(),
+            columns: vec![Series::new("value", SeriesValues::F64(vec![1.0, 2.0]))],
+        };
+
+        assert_eq!(cache_column_samples(&dataset), vec![None]);
+    }
+
+    #[test]
+    fn cache_column_samples_converts_a_non_f64_numeric_column() {
+        let dataset = Dataset {
+            time: TimeAxis::Progressive {
+                values: vec![0.0, 1.0, 2.0].into(),
+            },
+            time_column_name: "index".to_string(),
+            columns: vec![Series::new("value", SeriesValues::I64(vec![1, 2, 3]))],
+        };
+
+        assert_eq!(
+            cache_column_samples(&dataset),
+            vec![Some(vec![1.0, 2.0, 3.0])]
+        );
+    }
+
+    #[test]
+    fn cache_column_samples_is_none_for_a_non_numeric_column() {
+        let dataset = Dataset {
+            time: TimeAxis::Progressive {
+                values: vec![0.0, 1.0].into(),
+            },
+            time_column_name: "index".to_string(),
+            columns: vec![Series::new(
+                "state",
+                SeriesValues::String(vec!["on".to_string(), "off".to_string()]),
+            )],
+        };
+
+        assert_eq!(cache_column_samples(&dataset), vec![None]);
     }
 
     // SPEC §1.3's "never interpolated" applied to a decimated pixel column:
