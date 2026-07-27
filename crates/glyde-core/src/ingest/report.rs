@@ -41,10 +41,7 @@
 use super::csv::{open_path_capturing_column, CsvParseOutcome};
 use super::dataset::{self, Checkpoint, Dataset, TimeAxis};
 use super::infer::Confidence;
-use crate::time::{
-    classify_sampling, detect_gaps, detect_monotonicity, infer_timestamp_format, parse_timestamp,
-    TimestampFormat,
-};
+use crate::time::{infer_timestamp_format, parse_timestamp, summarize_ticks, TimestampFormat};
 use crate::{GlydeError, Result};
 use std::path::Path;
 
@@ -190,16 +187,14 @@ pub fn inspect(path: &Path) -> Result<OpenSummary> {
             for field in &time_fields {
                 ticks.push(parse_timestamp(field, format_inference.format)?.ticks);
             }
-            let sampling_class: SamplingClass = classify_sampling(&ticks).into();
-            let gap_count = detect_gaps(&ticks).len() as u64;
-            let monotonicity = detect_monotonicity(&ticks);
+            let stats = summarize_ticks(ticks.as_slice())?;
             (
                 Some(time_column_name),
                 Some(timestamp_format_label(format_inference.format).to_string()),
-                sampling_class,
-                gap_count,
-                monotonicity.non_monotonic_count as u64,
-                monotonicity.duplicate_count as u64,
+                stats.sampling_class.into(),
+                stats.gap_count as u64,
+                stats.monotonicity.non_monotonic_count as u64,
+                stats.monotonicity.duplicate_count as u64,
             )
         }
         // SPEC §2.1: a progressive numeric index has no absolute-time
@@ -234,11 +229,7 @@ pub fn inspect(path: &Path) -> Result<OpenSummary> {
 /// agree by construction rather than by re-derivation.
 pub fn open_dataset(path: &Path) -> Result<(OpenSummary, InferenceReport, Dataset)> {
     let (outcome, dataset, timestamp_format_ambiguous) = dataset::load_with_outcome(path)?;
-    Ok(build_summary_and_report(
-        outcome,
-        dataset,
-        timestamp_format_ambiguous,
-    ))
+    build_summary_and_report(outcome, dataset, timestamp_format_ambiguous)
 }
 
 /// [`open_dataset`] against an explicit RAM budget and spill directory, so a
@@ -252,11 +243,7 @@ pub fn open_dataset_with_budget(
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
     let (outcome, dataset, timestamp_format_ambiguous) =
         dataset::load_with_outcome_with_budget(path, budget, cache_dir)?;
-    Ok(build_summary_and_report(
-        outcome,
-        dataset,
-        timestamp_format_ambiguous,
-    ))
+    build_summary_and_report(outcome, dataset, timestamp_format_ambiguous)
 }
 
 /// [`open_dataset`], additionally invoking `on_checkpoint` with a
@@ -277,11 +264,7 @@ pub fn open_dataset_progressive(
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
     let (outcome, dataset, timestamp_format_ambiguous) =
         dataset::load_with_outcome_progressive(path, on_checkpoint)?;
-    Ok(build_summary_and_report(
-        outcome,
-        dataset,
-        timestamp_format_ambiguous,
-    ))
+    build_summary_and_report(outcome, dataset, timestamp_format_ambiguous)
 }
 
 /// The summary/report-building half of [`open_dataset`], shared with
@@ -291,7 +274,7 @@ fn build_summary_and_report(
     outcome: CsvParseOutcome,
     dataset: Dataset,
     timestamp_format_ambiguous: bool,
-) -> (OpenSummary, InferenceReport, Dataset) {
+) -> Result<(OpenSummary, InferenceReport, Dataset)> {
     let (
         time_column,
         timestamp_format,
@@ -301,21 +284,19 @@ fn build_summary_and_report(
         duplicate_timestamp_count,
     ) = match &dataset.time {
         TimeAxis::Absolute { timestamps, format } => {
-            // Borrowed straight from the spill mapping for a spilled axis
-            // (issue #75), so a large file's summary costs no copy of its
-            // whole tick column; owned only on the in-memory path, where the
-            // ticks live inside each `Timestamp`.
-            let ticks = timestamps.ticks();
-            let sampling_class: SamplingClass = classify_sampling(&ticks).into();
-            let gap_count = detect_gaps(&ticks).len() as u64;
-            let monotonicity = detect_monotonicity(&ticks);
+            // Read as a `TickSource`, never as one whole slice (issue #85): a
+            // spilled axis hands its ticks over a buffer at a time, so the
+            // summary of a 10 GB file costs the same memory as the summary of a
+            // 10 MB one — SPEC §5's peak-RSS cap is a flat number, not a
+            // fraction of file size.
+            let stats = summarize_ticks(timestamps)?;
             (
                 Some(dataset.time_column_name.clone()),
                 Some(timestamp_format_label(*format).to_string()),
-                sampling_class,
-                gap_count,
-                monotonicity.non_monotonic_count as u64,
-                monotonicity.duplicate_count as u64,
+                stats.sampling_class.into(),
+                stats.gap_count as u64,
+                stats.monotonicity.non_monotonic_count as u64,
+                stats.monotonicity.duplicate_count as u64,
             )
         }
         // SPEC §2.1: a progressive numeric index has no absolute-time
@@ -378,7 +359,7 @@ fn build_summary_and_report(
         sampling_class,
     };
 
-    (summary, report, dataset)
+    Ok((summary, report, dataset))
 }
 
 #[cfg(test)]

@@ -12,6 +12,65 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- **Opening a big file now costs the same memory whatever its size — about
+  10 MB.** The previous entry got a 2 GB file down from 7.16 GB of memory to
+  0.90 GB by keeping the sample data on disk, but the figure was still a
+  *fraction* of the file (0.42×), so it kept growing: a 10 GB file would have
+  needed ~4.2 GB, right at the ceiling Glyde promises to stay under
+  (`docs/SPEC.md` §5: `min(25% of your RAM, 4 GB)`), and over it on a smaller
+  machine (issue #85).
+
+  What was left growing was not your data — that is fully on disk — it was the
+  handful of *statistics* Glyde works out about the time column every time it
+  opens a file: the typical spacing between samples, where the gaps are, and
+  whether the sampling is regular enough for a PSD. Those were computed by laying
+  every gap between consecutive samples out in memory at once and sorting them.
+  Glyde now reads the time column back a small piece at a time and works the same
+  numbers out without ever holding them all, so the cost no longer depends on how
+  many rows there are.
+
+  Measured with the memory harness on the generated test fixtures (an ISO 8601
+  timestamp column plus eight numeric columns), before and after, on the same
+  files:
+
+  | Fixture | Peak memory before | Peak memory after |
+  |---|---|---|
+  | 2 GB | 895 MB (0.42× the file) | **10.7 MB (0.005×)** |
+  | 8 GB | not measured (0.42× predicts ~3.6 GB) | **10.3 MB (0.001×)** |
+
+  A 2 GB file and an 8 GB file now cost the *same* memory to open — 10.7 MB and
+  10.3 MB, a difference smaller than the run-to-run noise. That is what "flat"
+  means, and it is what `SPEC.md` §5 asks for. The 4 GB ceiling is no longer
+  anywhere near in play: a 20 GB file should open in the same ~10 MB.
+  Opening is not slower: the same 2 GB file took 37.6 s before and 38.4 s after
+  (within run-to-run noise), because the new method usually settles the answer in
+  a couple of quick passes where the old one had to sort millions of values.
+
+  **Nothing about the results changed.** The spacing, gap count, regular-vs-
+  irregular verdict, and out-of-order/duplicate timestamp counts are the same
+  numbers as before, not approximations of them: the new method finds the *exact*
+  same middle value a full sort would have found, and every existing test —
+  including the torture corpus's file-by-file expected results and the
+  hand-checked timestamp tests — passes unchanged. A property test cross-checks
+  the new method against a plain sort on 256 random series per run, and another
+  checks that reading a series in tiny pieces gives the identical verdict to
+  reading it whole.
+
+  **Assumptions made:**
+  - **Nothing in `SPEC.md` needed reinterpreting.** §2.2 defines its rules
+    against the *median* spacing, and the median is the one statistic that cannot
+    be computed in a single bounded pass. Rather than substitute a cheaper
+    approximation (a running average, a sampled subset) and quietly change what
+    the app reports, Glyde re-reads the time column a few times to get the
+    genuine median. Fidelity over speed, per the golden rules.
+  - **Where the extra reading happens.** Re-reading comes from the scratch files
+    Glyde already wrote, or from memory for a file small enough to fit — never
+    from re-parsing your original file, which is still read exactly once.
+  - **A file with an implausible number of gaps.** Gap *counting* is now
+    unbounded-file-safe, but the gap *list* (which a future gap view will draw)
+    is still built in memory. A normal file has a handful of gaps; a
+    deliberately pathological one could have millions. Noted as a backlog issue,
+    not a change here.
 - **Big files no longer eat memory in proportion to their size.** Before this
   change, opening a CSV cost roughly **3.3× the file's size in RAM** — so a
   2 GB file needed about 7 GB, which is past the memory ceiling Glyde promises

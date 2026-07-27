@@ -180,12 +180,13 @@ records the full decision. Measured with `memory_gate` on the 8-column generated
 fixture: a 2 GB file went from 7.16 GB peak RSS (3.34×, over the 4.21 GB cap) to
 0.90 GB (0.42×); a 0.5 GB file still fits the budget and is unchanged.
 
-**Residual, tracked separately (#85).** Peak RSS is ~0.42× file size, not flat. The
-sample data is fully on disk; what still scales is `time::gap`'s `O(rows)` Δt
-temporaries plus the resident tick pages SPEC §2.2's median-based statistics scan —
-~48 bytes/row measured. Extrapolated, a 10 GB file needs ~4.2 GB, i.e. at the cap on
-the SPEC §5 reference machine and over it on a 7.5 GB CI runner. R6 (#83) should not
-re-arm the memory gate at a large fixture size until #86 lands.
+**Residual, since closed (#85).** Peak RSS was ~0.42× file size, not flat: the sample
+data was fully on disk, but `time::gap`'s `O(rows)` Δt temporaries plus the resident
+tick pages SPEC §2.2's median-based statistics scanned still cost ~48 bytes/row.
+`time::TickSource` (bounded, replayable chunk reads) plus an exact iterative-histogram
+order statistic removed both. Measured with `memory_gate` on the same 8-column fixture:
+**10.7 MB on a 2 GB file and 10.3 MB on an 8 GB one** — flat, and 0.4% of the cap
+rather than 21% of it. R6 (#83) can now re-arm the memory gate at a large fixture size.
 
 ### R1 · #82a — Implement `DateTimeSpace`
 

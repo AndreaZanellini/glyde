@@ -52,8 +52,8 @@ use crate::index::level0::{self, CacheKey};
 use crate::index::spill::{SpillStringsWriter, SpillVec, SpillVecWriter};
 use crate::series::{Anomalies, Dtype, NanRunScan, Series, SeriesValues, SpilledValues};
 use crate::time::{
-    infer_timestamp_format, parse_timestamp, TimeUnit, Timestamp, TimestampFormat,
-    TimestampFormatScan,
+    infer_timestamp_format, parse_timestamp, TickSource, TimeUnit, Timestamp, TimestampFormat,
+    TimestampFormatScan, TICK_CHUNK_LEN,
 };
 use crate::{GlydeError, Result};
 use std::borrow::Cow;
@@ -162,6 +162,49 @@ impl Timestamps {
 
     fn is_spilled(&self) -> bool {
         matches!(self, Timestamps::Spilled { .. })
+    }
+}
+
+/// How SPEC §2.1–2.2's statistics read this axis (issue #85): in bounded
+/// chunks, replayable, whichever storage backs it.
+///
+/// [`Timestamps::ticks`] is still the right way to hand a *whole* tick column
+/// to a caller that needs one contiguously (`TimeAxis::to_pyramid_ticks`).
+/// This is for the multi-pass statistics in [`crate::time`], where a spilled
+/// column is read back through a fixed-size buffer instead, so a scan of it
+/// does not make the mapping resident and cost memory proportional to file
+/// size.
+impl TickSource for Timestamps {
+    fn tick_count(&self) -> usize {
+        self.len()
+    }
+
+    fn visit_tick_chunks(
+        &self,
+        range: std::ops::Range<usize>,
+        visit: &mut dyn FnMut(&[i128]) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            // The heap path's ticks each live inside a `Timestamp`, so they are
+            // gathered into one reused chunk buffer rather than borrowed. This
+            // path is only taken for a file that already fit the RAM budget, so
+            // the copy is bounded by construction.
+            Timestamps::Memory(timestamps) => {
+                let start = range.start.min(timestamps.len());
+                let end = range.end.min(timestamps.len());
+                if start >= end {
+                    return Ok(());
+                }
+                let mut chunk = Vec::with_capacity(TICK_CHUNK_LEN.min(end - start));
+                for timestamps in timestamps[start..end].chunks(TICK_CHUNK_LEN) {
+                    chunk.clear();
+                    chunk.extend(timestamps.iter().map(|timestamp| timestamp.ticks));
+                    visit(&chunk)?;
+                }
+                Ok(())
+            }
+            Timestamps::Spilled { ticks, .. } => ticks.read_chunks(range, visit),
+        }
     }
 }
 

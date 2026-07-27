@@ -53,9 +53,10 @@
 //! same deferral `index::level0` already records.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::mem::size_of;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -85,6 +86,9 @@ const EXTENSION: &str = "glysp";
 /// message without copying the samples themselves.
 pub struct SpillVec<T> {
     mmap: Arc<Mmap>,
+    /// The file the mapping came from, kept so [`SpillVec::read_chunks`] can
+    /// read elements back *without* going through the mapping.
+    path: Arc<Path>,
     len: usize,
     marker: PhantomData<fn() -> T>,
 }
@@ -93,11 +97,18 @@ impl<T> Clone for SpillVec<T> {
     fn clone(&self) -> Self {
         Self {
             mmap: Arc::clone(&self.mmap),
+            path: Arc::clone(&self.path),
             len: self.len,
             marker: PhantomData,
         }
     }
 }
+
+/// How much a [`SpillVec::read_chunks`] scan reads at a time. Sized like
+/// `ingest::csv`'s streaming read buffer: big enough that the syscall cost per
+/// element is negligible, small enough that a scan's footprint is a flat
+/// number independent of the column's length.
+const READ_CHUNK_BYTES: usize = 1 << 20;
 
 impl<T: Pod> SpillVec<T> {
     /// The spilled elements, in the order they were pushed.
@@ -125,6 +136,58 @@ impl<T: Pod> SpillVec<T> {
     /// The element at `index`, or `None` when out of range.
     pub fn get(&self, index: usize) -> Option<T> {
         self.as_slice().get(index).copied()
+    }
+
+    /// Hands `range`'s elements to `visit` in contiguous chunks, in order,
+    /// reading them back through a fixed-size buffer instead of through the
+    /// mapping (issue #85).
+    ///
+    /// [`Self::as_slice`] is the right choice for a column a caller walks once
+    /// and can afford to make resident. This is for the opposite case: a
+    /// *multi-pass* statistic over a column far larger than the peak-RSS cap
+    /// (SPEC §5), where scanning the mapping end to end would make every page
+    /// of it resident and so cost memory proportional to file size. Reading
+    /// through a buffer leaves the pages in the OS page cache, which the cap
+    /// does not count and the OS is free to reclaim — SPEC §5.1's "read in
+    /// bounded chunks" applied to our own spill files, the same way
+    /// `ingest::csv::stream_path` applies it to the user's source file.
+    ///
+    /// A `range` reaching past the column's end is clamped to it, so a caller
+    /// need not special-case the last chunk.
+    pub fn read_chunks(
+        &self,
+        range: Range<usize>,
+        visit: &mut dyn FnMut(&[T]) -> Result<()>,
+    ) -> Result<()> {
+        let start = range.start.min(self.len);
+        let end = range.end.min(self.len);
+        if start >= end {
+            return Ok(());
+        }
+
+        let io_error = |source: std::io::Error| GlydeError::Io {
+            path: self.path.to_path_buf(),
+            source,
+        };
+        let mut file = File::open(&*self.path).map_err(io_error)?;
+        let offset = HEADER_LEN + start * size_of::<T>();
+        file.seek(SeekFrom::Start(offset as u64))
+            .map_err(io_error)?;
+
+        // At least one element per chunk even for a `T` wider than the buffer,
+        // which no current caller has but the arithmetic must not assume.
+        let chunk_len = (READ_CHUNK_BYTES / size_of::<T>()).max(1);
+        let mut buffer = vec![T::zeroed(); chunk_len];
+        let mut remaining = end - start;
+        while remaining > 0 {
+            let take = remaining.min(chunk_len);
+            file.read_exact(bytemuck::cast_slice_mut(&mut buffer[..take]))
+                .map_err(io_error)?;
+            visit(&buffer[..take])?;
+            remaining -= take;
+        }
+
+        Ok(())
     }
 }
 
@@ -260,6 +323,7 @@ impl<T: Pod> SpillVecWriter<T> {
         let mmap = map_spill_file(&self.final_path, len, size_of::<T>())?;
         Ok(SpillVec {
             mmap: Arc::new(mmap),
+            path: Arc::from(self.final_path.as_path()),
             len,
             marker: PhantomData,
         })
@@ -511,6 +575,83 @@ mod tests {
         let err = map_spill_file(&path, 2, size_of::<f64>())
             .expect_err("a foreign file must not be misread as spilled samples");
         assert!(matches!(err, GlydeError::CorruptCache { .. }));
+    }
+
+    /// Every element `read_chunks` hands back over `range`, flattened, plus the
+    /// chunk lengths it used.
+    fn read_back<T: Pod>(spilled: &SpillVec<T>, range: Range<usize>) -> (Vec<T>, Vec<usize>) {
+        let mut elements = Vec::new();
+        let mut chunk_lens = Vec::new();
+        spilled
+            .read_chunks(range, &mut |chunk| {
+                chunk_lens.push(chunk.len());
+                elements.extend_from_slice(chunk);
+                Ok(())
+            })
+            .expect("reading back a spill file this test just wrote");
+        (elements, chunk_lens)
+    }
+
+    // Issue #85: the bounded read path must be a *storage* detail only — it has
+    // to yield exactly what the mapping does, chunk boundaries included.
+    #[test]
+    fn read_chunks_yields_exactly_what_the_mapping_does() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // More elements than fit one chunk, so the loop runs several times and
+        // the last chunk is a partial one.
+        let chunk_len = READ_CHUNK_BYTES / size_of::<i128>();
+        let count = chunk_len * 2 + 7;
+
+        let mut writer = SpillVecWriter::<i128>::create(dir.path(), "ticks").expect("create");
+        for value in 0..count {
+            writer.push(value as i128 * 3 - 5).expect("push");
+        }
+        let spilled = writer.finish().expect("finish");
+
+        let (elements, chunk_lens) = read_back(&spilled, 0..count);
+        assert_eq!(elements, spilled.as_slice());
+        assert_eq!(chunk_lens, vec![chunk_len, chunk_len, 7]);
+    }
+
+    #[test]
+    fn read_chunks_reads_a_sub_range_and_clamps_one_past_the_end() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut writer = SpillVecWriter::<f64>::create(dir.path(), "samples").expect("create");
+        for value in [1.5_f64, 2.5, 3.5, 4.5, 5.5] {
+            writer.push(value).expect("push");
+        }
+        let spilled = writer.finish().expect("finish");
+
+        assert_eq!(read_back(&spilled, 1..4).0, vec![2.5, 3.5, 4.5]);
+        assert_eq!(read_back(&spilled, 3..99).0, vec![4.5, 5.5]);
+        assert!(read_back(&spilled, 2..2).0.is_empty());
+        assert!(read_back(&spilled, 99..200).0.is_empty());
+    }
+
+    // Golden Rule 1 again, for the read path this time: `as_slice`'s bit-for-bit
+    // round trip must hold when the same file is read through a buffer instead.
+    #[test]
+    fn read_chunks_round_trips_f64_samples_bit_for_bit_including_nan() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let samples = [1.5_f64, -0.0, f64::NAN, f64::INFINITY, f64::MIN_POSITIVE];
+
+        let mut writer = SpillVecWriter::<f64>::create(dir.path(), "nan").expect("create");
+        for &sample in &samples {
+            writer.push(sample).expect("push");
+        }
+        let spilled = writer.finish().expect("finish");
+
+        assert_eq!(
+            read_back(&spilled, 0..samples.len())
+                .0
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            samples
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
