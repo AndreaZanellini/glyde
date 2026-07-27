@@ -223,6 +223,15 @@ caps it at a flat `min(25% RAM, 4 GB)`. Resolved as follows (the maintainer's
   never depend on how large the file happens to be. This is the
   §"Two classes of inference" split above, finally realized: dtype is a
   provisional hypothesis the streaming stage validates and may only widen.
+- **Progress checkpoints survive the spill.** SPEC §5's "first meaningful plot,
+  any file size ≤ 2 s" applies to spilled files most of all, but a checkpoint
+  cannot hand out a `Dataset` over spill files still being written — they are
+  published by an atomic rename, and Windows will not rename a mapped file. The
+  spilled path therefore keeps a *bounded* in-memory preview of the first rows
+  (`ingest::dataset::PREVIEW_MAX_ROWS`) and checkpoints from that, on the same
+  doubling schedule the in-memory path uses; past the cap it retires the preview
+  and streams straight through. A preview is a real heap-backed `Dataset`, so
+  `glyde-app` needs no special case for it.
 - **Two passes over the source, not one.** A column's dtype is only settled once
   the last row has been seen (SPEC §1.4: one non-numeric cell keeps the whole
   column as text), so the spill path scans first and writes typed values second.
@@ -236,9 +245,7 @@ caps it at a flat `min(25% RAM, 4 GB)`. Resolved as follows (the maintainer's
 - **Still outstanding:** peak RSS is ~0.42× file size rather than flat. The
   residual is `time::gap`'s `O(rows)` Δt temporaries and the resident tick
   pages the SPEC §2.2 statistics scan — derived statistics, not sample data —
-  tracked as issue #85. Progress checkpoints are also skipped on the spill
-  path (publishing a half-written spill file is not portable across the CI
-  matrix).
+  tracked as issue #85.
 
 ### Progressive-axis tick mapping and `TimeUnit` placement (decision, issue #60)
 

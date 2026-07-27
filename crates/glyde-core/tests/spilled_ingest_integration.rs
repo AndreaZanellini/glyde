@@ -290,6 +290,75 @@ fn open_dataset_reports_the_same_summary_whichever_storage_it_chose() {
     assert_eq!(spilled_report, memory_report);
 }
 
+// SPEC §5's "first meaningful plot, **any file size**: ≤ 2 s (progressive:
+// render what is indexed, keep indexing in background)" applies to exactly the
+// files that get spilled — the large ones. A spilled open must therefore still
+// report progress checkpoints, not go quiet until the whole read finishes.
+//
+// Caught in CI by the `first_plot` bench, which spills on the 7.5 GB macos-14
+// runner (cap 1.88 GB) where it did not on a 16 GB dev machine, and panicked
+// on "a 1 GB fixture must cross at least one progress checkpoint".
+#[test]
+fn a_spilled_open_still_reports_progress_checkpoints() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    // More than the 20,000-row first checkpoint, so the doubling schedule fires
+    // at least twice.
+    let path = write_mixed_dtype_fixture(dir.path(), 50_000);
+
+    let mut checkpoints: Vec<(u64, usize)> = Vec::new();
+    let dataset =
+        ingest::load_progressive_with_budget(&path, zero_budget(), cache.path(), |checkpoint| {
+            checkpoints.push((checkpoint.rows_read, checkpoint.dataset.time.len()));
+        })
+        .expect("spilled progressive open must succeed");
+
+    assert!(dataset.is_spilled());
+    assert_eq!(dataset.time.len(), 50_000);
+    assert_eq!(
+        checkpoints
+            .iter()
+            .map(|&(rows, _)| rows)
+            .collect::<Vec<_>>(),
+        vec![20_000, 40_000],
+        "a spilled open must checkpoint on the same doubling schedule as an \
+         in-memory one"
+    );
+    for &(rows_read, dataset_len) in &checkpoints {
+        assert_eq!(
+            dataset_len, rows_read as usize,
+            "a checkpoint's dataset must hold exactly the rows it reports"
+        );
+    }
+}
+
+// The preview that makes the checkpoints above possible is bounded: past
+// `PREVIEW_MAX_ROWS` it stops growing, so a genuinely huge file cannot smuggle
+// an unbounded `Vec` back in through the progress path. A 250k-row fixture
+// crosses the 200k cap, so the 160k checkpoint must be the last one even
+// though the file has far more rows.
+#[test]
+fn the_spilled_progressive_preview_stops_growing_at_its_cap() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let path = write_mixed_dtype_fixture(dir.path(), 250_000);
+
+    let mut checkpoint_rows: Vec<u64> = Vec::new();
+    let dataset =
+        ingest::load_progressive_with_budget(&path, zero_budget(), cache.path(), |checkpoint| {
+            checkpoint_rows.push(checkpoint.rows_read);
+        })
+        .expect("spilled progressive open must succeed");
+
+    assert_eq!(dataset.time.len(), 250_000);
+    assert_eq!(
+        checkpoint_rows,
+        vec![20_000, 40_000, 80_000, 160_000],
+        "the preview must retire at its row cap instead of following the \
+         doubling schedule all the way up with the file"
+    );
+}
+
 #[test]
 fn a_single_column_file_is_still_a_clean_error_on_the_spill_path() {
     let dir = tempfile::tempdir().expect("temp dir");

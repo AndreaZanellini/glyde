@@ -64,12 +64,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
     so reopening the same file overwrites rather than accumulating — but a
     *different* big file adds a new set. Reading them back to make a reopen
     instant is issue #81; deleting old ones was already a tracked gap.
-  - **A big file no longer fills its plot progressively.** Files small enough for
-    the in-memory path still draw a growing plot while they load. A file large
-    enough to be spilled shows the spinner until the read finishes, then the
-    whole plot. Handing out a half-written on-disk column safely is not portable
-    across the three OSes Glyde ships on, so it was left out rather than done
-    unreliably.
+  - **A big file's plot fills in from a capped preview.** Both paths still draw a
+    growing plot while a file loads. For a spilled file the growing plot is built
+    from the first 200,000 rows kept in memory; past that it stops growing and
+    the complete plot appears when the read finishes. (Drawing directly from the
+    scratch files while they are still being written is not safe on all three
+    OSes Glyde ships on, so the preview is capped instead — which also keeps its
+    memory cost fixed at roughly 20 MB whatever the file's size.)
   - **If your machine has no usable cache directory**, a file too large for the
     budget is refused with a clear message rather than attempted anyway
     (`SPEC.md` §5.1: never start an action that would run the machine out of

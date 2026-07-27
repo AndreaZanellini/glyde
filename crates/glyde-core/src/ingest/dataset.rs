@@ -43,7 +43,7 @@
 
 use super::csv::{
     open_path_capturing_all_columns, open_path_capturing_all_columns_with_progress, ColumnText,
-    CsvParseOutcome, RowFields, Sniff,
+    CsvParseOutcome, RowFields, Sniff, FIRST_PROGRESS_CHECKPOINT_ROWS,
 };
 use super::infer::{log_dtype_choice, normalize_decimal_field, ColumnDtypeChoice, ColumnDtypeScan};
 use crate::budget::RamBudget;
@@ -479,7 +479,7 @@ fn load_with_outcome_using(
         }
         Storage::Spill(sniff) => {
             let cache_dir = cache_dir.expect("choose_storage refuses to spill without a cache dir");
-            load_spilled(path, &sniff, cache_dir)
+            load_spilled(path, &sniff, cache_dir, None)
         }
     }
 }
@@ -598,6 +598,7 @@ fn load_spilled(
     path: &Path,
     sniff: &Sniff,
     cache_dir: &Path,
+    on_checkpoint: Option<&mut dyn FnMut(Checkpoint)>,
 ) -> Result<(CsvParseOutcome, Dataset, bool)> {
     let column_names = sniff.column_names().to_vec();
     if column_names.len() < 2 {
@@ -638,14 +639,26 @@ fn load_spilled(
         })
         .collect::<Result<_>>()?;
 
+    let mut preview = SpillPreview::new(
+        on_checkpoint,
+        &column_names,
+        &choices,
+        timestamp_format.map(|inference| inference.format),
+    );
+
     let outcome = super::csv::stream_path(path, sniff, &mut |row: RowFields<'_>| {
-        time_writer.push(row.get(0).unwrap_or_default())?;
+        let time_value = time_writer.push(row.get(0).unwrap_or_default())?;
+        preview.observe_time(time_value);
         for (index, writer) in column_writers.iter_mut().enumerate() {
             let field = row.get(index + 1).unwrap_or_default();
-            writer.push(&normalize_decimal_field(field, decimal_separator))?;
+            let normalized = normalize_decimal_field(field, decimal_separator);
+            let value = writer.push(&normalized)?;
+            preview.observe_column(index, value);
         }
+        preview.end_row();
         Ok(())
     })?;
+    drop(preview);
 
     let time = time_writer.finish()?;
     let columns = column_writers
@@ -677,25 +690,36 @@ fn load_spilled(
 }
 
 /// Writes a [`TimeAxis`] to the spill cache one row at a time.
+///
+/// The `Absolute` payload is boxed: it carries three writers to the
+/// `Progressive` arm's one, and each writer owns two `PathBuf`s, so inline it
+/// would make every `Progressive` axis pay for storage it never uses
+/// (`clippy::large_enum_variant`).
 enum TimeAxisSpillWriter {
-    Absolute {
-        ticks: SpillVecWriter<i128>,
-        units: SpillVecWriter<u8>,
-        offsets: SpillVecWriter<i64>,
-        format: TimestampFormat,
-    },
+    Absolute(Box<AbsoluteAxisSpillWriter>),
     Progressive(SpillVecWriter<f64>),
+}
+
+/// [`TimeAxisSpillWriter::Absolute`]'s payload: SPEC §2.1's ticks, per-row
+/// [`TimeUnit`] and per-row UTC offset, each in its own spill file.
+struct AbsoluteAxisSpillWriter {
+    ticks: SpillVecWriter<i128>,
+    units: SpillVecWriter<u8>,
+    offsets: SpillVecWriter<i64>,
+    format: TimestampFormat,
 }
 
 impl TimeAxisSpillWriter {
     fn create(cache_dir: &Path, stem: &str, format: Option<TimestampFormat>) -> Result<Self> {
         match format {
-            Some(format) => Ok(TimeAxisSpillWriter::Absolute {
-                ticks: SpillVecWriter::create(cache_dir, &format!("{stem}.ts"))?,
-                units: SpillVecWriter::create(cache_dir, &format!("{stem}.tsunit"))?,
-                offsets: SpillVecWriter::create(cache_dir, &format!("{stem}.tsoffset"))?,
-                format,
-            }),
+            Some(format) => Ok(TimeAxisSpillWriter::Absolute(Box::new(
+                AbsoluteAxisSpillWriter {
+                    ticks: SpillVecWriter::create(cache_dir, &format!("{stem}.ts"))?,
+                    units: SpillVecWriter::create(cache_dir, &format!("{stem}.tsunit"))?,
+                    offsets: SpillVecWriter::create(cache_dir, &format!("{stem}.tsoffset"))?,
+                    format,
+                },
+            ))),
             None => Ok(TimeAxisSpillWriter::Progressive(SpillVecWriter::create(
                 cache_dir,
                 &format!("{stem}.tsprogressive"),
@@ -703,49 +727,61 @@ impl TimeAxisSpillWriter {
         }
     }
 
-    fn push(&mut self, field: &str) -> Result<()> {
+    /// Types one row's time field and appends it. Returns the typed value so
+    /// [`SpillPreview`] can record it without parsing the same field twice.
+    fn push(&mut self, field: &str) -> Result<TimeValue> {
         match self {
-            TimeAxisSpillWriter::Absolute {
-                ticks,
-                units,
-                offsets,
-                format,
-            } => {
-                let timestamp = parse_timestamp(field, *format)?;
-                ticks.push(timestamp.ticks)?;
-                units.push(time_unit_code(timestamp.unit))?;
-                offsets.push(
+            TimeAxisSpillWriter::Absolute(writer) => {
+                let timestamp = parse_timestamp(field, writer.format)?;
+                writer.ticks.push(timestamp.ticks)?;
+                writer.units.push(time_unit_code(timestamp.unit))?;
+                writer.offsets.push(
                     timestamp
                         .offset_seconds
                         .map_or(NO_UTC_OFFSET, |offset| offset as i64),
-                )
+                )?;
+                Ok(TimeValue::Absolute(timestamp))
             }
             TimeAxisSpillWriter::Progressive(values) => {
-                values.push(parse_progressive_value(field)?)
+                let value = parse_progressive_value(field)?;
+                values.push(value)?;
+                Ok(TimeValue::Progressive(value))
             }
         }
     }
 
     fn finish(self) -> Result<TimeAxis> {
         match self {
-            TimeAxisSpillWriter::Absolute {
-                ticks,
-                units,
-                offsets,
-                format,
-            } => Ok(TimeAxis::Absolute {
+            TimeAxisSpillWriter::Absolute(writer) => Ok(TimeAxis::Absolute {
                 timestamps: Timestamps::Spilled {
-                    ticks: ticks.finish()?,
-                    units: units.finish()?,
-                    offsets: offsets.finish()?,
+                    ticks: writer.ticks.finish()?,
+                    units: writer.units.finish()?,
+                    offsets: writer.offsets.finish()?,
                 },
-                format,
+                format: writer.format,
             }),
             TimeAxisSpillWriter::Progressive(values) => Ok(TimeAxis::Progressive {
                 values: ProgressiveValues::Spilled(values.finish()?),
             }),
         }
     }
+}
+
+/// One row's typed time value, handed back by [`TimeAxisSpillWriter::push`].
+#[derive(Debug, Clone, Copy)]
+enum TimeValue {
+    Absolute(Timestamp),
+    Progressive(f64),
+}
+
+/// One row's typed data value, handed back by [`ColumnSpillWriter::push`],
+/// borrowing the source text for the string case so the common numeric path
+/// costs no allocation.
+enum ColumnValue<'a> {
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    Str(&'a str),
 }
 
 /// Writes one data column to the spill cache in its inferred dtype, one
@@ -778,20 +814,30 @@ impl ColumnSpillWriter {
         })
     }
 
-    fn push(&mut self, field: &str) -> Result<()> {
+    /// Types one row's field and appends it. Returns the typed value so
+    /// [`SpillPreview`] can record it without parsing the same field twice.
+    fn push<'f>(&mut self, field: &'f str) -> Result<ColumnValue<'f>> {
         match self {
-            ColumnSpillWriter::Bool(values) => values.push(u8::from(
-                super::infer::parse_bool_field(field).unwrap_or_default(),
-            )),
+            ColumnSpillWriter::Bool(values) => {
+                let value = super::infer::parse_bool_field(field).unwrap_or_default();
+                values.push(u8::from(value))?;
+                Ok(ColumnValue::Bool(value))
+            }
             ColumnSpillWriter::I64(values) => {
-                values.push(field.trim().parse::<i64>().unwrap_or_default())
+                let value = field.trim().parse::<i64>().unwrap_or_default();
+                values.push(value)?;
+                Ok(ColumnValue::I64(value))
             }
             ColumnSpillWriter::F64(values, nan_runs) => {
                 let value = field.trim().parse::<f64>().unwrap_or_default();
                 nan_runs.observe(value);
-                values.push(value)
+                values.push(value)?;
+                Ok(ColumnValue::F64(value))
             }
-            ColumnSpillWriter::String(values) => values.push(field),
+            ColumnSpillWriter::String(values) => {
+                values.push(field)?;
+                Ok(ColumnValue::Str(field))
+            }
         }
     }
 
@@ -827,6 +873,226 @@ impl ColumnSpillWriter {
                 SeriesValues::Spilled(SpilledValues::String(values.finish()?)),
             ),
         })
+    }
+}
+
+/// How many rows of a spilled open the progressive preview keeps in memory.
+///
+/// SPEC §5 requires a first meaningful plot within 2 s *for any file size*, so
+/// a spilled open cannot simply skip progress reporting — that is the file
+/// size where it matters most. It also cannot hand out a `Dataset` over spill
+/// files that are still being written: they are published by an atomic rename,
+/// and Windows will not rename a mapped file.
+///
+/// The way out is that a *preview* does not need every row. The preview keeps
+/// the first rows' typed values in ordinary heap `Vec`s — the same shape the
+/// in-memory path produces, so `views::time` needs no special case — and stops
+/// growing at this cap, which bounds it at roughly 20 MB for a typical
+/// ten-column file no matter how large the source is. The complete, spilled
+/// dataset replaces it when the read finishes.
+///
+/// Sized so the doubling checkpoint schedule fires several times before the
+/// cap (20k, 40k, 80k, 160k kept rows), which is what makes the plot visibly
+/// fill rather than appear once.
+const PREVIEW_MAX_ROWS: u64 = 200_000;
+
+/// The spilled path's progressive preview (see [`PREVIEW_MAX_ROWS`]).
+/// Accumulates typed values already computed by the spill writers — it never
+/// re-parses a field — and emits a [`Checkpoint`] on the same
+/// row-count-doubling schedule `super::csv` uses for the in-memory path, so a
+/// caller cannot tell which storage produced a given progress update.
+struct SpillPreview<'a> {
+    on_checkpoint: Option<&'a mut dyn FnMut(Checkpoint)>,
+    time_column_name: String,
+    column_names: Vec<String>,
+    format: Option<TimestampFormat>,
+    timestamps: Vec<Timestamp>,
+    progressive: Vec<f64>,
+    columns: Vec<PreviewColumn>,
+    rows: u64,
+    next_checkpoint_rows: u64,
+}
+
+/// One preview column's heap-backed values, in the dtype the scan pass
+/// settled on.
+enum PreviewColumn {
+    Bool(Vec<bool>),
+    I64(Vec<i64>),
+    F64(Vec<f64>),
+    String(Vec<String>),
+}
+
+impl PreviewColumn {
+    fn new(dtype: Dtype) -> Self {
+        match dtype {
+            Dtype::Bool => PreviewColumn::Bool(Vec::new()),
+            Dtype::I64 => PreviewColumn::I64(Vec::new()),
+            Dtype::F64 => PreviewColumn::F64(Vec::new()),
+            _ => PreviewColumn::String(Vec::new()),
+        }
+    }
+
+    fn push(&mut self, value: ColumnValue<'_>) {
+        match (self, value) {
+            (PreviewColumn::Bool(values), ColumnValue::Bool(value)) => values.push(value),
+            (PreviewColumn::I64(values), ColumnValue::I64(value)) => values.push(value),
+            (PreviewColumn::F64(values), ColumnValue::F64(value)) => values.push(value),
+            (PreviewColumn::String(values), ColumnValue::Str(value)) => {
+                values.push(value.to_string())
+            }
+            // Unreachable: the writer and the preview were built from the same
+            // `ColumnDtypeChoice`, so their variants always agree.
+            _ => {}
+        }
+    }
+
+    fn to_series(&self, name: &str) -> Series {
+        match self {
+            PreviewColumn::Bool(values) => Series::new(name, SeriesValues::Bool(values.clone())),
+            PreviewColumn::I64(values) => Series::new(name, SeriesValues::I64(values.clone())),
+            PreviewColumn::F64(values) => Series::with_anomalies(
+                name,
+                SeriesValues::F64(values.clone()),
+                Anomalies {
+                    nan_runs: crate::series::detect_nan_runs(values),
+                    ..Anomalies::default()
+                },
+            ),
+            PreviewColumn::String(values) => {
+                Series::new(name, SeriesValues::String(values.clone()))
+            }
+        }
+    }
+
+    fn release(&mut self) {
+        match self {
+            PreviewColumn::Bool(values) => {
+                values.clear();
+                values.shrink_to_fit();
+            }
+            PreviewColumn::I64(values) => {
+                values.clear();
+                values.shrink_to_fit();
+            }
+            PreviewColumn::F64(values) => {
+                values.clear();
+                values.shrink_to_fit();
+            }
+            PreviewColumn::String(values) => {
+                values.clear();
+                values.shrink_to_fit();
+            }
+        }
+    }
+}
+
+impl<'a> SpillPreview<'a> {
+    fn new(
+        on_checkpoint: Option<&'a mut dyn FnMut(Checkpoint)>,
+        column_names: &[String],
+        choices: &[ColumnDtypeChoice],
+        format: Option<TimestampFormat>,
+    ) -> Self {
+        Self {
+            on_checkpoint,
+            time_column_name: column_names[0].clone(),
+            column_names: column_names[1..].to_vec(),
+            format,
+            timestamps: Vec::new(),
+            progressive: Vec::new(),
+            columns: choices
+                .iter()
+                .map(|choice| PreviewColumn::new(choice.dtype))
+                .collect(),
+            rows: 0,
+            next_checkpoint_rows: FIRST_PROGRESS_CHECKPOINT_ROWS,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.on_checkpoint.is_some()
+    }
+
+    fn observe_time(&mut self, value: TimeValue) {
+        if !self.is_active() {
+            return;
+        }
+        match value {
+            TimeValue::Absolute(timestamp) => self.timestamps.push(timestamp),
+            TimeValue::Progressive(value) => self.progressive.push(value),
+        }
+    }
+
+    fn observe_column(&mut self, index: usize, value: ColumnValue<'_>) {
+        if !self.is_active() {
+            return;
+        }
+        if let Some(column) = self.columns.get_mut(index) {
+            column.push(value);
+        }
+    }
+
+    /// Closes the row, firing a checkpoint if the doubling schedule says so
+    /// and retiring the preview once it reaches [`PREVIEW_MAX_ROWS`].
+    fn end_row(&mut self) {
+        if !self.is_active() {
+            return;
+        }
+        self.rows += 1;
+        if self.rows >= self.next_checkpoint_rows {
+            self.emit();
+            self.next_checkpoint_rows = self.next_checkpoint_rows.saturating_mul(2);
+        }
+        if self.rows >= PREVIEW_MAX_ROWS {
+            self.retire();
+        }
+    }
+
+    fn emit(&mut self) {
+        let dataset = Dataset {
+            time: match self.format {
+                Some(format) => TimeAxis::Absolute {
+                    timestamps: Timestamps::Memory(self.timestamps.clone()),
+                    format,
+                },
+                None => TimeAxis::Progressive {
+                    values: ProgressiveValues::Memory(self.progressive.clone()),
+                },
+            },
+            time_column_name: self.time_column_name.clone(),
+            columns: self
+                .columns
+                .iter()
+                .zip(&self.column_names)
+                .map(|(column, name)| column.to_series(name))
+                .collect(),
+        };
+        let pyramids = pyramids_for(&dataset);
+        let rows_read = self.rows;
+        if let Some(on_checkpoint) = self.on_checkpoint.as_deref_mut() {
+            on_checkpoint(Checkpoint {
+                dataset,
+                pyramids,
+                rows_read,
+            });
+        }
+    }
+
+    /// Stops previewing and hands back the memory. Everything after this point
+    /// is read straight through to the spill files, so peak memory stops
+    /// depending on how many rows are left.
+    fn retire(&mut self) {
+        info!(
+            rows = self.rows,
+            "progressive preview reached its row cap; the remaining rows stream straight to \
+             the spill cache and the complete plot appears when the read finishes"
+        );
+        self.on_checkpoint = None;
+        self.timestamps = Vec::new();
+        self.progressive = Vec::new();
+        for column in &mut self.columns {
+            column.release();
+        }
     }
 }
 
@@ -869,13 +1135,14 @@ pub struct Checkpoint {
 /// on malformed user data", applied here to a checkpoint's own internal
 /// consistency rather than the source file).
 ///
-/// **Checkpoints are an in-memory-path feature.** A file large enough to be
-/// spilled reports no progress updates: a checkpoint hands out a `Dataset`
-/// over samples that are still being written, and re-mapping a growing spill
-/// file is not portable (Windows will not rename a mapped file, which is how
-/// every spill file is published). Such a file still opens — it just shows a
-/// spinner rather than a filling plot until the read completes. Tracked as
-/// its own follow-up; wiring the *pyramid* into the UI is issue #80.
+/// **Both storage paths checkpoint**, on the same doubling schedule — SPEC §5's
+/// "first meaningful plot, **any file size**: ≤ 2 s" applies to spilled files
+/// most of all. The in-memory path checkpoints from the growing captured text;
+/// the spilled path cannot hand out a `Dataset` over spill files that are still
+/// being written (they are published by an atomic rename, and Windows will not
+/// rename a mapped file), so it keeps a bounded in-memory preview of the first
+/// rows instead — see [`PREVIEW_MAX_ROWS`]. Past that cap a spilled open stops
+/// checkpointing and the complete plot appears when the read finishes.
 pub(crate) fn load_with_outcome_progressive(
     path: &Path,
     mut on_checkpoint: impl FnMut(Checkpoint),
@@ -886,11 +1153,7 @@ pub(crate) fn load_with_outcome_progressive(
             let cache_dir = cache_dir
                 .as_deref()
                 .expect("choose_storage refuses to spill without a cache dir");
-            info!(
-                "progress checkpoints are skipped for a spilled open; the plot appears once the \
-                 read completes"
-            );
-            load_spilled(path, &sniff, cache_dir)
+            load_spilled(path, &sniff, cache_dir, Some(&mut on_checkpoint))
         }
         Storage::InMemory => {
             let (outcome, columns_text) = open_path_capturing_all_columns_with_progress(
@@ -927,6 +1190,36 @@ pub(crate) fn load_with_outcome_progressive(
 pub fn load_progressive(path: &Path, on_checkpoint: impl FnMut(Checkpoint)) -> Result<Dataset> {
     load_with_outcome_progressive(path, on_checkpoint)
         .map(|(_outcome, dataset, _ambiguous)| dataset)
+}
+
+/// [`load_progressive`] against an explicit budget and spill directory, so a
+/// test can exercise progress reporting on a chosen storage path rather than
+/// whichever one the host machine's RAM selects (issue #75) — the same split
+/// [`load_with_budget`] provides for [`load`].
+pub fn load_progressive_with_budget(
+    path: &Path,
+    budget: RamBudget,
+    cache_dir: &Path,
+    mut on_checkpoint: impl FnMut(Checkpoint),
+) -> Result<Dataset> {
+    match choose_storage(path, budget, Some(cache_dir))? {
+        Storage::Spill(sniff) => load_spilled(path, &sniff, cache_dir, Some(&mut on_checkpoint))
+            .map(|(_outcome, dataset, _ambiguous)| dataset),
+        Storage::InMemory => {
+            let (outcome, columns_text) =
+                open_path_capturing_all_columns_with_progress(path, |partial, columns| {
+                    if let Ok((dataset, _ambiguous)) = build_dataset(partial, columns) {
+                        let pyramids = pyramids_for(&dataset);
+                        on_checkpoint(Checkpoint {
+                            rows_read: partial.row_count,
+                            pyramids,
+                            dataset,
+                        });
+                    }
+                })?;
+            build_dataset(&outcome, &columns_text).map(|(dataset, _ambiguous)| dataset)
+        }
+    }
 }
 
 /// `dataset`'s own min/max pyramid, one entry per column in `dataset.columns`

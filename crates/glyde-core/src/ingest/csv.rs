@@ -356,7 +356,7 @@ pub(crate) fn parse_capturing_all_columns_with_progress(
 /// The first checkpoint [`parse_capturing_all_columns_with_progress`] fires
 /// at, in kept rows (not skipped/ragged ones) — see that function's doc
 /// comment for the doubling schedule this seeds.
-const FIRST_PROGRESS_CHECKPOINT_ROWS: u64 = 20_000;
+pub(crate) const FIRST_PROGRESS_CHECKPOINT_ROWS: u64 = 20_000;
 
 /// One kept row's already-tokenized fields, handed to a streaming sink
 /// without an intermediate `Vec` allocation per row: the two tokenizers
