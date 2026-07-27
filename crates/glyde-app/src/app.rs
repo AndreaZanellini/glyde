@@ -298,7 +298,7 @@ mod tests {
     fn sample_dataset() -> Box<Dataset> {
         Box::new(Dataset {
             time: TimeAxis::Absolute {
-                timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)],
+                timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
                 format: TimestampFormat::EpochSeconds,
             },
             time_column_name: "timestamp".to_string(),

@@ -18,7 +18,7 @@
 //! decimal-separator inference (SPEC §1.2.2-1.2.4) join it here, and column
 //! dtype inference (SPEC §1.4) after that.
 
-use crate::series::{detect_nan_runs, Anomalies, Series, SeriesValues};
+use crate::series::{detect_nan_runs, Anomalies, Dtype, Series, SeriesValues};
 use chardetng::EncodingDetector;
 use encoding_rs::Encoding;
 use std::borrow::Cow;
@@ -629,15 +629,116 @@ pub struct DtypeInference {
     pub ambiguous: bool,
 }
 
-/// Whether every field in `fields` is the bare numeric `"0"`/`"1"` boolean
-/// convention (trimmed) — the one spelling [`parse_bool_field`] accepts that
-/// an integer parse would *also* accept, making the bool-vs-integer choice
-/// genuinely ambiguous rather than a confident dtype match.
-fn is_ambiguous_numeric_bool_column<S: AsRef<str>>(fields: &[S]) -> bool {
-    !fields.is_empty()
-        && fields
-            .iter()
-            .all(|field| matches!(field.as_ref().trim(), "0" | "1"))
+/// Which dtype a column's fields settled on, and whether that choice was
+/// ambiguous — [`DtypeInference`] without the parsed values, which is all
+/// the streaming ingestion path (issue #75) needs before it starts writing
+/// typed samples to the spill cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnDtypeChoice {
+    pub dtype: Dtype,
+    /// See [`DtypeInference::ambiguous`].
+    pub ambiguous: bool,
+}
+
+/// [`infer_column`]'s dtype *decision* as an incremental scan, for the
+/// streaming path, which sees each field exactly once and can never hold a
+/// whole `&[S]` column to hand the whole-slice form. [`infer_column`] is
+/// implemented on top of this, so a column's dtype never depends on whether
+/// the file was small enough to load in memory (docs/ARCHITECTURE.md Hard
+/// rule 4: one canonical implementation per concept).
+///
+/// docs/ARCHITECTURE.md §"Two classes of inference" calls dtype a
+/// *provisional hypothesis* that the streaming stage validates against every
+/// row and may only widen, never narrow — which is exactly what each of
+/// these "still matches every field so far" flags is: it can only ever go
+/// from `true` to `false`, moving the column further along the
+/// `Bool → Integer → Float → String` lattice.
+#[derive(Debug, Clone)]
+pub struct ColumnDtypeScan {
+    field_count: usize,
+    bool_matches_every_field: bool,
+    i64_matches_every_field: bool,
+    f64_matches_every_field: bool,
+    /// Whether every field so far is the bare numeric `"0"`/`"1"` boolean
+    /// convention (trimmed) — the one spelling [`parse_bool_field`] accepts
+    /// that an integer parse would *also* accept, making the bool-vs-integer
+    /// choice genuinely ambiguous rather than a confident dtype match.
+    numeric_bool_convention_only: bool,
+}
+
+impl Default for ColumnDtypeScan {
+    fn default() -> Self {
+        Self {
+            field_count: 0,
+            bool_matches_every_field: true,
+            i64_matches_every_field: true,
+            f64_matches_every_field: true,
+            numeric_bool_convention_only: true,
+        }
+    }
+}
+
+impl ColumnDtypeScan {
+    /// Feeds the next raw field of the column, in row order. The field must
+    /// already be decimal-normalized ([`normalize_decimal_field`]), exactly
+    /// as [`infer_column`]'s callers normalize before calling it.
+    pub fn observe(&mut self, field: &str) {
+        self.field_count += 1;
+        let trimmed = field.trim();
+        self.bool_matches_every_field &= parse_bool_field(field).is_some();
+        self.numeric_bool_convention_only &= matches!(trimmed, "0" | "1");
+        self.i64_matches_every_field &= trimmed.parse::<i64>().is_ok();
+        self.f64_matches_every_field &= trimmed.parse::<f64>().is_ok();
+    }
+
+    /// The dtype every observed field agreed on, tried bool → integer →
+    /// float → string, the same order and the same "every field must agree"
+    /// rule [`infer_column`] documents.
+    pub fn finish(&self) -> ColumnDtypeChoice {
+        if self.bool_matches_every_field {
+            return ColumnDtypeChoice {
+                dtype: Dtype::Bool,
+                ambiguous: self.field_count > 0 && self.numeric_bool_convention_only,
+            };
+        }
+        let dtype = if self.i64_matches_every_field {
+            Dtype::I64
+        } else if self.f64_matches_every_field {
+            Dtype::F64
+        } else {
+            Dtype::String
+        };
+        ColumnDtypeChoice {
+            dtype,
+            ambiguous: false,
+        }
+    }
+}
+
+/// Logs the dtype a column settled on, shared by [`infer_column`] and the
+/// streaming path so both surface the same SPEC §1.4 decision (Golden Rule
+/// 2: never guess silently).
+pub(crate) fn log_dtype_choice(choice: ColumnDtypeChoice, field_count: usize) {
+    match choice.dtype {
+        Dtype::Bool if choice.ambiguous => warn!(
+            dtype = "bool",
+            field_count,
+            "column dtype inferred as bool from the bare 0/1 convention, but every field \
+             also parses as i64 — low-confidence dtype choice (SPEC §1.2, CLAUDE.md \
+             Golden Rule 2)"
+        ),
+        Dtype::String => info!(
+            dtype = "string",
+            field_count,
+            "column dtype inferred as string/categorical — not every field parsed as bool, \
+             integer, or float (SPEC §1.4)"
+        ),
+        dtype => info!(
+            dtype = ?dtype,
+            field_count,
+            "column dtype inferred (SPEC §1.4)"
+        ),
+    }
 }
 
 /// Infers a column's dtype from its raw source-text fields (SPEC §1.4) and
@@ -660,94 +761,64 @@ fn is_ambiguous_numeric_bool_column<S: AsRef<str>>(fields: &[S]) -> bool {
 /// integer widths (`i8`..`i32`, `u8`..`u64`) and `f32` are a later item's
 /// job, not required by any corpus case this one is proven against.
 pub fn infer_column<S: AsRef<str>>(name: impl Into<String>, fields: &[S]) -> DtypeInference {
-    if let Some(values) = parse_every(fields, parse_bool_field) {
-        let ambiguous = is_ambiguous_numeric_bool_column(fields);
-        if ambiguous {
-            warn!(
-                dtype = "bool",
-                field_count = fields.len(),
-                "column dtype inferred as bool from the bare 0/1 convention, but every field \
-                 also parses as i64 — low-confidence dtype choice (SPEC §1.2, CLAUDE.md \
-                 Golden Rule 2)"
-            );
-        } else {
-            info!(
-                dtype = "bool",
-                field_count = fields.len(),
-                "column dtype inferred (SPEC §1.4)"
-            );
-        }
-        return DtypeInference {
-            series: Series::new(name, SeriesValues::Bool(values)),
-            ambiguous,
-        };
+    let mut scan = ColumnDtypeScan::default();
+    for field in fields {
+        scan.observe(field.as_ref());
     }
-    if let Some(values) = parse_every(fields, |field| field.trim().parse::<i64>().ok()) {
-        info!(
-            dtype = "i64",
-            field_count = fields.len(),
-            "column dtype inferred (SPEC §1.4)"
-        );
-        return DtypeInference {
-            series: Series::new(name, SeriesValues::I64(values)),
-            ambiguous: false,
-        };
-    }
-    if let Some(values) = parse_every(fields, |field| field.trim().parse::<f64>().ok()) {
-        let nan_runs = detect_nan_runs(&values);
-        if !nan_runs.is_empty() {
-            warn!(
-                run_count = nan_runs.len(),
-                "NaN run(s) flagged in a numeric column (SPEC §1.3)"
-            );
-        }
-        info!(
-            dtype = "f64",
-            field_count = fields.len(),
-            "column dtype inferred (SPEC §1.4)"
-        );
-        return DtypeInference {
-            series: Series::with_anomalies(
-                name,
-                SeriesValues::F64(values),
-                Anomalies {
-                    nan_runs,
-                    ..Anomalies::default()
-                },
-            ),
-            ambiguous: false,
-        };
-    }
+    let choice = scan.finish();
+    log_dtype_choice(choice, fields.len());
 
-    info!(
-        dtype = "string",
-        field_count = fields.len(),
-        "column dtype inferred as string/categorical — not every field parsed as bool, \
-         integer, or float (SPEC §1.4)"
-    );
-    DtypeInference {
-        series: Series::new(
-            name,
-            SeriesValues::String(
-                fields
-                    .iter()
-                    .map(|field| field.as_ref().to_string())
-                    .collect(),
-            ),
+    let values = match choice.dtype {
+        Dtype::Bool => SeriesValues::Bool(
+            fields
+                .iter()
+                .map(|field| parse_bool_field(field.as_ref()).unwrap_or_default())
+                .collect(),
         ),
-        ambiguous: false,
-    }
-}
+        Dtype::I64 => SeriesValues::I64(
+            fields
+                .iter()
+                .map(|field| field.as_ref().trim().parse::<i64>().unwrap_or_default())
+                .collect(),
+        ),
+        Dtype::F64 => SeriesValues::F64(
+            fields
+                .iter()
+                .map(|field| field.as_ref().trim().parse::<f64>().unwrap_or_default())
+                .collect(),
+        ),
+        _ => SeriesValues::String(
+            fields
+                .iter()
+                .map(|field| field.as_ref().to_string())
+                .collect(),
+        ),
+    };
 
-/// Parses every field with `parse`, succeeding only if all of them do —
-/// `?`-style short-circuiting via `Option<Vec<_>>`'s `FromIterator` impl, so
-/// a single field that doesn't fit the candidate dtype rejects the whole
-/// column rather than partially parsing it.
-fn parse_every<T, S: AsRef<str>>(
-    fields: &[S],
-    parse: impl Fn(&str) -> Option<T>,
-) -> Option<Vec<T>> {
-    fields.iter().map(|field| parse(field.as_ref())).collect()
+    // SPEC §1.3: NaN runs are flagged, never filled. Only a float column can
+    // carry them; `to_f64_vec` is not used here because a `Bool`/`String`
+    // column has no NaN concept at all and an `I64` one cannot produce a NaN.
+    let anomalies = match values.as_f64_slice() {
+        Some(samples) => {
+            let nan_runs = detect_nan_runs(samples);
+            if !nan_runs.is_empty() {
+                warn!(
+                    run_count = nan_runs.len(),
+                    "NaN run(s) flagged in a numeric column (SPEC §1.3)"
+                );
+            }
+            Anomalies {
+                nan_runs,
+                ..Anomalies::default()
+            }
+        }
+        None => Anomalies::default(),
+    };
+
+    DtypeInference {
+        series: Series::with_anomalies(name, values, anomalies),
+        ambiguous: choice.ambiguous,
+    }
 }
 
 /// SPEC §1.4 / corpus case 47: the boolean spellings the torture corpus
@@ -755,7 +826,7 @@ fn parse_every<T, S: AsRef<str>>(
 /// numeric convention. Checked before integer/float inference so a column of
 /// only `0`s and `1`s reads as boolean, matching the corpus's
 /// `flag_numeric` column.
-fn parse_bool_field(field: &str) -> Option<bool> {
+pub(crate) fn parse_bool_field(field: &str) -> Option<bool> {
     match field.trim() {
         "1" => Some(true),
         "0" => Some(false),

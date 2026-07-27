@@ -166,18 +166,26 @@ Ordered by dependency. Every item is one PR unless noted.
                     M4 → M5 → …
 ```
 
-### R0 · #75 — Decide the raw-`Dataset` memory strategy · **blocking**
+### R0 · #75 — Decide the raw-`Dataset` memory strategy · **decided and landed**
 
-Not an implementation task. The maintainer picks Option A (bolt-on budget refusal),
-Option B (stream rows into bounded/spilled storage), or A-then-B. Option A is one small
-PR but leaves large files simply failing to open, which contradicts M3's own maintainer
-test ("open one of your own large CSVs (> 5 GB)"). Option B is the real fix and touches
-`ingest/csv.rs`, `ingest/dataset.rs`, `ingest/report.rs`, `index/level0.rs`, and
-`index/pyramid.rs` together.
+The maintainer picked **Option B** (stream rows into bounded/spilled storage), not A and
+not A-then-B, for the reason this section recommended: A is work that gets thrown away,
+and R5 (#81) has to pick the same storage shape anyway.
 
-**Recommendation: go straight to B.** A is ~a week of work that gets thrown away, and
-R5 (#81) has to pick the same storage shape anyway — deciding it once, in B, avoids
-writing the spill wiring twice.
+**Landed.** `index::spill` is the one on-disk primitive; `ingest::dataset` runs the
+SPEC §5.1 affordability check on a bounded head sample *before* reading and picks
+between the untouched in-memory path and a bounded-chunk streaming path that writes each
+typed column straight to disk. `docs/ARCHITECTURE.md` §"Where the raw `Dataset` lives"
+records the full decision. Measured with `memory_gate` on the 8-column generated
+fixture: a 2 GB file went from 7.16 GB peak RSS (3.34×, over the 4.21 GB cap) to
+0.90 GB (0.42×); a 0.5 GB file still fits the budget and is unchanged.
+
+**Residual, tracked separately (#85).** Peak RSS is ~0.42× file size, not flat. The
+sample data is fully on disk; what still scales is `time::gap`'s `O(rows)` Δt
+temporaries plus the resident tick pages SPEC §2.2's median-based statistics scan —
+~48 bytes/row measured. Extrapolated, a 10 GB file needs ~4.2 GB, i.e. at the cap on
+the SPEC §5 reference machine and over it on a 7.5 GB CI runner. R6 (#83) should not
+re-arm the memory gate at a large fixture size until #86 lands.
 
 ### R1 · #82a — Implement `DateTimeSpace`
 
@@ -251,7 +259,7 @@ step up one level if a first attempt stalls.
 
 | # | Item | Model | Effort | Why this is the floor |
 |---|---|---|---|---|
-| R0 | #75 decision | — | — | Maintainer call; no model involved |
+| R0 | #75 decision | — | — | Maintainer call; no model involved — **decided: Option B** |
 | R0-B | #75 Option B implementation | `claude-opus-5` | `xhigh` | Cross-module architecture change (~1,500 LOC across 5 files) that must keep every decimation golden and the corpus gate green. The one item where under-powering it costs more than it saves |
 | R1 | #82a `DateTimeSpace` | `claude-sonnet-5` | `medium` | Well-scoped TDD: golden test already written, sibling helpers already exist. Not Haiku — the sub-nanosecond fractional path is exactly where a cheap model silently rounds (Golden Rule 1) |
 | R2 | #82b never-abort fallback | `claude-opus-5` | `high` | Small diff, but it is a product decision under SPEC ambiguity plus a blast radius across every corpus case. Judgment, not volume |

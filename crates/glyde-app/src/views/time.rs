@@ -139,7 +139,7 @@ fn x_axis_seconds(time: &TimeAxis) -> Vec<f64> {
             .iter()
             .map(|timestamp| timestamp.ticks as f64 / timestamp.unit.ticks_per_second() as f64)
             .collect(),
-        TimeAxis::Progressive { values } => values.clone(),
+        TimeAxis::Progressive { values } => values.as_slice().to_vec(),
     }
 }
 
@@ -327,20 +327,12 @@ fn nearest_index(x: &[f64], target: f64) -> Option<usize> {
 /// M8 owns flagging the rare `i64`/`u64` magnitude that doesn't fit). `bool`
 /// and `string` series never reach here — callers only invoke this for
 /// [`ViewKind::TimeDomain`] series.
+///
+/// The per-dtype match itself lives in `glyde_core::series` (Hard rule 2:
+/// all product logic in core, and one canonical implementation of it) —
+/// this is the rendering-side name for it.
 fn value_as_f64(values: &SeriesValues, index: usize) -> Option<f64> {
-    match values {
-        SeriesValues::I8(v) => v.get(index).map(|&n| n as f64),
-        SeriesValues::I16(v) => v.get(index).map(|&n| n as f64),
-        SeriesValues::I32(v) => v.get(index).map(|&n| n as f64),
-        SeriesValues::I64(v) => v.get(index).map(|&n| n as f64),
-        SeriesValues::U8(v) => v.get(index).map(|&n| n as f64),
-        SeriesValues::U16(v) => v.get(index).map(|&n| n as f64),
-        SeriesValues::U32(v) => v.get(index).map(|&n| n as f64),
-        SeriesValues::U64(v) => v.get(index).map(|&n| n as f64),
-        SeriesValues::F32(v) => v.get(index).map(|&n| n as f64),
-        SeriesValues::F64(v) => v.get(index).copied(),
-        SeriesValues::Bool(_) | SeriesValues::String(_) => None,
-    }
+    values.f64_at(index)
 }
 
 /// The cursor-readout text for `values[index]`, in the value's own native
@@ -349,19 +341,7 @@ fn value_as_f64(values: &SeriesValues, index: usize) -> Option<f64> {
 /// integer text here even where the plotted point itself is an `f64`
 /// approximation.
 fn format_series_value(values: &SeriesValues, index: usize) -> Option<String> {
-    match values {
-        SeriesValues::I8(v) => v.get(index).map(i8::to_string),
-        SeriesValues::I16(v) => v.get(index).map(i16::to_string),
-        SeriesValues::I32(v) => v.get(index).map(i32::to_string),
-        SeriesValues::I64(v) => v.get(index).map(i64::to_string),
-        SeriesValues::U8(v) => v.get(index).map(u8::to_string),
-        SeriesValues::U16(v) => v.get(index).map(u16::to_string),
-        SeriesValues::U32(v) => v.get(index).map(u32::to_string),
-        SeriesValues::U64(v) => v.get(index).map(u64::to_string),
-        SeriesValues::F32(v) => v.get(index).map(f32::to_string),
-        SeriesValues::F64(v) => v.get(index).map(f64::to_string),
-        SeriesValues::Bool(_) | SeriesValues::String(_) => None,
-    }
+    values.display_at(index)
 }
 
 /// The cursor-readout text for the timestamp at `index` (SPEC §4.1 "exact
@@ -373,11 +353,13 @@ fn format_cursor_time(time: &TimeAxis, index: usize) -> String {
     match time {
         TimeAxis::Absolute { timestamps, format } => timestamps
             .get(index)
-            .map(|timestamp| format_timestamp(timestamp, *format))
+            .map(|timestamp| format_timestamp(&timestamp, *format))
             .unwrap_or_default(),
-        TimeAxis::Progressive { values } => {
-            values.get(index).map(f64::to_string).unwrap_or_default()
-        }
+        TimeAxis::Progressive { values } => values
+            .as_slice()
+            .get(index)
+            .map(f64::to_string)
+            .unwrap_or_default(),
     }
 }
 
@@ -403,7 +385,8 @@ mod render_tests {
                     Timestamp::new(0, TimeUnit::Seconds),
                     Timestamp::new(1, TimeUnit::Seconds),
                     Timestamp::new(2, TimeUnit::Seconds),
-                ],
+                ]
+                .into(),
                 format: TimestampFormat::EpochSeconds,
             },
             time_column_name: "timestamp".to_string(),
@@ -442,7 +425,7 @@ mod render_tests {
     fn show_renders_an_empty_dataset_without_panicking() {
         let dataset = Dataset {
             time: TimeAxis::Absolute {
-                timestamps: vec![],
+                timestamps: vec![].into(),
                 format: TimestampFormat::EpochSeconds,
             },
             time_column_name: "timestamp".to_string(),
@@ -550,7 +533,8 @@ mod tests {
             timestamps: vec![
                 Timestamp::new(0, TimeUnit::Nanoseconds),
                 Timestamp::new(1_500_000_000, TimeUnit::Nanoseconds),
-            ],
+            ]
+            .into(),
             format: TimestampFormat::EpochNanos,
         };
 
@@ -560,7 +544,7 @@ mod tests {
     #[test]
     fn x_axis_seconds_passes_progressive_values_through_unchanged() {
         let time = TimeAxis::Progressive {
-            values: vec![0.0, 1.0, 2.0],
+            values: vec![0.0, 1.0, 2.0].into(),
         };
 
         assert_eq!(x_axis_seconds(&time), vec![0.0, 1.0, 2.0]);
@@ -620,7 +604,7 @@ mod tests {
     #[test]
     fn format_cursor_time_round_trips_an_absolute_timestamp_in_its_own_format() {
         let time = TimeAxis::Absolute {
-            timestamps: vec![Timestamp::with_offset(0, TimeUnit::Nanoseconds, 2 * 3600)],
+            timestamps: vec![Timestamp::with_offset(0, TimeUnit::Nanoseconds, 2 * 3600)].into(),
             format: TimestampFormat::Iso8601WithOffset,
         };
 
@@ -632,7 +616,7 @@ mod tests {
     #[test]
     fn format_cursor_time_of_a_progressive_index_shows_the_plain_number() {
         let time = TimeAxis::Progressive {
-            values: vec![0.0, 1.0, 2.0],
+            values: vec![0.0, 1.0, 2.0].into(),
         };
 
         assert_eq!(format_cursor_time(&time, 1), "1");
@@ -644,7 +628,7 @@ mod tests {
     #[test]
     fn format_x_axis_tick_formats_an_absolute_axis_like_the_cursor_readout() {
         let time = TimeAxis::Absolute {
-            timestamps: vec![Timestamp::with_offset(0, TimeUnit::Nanoseconds, 2 * 3600)],
+            timestamps: vec![Timestamp::with_offset(0, TimeUnit::Nanoseconds, 2 * 3600)].into(),
             format: TimestampFormat::Iso8601WithOffset,
         };
         let x = x_axis_seconds(&time);
@@ -663,7 +647,7 @@ mod tests {
     #[test]
     fn format_x_axis_tick_converts_a_grid_value_that_is_not_an_existing_sample() {
         let time = TimeAxis::Absolute {
-            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)],
+            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
             format: TimestampFormat::EpochSeconds,
         };
         let x = x_axis_seconds(&time);
@@ -687,7 +671,8 @@ mod tests {
             timestamps: vec![
                 Timestamp::with_offset(0, TimeUnit::Seconds, 3600),
                 Timestamp::with_offset(3600, TimeUnit::Seconds, 2 * 3600),
-            ],
+            ]
+            .into(),
             format: TimestampFormat::Iso8601WithOffset,
         };
         let x = x_axis_seconds(&time);
@@ -707,7 +692,7 @@ mod tests {
     #[test]
     fn format_x_axis_tick_of_a_progressive_index_shows_a_plain_number() {
         let time = TimeAxis::Progressive {
-            values: vec![0.0, 1.0, 2.0],
+            values: vec![0.0, 1.0, 2.0].into(),
         };
         let x = x_axis_seconds(&time);
         let mark = GridMark {

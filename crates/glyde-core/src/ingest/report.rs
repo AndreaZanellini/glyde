@@ -241,6 +241,24 @@ pub fn open_dataset(path: &Path) -> Result<(OpenSummary, InferenceReport, Datase
     ))
 }
 
+/// [`open_dataset`] against an explicit RAM budget and spill directory, so a
+/// test or diagnostic can exercise a specific storage choice rather than
+/// whatever the host machine's RAM selects (issue #75) — the same split
+/// [`crate::ingest::load_with_budget`] provides for [`dataset::load`].
+pub fn open_dataset_with_budget(
+    path: &Path,
+    budget: crate::budget::RamBudget,
+    cache_dir: &Path,
+) -> Result<(OpenSummary, InferenceReport, Dataset)> {
+    let (outcome, dataset, timestamp_format_ambiguous) =
+        dataset::load_with_outcome_with_budget(path, budget, cache_dir)?;
+    Ok(build_summary_and_report(
+        outcome,
+        dataset,
+        timestamp_format_ambiguous,
+    ))
+}
+
 /// [`open_dataset`], additionally invoking `on_checkpoint` with a
 /// [`Checkpoint`] as the background parse progresses (docs/ROADMAP.md M3
 /// "Background progressive build emitting partial levels") — see
@@ -283,7 +301,11 @@ fn build_summary_and_report(
         duplicate_timestamp_count,
     ) = match &dataset.time {
         TimeAxis::Absolute { timestamps, format } => {
-            let ticks: Vec<i128> = timestamps.iter().map(|timestamp| timestamp.ticks).collect();
+            // Borrowed straight from the spill mapping for a spilled axis
+            // (issue #75), so a large file's summary costs no copy of its
+            // whole tick column; owned only on the in-memory path, where the
+            // ticks live inside each `Timestamp`.
+            let ticks = timestamps.ticks();
             let sampling_class: SamplingClass = classify_sampling(&ticks).into();
             let gap_count = detect_gaps(&ticks).len() as u64;
             let monotonicity = detect_monotonicity(&ticks);

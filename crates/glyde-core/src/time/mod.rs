@@ -42,7 +42,7 @@ mod monotonic;
 
 pub use format::{
     format_timestamp, infer_timestamp_format, parse_timestamp, TimeUnit, Timestamp,
-    TimestampFormat, TimestampFormatInference,
+    TimestampFormat, TimestampFormatInference, TimestampFormatScan,
 };
 pub use gap::{classify_sampling, detect_gaps, Gap, SamplingClass};
 pub use monotonic::{detect_monotonicity, MonotonicityReport};
