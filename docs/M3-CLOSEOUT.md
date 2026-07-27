@@ -4,6 +4,57 @@ Status as of 2026-07-27, against `docs/ROADMAP.md` §M3 and its maintainer test.
 Working tree: merge-base `4214a64`. `cargo test --workspace` is **green** (296 passed,
 0 failed, 9 ignored — the 8 Welch goldens for M5 plus 1 time golden for issue #82).
 
+> **Update, same day: R3+R4 (issue #80) landed.** `Checkpoint::pyramids` and a new
+> `pyramids_for_dataset` for the completed load now flow through `IndexingMessage` into
+> `Status::Loading`/`Status::Loaded`, and `views/time.rs` queries `decimate_viewport`
+> every frame against the plot's live pan/zoom bounds and pixel width instead of
+> iterating raw samples — the raw-samples-plus-markers regime is now conditional on
+> `decimate_viewport`'s own convergence, per SPEC §3.1, rather than unconditional. A new
+> headless `glyde-app` bench (`benches/time_view_render.rs`, which required splitting
+> `glyde-app` into a `[lib]` + `[[bin]]` so a bench can reach `views::time::show`) gates
+> the real render path against SPEC §5's p99 ≤100ms frame-time ceiling — closing the gap
+> the G1 section below calls out ("a green performance gate [on `decimate_viewport`
+> alone] says nothing about actual pan/zoom frame time, which nothing currently
+> measures"). The bench earned its keep immediately: the first version of `show`
+> recomputed `TimeAxis::to_pyramid_ticks()` (an O(n) materialization for an in-memory
+> dataset) unconditionally on every frame, which the bench caught at 4.75s for one
+> frame at 8M samples — ~47x the ceiling, and entirely invisible to `decimate_viewport`'s
+> own isolated bench. Fixed two ways: (1) `format_x_axis_tick`'s per-gridline offset
+> lookup switched from `nearest_index`'s O(n) exact scan to a new O(log n)
+> `nearest_index_tick`-style binary search (safe here because it only picks which real
+> sample's UTC *offset* a label borrows, not the label's own instant or the cursor
+> readout's SPEC §4.1 "exact raw value" guarantee, which keeps the exact scan); (2)
+> `ticks` itself moved out of `views::time::show` entirely and into `crate::app`'s
+> `PartialLoad`/`Status::Loaded`, computed once per status change exactly like
+> `pyramids` already was, rather than once per frame. Together: 4.75s → 121ms → **~60µs
+> steady-state** (criterion's own measurement), comfortably inside both the p50 ≤16ms
+> and p99 ≤100ms budgets.
+>
+> **Deliberately not done, to avoid reopening issue #75/#85's RSS work:** a *completed*
+> load whose storage was spilled (`Dataset::is_spilled()`) does not get a final pyramid
+> built for it — `pyramids_for_dataset` walks every raw sample end to end via
+> `to_f64_vec()` for any non-`f64` column, which for a memory-mapped spill file would
+> make every page resident, exactly the regression issue #88 warned this item risked
+> reintroducing. The view falls back to an un-pyramided `decimate_viewport` call for
+> that case instead, which stays correct and viewport-bounded (not file-size-bounded)
+> as long as the column is already `f64` (spilled `f64` columns are a zero-copy mmap
+> slice; other dtypes still convert whole, a pre-existing, tracked constraint — see
+> `dsp::decimation`'s own module docs on why its API takes plain slices). Real
+> pyramid-accelerated rendering of a spilled file's tail is what R5 (#81, still open)
+> delivers.
+>
+> **Not done, split into a new follow-up issue:** rebuilding every column's pyramid
+> from scratch at each progressive checkpoint (rather than incrementally) — the G1
+> section's "O(n log n) of pure waste" observation still holds; #80's scope was the
+> UI wiring, not this rebuild-cost optimization, so it is tracked separately rather
+> than silently dropped.
+>
+> R4's effort estimate below called for `claude-opus-5`/`high`; this landed on
+> `claude-sonnet-5` after the technical design (egui_plot's `PlotTransform`/`PlotBounds`
+> API, the tick↔seconds conversion, the gap-bucket classification) was worked out ahead
+> of implementation — noted here in case a future session needs to reassess the model
+> guidance below against how the rest of the M3 punch list actually goes.
+
 ---
 
 ## 1. Verdict
@@ -157,8 +208,8 @@ Ordered by dependency. Every item is one PR unless noted.
         └─────────────────┬───────────────────────────┘
                           │
         ┌─────────────────▼───────────────────────────┐
-        │ R3  #80a  plumb pyramids into app state     │  can start before R0
-        │ R4  #80b  decimated render + SPEC §3.1 rule │  shape depends on R0
+        │ R3  #80a  plumb pyramids into app state     │  DONE
+        │ R4  #80b  decimated render + SPEC §3.1 rule │  DONE (frame-time gate: #90 tracks the rebuild-cost residual)
         │ R5  #81   wire the spill cache into open()  │  shape depends on R0
         │ R6  #83   re-arm the memory gate            │  needs R0's fix landed
         └─────────────────┬───────────────────────────┘
@@ -207,21 +258,24 @@ Flag the assumption in the PR description and `CHANGELOG.md` per CLAUDE.md.
 
 Doing this *before* M4 also removes the `todo!()` panic landmine from M4's correction UI.
 
-### R3 · #80a — Plumb pyramids from ingest to app state
+### R3 · #80a — Plumb pyramids from ingest to app state · **done**
 
-Mechanical and decision-independent: carry `Checkpoint::pyramids` (and an equivalent
-for the completed load) through `IndexingMessage` into `Status::Loading`/`Status::Loaded`.
-Also stop rebuilding every pyramid from scratch at every checkpoint — build
-incrementally, or at minimum drop the per-column `to_f64_vec()` copy per checkpoint.
-Worth splitting from R4 so the wasteful rebuild is fixed early; it feeds #75.
+`Checkpoint::pyramids`, and a new `pyramids_for_dataset` for the completed load, now
+flow through `IndexingMessage` into `Status::Loading`/`Status::Loaded`. **Split off,
+not done here:** stopping the from-scratch pyramid rebuild at every checkpoint — tracked
+as issue #90 so it is not silently dropped.
 
-### R4 · #80b — Decimated rendering
+### R4 · #80b — Decimated rendering · **done**
 
-`views/time.rs` queries `decimate_viewport(range, pixels)` per numeric column per
-frame instead of iterating raw samples, and the raw-samples-plus-markers path becomes
-conditional on `samples < pixels` per SPEC §3.1. Add a frame-time gate (or a headless
-viewport-render bench over the app's actual draw path) so SPEC §5's p50 ≤ 16 ms /
-p99 ≤ 100 ms budget is enforced rather than assumed.
+`views/time.rs` queries `decimate_viewport(range, pixels)` per numeric column every
+frame, against the plot's live pan/zoom bounds and pixel width; the raw-samples-plus-
+markers path is conditional on `decimate_viewport`'s own convergence (SPEC §3.1) rather
+than unconditional. `crates/glyde-app/benches/time_view_render.rs` — a new headless
+bench, which required splitting `glyde-app` into a `[lib]` + `[[bin]]` — gates the real
+render path (not just `decimate_viewport` in isolation) against SPEC §5's p99 ≤ 100 ms
+ceiling. **Deliberately not pyramid-accelerated:** a completed load whose storage was
+spilled does not get a final pyramid (issue #88's RSS concern); the view falls back to
+a viewport-bounded raw scan there instead, which R5 (#81) is what fixes properly.
 
 ### R5 · #81 — Wire the spill cache into the open path
 

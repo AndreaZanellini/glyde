@@ -12,36 +12,61 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Time-domain view v1 (docs/ROADMAP.md M2, SPEC §4.1): renders every raw
-//! numeric sample of a [`Dataset`] as a line-plus-points plot with
+//! Time-domain view (docs/ROADMAP.md M2/M3, SPEC §4.1/§3.1): renders a
+//! [`Dataset`]'s numeric columns as a min/max-decimated plot with
 //! pan/zoom/box-zoom (via `egui_plot`, see the workspace `Cargo.toml`
 //! dependency comment), a "Fit to data" button, and a cursor readout of the
 //! exact raw value and timestamp at the nearest sample to the pointer.
 //!
-//! This is deliberately the "small files, pre-pyramid" half of SPEC §3.1:
-//! every raw sample is plotted directly (never averaged or LTTB-resampled —
-//! forbidden by SPEC §3.1 for the time-domain view), with no min/max
-//! decimation pyramid behind it yet (docs/ROADMAP.md M3). [`nearest_index`]
-//! is therefore a plain linear scan, bounded to the same "small file" sample
-//! counts this view already assumes; M3's pyramid is what makes an
-//! arbitrary-size file's viewport query fast, not this module.
+//! Every frame queries [`decimate_viewport`] per numeric column against the
+//! plot's *current* pan/zoom bounds and pixel width (SPEC §3.1: "for each
+//! pixel column, compute min and max of the raw samples whose timestamps
+//! fall in that column's time range; draw the vertical extent between
+//! them"), using `pyramids` — the same min/max pyramid `glyde_core::ingest`
+//! builds at index time — wherever it is available, and falling back to a
+//! direct, viewport-bounded raw scan when it is not (see
+//! [`crate::plumbing::IndexingMessage::Completed`]'s doc comment for when
+//! that happens). A pixel column with no finite reading collapses to a gap
+//! bucket ([`bucket_is_gap`]) and is skipped, never interpolated across
+//! (SPEC §1.3); once the viewport has zoomed in far enough that every raw
+//! sample gets its own pixel column, `decimate_viewport` itself switches to
+//! returning one bucket per sample, which is what makes SPEC §3.1's
+//! "draw individual point markers" convergence guarantee hold here without
+//! this module needing its own `samples < pixels` check.
 //!
 //! Non-numeric columns (`bool`/`string`, SPEC §1.4) are not drawn here —
 //! they route to the state timeline (SPEC §4.3, docs/ROADMAP.md M6), not
 //! yet built.
 
+use std::borrow::Cow;
+
 use egui_plot::{GridMark, Legend, Line, Plot, PlotBounds, PlotPoints, Points};
-use glyde_core::ingest::{Dataset, TimeAxis};
+use glyde_core::dsp::decimation::{decimate_viewport, Bucket};
+use glyde_core::ingest::{progressive_tick_to_value, progressive_value_to_tick, Dataset, TimeAxis};
 use glyde_core::series::{Series, SeriesValues, ViewKind};
 use glyde_core::time::{format_timestamp, Timestamp};
 
-/// Renders `dataset`'s numeric columns as a time-domain plot (SPEC §4.1)
-/// into `ui`: pan (drag), zoom (scroll wheel and box-select), a "Fit to
-/// data" button, and — while the pointer hovers the plot — a readout row
+/// Renders `dataset`'s numeric columns as a time-domain plot (SPEC §4.1,
+/// §3.1) into `ui`: pan (drag), zoom (scroll wheel and box-select), a "Fit
+/// to data" button, and — while the pointer hovers the plot — a readout row
 /// below it showing the exact raw value of every plotted series and the
-/// timestamp at the nearest sample.
-pub fn show(ui: &mut egui::Ui, dataset: &Dataset) {
-    let x = x_axis_seconds(&dataset.time);
+/// timestamp at the nearest sample. `pyramids` is `dataset.columns`-parallel
+/// (see the module docs); a `None` entry (non-numeric column, or a
+/// completed load whose storage was spilled) falls back to an un-pyramided
+/// [`decimate_viewport`] query. `ticks` is `dataset.time`'s own pyramid
+/// ticks (`glyde_core::ingest::TimeAxis::to_pyramid_ticks`) — taken as a
+/// parameter, computed by the caller once per status change, rather than
+/// computed here: for an in-memory dataset that call materializes a fresh
+/// `Vec` over every raw sample, so calling it once per egui frame (as this
+/// function used to) reintroduced the same unconditional-per-frame-O(n) cost
+/// issue #80's own frame-time bench was written to catch — see
+/// `crate::app::PartialLoad::ticks`'s doc comment.
+pub fn show(
+    ui: &mut egui::Ui,
+    dataset: &Dataset,
+    pyramids: &[Option<Vec<Vec<Bucket>>>],
+    ticks: &[i128],
+) {
     let fit_clicked = ui.button("Fit to data").clicked();
 
     let plot = Plot::new("time_domain_view")
@@ -50,10 +75,15 @@ pub fn show(ui: &mut egui::Ui, dataset: &Dataset) {
         .allow_scroll(true)
         .allow_drag(true)
         .allow_boxed_zoom(true)
-        .x_axis_formatter(|mark, _range| format_x_axis_tick(&x, mark, &dataset.time));
+        .x_axis_formatter(|mark, _range| format_x_axis_tick(ticks, mark, &dataset.time));
 
     let response = plot.show(ui, |plot_ui| {
         if fit_clicked {
+            // Computed lazily, only on the frame the button was actually
+            // clicked (SPEC §5 frame-time budget, issue #80's bench found
+            // this cost dominating a per-frame unconditional computation —
+            // see `x_axis_seconds`'s doc comment).
+            let x = x_axis_seconds(&dataset.time);
             if let Some(bounds) = data_bounds(&x, &dataset.columns) {
                 plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                     [bounds.x_min, bounds.y_min],
@@ -62,53 +92,85 @@ pub fn show(ui: &mut egui::Ui, dataset: &Dataset) {
             }
         }
 
+        // SPEC §3.1: resolve this frame's visible range and pixel width from
+        // the plot's own current transform, so a decimation query always
+        // matches exactly what is about to be drawn — never a fixed,
+        // once-per-open resampling (docs/ROADMAP.md M3, issue #80).
+        let plot_bounds = plot_ui.plot_bounds();
+        let pixel_columns = plot_ui.transform().frame().width().round().max(1.0) as usize;
+        let range = (
+            seconds_to_tick(&dataset.time, plot_bounds.min()[0]),
+            seconds_to_tick(&dataset.time, plot_bounds.max()[0]),
+        );
+
         let mut next_color_index = 0usize;
-        for series in &dataset.columns {
+        for (column_index, series) in dataset.columns.iter().enumerate() {
             if series.view_kind() != ViewKind::TimeDomain {
                 continue;
             }
             // Issue #55: one color per series, assigned here rather than
             // left to `egui_plot`'s own per-draw-call auto-assignment —
             // `egui_plot` would otherwise hand out a new color to every
-            // `line()`/`points()` call, so a series with a NaN-delimited gap
-            // (split into multiple `Line`s below) rendered as several
-            // differently-colored segments instead of one consistent color.
+            // `line()`/`points()` call, so a series with more than one
+            // vertical-extent bar (drawn as separate `Line`s below) rendered
+            // as several differently-colored segments instead of one
+            // consistent color.
             let color = series_color(next_color_index);
             next_color_index += 1;
 
-            let segments = series_segments(&x, series.values());
-            // SPEC §1.3: "NaN / missing values ... rendered as a visible
-            // discontinuity ... never interpolated." Each NaN-delimited run
-            // is drawn as its own `Line`, so the line can never be drawn
-            // across a NaN sample by construction — not by relying on
-            // whatever `egui_plot`'s own tessellation happens to do with a
-            // NaN vertex. Every segment shares `series.name()` so they group
-            // under a single legend entry instead of one per run, and now
-            // `color` so they also share one color instead of one per run.
-            for segment in &segments {
-                plot_ui.line(
-                    Line::new(PlotPoints::new(segment.clone()))
+            let pyramid = pyramids
+                .get(column_index)
+                .and_then(Option::as_ref)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let samples = column_f64_samples(series.values());
+            let buckets = decimate_viewport(pyramid, &samples, ticks, range, pixel_columns);
+
+            // SPEC §3.1: one vertical extent (or, once fully converged, one
+            // point marker) per bucket — never a line connecting one pixel
+            // column to the next, and never interpolated across a gap bucket
+            // (SPEC §1.3).
+            let mut points: Vec<[f64; 2]> = Vec::new();
+            for bucket in &buckets {
+                if bucket_is_gap(bucket) {
+                    continue;
+                }
+                let bucket_x =
+                    tick_to_seconds(&dataset.time, (bucket.first_ts + bucket.last_ts) / 2);
+                if bucket.min == bucket.max {
+                    points.push([bucket_x, bucket.min]);
+                } else {
+                    plot_ui.line(
+                        Line::new(PlotPoints::new(vec![
+                            [bucket_x, bucket.min],
+                            [bucket_x, bucket.max],
+                        ]))
                         .name(series.name())
+                        .color(color),
+                    );
+                }
+            }
+            if !points.is_empty() {
+                plot_ui.points(
+                    Points::new(PlotPoints::new(points))
+                        .name(series.name())
+                        .radius(2.0_f32)
                         .color(color),
                 );
             }
-            // SPEC §3.1: "when the visible range contains fewer samples than
-            // pixels, draw the raw samples with visible point markers ... the
-            // user must be able to reach the individual sample." There is no
-            // decimation pyramid yet (M3), so every raw sample is always in
-            // that regime for now — the markers are drawn unconditionally.
-            let points: Vec<[f64; 2]> = segments.into_iter().flatten().collect();
-            plot_ui.points(
-                Points::new(PlotPoints::new(points))
-                    .name(series.name())
-                    .radius(2.0_f32)
-                    .color(color),
-            );
         }
 
-        plot_ui
-            .pointer_coordinate()
-            .and_then(|pointer| nearest_index(&x, pointer.x))
+        // Computed lazily, only while the pointer actually hovers the plot
+        // (same rationale as the `fit_clicked` branch above): SPEC §4.1's
+        // "exact raw value" cursor readout needs the exact (not
+        // decimation-approximated) nearest sample, which `nearest_index`
+        // finds via a real linear scan (correct even on a non-monotonic
+        // axis — see its own doc comment) rather than the O(log n) but
+        // offset-only-accurate lookup `format_x_axis_tick` uses.
+        plot_ui.pointer_coordinate().and_then(|pointer| {
+            let x = x_axis_seconds(&dataset.time);
+            nearest_index(&x, pointer.x)
+        })
     });
 
     if let Some(index) = response.inner {
@@ -133,6 +195,13 @@ pub fn show(ui: &mut egui::Ui, dataset: &Dataset) {
 /// to how time is stored (SPEC §2.1's "never store absolute time as `f64`
 /// seconds" governs [`Dataset`]'s own fields, which stay `i128` ticks; nothing
 /// here mutates them).
+///
+/// O(n) — every raw sample, not the decimated view — so [`show`] only ever
+/// calls this lazily, on the (rare, at most one per frame) occasions it is
+/// actually needed: a "Fit to data" click, or the pointer hovering the plot
+/// for the cursor readout. Never called unconditionally once per frame; see
+/// [`format_x_axis_tick`]'s doc comment for the per-frame call site this
+/// used to be on and why that had to change.
 fn x_axis_seconds(time: &TimeAxis) -> Vec<f64> {
     match time {
         TimeAxis::Absolute { timestamps, .. } => timestamps
@@ -151,34 +220,43 @@ fn x_axis_seconds(time: &TimeAxis) -> Vec<f64> {
 /// seconds-since-epoch number [`x_axis_seconds`] uses for plotting.
 ///
 /// `mark.value` is a grid position, not necessarily an existing sample's
-/// tick, so its *tick count* is derived by inverting [`x_axis_seconds`]'s
-/// tick-to-seconds conversion — a pure display transform, not a new
-/// inference. Its UTC *offset*, however, is taken from `x`'s nearest real
-/// sample ([`nearest_index`]) rather than always the first one: SPEC §2.1
-/// honors whatever offset each source row carried, and
-/// [`crate::time::format::parse_iso8601_with_offset`]-parsed columns can
-/// carry a different offset per row (e.g. a DST transition partway through
-/// the file), so anchoring every tick to the first sample's offset would
-/// mislabel ticks elsewhere in such a file even though their underlying
-/// instant is unaffected. `glyde_core`'s ISO 8601 parser reads each row's
-/// offset independently, so this is a real, not merely hypothetical, case.
+/// tick, so its *tick count* is derived via [`seconds_to_tick`] — a pure
+/// display transform, not a new inference. Its UTC *offset*, however, is
+/// taken from `ticks`'s nearest real sample ([`nearest_tick_index`]) rather
+/// than always the first one: SPEC §2.1 honors whatever offset each source
+/// row carried, and [`crate::time::format::parse_iso8601_with_offset`]-parsed
+/// columns can carry a different offset per row (e.g. a DST transition
+/// partway through the file), so anchoring every tick to the first sample's
+/// offset would mislabel ticks elsewhere in such a file even though their
+/// underlying instant is unaffected. `glyde_core`'s ISO 8601 parser reads
+/// each row's offset independently, so this is a real, not merely
+/// hypothetical, case.
+///
+/// `egui_plot` calls this once per rendered gridline, and typically several
+/// more times per frame while it settles on a tick spacing — cheap on a
+/// small file, but `nearest_index`'s O(n) exact scan turned into the
+/// dominant per-frame cost once large files became a real, supported case
+/// via decimated rendering (issue #80's `crates/glyde-app/benches/time_view_render.rs`
+/// caught an 8M-sample frame taking ~4.75s, entirely from this call site).
+/// [`nearest_tick_index`]'s O(log n) binary search is what this function
+/// uses instead — see its own doc comment for why that is safe for an
+/// *offset label*, unlike the cursor readout's exact-value guarantee.
 ///
 /// A [`TimeAxis::Progressive`] index has no calendar meaning, so its tick is
 /// shown as a plain number, matching `egui_plot`'s own default axis
 /// formatting.
-fn format_x_axis_tick(x: &[f64], mark: GridMark, time: &TimeAxis) -> String {
+fn format_x_axis_tick(ticks: &[i128], mark: GridMark, time: &TimeAxis) -> String {
     match time {
         TimeAxis::Absolute { timestamps, format } => {
-            let Some(index) = nearest_index(x, mark.value) else {
+            let tick = seconds_to_tick(time, mark.value);
+            let Some(index) = nearest_tick_index(ticks, tick) else {
                 return String::new();
             };
             let Some(nearest) = timestamps.get(index) else {
                 return String::new();
             };
-            let ticks_per_second = nearest.unit.ticks_per_second() as f64;
-            let ticks = (mark.value * ticks_per_second).round() as i128;
             let timestamp = Timestamp {
-                ticks,
+                ticks: tick,
                 unit: nearest.unit,
                 offset_seconds: nearest.offset_seconds,
             };
@@ -189,6 +267,41 @@ fn format_x_axis_tick(x: &[f64], mark: GridMark, time: &TimeAxis) -> String {
             egui::emath::format_with_decimals_in_range(mark.value, num_decimals..=num_decimals)
         }
     }
+}
+
+/// The index into `ticks` nearest `target`, assuming `ticks` is sorted
+/// (non-decreasing) — via binary search ([`slice::partition_point`]),
+/// O(log n) rather than [`nearest_index`]'s O(n) exact scan.
+///
+/// This assumption is safe *here* specifically because the only thing
+/// [`format_x_axis_tick`] uses the result for is which real sample's UTC
+/// *offset* an axis label borrows — a cosmetic refinement (issue #56), not
+/// the label's own instant (computed directly from `target`, independent of
+/// any sample) and not SPEC §4.1's "exact raw value" guarantee, which the
+/// cursor readout gets from [`nearest_index`]'s real scan instead. SPEC
+/// §2.1 non-monotonic timestamps are a flagged anomaly, not the default
+/// shape of a file (`docs/SPEC.md` §2.1, §2.3), so on the rare file where
+/// `ticks` is not actually sorted this can pick a nearby-but-not-globally-
+/// nearest sample's offset — still a real sample's real offset, never a
+/// fabricated one, and never affecting the plotted data itself.
+fn nearest_tick_index(ticks: &[i128], target: i128) -> Option<usize> {
+    if ticks.is_empty() {
+        return None;
+    }
+    let pos = ticks.partition_point(|&tick| tick < target);
+    if pos == 0 {
+        return Some(0);
+    }
+    if pos == ticks.len() {
+        return Some(ticks.len() - 1);
+    }
+    let before_distance = target - ticks[pos - 1];
+    let after_distance = ticks[pos] - target;
+    Some(if before_distance <= after_distance {
+        pos - 1
+    } else {
+        pos
+    })
 }
 
 /// The color for the `index`-th plotted [`ViewKind::TimeDomain`] series
@@ -210,36 +323,67 @@ fn series_color(index: usize) -> egui::Color32 {
     egui::epaint::Hsva::new(hue, 0.85, 0.5, 1.0).into()
 }
 
-/// `x` paired with every raw sample of `values`, split into one or more
-/// contiguous runs that break wherever a sample is NaN or has no numeric
-/// reading at all (SPEC §1.3: "NaN / missing values ... rendered as a
-/// visible discontinuity ... never interpolated"). Each returned run is
-/// drawn as its own `egui_plot::Line` by [`show`], so a NaN sample can never
-/// end up connected across by a single continuous line, regardless of how
-/// the plotting library itself would tessellate a NaN vertex — the
-/// discontinuity is guaranteed by this split, not by an assumption about
-/// library internals.
-///
-/// An infinite (non-NaN) reading does *not* break a run: SPEC §1.4 /
-/// corpus case 44 treat an explicit `Infinity`/`-Infinity` value as valid,
-/// non-anomalous data, not a gap — only NaN means "no reading here".
-fn series_segments(x: &[f64], values: &SeriesValues) -> Vec<Vec<[f64; 2]>> {
-    let mut segments = Vec::new();
-    let mut current = Vec::new();
-    for (index, &xi) in x.iter().enumerate() {
-        match value_as_f64(values, index) {
-            Some(y) if !y.is_nan() => current.push([xi, y]),
-            _ => {
-                if !current.is_empty() {
-                    segments.push(std::mem::take(&mut current));
-                }
-            }
-        }
+/// `values` as an `f64` slice for [`decimate_viewport`] (which needs direct
+/// index access over the *whole* column, not just what is on screen):
+/// zero-copy via [`SeriesValues::as_f64_slice`] when the column is already
+/// `f64`, otherwise a real converted copy via
+/// [`SeriesValues::to_f64_vec`] — the same fast-path-or-convert split
+/// `glyde_core::ingest::pyramids_for_dataset` uses when it builds a
+/// checkpoint's pyramid over these same samples. `bool`/`string` columns
+/// never reach here (callers only invoke this for [`ViewKind::TimeDomain`]
+/// series, which excludes them by construction).
+fn column_f64_samples(values: &SeriesValues) -> Cow<'_, [f64]> {
+    match values.as_f64_slice() {
+        Some(slice) => Cow::Borrowed(slice),
+        None => Cow::Owned(values.to_f64_vec().unwrap_or_default()),
     }
-    if !current.is_empty() {
-        segments.push(current);
+}
+
+/// A [`Bucket`] with no finite reading at all — SPEC §1.3's "never
+/// interpolated" applied to a decimated pixel column rather than a single
+/// raw sample. Two distinct shapes both count: a single raw NaN sample once
+/// `decimate_viewport` has converged past the point-per-sample threshold
+/// (`min == max == NaN`), and a pixel column whose every raw sample was NaN,
+/// which [`glyde_core::dsp::decimation::build_pyramid`]'s bucket aggregation
+/// leaves at its `min = +INFINITY, max = -INFINITY` starting sentinel
+/// (`min > max`) since nothing ever updated it.
+fn bucket_is_gap(bucket: &Bucket) -> bool {
+    bucket.min.is_nan() || bucket.max.is_nan() || bucket.min > bucket.max
+}
+
+/// `time`'s own ticks-per-second, for converting a single synthesized pyramid
+/// tick (a bucket boundary, not necessarily any real sample's own tick) to
+/// and from plot seconds — the same scale [`x_axis_seconds`] applies to every
+/// real sample, generalized to an arbitrary tick. `None` for
+/// [`TimeAxis::Progressive`], whose ticks instead use the fixed
+/// [`glyde_core::ingest::PROGRESSIVE_TICK_SCALE`] via
+/// [`progressive_tick_to_value`]/[`progressive_value_to_tick`].
+fn absolute_ticks_per_second(time: &TimeAxis) -> Option<i128> {
+    match time {
+        TimeAxis::Absolute { timestamps, .. } => Some(timestamps.get(0)?.unit.ticks_per_second()),
+        TimeAxis::Progressive { .. } => None,
     }
-    segments
+}
+
+/// Inverse of [`seconds_to_tick`]: a pyramid tick (e.g. a [`Bucket`]'s
+/// midpoint) as a plot-seconds x-coordinate, the same coordinate space
+/// [`x_axis_seconds`] produces for real samples.
+fn tick_to_seconds(time: &TimeAxis, tick: i128) -> f64 {
+    match absolute_ticks_per_second(time) {
+        Some(ticks_per_second) => tick as f64 / ticks_per_second as f64,
+        None => progressive_tick_to_value(tick),
+    }
+}
+
+/// Inverse of [`tick_to_seconds`]: a plot-seconds x-coordinate (e.g. the
+/// current viewport bounds from `egui_plot`) back to a pyramid tick, for
+/// querying [`decimate_viewport`] with a range in the same tick units
+/// `glyde_core::ingest::TimeAxis::to_pyramid_ticks` produces.
+fn seconds_to_tick(time: &TimeAxis, seconds: f64) -> i128 {
+    match absolute_ticks_per_second(time) {
+        Some(ticks_per_second) => (seconds * ticks_per_second as f64).round() as i128,
+        None => progressive_value_to_tick(seconds),
+    }
 }
 
 /// The axis-aligned bounding box of `x` and every plottable value across
@@ -402,11 +546,13 @@ mod render_tests {
     #[test]
     fn show_renders_a_small_dataset_without_panicking() {
         let dataset = sample_dataset();
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
+        let ticks = dataset.time.to_pyramid_ticks();
         let ctx = egui::Context::default();
 
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset);
+                show(ui, &dataset, &pyramids, &ticks);
             });
         });
 
@@ -435,7 +581,7 @@ mod render_tests {
 
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset);
+                show(ui, &dataset, &[], &[]);
             });
         });
 
@@ -445,14 +591,15 @@ mod render_tests {
         );
     }
 
-    // Review finding on this PR: the NaN-discontinuity claim in
-    // `series_segments`'s doc comment was previously untested end to end —
-    // no test actually drove a NaN-bearing series through `show`. This loads
-    // the real torture-corpus case 43 fixture (a 3-sample NaN run in the
-    // middle of an otherwise clean series) through the same
-    // `glyde_core::ingest::load` the app uses, and proves the full pipeline
-    // — real ingestion into a `Dataset`, then `show` — renders it without
-    // panicking, with the NaN run correctly excluded from what gets plotted.
+    // Review finding on the original M2 PR: the NaN-discontinuity claim was
+    // previously untested end to end — no test actually drove a NaN-bearing
+    // series through `show`. This loads the real torture-corpus case 43
+    // fixture (a 3-sample NaN run in the middle of an otherwise clean
+    // series) through the same `glyde_core::ingest::load` the app uses, and
+    // proves both that `decimate_viewport`'s buckets correctly mark every
+    // NaN sample as a gap ([`bucket_is_gap`], SPEC §1.3) and that the full
+    // pipeline — real ingestion into a `Dataset`, then `show` — renders it
+    // without panicking.
     #[test]
     fn show_renders_a_real_nan_run_corpus_file_without_panicking() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -463,37 +610,87 @@ mod render_tests {
             .join("case-43-nan-runs.csv");
         let dataset = glyde_core::ingest::load(&path).expect("case 43 must load");
 
-        // Sanity check on the fixture itself before trusting the render
-        // assertion below: 7 samples, 3 of them NaN in the middle.
-        let nan_count = match dataset.columns[0].values() {
-            SeriesValues::F64(values) => values.iter().filter(|v| v.is_nan()).count(),
+        // Sanity check on the fixture itself before trusting the assertions
+        // below: 7 samples, 3 of them NaN in the middle.
+        let samples = match dataset.columns[0].values() {
+            SeriesValues::F64(values) => values.clone(),
             other => panic!("expected an f64 column, got {other:?}"),
         };
-        assert_eq!(nan_count, 3);
+        assert_eq!(samples.iter().filter(|v| v.is_nan()).count(), 3);
+        assert_eq!(samples.len(), 7);
 
-        let x = x_axis_seconds(&dataset.time);
-        let segments = series_segments(&x, dataset.columns[0].values());
+        // At full convergence (pixel_columns >= sample count) every raw
+        // sample gets its own bucket, so this proves the NaN samples come
+        // back as gap buckets one for one — SPEC §1.3's "never
+        // interpolated" applied to the exact mechanism `show` uses.
+        let ticks = dataset.time.to_pyramid_ticks();
+        let range = (*ticks.first().unwrap(), *ticks.last().unwrap());
+        let buckets = decimate_viewport(&[], &samples, &ticks, range, samples.len());
+        assert_eq!(buckets.len(), 7);
         assert_eq!(
-            segments.len(),
-            2,
-            "the NaN run must split the line into exactly two segments"
+            buckets.iter().filter(|b| bucket_is_gap(b)).count(),
+            3,
+            "each NaN sample must come back as its own gap bucket"
         );
         assert_eq!(
-            segments.iter().map(Vec::len).sum::<usize>(),
+            buckets.iter().filter(|b| !bucket_is_gap(b)).count(),
             4,
-            "the 3 NaN samples must be excluded from both segments"
+            "the 4 non-NaN samples must not be flagged as gaps"
         );
 
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset);
+                show(ui, &dataset, &pyramids, &ticks);
             });
         });
 
         assert!(
             !output.shapes.is_empty(),
             "must draw something around a NaN run without panicking"
+        );
+    }
+
+    // docs/ROADMAP.md M3 "Zoom all the way in → converges to individual
+    // sample points" / "one-sample spike stays visible at every zoom
+    // level" (issue #80): a dataset far larger than any plausible pixel
+    // width must still render without panicking, exercising the
+    // *aggregated* (min/max-bar) branch of `show` rather than only the
+    // small-dataset convergence branch every other test in this module
+    // hits — the headless test harness's default viewport is large
+    // (10,000 x 10,000 points, see `egui::input_state::InputState`'s
+    // fallback), but nowhere near this fixture's 200,000 samples.
+    #[test]
+    fn show_renders_a_large_dataset_without_panicking() {
+        let sample_count = 200_000;
+        let timestamps: Vec<Timestamp> = (0..sample_count)
+            .map(|i| Timestamp::new(i as i128, TimeUnit::Seconds))
+            .collect();
+        let values: Vec<f64> = (0..sample_count)
+            .map(|i| (i as f64 * 0.001).sin())
+            .collect();
+        let dataset = Dataset {
+            time: TimeAxis::Absolute {
+                timestamps: timestamps.into(),
+                format: TimestampFormat::EpochSeconds,
+            },
+            time_column_name: "timestamp".to_string(),
+            columns: vec![Series::new("value", SeriesValues::F64(values))],
+        };
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
+        let ticks = dataset.time.to_pyramid_ticks();
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, &dataset, &pyramids, &ticks);
+            });
+        });
+
+        assert!(
+            !output.shapes.is_empty(),
+            "must draw something for a large, decimated dataset without panicking"
         );
     }
 }
@@ -577,6 +774,44 @@ mod tests {
     }
 
     #[test]
+    fn nearest_tick_index_of_an_empty_slice_is_none() {
+        assert_eq!(nearest_tick_index(&[], 0), None);
+    }
+
+    #[test]
+    fn nearest_tick_index_finds_an_exact_match() {
+        let ticks = [0, 10, 20, 30];
+
+        assert_eq!(nearest_tick_index(&ticks, 20), Some(2));
+    }
+
+    #[test]
+    fn nearest_tick_index_clamps_to_the_first_and_last_entry() {
+        let ticks = [10, 20, 30];
+
+        assert_eq!(nearest_tick_index(&ticks, -100), Some(0));
+        assert_eq!(nearest_tick_index(&ticks, 100), Some(2));
+    }
+
+    #[test]
+    fn nearest_tick_index_picks_whichever_neighbor_is_closer() {
+        let ticks = [0, 10];
+
+        assert_eq!(nearest_tick_index(&ticks, 3), Some(0));
+        assert_eq!(nearest_tick_index(&ticks, 7), Some(1));
+    }
+
+    // A tie is broken towards the earlier index — an arbitrary but
+    // deterministic choice; ties only matter for which of two real samples'
+    // offsets an axis label borrows (see the function's own doc comment).
+    #[test]
+    fn nearest_tick_index_breaks_a_tie_towards_the_earlier_index() {
+        let ticks = [0, 10];
+
+        assert_eq!(nearest_tick_index(&ticks, 5), Some(0));
+    }
+
+    #[test]
     fn value_as_f64_reads_every_numeric_dtype() {
         assert_eq!(value_as_f64(&SeriesValues::I64(vec![42]), 0), Some(42.0));
         assert_eq!(value_as_f64(&SeriesValues::F32(vec![1.5]), 0), Some(1.5));
@@ -631,13 +866,13 @@ mod tests {
             timestamps: vec![Timestamp::with_offset(0, TimeUnit::Nanoseconds, 2 * 3600)].into(),
             format: TimestampFormat::Iso8601WithOffset,
         };
-        let x = x_axis_seconds(&time);
+        let ticks = time.to_pyramid_ticks();
         let mark = GridMark {
             value: 0.0,
             step_size: 1.0,
         };
 
-        let text = format_x_axis_tick(&x, mark, &time);
+        let text = format_x_axis_tick(&ticks, mark, &time);
 
         assert!(text.contains("02:00"), "must honor the offset: {text}");
     }
@@ -650,13 +885,13 @@ mod tests {
             timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
             format: TimestampFormat::EpochSeconds,
         };
-        let x = x_axis_seconds(&time);
+        let ticks = time.to_pyramid_ticks();
         let mark = GridMark {
             value: 1.4,
             step_size: 1.0,
         };
 
-        assert_eq!(format_x_axis_tick(&x, mark, &time), "1");
+        assert_eq!(format_x_axis_tick(&ticks, mark, &time), "1");
     }
 
     // A source column can carry a different UTC offset per row (e.g. a DST
@@ -675,13 +910,13 @@ mod tests {
             .into(),
             format: TimestampFormat::Iso8601WithOffset,
         };
-        let x = x_axis_seconds(&time);
+        let ticks = time.to_pyramid_ticks();
         let mark = GridMark {
             value: 3600.0,
             step_size: 1.0,
         };
 
-        let text = format_x_axis_tick(&x, mark, &time);
+        let text = format_x_axis_tick(&ticks, mark, &time);
 
         assert!(
             text.contains("02:00"),
@@ -694,13 +929,13 @@ mod tests {
         let time = TimeAxis::Progressive {
             values: vec![0.0, 1.0, 2.0].into(),
         };
-        let x = x_axis_seconds(&time);
+        let ticks = time.to_pyramid_ticks();
         let mark = GridMark {
             value: 1.5,
             step_size: 0.1,
         };
 
-        assert_eq!(format_x_axis_tick(&x, mark, &time), "1.5");
+        assert_eq!(format_x_axis_tick(&ticks, mark, &time), "1.5");
     }
 
     #[test]
@@ -730,61 +965,113 @@ mod tests {
     }
 
     #[test]
-    fn series_segments_of_a_non_numeric_series_is_empty() {
-        let x = vec![0.0, 1.0];
-        let segments = series_segments(&x, &SeriesValues::Bool(vec![true, false]));
+    fn column_f64_samples_is_zero_copy_for_an_f64_series() {
+        let values = SeriesValues::F64(vec![1.0, 2.0, 3.0]);
 
-        assert!(segments.is_empty());
-    }
+        let samples = column_f64_samples(&values);
 
-    #[test]
-    fn series_segments_is_one_run_for_a_series_with_no_nan() {
-        let x = vec![0.0, 1.0, 2.0];
-        let segments = series_segments(&x, &SeriesValues::F64(vec![1.0, 2.0, 3.0]));
-
-        assert_eq!(segments, vec![vec![[0.0, 1.0], [1.0, 2.0], [2.0, 3.0]]]);
-    }
-
-    // The exact bug flagged in review: a NaN sample in the middle of a
-    // series must split the line into two separate runs, with the NaN
-    // sample itself excluded from both — never a single run that silently
-    // carries a NaN vertex through to the plotting library (SPEC §1.3).
-    #[test]
-    fn series_segments_breaks_into_separate_runs_at_a_nan_sample() {
-        let x = vec![0.0, 1.0, 2.0, 3.0];
-        let values = SeriesValues::F64(vec![1.0, f64::NAN, 3.0, 4.0]);
-
-        let segments = series_segments(&x, &values);
-
-        assert_eq!(
-            segments,
-            vec![vec![[0.0, 1.0]], vec![[2.0, 3.0], [3.0, 4.0]]]
+        assert!(
+            matches!(samples, Cow::Borrowed(_)),
+            "an already-f64 column must not be copied"
         );
+        assert_eq!(&*samples, &[1.0, 2.0, 3.0]);
     }
 
     #[test]
-    fn series_segments_breaks_at_a_leading_and_trailing_nan_run() {
-        let x = vec![0.0, 1.0, 2.0, 3.0, 4.0];
-        let values = SeriesValues::F64(vec![f64::NAN, f64::NAN, 1.0, 2.0, f64::NAN]);
+    fn column_f64_samples_converts_a_non_f64_dtype() {
+        let values = SeriesValues::I64(vec![1, 2, 3]);
 
-        let segments = series_segments(&x, &values);
+        let samples = column_f64_samples(&values);
 
-        assert_eq!(segments, vec![vec![[2.0, 1.0], [3.0, 2.0]]]);
+        assert!(matches!(samples, Cow::Owned(_)));
+        assert_eq!(&*samples, &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn column_f64_samples_of_a_non_numeric_series_is_empty() {
+        let values = SeriesValues::Bool(vec![true, false]);
+        let samples = column_f64_samples(&values);
+
+        assert!(samples.is_empty());
+    }
+
+    // SPEC §1.3's "never interpolated" applied to a decimated pixel column:
+    // both shapes of "no finite reading" must count as a gap.
+    #[test]
+    fn bucket_is_gap_detects_a_nan_sample_and_an_all_nan_aggregate() {
+        let single_nan_sample = Bucket {
+            min: f64::NAN,
+            max: f64::NAN,
+            first_ts: 0,
+            last_ts: 0,
+            nan_count: 1,
+        };
+        let all_nan_aggregate = Bucket {
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            first_ts: 0,
+            last_ts: 7,
+            nan_count: 8,
+        };
+
+        assert!(bucket_is_gap(&single_nan_sample));
+        assert!(bucket_is_gap(&all_nan_aggregate));
+    }
+
+    #[test]
+    fn bucket_is_gap_is_false_for_a_bucket_with_any_finite_reading() {
+        let single_sample = Bucket {
+            min: 1.5,
+            max: 1.5,
+            first_ts: 0,
+            last_ts: 0,
+            nan_count: 0,
+        };
+        let aggregate_with_one_finite_reading = Bucket {
+            min: 2.0,
+            max: 2.0,
+            first_ts: 0,
+            last_ts: 7,
+            nan_count: 7,
+        };
+
+        assert!(!bucket_is_gap(&single_sample));
+        assert!(!bucket_is_gap(&aggregate_with_one_finite_reading));
     }
 
     // SPEC §1.4 / corpus case 44: an explicit `Infinity` is valid data, not
-    // a gap — it must stay in the same run as its finite neighbors, unlike
-    // a NaN sample.
+    // a gap.
     #[test]
-    fn series_segments_does_not_break_at_an_infinite_value() {
-        let x = vec![0.0, 1.0, 2.0];
-        let values = SeriesValues::F64(vec![1.0, f64::INFINITY, 2.0]);
+    fn bucket_is_gap_is_false_for_an_infinite_reading() {
+        let bucket = Bucket {
+            min: 1.0,
+            max: f64::INFINITY,
+            first_ts: 0,
+            last_ts: 1,
+            nan_count: 0,
+        };
 
-        let segments = series_segments(&x, &values);
+        assert!(!bucket_is_gap(&bucket));
+    }
 
-        assert_eq!(
-            segments,
-            vec![vec![[0.0, 1.0], [1.0, f64::INFINITY], [2.0, 2.0]]]
-        );
+    #[test]
+    fn tick_to_seconds_and_seconds_to_tick_round_trip_on_an_absolute_axis() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Nanoseconds)].into(),
+            format: TimestampFormat::EpochNanos,
+        };
+
+        assert_eq!(tick_to_seconds(&time, 1_500_000_000), 1.5);
+        assert_eq!(seconds_to_tick(&time, 1.5), 1_500_000_000);
+    }
+
+    #[test]
+    fn tick_to_seconds_and_seconds_to_tick_round_trip_on_a_progressive_axis() {
+        let time = TimeAxis::Progressive {
+            values: vec![0.0].into(),
+        };
+
+        assert_eq!(tick_to_seconds(&time, 2_500_000_000), 2.5);
+        assert_eq!(seconds_to_tick(&time, 2.5), 2_500_000_000);
     }
 }

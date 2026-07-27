@@ -1738,6 +1738,7 @@ name = "glyde-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "criterion",
  "directories",
  "eframe",
  "egui",

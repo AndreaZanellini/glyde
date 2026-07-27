@@ -28,17 +28,31 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
+use glyde_core::dsp::decimation::Bucket;
 use glyde_core::ingest::{Dataset, InferenceReport, OpenSummary};
 
 use crate::plumbing::{spawn_index_job, spawn_open_dialog, IndexingMessage};
 use crate::{inference_bar, views};
 
+/// One numeric column's min/max pyramid, or `None` for a non-numeric column
+/// — parallel to `Dataset::columns` (see `glyde_core::ingest::Checkpoint::pyramids`).
+type Pyramids = Vec<Option<Vec<Vec<Bucket>>>>;
+
 /// The most recent background progress checkpoint for a file still being
 /// indexed (docs/ROADMAP.md M3 "Background progressive build emitting
 /// partial levels"): a real, renderable [`Dataset`] with fewer rows than the
-/// final one, plus how many rows it reflects.
+/// final one, plus how many rows it reflects and that checkpoint's own
+/// min/max pyramid (docs/ROADMAP.md M3, issue #80). `ticks` is
+/// `dataset.time`'s own pyramid ticks, computed once here rather than by
+/// [`views::time::show`] on every frame — `TimeAxis::to_pyramid_ticks`
+/// materializes a fresh `Vec` over every sample for an in-memory dataset, so
+/// computing it per frame instead of per status change is exactly the
+/// unconditional-per-frame-O(n) mistake issue #80's own frame-time bench
+/// (`crates/glyde-app/benches/time_view_render.rs`) was written to catch.
 struct PartialLoad {
     dataset: Box<Dataset>,
+    pyramids: Pyramids,
+    ticks: Vec<i128>,
     rows_read: u64,
 }
 
@@ -58,6 +72,10 @@ enum Status {
         summary: Box<OpenSummary>,
         report: Box<InferenceReport>,
         dataset: Box<Dataset>,
+        pyramids: Pyramids,
+        /// See [`PartialLoad::ticks`] — the same once-per-status-change
+        /// caching, for the completed dataset.
+        ticks: Vec<i128>,
     },
     Failed {
         path: PathBuf,
@@ -130,24 +148,39 @@ impl GlydeApp {
                 IndexingMessage::Progress {
                     path,
                     dataset,
+                    pyramids,
                     rows_read,
                     ..
-                } => Status::Loading {
-                    path,
-                    partial: Some(PartialLoad { dataset, rows_read }),
-                },
+                } => {
+                    let ticks = dataset.time.to_pyramid_ticks().into_owned();
+                    Status::Loading {
+                        path,
+                        partial: Some(PartialLoad {
+                            dataset,
+                            pyramids,
+                            ticks,
+                            rows_read,
+                        }),
+                    }
+                }
                 IndexingMessage::Completed {
                     path,
                     summary,
                     report,
                     dataset,
+                    pyramids,
                     ..
-                } => Status::Loaded {
-                    path,
-                    summary,
-                    report,
-                    dataset,
-                },
+                } => {
+                    let ticks = dataset.time.to_pyramid_ticks().into_owned();
+                    Status::Loaded {
+                        path,
+                        summary,
+                        report,
+                        dataset,
+                        pyramids,
+                        ticks,
+                    }
+                }
                 IndexingMessage::Failed { path, message, .. } => Status::Failed { path, message },
             };
         }
@@ -205,7 +238,7 @@ impl eframe::App for GlydeApp {
                                 partial.rows_read
                             ));
                         });
-                        views::time::show(ui, &partial.dataset);
+                        views::time::show(ui, &partial.dataset, &partial.pyramids, &partial.ticks);
                     }
                     None => {
                         ui.centered_and_justified(|ui| {
@@ -223,6 +256,8 @@ impl eframe::App for GlydeApp {
                 summary,
                 report,
                 dataset,
+                pyramids,
+                ticks,
             } => {
                 ui.heading(path.display().to_string());
                 // SPEC §1.2 mandatory UX / docs/ROADMAP.md M4 "Inference bar
@@ -232,8 +267,9 @@ impl eframe::App for GlydeApp {
                 if summary.skipped_row_count > 0 {
                     ui.label(format!("{} rows skipped", summary.skipped_row_count));
                 }
-                // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1".
-                views::time::show(ui, dataset);
+                // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1"; SPEC
+                // §3.1 decimation via `pyramids` (docs/ROADMAP.md M3, issue #80).
+                views::time::show(ui, dataset, pyramids, ticks);
             }
             Status::Failed { path, message } => {
                 ui.colored_label(
@@ -306,6 +342,13 @@ mod tests {
         })
     }
 
+    /// One `None` pyramid per [`sample_dataset`] column — a plausible
+    /// `Progress`/`Completed` payload without needing a real
+    /// `pyramids_for_dataset` build for these single-sample fixtures.
+    fn sample_pyramids() -> Pyramids {
+        vec![None]
+    }
+
     /// The bug the generation guard exists to prevent: file A is slow to
     /// index, the user opens file B before A's background thread reports
     /// back, and A's late `Completed` message must not silently overwrite
@@ -327,6 +370,7 @@ mod tests {
                 summary: sample_summary(),
                 report: sample_report(),
                 dataset: sample_dataset(),
+                pyramids: sample_pyramids(),
             })
             .expect("channel send");
 
@@ -355,6 +399,7 @@ mod tests {
                 generation: 1,
                 path: path.clone(),
                 dataset: sample_dataset(),
+                pyramids: sample_pyramids(),
                 rows_read: 1,
             })
             .expect("channel send");
@@ -392,6 +437,7 @@ mod tests {
                 generation: 1,
                 path: PathBuf::from("a.csv"),
                 dataset: sample_dataset(),
+                pyramids: sample_pyramids(),
                 rows_read: 1,
             })
             .expect("channel send");
@@ -422,6 +468,7 @@ mod tests {
                 summary: sample_summary(),
                 report: sample_report(),
                 dataset: sample_dataset(),
+                pyramids: sample_pyramids(),
             })
             .expect("channel send");
 

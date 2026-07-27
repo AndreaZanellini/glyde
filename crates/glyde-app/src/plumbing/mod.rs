@@ -45,7 +45,12 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::thread;
 
+use glyde_core::dsp::decimation::Bucket;
 use glyde_core::ingest::{Dataset, InferenceReport, OpenSummary};
+
+/// One numeric column's min/max pyramid, or `None` for a non-numeric column
+/// — parallel to `Dataset::columns` (see `glyde_core::ingest::Checkpoint::pyramids`).
+type Pyramids = Vec<Option<Vec<Vec<Bucket>>>>;
 
 /// Progress emitted by a background indexing job, polled by the UI thread.
 /// `generation` identifies which open request this message belongs to (see
@@ -60,23 +65,35 @@ pub enum IndexingMessage {
     /// sample read so far, renderable exactly like a [`Self::Completed`]
     /// dataset, just with fewer rows — `views::time::show` needs no special
     /// case for a partial dataset. `rows_read` is how many rows are reflected
-    /// in it, for a "N rows so far" progress readout.
+    /// in it, for a "N rows so far" progress readout. `pyramids` is that same
+    /// checkpoint's own min/max pyramid (issue #80), exact over the rows read
+    /// so far — never an approximation — so `views::time::show` can decimate
+    /// a still-growing plot exactly like a finished one.
     Progress {
         generation: u64,
         path: PathBuf,
         dataset: Box<Dataset>,
+        pyramids: Pyramids,
         rows_read: u64,
     },
     /// `path` opened successfully; `summary` is what was inferred, `report`
     /// is the same inference surfaced as SPEC §1.2's mandatory UX fields
     /// (docs/ROADMAP.md M4), and `dataset` is every sample, ready for
-    /// [`crate::views::time::show`].
+    /// [`crate::views::time::show`]. `pyramids` is the completed dataset's
+    /// own min/max pyramid (issue #80) — `None` per column when `dataset`
+    /// came from the spilled storage path (`Dataset::is_spilled`), since
+    /// building one there would walk every raw sample of a memory-mapped
+    /// column end to end, making every page of a large file resident just to
+    /// draw it (issue #88); `views::time::show` falls back to querying raw
+    /// samples directly for the affected columns, which stays bounded to
+    /// whatever range is actually on screen.
     Completed {
         generation: u64,
         path: PathBuf,
         summary: Box<OpenSummary>,
         report: Box<InferenceReport>,
         dataset: Box<Dataset>,
+        pyramids: Pyramids,
     },
     /// `path` failed to open; `message` is the human-readable reason.
     Failed {
@@ -168,6 +185,7 @@ fn run_index_job(generation: u64, path: PathBuf, tx: &Sender<IndexingMessage>) {
             generation,
             path: path.clone(),
             dataset: Box::new(checkpoint.dataset),
+            pyramids: checkpoint.pyramids,
             rows_read: checkpoint.rows_read,
         });
     }) {
@@ -178,12 +196,20 @@ fn run_index_job(generation: u64, path: PathBuf, tx: &Sender<IndexingMessage>) {
                 sampling_class = ?summary.sampling_class,
                 "file opened"
             );
+            // issue #88: a spilled dataset's pyramid is never built from the
+            // completed load — see the `Completed` variant's doc comment.
+            let pyramids = if dataset.is_spilled() {
+                vec![None; dataset.columns.len()]
+            } else {
+                glyde_core::ingest::pyramids_for_dataset(&dataset)
+            };
             let _ = tx.send(IndexingMessage::Completed {
                 generation,
                 path,
                 summary: Box::new(summary),
                 report: Box::new(report),
                 dataset: Box::new(dataset),
+                pyramids,
             });
         }
         Err(err) => {
@@ -237,6 +263,7 @@ mod tests {
                 summary,
                 report,
                 dataset,
+                pyramids,
             } => {
                 assert_eq!(generation, 7);
                 assert_eq!(completed_path, path);
@@ -245,6 +272,11 @@ mod tests {
                 assert_eq!(report.sample_count, 6);
                 assert_eq!(dataset.time.len(), 6);
                 assert_eq!(dataset.columns.len(), 2);
+                assert_eq!(pyramids.len(), 2);
+                assert!(
+                    pyramids.iter().all(Option::is_some),
+                    "an in-memory dataset's completed pyramid must be built for every numeric column"
+                );
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -288,11 +320,13 @@ mod tests {
                     generation,
                     path: progress_path,
                     dataset,
+                    pyramids,
                     rows_read,
                 } => {
                     assert_eq!(generation, 3);
                     assert_eq!(progress_path, path);
                     assert_eq!(dataset.time.len(), rows_read as usize);
+                    assert_eq!(pyramids.len(), dataset.columns.len());
                     progress_rows_read.push(rows_read);
                 }
                 IndexingMessage::Completed { generation, .. } => {
@@ -390,6 +424,7 @@ mod tests {
                     glyde_core::ingest::load(&corpus_path("case-01-comma-clean.csv"))
                         .expect("corpus case 1 must load")
                 ),
+                pyramids: Vec::new(),
                 rows_read: 6,
             }
             .generation(),
