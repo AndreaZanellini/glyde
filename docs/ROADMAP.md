@@ -117,7 +117,7 @@ them, so CI stays green while honoring "written first."
 ## M4 — Inference bar (honest transparency)
 
 - [x] `InferenceReport` surfaced to the UI: encoding, delimiter, decimal, time column, timestamp format, sample count, sampling class, per-field confidence → SPEC §1.2 (mandatory UX) · proven by: report-struct snapshot + manual
-- [ ] Inference bar widget: persistent and discreet; opens expanded when any inference is low-confidence → SPEC §1.2, §2.1 · proven by: manual on corpus 28 (ambiguous dates → expanded)
+- [x] Inference bar widget: persistent and discreet; opens expanded when any inference is low-confidence → SPEC §1.2, §2.1 · proven by: manual on corpus 28 (ambiguous dates → expanded)
 - [ ] One-click correction of each field → triggers a re-index → SPEC §1.2 · proven by: manual (swap delimiter / decimal / date order → plot updates)
 - [ ] Skipped-rows detail surface ("N rows skipped — view details") → SPEC §1.3 · proven by: manual on corpus 21 (ragged)
 - [ ] Timestamp affordances: "not monotonic — [Sort]/[Keep as-is]", timezone label (honored or "naive local") → SPEC §2.1 · proven by: manual on corpus 36; corpus 24 (tz displayed)

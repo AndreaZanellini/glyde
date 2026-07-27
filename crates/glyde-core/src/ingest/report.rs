@@ -124,6 +124,20 @@ pub struct InferenceReport {
     pub sampling_class: SamplingClass,
 }
 
+impl InferenceReport {
+    /// SPEC §1.2 "[the inference bar] opens expanded when any inference is
+    /// low-confidence" (docs/ROADMAP.md M4). Lives in `glyde-core`, not
+    /// `glyde-app`, per docs/ARCHITECTURE.md's Hard rule 2 — the app only
+    /// renders this decision, it does not make it.
+    pub fn has_low_confidence_field(&self) -> bool {
+        self.encoding.confidence == Confidence::Low
+            || self.delimiter.confidence == Confidence::Low
+            || self.decimal_separator.confidence == Confidence::Low
+            || self.time_column.confidence == Confidence::Low
+            || self.timestamp_format.confidence == Confidence::Low
+    }
+}
+
 /// The `.expected.json` vocabulary name for `format` (docs/QUALITY.md §1's
 /// `timestamp_format` field) — naming invented in the M1 PR that committed
 /// the time-index corpus fixtures, before any of this code existed.
@@ -491,5 +505,27 @@ mod tests {
             .expect_err("a missing file must be a reported error");
 
         assert!(matches!(err, GlydeError::Io { .. }));
+    }
+
+    // SPEC §1.2 / docs/ROADMAP.md M4's inference-bar expand trigger: a fully
+    // unambiguous file must never claim low confidence anywhere.
+    #[test]
+    fn has_low_confidence_field_is_false_for_an_unambiguous_file() {
+        let path = corpus_path("case-01-comma-clean.csv");
+
+        let (_summary, report, _dataset) = open_dataset(&path).expect("case 1 must open");
+
+        assert!(!report.has_low_confidence_field());
+    }
+
+    // Case 28's only low-confidence field is `timestamp_format`; that alone
+    // must be enough to flip the whole-report flag the inference bar reads.
+    #[test]
+    fn has_low_confidence_field_is_true_when_one_field_is_low() {
+        let path = corpus_path("case-28-fully-ambiguous-dates.csv");
+
+        let (_summary, report, _dataset) = open_dataset(&path).expect("case 28 must open");
+
+        assert!(report.has_low_confidence_field());
     }
 }

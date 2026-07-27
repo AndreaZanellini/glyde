@@ -225,9 +225,10 @@ impl eframe::App for GlydeApp {
                 dataset,
             } => {
                 ui.heading(path.display().to_string());
-                // SPEC §1.2 mandatory UX / docs/ROADMAP.md M4 "InferenceReport
-                // surfaced to the UI".
-                inference_bar::show(ui, report);
+                // SPEC §1.2 mandatory UX / docs/ROADMAP.md M4 "Inference bar
+                // widget: persistent and discreet; opens expanded when any
+                // inference is low-confidence".
+                inference_bar::show(ui, report, path);
                 if summary.skipped_row_count > 0 {
                     ui.label(format!("{} rows skipped", summary.skipped_row_count));
                 }
