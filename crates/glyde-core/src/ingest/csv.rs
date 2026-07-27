@@ -28,6 +28,7 @@
 use super::infer::{self, Confidence, DecimalSeparator, Delimiter};
 use crate::{GlydeError, Result};
 use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -125,6 +126,168 @@ pub struct CsvParseOutcome {
     pub header_ambiguous: bool,
 }
 
+/// Everything SPEC §1.2 infers from a file's bounded head sample: the
+/// *stable configuration* half of docs/ARCHITECTURE.md's "Two classes of
+/// inference" (encoding, delimiter, header, decimal separator), which a
+/// correct sniff settles for the whole file.
+///
+/// Split out of the row loop (issue #75) because the budget decision has to
+/// be made **before** any row is read (SPEC §5.1 "checks affordability
+/// before acting, never after"): [`Sniff::footprint`] answers "how much
+/// memory would materializing this file cost" from the head sample alone,
+/// and the caller picks a storage strategy from that.
+pub(crate) struct Sniff {
+    encoding: infer::EncodingInference,
+    encoding_label: String,
+    encoding_confidence: Confidence,
+    pub(crate) delimiter: Delimiter,
+    delimiter_confidence: Confidence,
+    pub(crate) decimal_separator: DecimalSeparator,
+    decimal_separator_confidence: Confidence,
+    header: infer::HeaderInference,
+    /// First row index that carries data rather than a preamble/header line.
+    data_start_row: usize,
+    /// Byte length of the head sample the row statistics below came from.
+    head_sample_bytes: usize,
+    /// How many data rows that head sample contained.
+    head_sample_data_rows: usize,
+}
+
+/// What materializing a whole file as an in-memory [`super::Dataset`] would
+/// cost, estimated from a bounded head sample before a single data row is
+/// read (SPEC §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Footprint {
+    pub(crate) column_count: usize,
+    pub(crate) estimated_row_count: u64,
+    pub(crate) estimated_bytes: u64,
+}
+
+/// Bytes one captured field costs in a [`ColumnText`] offset table, on top
+/// of its own text in the arena: a `(start, len)` pair of `usize`.
+const CAPTURED_FIELD_OVERHEAD_BYTES: u64 = 2 * std::mem::size_of::<usize>() as u64;
+
+/// Bytes one row of the typed time axis costs — a `Timestamp` is an `i128`
+/// tick count plus its unit and optional UTC offset.
+const TYPED_TIMESTAMP_BYTES: u64 = std::mem::size_of::<crate::time::Timestamp>() as u64;
+
+/// Bytes one typed sample of one data column costs (`i64`/`f64` alike; a
+/// `bool` column is cheaper and a `string` one dearer, but neither is the
+/// case worth sizing the budget check against).
+const TYPED_SAMPLE_BYTES: u64 = 8;
+
+impl Sniff {
+    /// Estimates what [`parse_capturing_all_columns`] plus
+    /// [`super::dataset::load`]'s typed conversion would hold in memory at
+    /// once for a `file_bytes`-long file of this shape.
+    ///
+    /// The arena holds every field's source text, so it is bounded by the
+    /// file itself; on top of that sits one offset-table entry per captured
+    /// field and one typed value per sample. Row count is extrapolated from
+    /// the head sample's own mean row length, which is exact for the fixed-
+    /// width numeric rows this matters for and an approximation for ragged
+    /// text; the estimate is deliberately on the generous side, since
+    /// over-estimating costs a file the (correct but slower) spill path
+    /// while under-estimating costs the user the freeze SPEC §5.1 calls
+    /// "the single most serious class of bug in this product".
+    pub(crate) fn footprint(&self, file_bytes: u64) -> Footprint {
+        let column_count = self.header.column_names.len();
+        let mean_row_bytes = if self.head_sample_data_rows == 0 {
+            0.0
+        } else {
+            self.head_sample_bytes as f64 / self.head_sample_data_rows as f64
+        };
+        let estimated_row_count = if mean_row_bytes <= 0.0 {
+            0
+        } else {
+            (file_bytes as f64 / mean_row_bytes) as u64
+        };
+
+        let per_row_bytes = CAPTURED_FIELD_OVERHEAD_BYTES * column_count as u64
+            + TYPED_TIMESTAMP_BYTES
+            + TYPED_SAMPLE_BYTES * column_count.saturating_sub(1) as u64;
+
+        Footprint {
+            column_count,
+            estimated_row_count,
+            estimated_bytes: file_bytes
+                .saturating_add(estimated_row_count.saturating_mul(per_row_bytes)),
+        }
+    }
+
+    pub(crate) fn column_names(&self) -> &[String] {
+        &self.header.column_names
+    }
+}
+
+/// Runs SPEC §1.2's inference chain over `head_text`, a file's decoded
+/// bounded head sample ([`bounded_head_sample`]).
+fn sniff_from_head(encoding: infer::EncodingInference, head_text: &str) -> Sniff {
+    let encoding_confidence = encoding.confidence();
+    let delimiter_inference = infer::infer_delimiter(head_text);
+    let delimiter = delimiter_inference.delimiter;
+    let decimal_inference = infer::infer_decimal_separator(head_text, delimiter);
+    let header = infer::infer_header(head_text, delimiter);
+    let data_start_row = header
+        .header_row_index
+        .map_or(header.skipped_preamble_rows, |header_row_index| {
+            header_row_index + 1
+        });
+
+    Sniff {
+        encoding_label: encoding.label(),
+        encoding,
+        encoding_confidence,
+        delimiter,
+        delimiter_confidence: delimiter_inference.confidence(),
+        decimal_separator: decimal_inference.separator,
+        decimal_separator_confidence: decimal_inference.confidence(),
+        data_start_row,
+        head_sample_bytes: head_text.len(),
+        head_sample_data_rows: head_text.lines().skip(data_start_row).count(),
+        header,
+    }
+}
+
+/// Sniffs `bytes` (SPEC §1.2), decoding only as much of it as the head
+/// sample needs.
+fn sniff_bytes(bytes: &[u8]) -> Result<Sniff> {
+    if bytes.is_empty() {
+        return Err(GlydeError::EmptyFile);
+    }
+    let encoding = infer::detect_encoding(bytes);
+    let head_bytes = &bytes[..bytes.len().min(infer::HEAD_SAMPLE_BYTES)];
+    let head_text = infer::decode(head_bytes, &encoding);
+    Ok(sniff_from_head(encoding, bounded_head_sample(&head_text)))
+}
+
+/// Sniffs the file at `path` by reading only its head sample — never the
+/// whole file (SPEC §1.2 "a bounded head sample, never the whole file"), so
+/// this is safe to call before the RAM-budget decision on a file of any
+/// size.
+pub(crate) fn sniff_path(path: &Path) -> Result<Sniff> {
+    let mut file = File::open(path).map_err(|source| GlydeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut head = vec![0u8; infer::HEAD_SAMPLE_BYTES];
+    let mut filled = 0usize;
+    while filled < head.len() {
+        let read = file
+            .read(&mut head[filled..])
+            .map_err(|source| GlydeError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    head.truncate(filled);
+    sniff_bytes(&head)
+}
+
 /// Parses `bytes` as delimited text (SPEC §1.1) in one streaming pass:
 /// encoding and delimiter/header are inferred from a bounded head sample
 /// (SPEC §1.2), then every remaining row is read once and tallied — kept or
@@ -136,7 +299,7 @@ pub struct CsvParseOutcome {
 /// a `panic!`; an empty input is the only rejected input, reported as
 /// [`GlydeError::EmptyFile`].
 pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
-    parse_impl(bytes, Capture::None, None).map(|(outcome, _)| outcome)
+    parse_bytes(bytes, Capture::None, None).map(|(outcome, _)| outcome)
 }
 
 /// Parses `bytes` exactly like [`parse`], additionally capturing every kept
@@ -145,28 +308,26 @@ pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
 /// column's raw values to run `time::infer_timestamp_format` and friends
 /// against). This is bounded by `row_count` strings from *one* column, not
 /// the whole table — genuinely bounded/chunked reading for arbitrary-size
-/// files is still docs/ROADMAP.md M3's job, the same deferral
-/// [`CsvParseOutcome`]'s original doc comment noted for row data in general.
+/// files is [`super::dataset`]'s budget-driven spill path (issue #75).
 pub(crate) fn parse_capturing_column(
     bytes: &[u8],
     column_index: usize,
 ) -> Result<(CsvParseOutcome, ColumnText)> {
-    let (outcome, mut columns) = parse_impl(bytes, Capture::Column(column_index), None)?;
+    let (outcome, mut columns) = parse_bytes(bytes, Capture::Column(column_index), None)?;
     Ok((outcome, columns.pop().unwrap_or_default()))
 }
 
 /// Parses `bytes` exactly like [`parse`], additionally capturing every kept
-/// row's raw text for *every* column, one `Vec<String>` per column in header
-/// order (docs/ROADMAP.md M2 "Time-domain view v1": `ingest::dataset::load`
-/// needs every data series' raw values, not just the time index's). Same
-/// "small files only" deferral as [`parse_capturing_column`]: this holds the
-/// whole table in memory at once, which is exactly what
-/// [`CsvParseOutcome`]'s doc comment flags as docs/ROADMAP.md M3's job to
-/// bound for arbitrary-size files.
+/// row's raw text for *every* column, one [`ColumnText`] per column in
+/// header order (docs/ROADMAP.md M2 "Time-domain view v1":
+/// `ingest::dataset::load` needs every data series' raw values, not just the
+/// time index's). This holds the whole table in memory at once, which is
+/// exactly why `super::dataset::load_with_budget` only routes a file here
+/// once [`Sniff::footprint`] says it fits the RAM budget (issue #75).
 pub(crate) fn parse_capturing_all_columns(
     bytes: &[u8],
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
-    parse_impl(bytes, Capture::All, None)
+    parse_bytes(bytes, Capture::All, None)
 }
 
 /// [`parse_capturing_all_columns`], additionally invoking `on_chunk` with a
@@ -189,64 +350,113 @@ pub(crate) fn parse_capturing_all_columns_with_progress(
     bytes: &[u8],
     mut on_chunk: impl FnMut(&CsvParseOutcome, &[ColumnText]),
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
-    parse_impl(bytes, Capture::All, Some(&mut on_chunk))
+    parse_bytes(bytes, Capture::All, Some(&mut on_chunk))
 }
 
 /// The first checkpoint [`parse_capturing_all_columns_with_progress`] fires
 /// at, in kept rows (not skipped/ragged ones) — see that function's doc
 /// comment for the doubling schedule this seeds.
-const FIRST_PROGRESS_CHECKPOINT_ROWS: u64 = 20_000;
+pub(crate) const FIRST_PROGRESS_CHECKPOINT_ROWS: u64 = 20_000;
 
-/// What [`parse_impl`] should hold onto per kept row, alongside the tallies
-/// every capture mode needs regardless.
-enum Capture {
+/// One kept row's already-tokenized fields, handed to a streaming sink
+/// without an intermediate `Vec` allocation per row: the two tokenizers
+/// (`csv`'s [`csv::StringRecord`] for a real delimiter, a whitespace split
+/// for column-aligned text) expose the same `len`/`get` shape, so a sink can
+/// read fields by index from either.
+pub(crate) enum RowFields<'a> {
+    Record(&'a csv::StringRecord),
+    Split(&'a [&'a str]),
+}
+
+impl RowFields<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            RowFields::Record(record) => record.len(),
+            RowFields::Split(fields) => fields.len(),
+        }
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&str> {
+        match self {
+            RowFields::Record(record) => record.get(index),
+            RowFields::Split(fields) => fields.get(index).copied(),
+        }
+    }
+}
+
+/// What [`parse_rows`] should do with each kept row, alongside the tallies
+/// every mode needs regardless.
+enum Capture<'s> {
     /// Tallies only ([`parse`]) — no row text is retained.
     None,
     /// One column's raw text ([`parse_capturing_column`]).
     Column(usize),
-    /// Every column's raw text, one `Vec<String>` per column
-    /// ([`parse_capturing_all_columns`]).
+    /// Every column's raw text ([`parse_capturing_all_columns`]).
     All,
+    /// Neither: hand each kept row straight to a sink that consumes it and
+    /// forgets it (issue #75's spill path). Nothing is accumulated, so peak
+    /// memory does not depend on the file's length.
+    Sink(&'s mut dyn FnMut(RowFields<'_>) -> Result<()>),
 }
 
 /// A progress checkpoint callback (see
 /// [`parse_capturing_all_columns_with_progress`]), named so
-/// [`parse_impl`]/[`maybe_checkpoint`] don't repeat this trait-object type
+/// [`parse_rows`]/[`maybe_checkpoint`] don't repeat this trait-object type
 /// inline (clippy `type_complexity`).
 type ChunkCallback<'a> = &'a mut dyn FnMut(&CsvParseOutcome, &[ColumnText]);
 
-fn parse_impl(
+/// Sniffs `bytes`, then parses every row of it from memory.
+fn parse_bytes(
     bytes: &[u8],
     capture: Capture,
+    on_chunk: Option<ChunkCallback>,
+) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
+    let sniff = sniff_bytes(bytes)?;
+    let text = infer::decode(bytes, &sniff.encoding);
+    parse_rows(text.as_bytes(), &sniff, capture, on_chunk)
+}
+
+/// Streams every row of the file at `path` through `on_row`, decoding and
+/// tokenizing in bounded chunks and retaining nothing (issue #75). `sniff`
+/// must be the one [`sniff_path`] produced for the same file, so the
+/// streaming pass reads the file under exactly the inference the budget
+/// decision was made against.
+///
+/// Unlike [`parse`] and friends, this never memory-maps the whole file:
+/// mapping it and walking it end to end makes every page resident, which is
+/// itself proportional to file size (SPEC §5's peak-RSS cap is a flat
+/// number, independent of it). The file is read through a fixed-size buffer
+/// instead — SPEC §5.1's "read in bounded chunks" taken literally.
+pub(crate) fn stream_path(
+    path: &Path,
+    sniff: &Sniff,
+    on_row: &mut dyn FnMut(RowFields<'_>) -> Result<()>,
+) -> Result<CsvParseOutcome> {
+    let file = File::open(path).map_err(|source| GlydeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let reader = DecodedReader::new(
+        BufReader::with_capacity(READ_BUFFER_BYTES, file),
+        sniff.encoding.encoding.new_decoder(),
+    );
+    parse_rows(reader, sniff, Capture::Sink(on_row), None).map(|(outcome, _)| outcome)
+}
+
+/// The row loop, shared by every entry point above. `reader` yields the
+/// file's *decoded* UTF-8 bytes — from memory for the in-memory paths, in
+/// bounded chunks for [`stream_path`].
+fn parse_rows<R: BufRead>(
+    reader: R,
+    sniff: &Sniff,
+    mut capture: Capture,
     mut on_chunk: Option<ChunkCallback>,
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
-    if bytes.is_empty() {
-        return Err(GlydeError::EmptyFile);
-    }
-
-    let encoding = infer::detect_encoding(bytes);
-    let encoding_confidence = encoding.confidence();
-    let text = infer::decode(bytes, &encoding);
-
-    let sample = bounded_head_sample(&text);
-    let delimiter_inference = infer::infer_delimiter(sample);
-    let delimiter = delimiter_inference.delimiter;
-    let delimiter_confidence = delimiter_inference.confidence();
-    let decimal_inference = infer::infer_decimal_separator(sample, delimiter);
-    let decimal_separator = decimal_inference.separator;
-    let decimal_separator_confidence = decimal_inference.confidence();
-    let header = infer::infer_header(sample, delimiter);
-
-    let expected_field_count = header.column_names.len();
-    let data_start_row = header
-        .header_row_index
-        .map_or(header.skipped_preamble_rows, |header_row_index| {
-            header_row_index + 1
-        });
+    let expected_field_count = sniff.header.column_names.len();
 
     let mut acc = ParseAccumulator {
         captured: match capture {
-            Capture::None => Vec::new(),
+            Capture::None | Capture::Sink(_) => Vec::new(),
             Capture::Column(_) => vec![ColumnText::default()],
             Capture::All => (0..expected_field_count)
                 .map(|_| ColumnText::default())
@@ -254,45 +464,34 @@ fn parse_impl(
         },
         row_count: 0,
         skipped_row_count: 0,
+        error: None,
     };
 
     // Built once, only when a checkpoint callback is actually installed: the
     // fields of `CsvParseOutcome` known before the row loop starts, cloned
     // fresh into each checkpoint snapshot with that snapshot's own
     // `row_count`/`skipped_row_count` (see `maybe_checkpoint`).
-    let outcome_template = on_chunk.is_some().then(|| CsvParseOutcome {
-        column_names: header.column_names.clone(),
-        row_count: 0,
-        skipped_row_count: 0,
-        encoding_label: encoding.label(),
-        delimiter,
-        decimal_separator,
-        encoding_confidence,
-        delimiter_confidence,
-        decimal_separator_confidence,
-        header_ambiguous: header.ambiguous,
-    });
+    let outcome_template = on_chunk.is_some().then(|| sniff.outcome(0, 0));
     let mut next_checkpoint_rows = FIRST_PROGRESS_CHECKPOINT_ROWS;
 
-    match delimiter.as_csv_byte() {
+    match sniff.delimiter.as_csv_byte() {
         Some(byte) => {
             let mut reader = csv::ReaderBuilder::new()
                 .delimiter(byte)
                 .has_headers(false)
                 .flexible(true)
-                .from_reader(text.as_bytes());
+                .from_reader(reader);
             let mut record = csv::StringRecord::new();
             let mut row_index = 0usize;
-            loop {
+            while acc.error.is_none() {
                 match reader.read_record(&mut record) {
                     Ok(true) => {
-                        if row_index >= data_start_row {
+                        if row_index >= sniff.data_start_row {
                             record_kept_or_ragged(
                                 row_index,
-                                record.iter(),
-                                record.len(),
+                                RowFields::Record(&record),
                                 expected_field_count,
-                                &capture,
+                                &mut capture,
                                 &mut acc,
                             );
                             maybe_checkpoint(
@@ -306,7 +505,7 @@ fn parse_impl(
                     }
                     Ok(false) => break,
                     Err(reason) => {
-                        if row_index >= data_start_row {
+                        if row_index >= sniff.data_start_row {
                             warn!(
                                 row_index,
                                 %reason,
@@ -320,19 +519,30 @@ fn parse_impl(
             }
         }
         None => {
+            let mut reader = reader;
+            let mut line = String::new();
             let mut row_index = 0usize;
-            for line in text.lines() {
+            while acc.error.is_none() {
+                line.clear();
+                let read = reader
+                    .read_line(&mut line)
+                    .map_err(|source| GlydeError::Io {
+                        path: std::path::PathBuf::from("<decoded input>"),
+                        source,
+                    })?;
+                if read == 0 {
+                    break;
+                }
                 let fields: Vec<&str> = line.split_whitespace().collect();
                 if fields.is_empty() {
                     continue;
                 }
-                if row_index >= data_start_row {
+                if row_index >= sniff.data_start_row {
                     record_kept_or_ragged(
                         row_index,
-                        fields.iter().copied(),
-                        fields.len(),
+                        RowFields::Split(&fields),
                         expected_field_count,
-                        &capture,
+                        &mut capture,
                         &mut acc,
                     );
                     maybe_checkpoint(
@@ -347,6 +557,10 @@ fn parse_impl(
         }
     }
 
+    if let Some(error) = acc.error {
+        return Err(error);
+    }
+
     info!(
         row_count = acc.row_count,
         skipped_row_count = acc.skipped_row_count,
@@ -355,68 +569,82 @@ fn parse_impl(
     );
 
     Ok((
-        CsvParseOutcome {
-            column_names: header.column_names,
-            row_count: acc.row_count,
-            skipped_row_count: acc.skipped_row_count,
-            encoding_label: encoding.label(),
-            delimiter,
-            decimal_separator,
-            encoding_confidence,
-            delimiter_confidence,
-            decimal_separator_confidence,
-            header_ambiguous: header.ambiguous,
-        },
+        sniff.outcome(acc.row_count, acc.skipped_row_count),
         acc.captured,
     ))
 }
 
+impl Sniff {
+    /// A [`CsvParseOutcome`] pairing this sniff's inference with a pass's own
+    /// row tallies.
+    fn outcome(&self, row_count: u64, skipped_row_count: u64) -> CsvParseOutcome {
+        CsvParseOutcome {
+            column_names: self.header.column_names.clone(),
+            row_count,
+            skipped_row_count,
+            encoding_label: self.encoding_label.clone(),
+            delimiter: self.delimiter,
+            decimal_separator: self.decimal_separator,
+            encoding_confidence: self.encoding_confidence,
+            delimiter_confidence: self.delimiter_confidence,
+            decimal_separator_confidence: self.decimal_separator_confidence,
+            header_ambiguous: self.header.ambiguous,
+        }
+    }
+}
+
 /// Mutable state threaded through the row loop: what's been captured per
-/// column so far, plus the running kept/skipped row tallies. Bundled into
-/// one struct so [`record_kept_or_ragged`] takes one accumulator parameter
-/// instead of three, keeping it under clippy's too-many-arguments threshold
-/// without silencing the lint (PR #64 review).
+/// column so far, the running kept/skipped row tallies, and the first error
+/// a [`Capture::Sink`] reported (an I/O failure writing the spill cache),
+/// which stops the loop rather than being swallowed.
 struct ParseAccumulator {
     captured: Vec<ColumnText>,
     row_count: u64,
     skipped_row_count: u64,
+    error: Option<GlydeError>,
 }
 
 /// Applies SPEC §1.3's ragged-row salvage to one already-tokenized row and,
-/// if kept, appends its fields into `acc.captured` per `capture` — borrowing
-/// straight from `fields` into each column's [`ColumnText`] arena rather
-/// than allocating an owned `String` per field (issue #62).
-fn record_kept_or_ragged<'a>(
+/// if kept, hands it to `capture` — appending straight into each column's
+/// [`ColumnText`] arena rather than allocating an owned `String` per field
+/// (issue #62), or forwarding it to a streaming sink that retains nothing
+/// (issue #75).
+fn record_kept_or_ragged(
     row_index: usize,
-    fields: impl Iterator<Item = &'a str>,
-    field_count: usize,
+    fields: RowFields<'_>,
     expected_field_count: usize,
-    capture: &Capture,
+    capture: &mut Capture,
     acc: &mut ParseAccumulator,
 ) {
-    if field_count == expected_field_count {
-        acc.row_count += 1;
-        match *capture {
-            Capture::None => {}
-            Capture::Column(index) => {
-                if let Some(field) = fields.into_iter().nth(index) {
-                    acc.captured[0].push(field);
-                }
-            }
-            Capture::All => {
-                for (column, field) in acc.captured.iter_mut().zip(fields) {
-                    column.push(field);
-                }
-            }
-        }
-    } else {
+    if fields.len() != expected_field_count {
         warn!(
             row_index,
-            field_count,
+            field_count = fields.len(),
             expected_field_count,
             "row skipped: field count does not match the header (SPEC §1.3 ragged-row salvage)"
         );
         acc.skipped_row_count += 1;
+        return;
+    }
+
+    acc.row_count += 1;
+    match capture {
+        Capture::None => {}
+        Capture::Column(index) => {
+            if let Some(field) = fields.get(*index) {
+                acc.captured[0].push(field);
+            }
+        }
+        Capture::All => {
+            for (column_index, column) in acc.captured.iter_mut().enumerate() {
+                column.push(fields.get(column_index).unwrap_or_default());
+            }
+        }
+        Capture::Sink(sink) => {
+            if let Err(error) = sink(fields) {
+                acc.error.get_or_insert(error);
+            }
+        }
     }
 }
 
@@ -501,6 +729,102 @@ fn map_file(path: &Path) -> Result<memmap2::Mmap> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// How much of the source file [`stream_path`] holds at once. Fixed, so peak
+/// memory is independent of file size (SPEC §5's flat peak-RSS cap).
+const READ_BUFFER_BYTES: usize = 256 * 1024;
+
+/// How much decoded text [`DecodedReader`] holds at once. Independent of
+/// `READ_BUFFER_BYTES` because a single-byte encoding can expand up to
+/// threefold on its way to UTF-8; the decoder simply resumes where it left
+/// off when the output buffer fills.
+const DECODE_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Decodes an arbitrary-encoding byte stream (SPEC §1.2.1) to UTF-8 in
+/// bounded chunks, so the streaming reader never holds a decoded copy of the
+/// whole file the way `infer::decode` does for the in-memory path. Invalid
+/// byte sequences are replaced with U+FFFD and reported once at `warn`,
+/// matching `infer::decode`'s behavior exactly (SPEC §1.3: "invalid byte
+/// sequences are replaced, never fatal").
+struct DecodedReader<R> {
+    inner: R,
+    decoder: encoding_rs::Decoder,
+    input: Box<[u8]>,
+    input_len: usize,
+    input_pos: usize,
+    input_eof: bool,
+    output: Box<[u8]>,
+    output_len: usize,
+    output_pos: usize,
+    finished: bool,
+    reported_errors: bool,
+}
+
+impl<R: Read> DecodedReader<R> {
+    fn new(inner: R, decoder: encoding_rs::Decoder) -> Self {
+        Self {
+            inner,
+            decoder,
+            input: vec![0u8; READ_BUFFER_BYTES].into_boxed_slice(),
+            input_len: 0,
+            input_pos: 0,
+            input_eof: false,
+            output: vec![0u8; DECODE_BUFFER_BYTES].into_boxed_slice(),
+            output_len: 0,
+            output_pos: 0,
+            finished: false,
+            reported_errors: false,
+        }
+    }
+}
+
+impl<R: Read> Read for DecodedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let available = self.fill_buf()?;
+        let take = available.len().min(buf.len());
+        buf[..take].copy_from_slice(&available[..take]);
+        self.consume(take);
+        Ok(take)
+    }
+}
+
+impl<R: Read> BufRead for DecodedReader<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        while self.output_pos == self.output_len && !self.finished {
+            if self.input_pos == self.input_len && !self.input_eof {
+                self.input_len = self.inner.read(&mut self.input)?;
+                self.input_pos = 0;
+                if self.input_len == 0 {
+                    self.input_eof = true;
+                }
+            }
+            let last = self.input_eof && self.input_pos == self.input_len;
+            let (result, read, written, had_errors) = self.decoder.decode_to_utf8(
+                &self.input[self.input_pos..self.input_len],
+                &mut self.output,
+                last,
+            );
+            self.input_pos += read;
+            self.output_pos = 0;
+            self.output_len = written;
+            if had_errors && !self.reported_errors {
+                warn!(
+                    encoding = self.decoder.encoding().name(),
+                    "invalid byte sequences encountered; replaced with U+FFFD"
+                );
+                self.reported_errors = true;
+            }
+            if last && result == encoding_rs::CoderResult::InputEmpty {
+                self.finished = true;
+            }
+        }
+        Ok(&self.output[self.output_pos..self.output_len])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.output_pos = (self.output_pos + amount).min(self.output_len);
+    }
 }
 
 /// SPEC §1.2's bounded head sample ([`infer::HEAD_SAMPLE_BYTES`]), cut at a

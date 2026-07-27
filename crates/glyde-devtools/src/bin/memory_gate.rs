@@ -50,6 +50,19 @@ struct Args {
     /// How often to sample this process's RSS while the fixture is open.
     #[arg(long, default_value = "20")]
     sample_interval_ms: u64,
+
+    /// Override the RAM budget ingestion *plans* against, in GB (issue #75),
+    /// so a fixture that would comfortably fit in memory can be measured
+    /// through the spill path instead. Without it, the machine's real
+    /// `min(25% RAM, 4 GB)` cap decides, which is what the CI gate measures.
+    ///
+    /// This can only ever *lower* the cap: SPEC §5's 4 GB ceiling is part of
+    /// the budget formula, so no value here makes a file above it affordable
+    /// in memory. Measuring the in-memory path on a large fixture therefore
+    /// means running this harness from a checkout that predates the spill
+    /// path, not passing a large number here.
+    #[arg(long)]
+    budget_gb: Option<f64>,
 }
 
 fn main() -> Result<()> {
@@ -70,16 +83,29 @@ fn main() -> Result<()> {
         .with_context(|| format!("reading fixture metadata for {}", path.display()))?
         .len();
 
+    // The cap the gate is asserted against is always the real SPEC §5 one;
+    // `--budget-gb` only changes the budget ingestion *plans* against, so a
+    // forced in-memory run is still measured against the same ceiling.
     let budget = RamBudget::from_system();
+    let planning_budget = args.budget_gb.map(|gb| {
+        RamBudget::from_total_ram_bytes(((gb * 1024.0 * 1024.0 * 1024.0) as u64).saturating_mul(4))
+    });
     info!(
         path = %path.display(),
         file_bytes,
         cap_bytes = budget.cap_bytes(),
+        planning_cap_bytes = planning_budget.map(|b| b.cap_bytes()),
         "memory_gate: opening fixture"
     );
 
+    let spill_dir = std::env::temp_dir().join("glyde-memory-gate-spill");
     let sampler = PeakRssSampler::start(Duration::from_millis(args.sample_interval_ms));
-    let open_result = ingest::open_dataset(&path);
+    let open_result = match planning_budget {
+        Some(planning_budget) => {
+            ingest::open_dataset_with_budget(&path, planning_budget, &spill_dir)
+        }
+        None => ingest::open_dataset(&path),
+    };
     let peak_bytes = sampler.stop();
 
     // Propagate an open failure after the sampler is stopped, not before —
@@ -87,14 +113,19 @@ fn main() -> Result<()> {
     let (_summary, _report, dataset) =
         open_result.with_context(|| format!("opening fixture {}", path.display()))?;
     let row_count = dataset.time.len();
+    let storage = if dataset.is_spilled() {
+        "spilled"
+    } else {
+        "in-memory"
+    };
     drop(dataset);
 
     let cap_bytes = budget.cap_bytes();
     let ratio = peak_bytes as f64 / file_bytes.max(1) as f64;
 
     println!(
-        "memory_gate: {row_count} rows, file {file_bytes} bytes, peak RSS {peak_bytes} bytes \
-         ({ratio:.2}x file size), cap {cap_bytes} bytes"
+        "memory_gate: {row_count} rows, file {file_bytes} bytes, storage {storage}, \
+         peak RSS {peak_bytes} bytes ({ratio:.2}x file size), cap {cap_bytes} bytes"
     );
 
     anyhow::ensure!(

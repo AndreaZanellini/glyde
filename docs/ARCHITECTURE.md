@@ -184,10 +184,68 @@ Resolved as follows:
   than mapping it in place. The win is skipping the aggregation pass (and
   not needing Level 0 open at all to redo it), not a zero-copy reopen.
 - **Deferred, tracked separately:** cache eviction (the cache directory only
-  ever grows, for both Level 0 and the pyramid) and the streaming/chunked
-  large-CSV reader that would call `index::level0::Level0CacheWriter`
-  row-by-row during ingestion instead of through the whole-slice
-  `build`/`build_or_open` convenience wrapper.
+  ever grows, for Level 0, the pyramid, and the ingestion spill files alike).
+
+### Where the raw `Dataset` lives (decision, issue #75)
+
+`Level0Cache` and the pyramid cache spill *derived* data. The raw `Dataset`'s
+own columns were, until issue #75, unconditionally `Vec`-backed for any file
+size, which put peak RSS at ~3.3× the source file — proportional, where SPEC §5
+caps it at a flat `min(25% RAM, 4 GB)`. Resolved as follows (the maintainer's
+"Option B" on that issue):
+
+- **One spill primitive, `index::spill`.** `SpillVec<T>`/`SpillVecWriter<T>`
+  append fixed-width typed elements to a file in the cache directory one at a
+  time and memory-map the finished file back as a real `&[T]`. `SpillStrings`
+  is the variable-width case (byte arena + end-offset table). `index::level0`
+  is unchanged and stays a separate thing: it is a *cache*, keyed for reuse
+  across opens, holding the `(i128, f64)` pair `dsp::decimation` consumes;
+  `index::spill` is the ingestion path's *backing store*, one file per column
+  in that column's own dtype width. They share the scheme, not the code —
+  merging them would give the Level-0 cache a dtype it does not need or give
+  every spilled column a duplicate timestamp file it does not want.
+- **The backing store is chosen before the read, from the RAM budget.**
+  `ingest::dataset` sniffs the bounded head sample, estimates what
+  materializing the file would cost, and asks `budget::RamBudget`. Affordable →
+  the existing in-memory path, untouched. Not affordable → the spill path.
+  SPEC §5.1's "checks affordability before acting, never after", with the
+  spill as the "affordable alternative" the same sentence requires.
+- **The spill path never memory-maps the whole file.** Walking a mapping end to
+  end makes every page resident, which is itself proportional to file size, so
+  the source is read through a fixed-size buffer and decoded incrementally
+  (SPEC §5.1's "read in bounded chunks" taken literally). The in-memory path
+  still maps, as before.
+- **Inference is incremental, never sampled.** `time::TimestampFormatScan` and
+  `ingest::infer::ColumnDtypeScan` are the whole-slice `infer_timestamp_format`
+  / `infer_column` decisions restated as one-pass scans, and those whole-slice
+  functions are implemented *on top of them* — so a file's inferred timestamp
+  format and column dtypes are decided over every row on both paths, and can
+  never depend on how large the file happens to be. This is the
+  §"Two classes of inference" split above, finally realized: dtype is a
+  provisional hypothesis the streaming stage validates and may only widen.
+- **Progress checkpoints survive the spill.** SPEC §5's "first meaningful plot,
+  any file size ≤ 2 s" applies to spilled files most of all, but a checkpoint
+  cannot hand out a `Dataset` over spill files still being written — they are
+  published by an atomic rename, and Windows will not rename a mapped file. The
+  spilled path therefore keeps a *bounded* in-memory preview of the first rows
+  (`ingest::dataset::PREVIEW_MAX_ROWS`) and checkpoints from that, on the same
+  doubling schedule the in-memory path uses; past the cap it retires the preview
+  and streams straight through. A preview is a real heap-backed `Dataset`, so
+  `glyde-app` needs no special case for it.
+- **Two passes over the source, not one.** A column's dtype is only settled once
+  the last row has been seen (SPEC §1.4: one non-numeric cell keeps the whole
+  column as text), so the spill path scans first and writes typed values second.
+  Re-reading the source is cheaper, and far more faithful, than spilling every
+  field's text first only to re-type it.
+- **Storage is invisible above `ingest`.** `SeriesValues::Spilled`,
+  `TimeAxis`'s `Timestamps` and `ProgressiveValues` compare equal to the
+  heap-backed values they would have been, element for element, so no consumer
+  has to know which it holds (Golden Rule 1: a storage change, not a data
+  change).
+- **Still outstanding:** peak RSS is ~0.42× file size rather than flat. The
+  residual is `time::gap`'s `O(rows)` Δt temporaries and the resident tick
+  pages the SPEC §2.2 statistics scan — derived statistics, not sample data —
+  tracked as issue #85.
 
 ### Progressive-axis tick mapping and `TimeUnit` placement (decision, issue #60)
 

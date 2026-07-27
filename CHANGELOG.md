@@ -11,6 +11,74 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Big files no longer eat memory in proportion to their size.** Before this
+  change, opening a CSV cost roughly **3.3× the file's size in RAM** — so a
+  2 GB file needed about 7 GB, which is past the memory ceiling Glyde promises
+  to stay under (`docs/SPEC.md` §5: `min(25% of your RAM, 4 GB)`) and, on a
+  smaller machine, past what the machine actually has. That is the freeze/crash
+  risk `SPEC.md` calls the most serious class of bug in this product (issue
+  #75).
+
+  Glyde now works out, **before it reads a single row**, how much memory a file
+  would need. If it fits the budget, nothing changes — the file is read exactly
+  as fast as before. If it does not, Glyde reads the file in small pieces and
+  writes each column straight to a scratch file on disk as it goes, instead of
+  building the whole thing in memory first. The plot then reads from those
+  scratch files.
+
+  Measured on this branch, opening the generated test fixtures (an ISO 8601
+  timestamp column plus eight numeric columns):
+
+  | Fixture | Peak memory before | Peak memory after | Which path |
+  |---|---|---|---|
+  | 0.5 GB | 1.79 GB (3.34× the file) | 1.79 GB (unchanged) | in memory — it fits the budget |
+  | 2 GB | 7.16 GB (3.34×) — **over the 4.21 GB ceiling** | **0.90 GB (0.42×)** | spilled to disk |
+
+  So a 2 GB file went from needing 7 GB to needing 0.9 GB — an 8× reduction,
+  and comfortably inside the ceiling instead of 70% past it.
+
+  **What this does not yet do:** peak memory is smaller, but it still grows with
+  file size (about 0.42× of it) rather than being completely flat. The remaining
+  growth is not the sample data any more — that part is fully on disk now — it
+  is the *statistics* Glyde computes about the time column when it opens a file
+  (spacing, gaps, regular-vs-irregular sampling), which still look at every row
+  at once. Extrapolating, a 10 GB file would need about 4.2 GB, which is right
+  at the ceiling on a 16 GB machine and over it on a smaller one. That is
+  tracked separately as issue #85; this change was scoped to the sample data.
+
+  Nothing about the data itself changed: a file opened through the disk path
+  gives byte-for-byte the same values, the same column types, and the same
+  timestamps (including per-row time-zone offsets and preserved NaN gaps) as
+  one opened in memory. A test opens the same file both ways and compares them
+  field by field.
+
+  **Assumptions made:**
+  - **How the memory estimate is made.** Glyde predicts a file's cost from its
+    first 1 MB — average row length, column count — and deliberately errs on the
+    high side. Over-estimating sends a file down the (correct but slower) disk
+    path unnecessarily; under-estimating risks the freeze this change exists to
+    prevent, so the trade is one-sided. `SPEC.md` does not specify a formula.
+  - **Scratch files are never cleaned up, and are not reused yet.** They live in
+    the OS cache directory keyed by the file's path, size and modification time,
+    so reopening the same file overwrites rather than accumulating — but a
+    *different* big file adds a new set. Reading them back to make a reopen
+    instant is issue #81; deleting old ones was already a tracked gap.
+  - **A big file's plot fills in from a capped preview.** Both paths still draw a
+    growing plot while a file loads. For a spilled file the growing plot is built
+    from the first 200,000 rows kept in memory; past that it stops growing and
+    the complete plot appears when the read finishes. (Drawing directly from the
+    scratch files while they are still being written is not safe on all three
+    OSes Glyde ships on, so the preview is capped instead — which also keeps its
+    memory cost fixed at roughly 20 MB whatever the file's size.)
+  - **If your machine has no usable cache directory**, a file too large for the
+    budget is refused with a clear message rather than attempted anyway
+    (`SPEC.md` §5.1: never start an action that would run the machine out of
+    memory).
+  - **Non-UTF-8 big files** (Latin-1, Windows-1252, UTF-16) are decoded in small
+    pieces too, so they get the same benefit; the character-by-character result
+    is identical to before, including how invalid bytes are replaced.
+
 ### Documentation
 - **New: `docs/M3-CLOSEOUT.md` — an honest status report on Milestone 3, plus a
   plan to finish it.** No app behavior changes in this entry; it is analysis.

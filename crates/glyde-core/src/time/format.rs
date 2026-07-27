@@ -774,7 +774,8 @@ fn field_matches_format(field: &str, format: TimestampFormat) -> bool {
             // `TimestampFormat::LabViewEpoch`/`ExcelSerial` below — the same
             // disambiguating role a bare decimal point played before float
             // epoch text was accepted at all (see
-            // `epoch_seconds_labview_epoch_overlap`'s doc comment). Only a
+            // `TimestampFormatScan::labview_epoch_also_matches`'s call site).
+            // Only a
             // fraction with a genuine nonzero digit is real evidence of a
             // float epoch value (SPEC §2.1).
             match split_decimal(field) {
@@ -829,40 +830,37 @@ fn leading_day_month_groups(field: &str) -> Option<(u32, u32)> {
 /// match" (`None`) rather than guessed either way, the same fidelity-first
 /// default `field_matches_format`'s epoch-magnitude window applies to
 /// implausible epoch values.
-fn infer_day_month_format<S: AsRef<str>>(fields: &[S]) -> Option<TimestampFormatInference> {
-    let groups: Vec<(u32, u32)> = fields
-        .iter()
-        .map(|field| leading_day_month_groups(field.as_ref()))
-        .collect::<Option<Vec<_>>>()?;
+fn infer_day_month_format(scan: &TimestampFormatScan) -> Option<TimestampFormatInference> {
+    if !scan.every_field_is_a_slash_date {
+        return None;
+    }
 
-    let day_first_evidence = groups.iter().any(|&(first, _)| first > 12);
-    let month_first_evidence = groups.iter().any(|&(_, second)| second > 12);
-
-    let (format, ambiguous) = match (day_first_evidence, month_first_evidence) {
+    let (format, ambiguous) = match (scan.day_first_evidence, scan.month_first_evidence) {
         (true, true) => return None,
         (true, false) => (TimestampFormat::DayFirst, false),
         (false, true) => (TimestampFormat::MonthFirst, false),
         (false, false) => (TimestampFormat::DayFirst, true),
     };
 
-    if !fields
-        .iter()
-        .all(|field| parse_timestamp(field.as_ref(), format).is_ok())
-    {
+    let parses_all = match format {
+        TimestampFormat::DayFirst => scan.day_first_parses_every_field,
+        _ => scan.month_first_parses_every_field,
+    };
+    if !parses_all {
         return None;
     }
 
     if ambiguous {
         warn!(
             format = ?format,
-            field_count = fields.len(),
+            field_count = scan.field_count,
             "day-vs-month ambiguous in every row (no field > 12 in either position) — defaulting \
              to the ISO-leaning DD/MM reading per SPEC §2.1; low-confidence inference"
         );
     } else {
         info!(
             format = ?format,
-            field_count = fields.len(),
+            field_count = scan.field_count,
             "day-vs-month disambiguated by a field > 12 (SPEC §2.1 ambiguity rule)"
         );
     }
@@ -878,49 +876,139 @@ fn infer_day_month_format<S: AsRef<str>>(fields: &[S]) -> Option<TimestampFormat
 /// progressive-numeric index (corpus case 35) rather than mis-detecting an
 /// absolute timestamp.
 pub fn infer_timestamp_format<S: AsRef<str>>(fields: &[S]) -> Option<TimestampFormatInference> {
-    if fields.is_empty() {
-        return None;
+    let mut scan = TimestampFormatScan::default();
+    for field in fields {
+        scan.observe(field.as_ref());
     }
-
-    if let Some(format) = IN_SCOPE_FORMATS.into_iter().find(|&format| {
-        fields
-            .iter()
-            .all(|field| field_matches_format(field.as_ref(), format))
-    }) {
-        let ambiguous = epoch_seconds_labview_epoch_overlap(format, fields);
-        if ambiguous {
-            warn!(
-                field_count = fields.len(),
-                "column magnitude matches both EpochSeconds and LabViewEpoch's plausibility \
-                 windows (SPEC §2.1) — defaulting to the far more common EpochSeconds reading; \
-                 low-confidence inference"
-            );
-        }
-        return Some(TimestampFormatInference { format, ambiguous });
-    }
-
-    infer_day_month_format(fields)
+    scan.finish()
 }
 
-/// Whether `format`/`fields` is [`TimestampFormat::EpochSeconds`] chosen for
-/// a column whose magnitude *also* falls in
-/// [`plausible_labview_epoch_magnitude`]'s window — i.e. every field is a
-/// bare integer syntactically valid under both readings, ~66 years apart
-/// ([`LABVIEW_EPOCH_OFFSET_SECONDS`]) depending on which one is right (PR #44
-/// review: [`IN_SCOPE_FORMATS`] tries `EpochSeconds` first, so without this
-/// check that reading would win with full, unwarranted confidence — Golden
-/// Rule 2). `LabViewEpoch` itself never needs the symmetric check: reaching
-/// it here already means every field failed `EpochSeconds`'s pure-integer
-/// match (almost always because of a decimal point, e.g. corpus case 34's
-/// `.0`), which is itself the disambiguating evidence.
-fn epoch_seconds_labview_epoch_overlap<S: AsRef<str>>(
-    format: TimestampFormat,
-    fields: &[S],
-) -> bool {
-    format == TimestampFormat::EpochSeconds
-        && fields
+/// [`infer_timestamp_format`] as an incremental scan over a time column's
+/// raw fields, for the streaming ingestion path (issue #75) — which reads
+/// each row exactly once and can never hold a whole `&[S]` of the column to
+/// hand the whole-slice form. [`infer_timestamp_format`] is implemented on
+/// top of this, so the two can never drift apart (docs/ARCHITECTURE.md Hard
+/// rule 4: one canonical implementation per concept) and a file's inferred
+/// format never depends on how large the file happens to be.
+///
+/// Every candidate is tracked as "still matches every field seen so far",
+/// which is exactly the `fields.iter().all(...)` the whole-slice form ran
+/// per candidate — the same decision, computed in one pass instead of
+/// several.
+#[derive(Debug, Clone)]
+pub struct TimestampFormatScan {
+    field_count: usize,
+    /// Parallel to [`IN_SCOPE_FORMATS`]: whether that format still matches
+    /// every field observed so far.
+    in_scope_still_matching: [bool; IN_SCOPE_FORMATS.len()],
+    /// SPEC §2.1's day-vs-month state (see [`infer_day_month_format`]).
+    every_field_is_a_slash_date: bool,
+    day_first_evidence: bool,
+    month_first_evidence: bool,
+    day_first_parses_every_field: bool,
+    month_first_parses_every_field: bool,
+}
+
+impl Default for TimestampFormatScan {
+    fn default() -> Self {
+        Self {
+            field_count: 0,
+            in_scope_still_matching: [true; IN_SCOPE_FORMATS.len()],
+            every_field_is_a_slash_date: true,
+            day_first_evidence: false,
+            month_first_evidence: false,
+            day_first_parses_every_field: true,
+            month_first_parses_every_field: true,
+        }
+    }
+}
+
+impl TimestampFormatScan {
+    /// Feeds the next raw field of the time column, in row order.
+    pub fn observe(&mut self, field: &str) {
+        self.field_count += 1;
+
+        for (still_matching, format) in self
+            .in_scope_still_matching
+            .iter_mut()
+            .zip(IN_SCOPE_FORMATS)
+        {
+            if *still_matching && !field_matches_format(field, format) {
+                *still_matching = false;
+            }
+        }
+        // The day/month fallback only ever applies to a column where *every*
+        // field has the three-part `.../.../...` shape, so stop paying for
+        // its two extra parses as soon as one field doesn't.
+        if !self.every_field_is_a_slash_date {
+            return;
+        }
+        match leading_day_month_groups(field) {
+            Some((first, second)) => {
+                self.day_first_evidence |= first > 12;
+                self.month_first_evidence |= second > 12;
+                self.day_first_parses_every_field &=
+                    parse_timestamp(field, TimestampFormat::DayFirst).is_ok();
+                self.month_first_parses_every_field &=
+                    parse_timestamp(field, TimestampFormat::MonthFirst).is_ok();
+            }
+            None => self.every_field_is_a_slash_date = false,
+        }
+    }
+
+    /// Whether every field observed so far *also* matches `LabViewEpoch` —
+    /// already tracked as that format's own entry in
+    /// [`Self::in_scope_still_matching`], so the overlap check costs nothing
+    /// extra per field.
+    fn labview_epoch_also_matches(&self) -> bool {
+        IN_SCOPE_FORMATS
             .iter()
-            .all(|field| field_matches_format(field.as_ref(), TimestampFormat::LabViewEpoch))
+            .position(|&format| format == TimestampFormat::LabViewEpoch)
+            .is_some_and(|index| self.in_scope_still_matching[index])
+    }
+
+    /// The format every observed field matched, or `None` when no candidate
+    /// explains them all — the signal a caller uses to fall back to a
+    /// progressive-numeric index (corpus case 35).
+    pub fn finish(self) -> Option<TimestampFormatInference> {
+        if self.field_count == 0 {
+            return None;
+        }
+
+        if let Some((index, _)) = self
+            .in_scope_still_matching
+            .iter()
+            .enumerate()
+            .find(|(_, &still_matching)| still_matching)
+        {
+            let format = IN_SCOPE_FORMATS[index];
+            // `EpochSeconds` chosen for a column whose magnitude *also* falls
+            // in `plausible_labview_epoch_magnitude`'s window: every field is
+            // a bare integer syntactically valid under both readings, ~66
+            // years apart (`LABVIEW_EPOCH_OFFSET_SECONDS`) depending on which
+            // one is right (PR #44 review: `IN_SCOPE_FORMATS` tries
+            // `EpochSeconds` first, so without this check that reading would
+            // win with full, unwarranted confidence — Golden Rule 2).
+            // `LabViewEpoch` itself never needs the symmetric check: reaching
+            // it already means every field failed `EpochSeconds`'s
+            // pure-integer match (almost always because of a decimal point,
+            // e.g. corpus case 34's `.0`), which is itself the disambiguating
+            // evidence.
+            let ambiguous =
+                format == TimestampFormat::EpochSeconds && self.labview_epoch_also_matches();
+            if ambiguous {
+                warn!(
+                    field_count = self.field_count,
+                    "column magnitude matches both EpochSeconds and LabViewEpoch's plausibility \
+                     windows (SPEC §2.1) — defaulting to the far more common EpochSeconds \
+                     reading; low-confidence inference"
+                );
+            }
+            return Some(TimestampFormatInference { format, ambiguous });
+        }
+
+        infer_day_month_format(&self)
+    }
 }
 
 #[cfg(test)]

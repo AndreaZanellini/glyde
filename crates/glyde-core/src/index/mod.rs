@@ -19,5 +19,7 @@
 
 pub mod level0;
 pub mod pyramid;
+pub mod spill;
 
 pub use level0::{CacheKey, Level0Cache, Level0CacheWriter};
+pub use spill::{SpillStrings, SpillStringsWriter, SpillVec, SpillVecWriter};

@@ -50,21 +50,44 @@ impl Anomalies {
 /// than being reported one index at a time (corpus case 43: three
 /// consecutive `NaN` readings are one gap, not three).
 pub fn detect_nan_runs(values: &[f64]) -> Vec<Range<usize>> {
-    let mut runs = Vec::new();
-    let mut run_start: Option<usize> = None;
+    let mut scan = NanRunScan::default();
+    for &value in values {
+        scan.observe(value);
+    }
+    scan.finish()
+}
 
-    for (index, value) in values.iter().enumerate() {
+/// [`detect_nan_runs`] as an incremental scan, for the streaming ingestion
+/// path (issue #75), which sees each sample exactly once on its way to the
+/// on-disk spill cache and must never re-read the whole column back to
+/// flag its NaN runs. [`detect_nan_runs`] itself is implemented on top of
+/// this, so the whole-slice and streaming callers can never drift apart
+/// (docs/ARCHITECTURE.md Hard rule 4: one canonical implementation).
+#[derive(Debug, Clone, Default)]
+pub struct NanRunScan {
+    runs: Vec<Range<usize>>,
+    run_start: Option<usize>,
+    observed: usize,
+}
+
+impl NanRunScan {
+    /// Feeds the next sample, in series order.
+    pub fn observe(&mut self, value: f64) {
         if value.is_nan() {
-            run_start.get_or_insert(index);
-        } else if let Some(start) = run_start.take() {
-            runs.push(start..index);
+            self.run_start.get_or_insert(self.observed);
+        } else if let Some(start) = self.run_start.take() {
+            self.runs.push(start..self.observed);
         }
-    }
-    if let Some(start) = run_start {
-        runs.push(start..values.len());
+        self.observed += 1;
     }
 
-    runs
+    /// Every NaN run seen, closing a run still open at the end of the series.
+    pub fn finish(mut self) -> Vec<Range<usize>> {
+        if let Some(start) = self.run_start.take() {
+            self.runs.push(start..self.observed);
+        }
+        self.runs
+    }
 }
 
 #[cfg(test)]

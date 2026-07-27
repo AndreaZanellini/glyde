@@ -69,6 +69,17 @@ impl RamBudget {
         self.cap_bytes
     }
 
+    /// Whether `requested_bytes` fits under the budget, as a plain
+    /// predicate. [`Self::check_affordable`] is the form for a caller that
+    /// must *refuse* an action it cannot afford; this one is for a caller
+    /// that has an affordable alternative to fall back to instead (SPEC
+    /// §5.1: "refuses it with a clear explanation **and offers the
+    /// affordable alternative**") — `ingest::dataset` uses it to pick
+    /// between materializing a file in memory and spilling it to disk.
+    pub fn affords(&self, requested_bytes: u64) -> bool {
+        requested_bytes <= self.cap_bytes
+    }
+
     /// Checks whether `requested_bytes` fits under the budget. Callers must
     /// call this **before** performing the allocation/read it describes
     /// (SPEC §5.1 "checks affordability before acting, never after") and,
