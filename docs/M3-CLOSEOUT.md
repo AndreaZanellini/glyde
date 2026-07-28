@@ -75,7 +75,7 @@ and the app does not call any of the M3 machinery:
 | Scroll/zoom for 30 s → no stutter; memory under the cap | **Fails** — every frame draws every raw sample; peak RSS is unbounded |
 | One-sample spike stays visible at every zoom level | **Not demonstrated** — holds only incidentally, by drawing everything |
 | Zoom all the way in → converges to individual sample points | **Cannot pass as specified** — there is no min/max regime to converge *from* |
-| Close and reopen the big file → opens instantly (from cache) | **Fails** — the spill cache is never read or written by the product |
+| Close and reopen the big file → opens instantly (from cache) | **Partial** — a reopened, non-spilled file's *pyramid* is now served from cache (issue #81, pyramid half); its raw-sample deep-zoom path and its CSV text parse are not, so the open is faster but not yet instant (issue #92) |
 
 This is a documentation-vs-reality gap, not a regression. Nothing was broken; the
 integration step was simply never scheduled as its own roadmap item. The purpose of
@@ -210,7 +210,7 @@ Ordered by dependency. Every item is one PR unless noted.
         ┌─────────────────▼───────────────────────────┐
         │ R3  #80a  plumb pyramids into app state     │  DONE
         │ R4  #80b  decimated render + SPEC §3.1 rule │  DONE (frame-time gate: #90 tracks the rebuild-cost residual)
-        │ R5  #81   wire the spill cache into open()  │  shape depends on R0
+        │ R5  #81   wire the spill cache into open()  │  pyramid half DONE; rest → #92
         │ R6  #83   re-arm the memory gate            │  needs R0's fix landed
         └─────────────────┬───────────────────────────┘
                           │
@@ -277,14 +277,28 @@ ceiling. **Deliberately not pyramid-accelerated:** a completed load whose storag
 spilled does not get a final pyramid (issue #88's RSS concern); the view falls back to
 a viewport-bounded raw scan there instead, which R5 (#81) is what fixes properly.
 
-### R5 · #81 — Wire the spill cache into the open path
+### R5 · #81 — Wire the spill cache into the open path · **pyramid half done, split**
 
-`try_open` on path+size+mtime at the top of `open()`, short-circuit the parse on a hit,
-write the cache after a completed build. Whether the write goes through
-`Level0CacheWriter::push` during ingestion (streaming — the Option B direction) or the
-whole-slice `build()` after materialization is **R0's decision**, not an independent
-one. Add an integration test that opens a file twice and asserts the second open takes
-the cache-hit path, so "reopen is instant" is covered by something other than a stopwatch.
+`index::pyramid::build_or_open` is now called per numeric column for a completed,
+non-spilled load (`ingest::pyramids_for_dataset_cached`), keyed by
+`CacheKey::for_path(path).with_column(index)` — `CacheKey::with_column` is new, since
+`index::pyramid`/`index::level0` were both originally keyed one-per-file, not
+one-per-column. A reopen of an unchanged file now skips rebuilding every column's
+pyramid aggregation; `pyramid_reopen_integration.rs` proves cache reuse the same way
+`pyramid_spill_integration.rs` already did for the bare API (a mismatched-data trick: a
+second call with different in-memory values but the same source path must still return
+the first call's cached result).
+
+**Not done, split into issue #92:** `index::level0` itself is still never called from
+the open path, so a reopen's raw-sample/deep-zoom rendering still reads from `Dataset`'s
+in-memory `Vec`, not the mmap'd cache — and, more fundamentally, the CSV *text* parse
+(encoding/delimiter inference, per-row typing, `CsvParseOutcome`/`InferenceReport`) still
+happens on every open regardless of cache state, since neither `index::level0` nor
+`index::pyramid` store enough to reconstruct a full `Dataset` (string/categorical/bool
+columns, anomalies, inference metadata). Whether "instant reopen" in the full sense
+extends that far is a scope question issue #92 raises rather than answers — R0's Option
+B decision covered the *raw `Dataset`'s storage*, not whether a *second* open of the same
+file should skip deriving it again from scratch.
 
 ### R6 · #83 — Re-arm the memory gate
 

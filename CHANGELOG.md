@@ -12,6 +12,24 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- **Reopening a file you've already viewed builds its plot's zoomed-out
+  overview faster, instead of redoing that work from scratch every time.**
+  When Glyde opens a file, it precomputes a multi-resolution "overview" of
+  each numeric column so panning and zooming stay smooth (see the panning
+  entry below). Until now, that overview was thrown away the moment the
+  file was closed, so opening the same file a second time rebuilt it from
+  nothing — wasted work for a file that had not changed at all. Glyde now
+  saves each column's overview to a small cache file after building it, and
+  reuses that cache on a later open of the same file (matched by its path,
+  size, and last-modified time — the moment any of those change, the cache
+  is skipped and a fresh one is built, so nothing stale is ever served).
+
+  **Assumption made:** this covers the initial overview only, for files
+  small enough to load into memory outright. It does not yet change how
+  long the very first open of a file takes, and files too large to fit in
+  memory (which stream from disk instead, see below) do not benefit from
+  this yet either — that remains open as its own follow-up (issue #92).
+
 - **Panning and zooming a large file is now smooth, and a one-sample spike
   never disappears.** The time-domain plot used to draw every single raw
   sample on every frame, however many rows the file had — fine for a small

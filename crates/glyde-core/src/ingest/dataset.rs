@@ -49,6 +49,7 @@ use super::infer::{log_dtype_choice, normalize_decimal_field, ColumnDtypeChoice,
 use crate::budget::RamBudget;
 use crate::dsp::decimation::{build_pyramid, Bucket};
 use crate::index::level0::{self, CacheKey};
+use crate::index::pyramid;
 use crate::index::spill::{SpillStringsWriter, SpillVec, SpillVecWriter};
 use crate::series::{Anomalies, Dtype, NanRunScan, Series, SeriesValues, SpilledValues};
 use crate::time::{
@@ -1289,6 +1290,93 @@ pub fn pyramids_for_dataset(dataset: &Dataset) -> Vec<Option<Vec<Vec<Bucket>>>> 
                 .values()
                 .to_f64_vec()
                 .map(|samples| build_pyramid(&samples, &ticks)),
+        })
+        .collect()
+}
+
+/// [`pyramids_for_dataset`], but reusing a previous completed open's cached
+/// pyramid for each numeric column when `path` names an unchanged file
+/// (path + size + mtime match what was cached), and writing the cache after
+/// building on a miss — so a second, completed open of the same file skips
+/// the pyramid aggregation entirely instead of redoing it (issue #81;
+/// docs/ROADMAP.md M3 "reopening rebuilds the pyramid from cached Level 0
+/// rather than loading it too"). Each column gets its own cache entry,
+/// keyed by [`CacheKey::with_column`], so a multi-column file's columns
+/// never overwrite each other's cache.
+///
+/// A cache miss or a cache read/write failure both fall back to an ordinary
+/// uncached [`build_pyramid`] rather than failing the open — a cache is an
+/// optimization, never a requirement to open a file
+/// (docs/ARCHITECTURE.md §The index).
+///
+/// Resolves the OS-standard cache directory itself; see
+/// [`pyramids_for_dataset_cached_with_cache_dir`] for a version that takes
+/// an explicit one (tests; a system with no OS cache directory falls back
+/// to the same uncached path).
+///
+/// Callers must not call this over a [`Dataset::is_spilled`] dataset, for
+/// the same reason [`pyramids_for_dataset`] warns against it: it walks
+/// every raw sample end to end, which would make every page of a
+/// memory-mapped spill file resident (issue #88, still open — Level 0's own
+/// cache wiring, which would let this cover the spilled case too, is
+/// intentionally out of scope here).
+pub fn pyramids_for_dataset_cached(
+    path: &Path,
+    dataset: &Dataset,
+) -> Vec<Option<Vec<Vec<Bucket>>>> {
+    match os_spill_dir() {
+        Some(cache_dir) => pyramids_for_dataset_cached_with_cache_dir(path, dataset, &cache_dir),
+        None => pyramids_for_dataset(dataset),
+    }
+}
+
+/// [`pyramids_for_dataset_cached`] against an explicit cache directory, for
+/// tests that need a temp directory rather than the real OS cache dir — the
+/// same split [`load_with_budget`] provides for [`load`].
+pub fn pyramids_for_dataset_cached_with_cache_dir(
+    path: &Path,
+    dataset: &Dataset,
+    cache_dir: &Path,
+) -> Vec<Option<Vec<Vec<Bucket>>>> {
+    let ticks = dataset.time.to_pyramid_ticks();
+    let key = match CacheKey::for_path(path) {
+        Ok(key) => key,
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "could not read this file's metadata to key its pyramid cache; pyramid will be \
+                 rebuilt and not cached (issue #81)"
+            );
+            return pyramids_for_dataset(dataset);
+        }
+    };
+
+    dataset
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, series)| {
+            let samples: Cow<'_, [f64]> = match series.values().as_f64_slice() {
+                // Already `f64`: hand the pyramid cache the samples
+                // themselves rather than a freshly allocated copy of them.
+                Some(samples) => Cow::Borrowed(samples),
+                None => Cow::Owned(series.values().to_f64_vec()?),
+            };
+            let column_key = key.with_column(index);
+            match pyramid::build_or_open(cache_dir, &column_key, &samples, &ticks) {
+                Ok(levels) => Some(levels),
+                Err(err) => {
+                    warn!(
+                        path = %path.display(),
+                        column = index,
+                        error = %err,
+                        "pyramid cache read/write failed for this column; falling back to an \
+                         uncached build (issue #81)"
+                    );
+                    Some(build_pyramid(&samples, &ticks))
+                }
+            }
         })
         .collect()
 }

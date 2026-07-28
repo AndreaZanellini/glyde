@@ -198,10 +198,13 @@ fn run_index_job(generation: u64, path: PathBuf, tx: &Sender<IndexingMessage>) {
             );
             // issue #88: a spilled dataset's pyramid is never built from the
             // completed load — see the `Completed` variant's doc comment.
+            // issue #81: a non-spilled dataset's pyramid is served from (and
+            // written to) the on-disk pyramid cache, so reopening an
+            // unchanged file skips rebuilding it.
             let pyramids = if dataset.is_spilled() {
                 vec![None; dataset.columns.len()]
             } else {
-                glyde_core::ingest::pyramids_for_dataset(&dataset)
+                glyde_core::ingest::pyramids_for_dataset_cached(&path, &dataset)
             };
             let _ = tx.send(IndexingMessage::Completed {
                 generation,
