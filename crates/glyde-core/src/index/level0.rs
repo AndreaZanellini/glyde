@@ -73,6 +73,13 @@ pub struct CacheKey {
     source_path: PathBuf,
     source_size: u64,
     source_mtime_unix_nanos: i128,
+    /// `None` identifies the whole file (the original, single-series
+    /// scheme); `Some(index)` scopes the key to one column of a
+    /// multi-column dataset, so a reopen's per-column Level 0/pyramid caches
+    /// (issue #81) never collide with each other or with the whole-file
+    /// form — `Option<u32>` makes the two kinds hash and compare unequal by
+    /// construction, not by convention.
+    column: Option<u32>,
 }
 
 impl CacheKey {
@@ -97,7 +104,19 @@ impl CacheKey {
             source_path: source_path.to_path_buf(),
             source_size: metadata.len(),
             source_mtime_unix_nanos,
+            column: None,
         })
+    }
+
+    /// Scopes this key to one column of the dataset, so a file with several
+    /// numeric columns gets one independent cache entry per column instead
+    /// of every column overwriting the same one (issue #81). Cheap: reuses
+    /// the already-read path/size/mtime rather than re-reading metadata.
+    pub fn with_column(&self, column_index: usize) -> Self {
+        Self {
+            column: Some(column_index as u32),
+            ..self.clone()
+        }
     }
 
     /// A filesystem-safe, content-addressed stem shared by every cache file
@@ -584,6 +603,47 @@ mod tests {
 
         let result = try_open(dir.path(), &key).expect("a missing cache must not be an error");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn with_column_scopes_the_cache_key_so_columns_never_collide() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key = temp_key(dir.path(), 42);
+
+        let column_0 = key.with_column(0);
+        let column_1 = key.with_column(1);
+
+        assert_ne!(
+            column_0, key,
+            "a column-scoped key must differ from the whole-file key"
+        );
+        assert_ne!(
+            column_0, column_1,
+            "two different columns of the same file must produce different keys"
+        );
+        assert_ne!(
+            column_0.cache_stem(),
+            column_1.cache_stem(),
+            "different columns must never share a cache file stem"
+        );
+
+        let timestamps_0: Vec<i128> = vec![0, 1, 2];
+        let samples_0: Vec<f64> = vec![10.0, 20.0, 30.0];
+        let timestamps_1: Vec<i128> = vec![100, 200];
+        let samples_1: Vec<f64> = vec![-1.0, -2.0];
+
+        build(dir.path(), &column_0, &samples_0, &timestamps_0).expect("build column 0");
+        build(dir.path(), &column_1, &samples_1, &timestamps_1).expect("build column 1");
+
+        let reopened_0 = try_open(dir.path(), &column_0)
+            .expect("try_open must not error")
+            .expect("column 0's cache must be present");
+        let reopened_1 = try_open(dir.path(), &column_1)
+            .expect("try_open must not error")
+            .expect("column 1's cache must be present");
+
+        assert_eq!(reopened_0.samples(), samples_0.as_slice());
+        assert_eq!(reopened_1.samples(), samples_1.as_slice());
     }
 
     #[test]
