@@ -11,6 +11,25 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CSV files whose time column is written as `2026-01-01 00:00:00` (a space
+  between date and time, no `T`) now open.** This is one of the most common
+  timestamp shapes in real-world exports — SQL dumps, `pandas.to_csv()`
+  defaults, many dataloggers — and `docs/SPEC.md` §2.1 lists it as a format
+  Glyde must support at minimum, but it was never actually implemented: such
+  a file failed to open at all, with no plot and nothing to correct.
+  Fractional seconds (`2026-01-01 00:00:00.123`), and fractions finer than a
+  nanosecond, are supported exactly like Glyde's other timestamp formats.
+  Added to the torture corpus as case 57 (`docs/QUALITY.md` §1's growth rule
+  for `file-wont-open` bugs) so this stays fixed. (issue #82)
+
+  **Assumption made:** this closes the "format is missing" half of issue
+  #82. The other half — what should happen when a time column matches *no*
+  known timestamp format at all — is a separate, still-open product
+  decision (today such a column still fails the whole load rather than
+  degrading gracefully, per `docs/SPEC.md` §1.3); filed as its own
+  `blocking-decision` issue rather than decided here.
+
 ### Changed
 - **Reopening a file you've already viewed builds its plot's zoomed-out
   overview faster, instead of redoing that work from scratch every time.**

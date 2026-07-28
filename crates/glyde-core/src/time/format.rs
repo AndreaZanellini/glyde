@@ -15,15 +15,15 @@
 //! Absolute-timestamp parsing and formatting (docs/SPEC.md §2.1).
 //!
 //! [`TimestampFormat::Iso8601WithOffset`], [`TimestampFormat::Iso8601Naive`],
-//! the four epoch formats, [`TimestampFormat::DayFirst`] /
-//! [`TimestampFormat::MonthFirst`] (with the SPEC §2.1 day-vs-month ambiguity
-//! rule), [`TimestampFormat::LabViewEpoch`], and [`TimestampFormat::ExcelSerial`]
-//! are implemented (docs/ROADMAP.md M2's "Time index" item, "DD/MM vs MM/DD
-//! disambiguation", and the Excel/LabVIEW/picosecond-index item). The two
-//! ISO 8601 formats also preserve sub-nanosecond (picosecond) fractional
+//! [`TimestampFormat::DateTimeSpace`], the four epoch formats,
+//! [`TimestampFormat::DayFirst`] / [`TimestampFormat::MonthFirst`] (with the
+//! SPEC §2.1 day-vs-month ambiguity rule), [`TimestampFormat::LabViewEpoch`],
+//! and [`TimestampFormat::ExcelSerial`] are implemented (docs/ROADMAP.md M2's
+//! "Time index" item, "DD/MM vs MM/DD disambiguation", and the
+//! Excel/LabVIEW/picosecond-index item). `Iso8601WithOffset`, `Iso8601Naive`,
+//! and `DateTimeSpace` also preserve sub-nanosecond (picosecond) fractional
 //! seconds exactly, rather than silently rounding them to `chrono`'s
-//! nanosecond precision. `DateTimeSpace` is a separate, not-yet-started M2
-//! roadmap item and remains `todo!()`.
+//! nanosecond precision.
 
 use tracing::{info, warn};
 
@@ -134,13 +134,11 @@ pub enum TimestampFormat {
 
 /// Parses `input` as `format`, producing a [`Timestamp`] in that format's
 /// native resolution (SPEC §2.1).
-///
-/// `DateTimeSpace` is a separate, not-yet-started roadmap item and remains
-/// `todo!()`.
 pub fn parse_timestamp(input: &str, format: TimestampFormat) -> crate::Result<Timestamp> {
     match format {
         TimestampFormat::Iso8601WithOffset => parse_iso8601_with_offset(input),
         TimestampFormat::Iso8601Naive => parse_iso8601_naive(input),
+        TimestampFormat::DateTimeSpace => parse_datetime_space(input),
         TimestampFormat::DayFirst => parse_naive_with_pattern(input, "%d/%m/%Y %H:%M:%S", format),
         TimestampFormat::MonthFirst => parse_naive_with_pattern(input, "%m/%d/%Y %H:%M:%S", format),
         TimestampFormat::EpochSeconds => parse_epoch_integer(input, TimeUnit::Seconds, format),
@@ -149,9 +147,6 @@ pub fn parse_timestamp(input: &str, format: TimestampFormat) -> crate::Result<Ti
         TimestampFormat::EpochNanos => parse_epoch_integer(input, TimeUnit::Nanoseconds, format),
         TimestampFormat::LabViewEpoch => parse_labview_epoch(input),
         TimestampFormat::ExcelSerial => parse_excel_serial(input),
-        TimestampFormat::DateTimeSpace => {
-            todo!("docs/ROADMAP.md M2: {format:?} timestamp parsing is a separate, not-yet-started roadmap item")
-        }
     }
 }
 
@@ -159,13 +154,11 @@ pub fn parse_timestamp(input: &str, format: TimestampFormat) -> crate::Result<Ti
 /// every format in [`TimestampFormat`],
 /// `format_timestamp(&parse_timestamp(s, format)?, format) == s`
 /// (docs/QUALITY.md §2 Time: format round-trip).
-///
-/// `DateTimeSpace` is a separate, not-yet-started roadmap item and remains
-/// `todo!()`.
 pub fn format_timestamp(timestamp: &Timestamp, format: TimestampFormat) -> String {
     match format {
         TimestampFormat::Iso8601WithOffset => format_iso8601_with_offset(timestamp),
         TimestampFormat::Iso8601Naive => format_iso8601_naive(timestamp),
+        TimestampFormat::DateTimeSpace => format_datetime_space(timestamp),
         TimestampFormat::DayFirst => format_naive_with_pattern(timestamp, "%d/%m/%Y %H:%M:%S"),
         TimestampFormat::MonthFirst => format_naive_with_pattern(timestamp, "%m/%d/%Y %H:%M:%S"),
         TimestampFormat::EpochSeconds => format_epoch(timestamp, TimeUnit::Seconds),
@@ -174,9 +167,6 @@ pub fn format_timestamp(timestamp: &Timestamp, format: TimestampFormat) -> Strin
         TimestampFormat::EpochNanos => format_epoch(timestamp, TimeUnit::Nanoseconds),
         TimestampFormat::LabViewEpoch => format_labview_epoch(timestamp),
         TimestampFormat::ExcelSerial => format_excel_serial(timestamp),
-        TimestampFormat::DateTimeSpace => {
-            todo!("docs/ROADMAP.md M2: {format:?} timestamp formatting is a separate, not-yet-started roadmap item")
-        }
     }
 }
 
@@ -260,12 +250,50 @@ fn format_iso8601_naive(timestamp: &Timestamp) -> String {
         .to_string()
 }
 
-/// Splits an ISO 8601 string's fractional-seconds digits from the rest of
-/// the string, e.g. `"2026-01-01T00:00:00.000000000001Z"` ->
+/// `YYYY-MM-DD HH:MM:SS[.fff…]` (SPEC §2.1 minimum-support format, issue
+/// #82) — the same grammar as [`parse_iso8601_naive`] with a space instead
+/// of a `T` between the date and time, and likewise naive (no timezone).
+fn parse_datetime_space(input: &str) -> crate::Result<Timestamp> {
+    if let Some((before, frac, suffix)) = split_iso8601_fraction(input) {
+        if frac.len() > CHRONO_MAX_FRACTIONAL_DIGITS {
+            return parse_subnanosecond_iso8601(
+                input,
+                TimestampFormat::DateTimeSpace,
+                before,
+                frac,
+                suffix,
+            );
+        }
+    }
+    let parsed =
+        chrono::NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M:%S%.f").map_err(|source| {
+            crate::GlydeError::InvalidTimestamp {
+                input: input.to_string(),
+                format: TimestampFormat::DateTimeSpace,
+                reason: source.to_string(),
+            }
+        })?;
+    let ticks = nanos_since_epoch(input, TimestampFormat::DateTimeSpace, &parsed.and_utc())?;
+    Ok(Timestamp::new(ticks, TimeUnit::Nanoseconds))
+}
+
+fn format_datetime_space(timestamp: &Timestamp) -> String {
+    if timestamp.unit == TimeUnit::Picoseconds {
+        return format_subnanosecond_datetime_space(timestamp);
+    }
+    utc_datetime_from_ticks(timestamp)
+        .format("%Y-%m-%d %H:%M:%S%.f")
+        .to_string()
+}
+
+/// Splits an ISO 8601 (or [`TimestampFormat::DateTimeSpace`], which shares
+/// this same fractional-seconds grammar) string's fractional-seconds digits
+/// from the rest of the string, e.g.
+/// `"2026-01-01T00:00:00.000000000001Z"` ->
 /// `("2026-01-01T00:00:00", "000000000001", "Z")`. `before` joined with
-/// `suffix` (with no `.` between them) is a valid fraction-free ISO 8601
-/// string, parseable by the ordinary `chrono`-based path. Returns `None`
-/// when `input` has no `.` at all (an integer-second timestamp, which never
+/// `suffix` (with no `.` between them) is a valid fraction-free string,
+/// parseable by the ordinary `chrono`-based path. Returns `None` when
+/// `input` has no `.` at all (an integer-second timestamp, which never
 /// needs the picosecond-preserving path).
 fn split_iso8601_fraction(input: &str) -> Option<(&str, &str, &str)> {
     let (before, after_dot) = input.split_once('.')?;
@@ -291,13 +319,13 @@ fn frac_digits_to_picos(frac_digits: &str) -> i128 {
     numerator * 10_i128.pow(12 - truncated.len() as u32)
 }
 
-/// Parses an ISO 8601 timestamp whose fractional seconds exceed `chrono`'s
-/// nanosecond precision (SPEC §2.1: "sub-nanosecond sources (picoseconds)
-/// are stored in their native unit"): the whole-second part is parsed by the
-/// ordinary `chrono` path (via `before` joined with `suffix`, the same
-/// string with the fraction removed), and the fractional part is scaled to
-/// picoseconds directly from its digit text, never through `chrono` or
-/// `f64`.
+/// Parses an ISO 8601 or [`TimestampFormat::DateTimeSpace`] timestamp whose
+/// fractional seconds exceed `chrono`'s nanosecond precision (SPEC §2.1:
+/// "sub-nanosecond sources (picoseconds) are stored in their native unit"):
+/// the whole-second part is parsed by the ordinary `chrono` path (via
+/// `before` joined with `suffix`, the same string with the fraction
+/// removed), and the fractional part is scaled to picoseconds directly from
+/// its digit text, never through `chrono` or `f64`.
 fn parse_subnanosecond_iso8601(
     input: &str,
     format: TimestampFormat,
@@ -338,7 +366,20 @@ fn parse_subnanosecond_iso8601(
                 + picos_of_second;
             Ok(Timestamp::new(ticks, TimeUnit::Picoseconds))
         }
-        _ => unreachable!("only called for the two ISO 8601 formats"),
+        TimestampFormat::DateTimeSpace => {
+            let parsed =
+                chrono::NaiveDateTime::parse_from_str(&whole_seconds_text, "%Y-%m-%d %H:%M:%S")
+                    .map_err(|source| crate::GlydeError::InvalidTimestamp {
+                        input: input.to_string(),
+                        format,
+                        reason: source.to_string(),
+                    })?;
+            let ticks = i128::from(parsed.and_utc().timestamp())
+                * TimeUnit::Picoseconds.ticks_per_second()
+                + picos_of_second;
+            Ok(Timestamp::new(ticks, TimeUnit::Picoseconds))
+        }
+        _ => unreachable!("only called for the ISO 8601 and DateTimeSpace formats"),
     }
 }
 
@@ -367,6 +408,16 @@ fn format_subnanosecond_iso8601_naive(timestamp: &Timestamp) -> String {
     format!(
         "{}.{picos_of_second:012}",
         utc_datetime_from_whole_seconds(whole_seconds).format("%Y-%m-%dT%H:%M:%S")
+    )
+}
+
+/// The inverse of [`parse_subnanosecond_iso8601`] for
+/// [`TimestampFormat::DateTimeSpace`].
+fn format_subnanosecond_datetime_space(timestamp: &Timestamp) -> String {
+    let (whole_seconds, picos_of_second) = split_picosecond_ticks(timestamp);
+    format!(
+        "{}.{picos_of_second:012}",
+        utc_datetime_from_whole_seconds(whole_seconds).format("%Y-%m-%d %H:%M:%S")
     )
 }
 
@@ -693,11 +744,15 @@ pub struct TimestampFormatInference {
 /// string can be syntactically identical, so picking between them needs
 /// [`infer_day_month_format`]'s dedicated field-scan (SPEC §2.1 ambiguity
 /// rule) rather than the "first format that parses every field" rule this
-/// list is tried under. `DateTimeSpace` is a separate, not-yet-started
-/// roadmap item and is never inferred.
-const IN_SCOPE_FORMATS: [TimestampFormat; 8] = [
+/// list is tried under. [`TimestampFormat::DateTimeSpace`] is listed right
+/// after [`TimestampFormat::Iso8601Naive`] — its closest sibling by shape —
+/// but the two can never shadow one another: `Iso8601Naive` requires a
+/// literal `T` between date and time where `DateTimeSpace` requires a space,
+/// so a field can match at most one of them.
+const IN_SCOPE_FORMATS: [TimestampFormat; 9] = [
     TimestampFormat::Iso8601WithOffset,
     TimestampFormat::Iso8601Naive,
+    TimestampFormat::DateTimeSpace,
     TimestampFormat::EpochNanos,
     TimestampFormat::EpochMicros,
     TimestampFormat::EpochMillis,

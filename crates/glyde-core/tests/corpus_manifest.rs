@@ -15,15 +15,17 @@
 //! Corpus manifest gate (docs/QUALITY.md §1, docs/ROADMAP.md M1).
 //!
 //! `every_committed_case_has_a_well_formed_expected_json` runs on every PR
-//! and covers whatever cases are committed so far. `corpus_has_all_56_cases`
-//! is the milestone-complete gate, un-ignored now that the last corpus batch
-//! (QUALITY.md §1, cases 53-56, Parquet) has landed.
+//! and covers whatever cases are committed so far. `corpus_has_all_57_cases`
+//! is the milestone-complete gate. Case 57 (`YYYY-MM-DD HH:MM:SS`
+//! space-separated datetime, issue #82) was added after M1's original
+//! 56-case batch, per QUALITY.md §1's growth rule ("every `file-wont-open`
+//! issue must add its file to the corpus with the fix in the same PR").
 
 mod support;
 
 use support::{corpus_dir, discover_cases, load_expected};
 
-const EXPECTED_CORPUS_SIZE: usize = 56;
+const EXPECTED_CORPUS_SIZE: usize = 57;
 
 #[test]
 fn every_committed_case_has_a_well_formed_expected_json() {
@@ -44,7 +46,7 @@ fn every_committed_case_has_a_well_formed_expected_json() {
 }
 
 #[test]
-fn corpus_has_all_56_cases() {
+fn corpus_has_all_57_cases() {
     let dir = corpus_dir();
     let cases = discover_cases(&dir).expect("read testdata/corpus");
 

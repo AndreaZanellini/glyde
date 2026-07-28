@@ -17,17 +17,14 @@
 //! The single combined round-trip test M1 committed
 //! (`every_timestamp_format_round_trips_through_parse_and_format`, looping
 //! over all 11 `TimestampFormat` variants in one `#[ignore]`d `#[test]`) has
-//! been split into one test per format here: docs/ROADMAP.md M2's "Time
-//! index" item implements `Iso8601WithOffset`, `Iso8601Naive`, the four
-//! epoch formats, and `DayFirst`/`MonthFirst` (`DateTimeSpace`,
-//! `LabViewEpoch`, and `ExcelSerial` are separate, not-yet-started M2 roadmap
-//! items) — a single shared test could not be un-ignored without either
-//! implementing every format at once or editing the loop, and this file's own
-//! rule (below) is to never do the latter. Splitting the test changes no
-//! input, no expected output, and no assertion for any format; only the
-//! in-scope formats' tests are un-ignored here. Un-ignore each remaining test
-//! only once its implementation makes it pass — never loosen an assertion to
-//! make that happen.
+//! been split into one test per format here — a single shared test could not
+//! be un-ignored without either implementing every format at once or editing
+//! the loop, and this file's own rule (below) is to never do the latter.
+//! Splitting the test changes no input, no expected output, and no assertion
+//! for any format. Every `TimestampFormat` variant is now implemented
+//! (`DateTimeSpace` last, issue #82); un-ignore each remaining test only once
+//! its implementation makes it pass — never loosen an assertion to make that
+//! happen.
 
 use glyde_core::time::{
     detect_gaps, detect_monotonicity, format_timestamp, parse_timestamp, Gap, MonotonicityReport,
@@ -106,7 +103,6 @@ fn epoch_nanos_round_trips() {
 // confuses them for one another, once that item is implemented.
 
 #[test]
-#[ignore = "docs/ROADMAP.md M2: DateTimeSpace timestamp parsing not implemented yet"]
 fn date_time_space_round_trips() {
     assert_round_trips(
         glyde_core::time::TimestampFormat::DateTimeSpace,
