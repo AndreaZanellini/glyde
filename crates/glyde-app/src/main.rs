@@ -14,22 +14,16 @@
 
 //! Glyde: glide through your time series.
 //!
-//! Thin shell: renders state and forwards user intent. If a behavior can be
-//! tested without a window, it belongs in glyde-core. See docs/ARCHITECTURE.md.
+//! The actual application code lives in `src/lib.rs` and its modules; this
+//! binary is just the native entry point (docs/ARCHITECTURE.md: `glyde-app`
+//! is a thin shell).
 
-mod app;
-mod error_boundary;
-mod inference_bar;
-mod logging;
-mod plumbing;
-mod views;
-
-use app::GlydeApp;
+use glyde_app::GlydeApp;
 
 fn main() -> anyhow::Result<()> {
     // Keep the guard alive for the whole process: dropping it stops the
     // background thread that flushes log lines to disk.
-    let _logging_guard = logging::init()?;
+    let _logging_guard = glyde_app::logging::init()?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "glyde starting");
 
     // SPEC §6: single window, single file at a time.

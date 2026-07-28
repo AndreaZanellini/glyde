@@ -28,7 +28,16 @@ directories.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 insta.workspace = true
+criterion.workspace = true
+
+[lib]
+name = "glyde_app"
+path = "src/lib.rs"
 
 [[bin]]
 name = "glyde"
 path = "src/main.rs"
+
+[[bench]]
+name = "time_view_render"
+harness = false

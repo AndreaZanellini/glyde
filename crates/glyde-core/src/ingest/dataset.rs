@@ -1110,7 +1110,7 @@ impl<'a> SpillPreview<'a> {
                 .map(|(column, name)| column.to_series(name))
                 .collect(),
         };
-        let pyramids = pyramids_for(&dataset);
+        let pyramids = pyramids_for_dataset(&dataset);
         let rows_read = self.rows;
         if let Some(on_checkpoint) = self.on_checkpoint.as_deref_mut() {
             on_checkpoint(Checkpoint {
@@ -1206,7 +1206,7 @@ pub(crate) fn load_with_outcome_progressive(
                     partial_columns,
                 ) {
                     Ok((dataset, _ambiguous)) => {
-                        let pyramids = pyramids_for(&dataset);
+                        let pyramids = pyramids_for_dataset(&dataset);
                         on_checkpoint(Checkpoint {
                             rows_read: partial_outcome.row_count,
                             pyramids,
@@ -1252,7 +1252,7 @@ pub fn load_progressive_with_budget(
             let (outcome, columns_text) =
                 open_path_capturing_all_columns_with_progress(path, |partial, columns| {
                     if let Ok((dataset, _ambiguous)) = build_dataset(partial, columns) {
-                        let pyramids = pyramids_for(&dataset);
+                        let pyramids = pyramids_for_dataset(&dataset);
                         on_checkpoint(Checkpoint {
                             rows_read: partial.row_count,
                             pyramids,
@@ -1266,8 +1266,17 @@ pub fn load_progressive_with_budget(
 }
 
 /// `dataset`'s own min/max pyramid, one entry per column in `dataset.columns`
-/// order (see [`Checkpoint::pyramids`]).
-fn pyramids_for(dataset: &Dataset) -> Vec<Option<Vec<Vec<Bucket>>>> {
+/// order (see [`Checkpoint::pyramids`]). `None` at an index whose column is
+/// non-numeric; `Some` for every numeric one, built by the same golden-tested
+/// [`build_pyramid`] the pyramid used internally by [`load_with_outcome_progressive`]
+/// checkpoints uses. Public so `glyde-app` can build a final pyramid for a
+/// completed, in-memory dataset once progressive checkpointing has stopped
+/// (docs/ROADMAP.md M3, issue #80) — callers must not call this over a
+/// [`Dataset::is_spilled`] dataset: it walks every raw sample end to end via
+/// [`crate::series::SeriesValues::to_f64_vec`] for any non-`f64` column,
+/// which would make every page of a memory-mapped spill file resident
+/// (issue #88).
+pub fn pyramids_for_dataset(dataset: &Dataset) -> Vec<Option<Vec<Vec<Bucket>>>> {
     let ticks = dataset.time.to_pyramid_ticks();
     dataset
         .columns

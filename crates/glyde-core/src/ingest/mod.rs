@@ -32,8 +32,8 @@ mod report;
 pub use csv::{open_path, parse, CsvParseOutcome, CsvReader};
 pub use dataset::{
     load, load_progressive, load_progressive_with_budget, load_with_budget,
-    progressive_tick_to_value, progressive_value_to_tick, Checkpoint, Dataset, ProgressiveValues,
-    TimeAxis, Timestamps, PROGRESSIVE_TICK_SCALE,
+    progressive_tick_to_value, progressive_value_to_tick, pyramids_for_dataset, Checkpoint,
+    Dataset, ProgressiveValues, TimeAxis, Timestamps, PROGRESSIVE_TICK_SCALE,
 };
 pub use infer::{
     decode, detect_encoding, infer_column, infer_decimal_separator, infer_delimiter, infer_header,

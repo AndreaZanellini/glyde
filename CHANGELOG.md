@@ -12,6 +12,61 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- **Panning and zooming a large file is now smooth, and a one-sample spike
+  never disappears.** The time-domain plot used to draw every single raw
+  sample on every frame, however many rows the file had — fine for a small
+  file, but a file with millions of rows meant redrawing millions of points
+  every time you moved the mouse, which is why panning or zooming a big file
+  could stutter or freeze. Glyde now draws one min/max bar per pixel column
+  instead, recomputed from the exact data every frame as you pan and zoom
+  (never a resampled or averaged approximation), so the amount of work stays
+  tied to how wide your window is, not how many rows the file has. A
+  one-sample spike still always shows up, at any zoom level, because the
+  min/max bar always includes it even when many other samples are collapsed
+  into the same pixel column; zoom in far enough and the view switches back
+  to drawing individual points, one per sample, exactly as before.
+
+  A gap (a run of missing/NaN readings) still shows up as a visible break in
+  the plot rather than being smoothed over, same as always (`docs/SPEC.md`
+  §1.3).
+
+  Measured on a synthetic 8-million-sample file, one simulated pan/zoom
+  frame: **4.75 seconds before → well under a tenth of a millisecond after**
+  (a new automated benchmark now fails the build if this ever regresses,
+  checked for both a whole-number column and a decimal one — the first
+  version of this fix only measured a decimal column and missed that
+  whole-number columns still had to be re-converted on every single frame).
+
+  **Assumption made:** for a very large file that had to be streamed from
+  disk instead of held in memory (`docs/SPEC.md` §5.1's affordability check),
+  the fast, precomputed version of this speedup is not built for the parts of
+  the file that arrived after the plot first appeared — Glyde still draws
+  those correctly, just by scanning the visible range directly rather than
+  from a cache. In practice this only matters on files large enough to spill
+  to disk in the first place; a follow-up on making that instant too is
+  tracked as its own issue (glyde-app issue #81).
+
+  **Assumption made:** a pan or zoom that lands entirely past the edge of
+  your data — nothing in view at all — now snaps the view back to show
+  everything, rather than showing an empty plot with no obvious way back.
+  Deliberate: the same rule is what makes the plot show your data the
+  instant a file opens (below), and there was no way to tell the two apart.
+
+  Two real bugs were caught and fixed before this shipped, both from
+  actually opening a file and looking at the result rather than only running
+  the test suite: opening a plain, ordinary file first showed a **completely
+  empty plot** until you clicked "Fit to data" — caused by the new per-frame
+  drawing logic asking "what's currently on screen?" before anything had
+  ever been put on screen, a chicken-and-egg gap the previous "draw
+  everything, always" approach never had. And once "Fit to data" was
+  clicked, a small file's points showed up **scattered and disconnected**
+  instead of joined by a line, because the new code only knew how to draw
+  either a connected line-plus-markers for zoomed-in data *or* isolated bars
+  for zoomed-out data, and had confused which one a small, fully-zoomed-in
+  file needed. Both are fixed and covered by tests that reproduce the exact
+  scenario (a real corpus file rendered on a brand-new plot, with no clicks
+  simulated) so they cannot silently come back.
+
 - **Opening a big file now costs the same memory whatever its size — about
   10 MB.** The previous entry got a 2 GB file down from 7.16 GB of memory to
   0.90 GB by keeping the sample data on disk, but the figure was still a
