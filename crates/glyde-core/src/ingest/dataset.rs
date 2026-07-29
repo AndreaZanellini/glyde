@@ -47,7 +47,7 @@ use super::csv::{
 };
 use super::infer::{log_dtype_choice, normalize_decimal_field, ColumnDtypeChoice, ColumnDtypeScan};
 use crate::budget::RamBudget;
-use crate::dsp::decimation::{build_pyramid, Bucket};
+use crate::dsp::decimation::{build_pyramid, extend_pyramid, Bucket};
 use crate::index::level0::{self, CacheKey};
 use crate::index::pyramid;
 use crate::index::spill::{SpillStringsWriter, SpillVec, SpillVecWriter};
@@ -955,6 +955,7 @@ struct SpillPreview<'a> {
     columns: Vec<PreviewColumn>,
     rows: u64,
     next_checkpoint_rows: u64,
+    pyramid_cursor: PyramidCursor,
 }
 
 /// One preview column's heap-backed values, in the dtype the scan pass
@@ -1050,6 +1051,7 @@ impl<'a> SpillPreview<'a> {
                 .collect(),
             rows: 0,
             next_checkpoint_rows: FIRST_PROGRESS_CHECKPOINT_ROWS,
+            pyramid_cursor: PyramidCursor::default(),
         }
     }
 
@@ -1111,7 +1113,7 @@ impl<'a> SpillPreview<'a> {
                 .map(|(column, name)| column.to_series(name))
                 .collect(),
         };
-        let pyramids = pyramids_for_dataset(&dataset);
+        let pyramids = self.pyramid_cursor.update(&dataset);
         let rows_read = self.rows;
         if let Some(on_checkpoint) = self.on_checkpoint.as_deref_mut() {
             on_checkpoint(Checkpoint {
@@ -1200,6 +1202,7 @@ pub(crate) fn load_with_outcome_progressive(
             load_spilled(path, &sniff, cache_dir, Some(&mut on_checkpoint))
         }
         Storage::InMemory => {
+            let mut pyramid_cursor = PyramidCursor::default();
             let (outcome, columns_text) = open_path_capturing_all_columns_with_progress(
                 path,
                 |partial_outcome, partial_columns| match build_dataset(
@@ -1207,7 +1210,7 @@ pub(crate) fn load_with_outcome_progressive(
                     partial_columns,
                 ) {
                     Ok((dataset, _ambiguous)) => {
-                        let pyramids = pyramids_for_dataset(&dataset);
+                        let pyramids = pyramid_cursor.update(&dataset);
                         on_checkpoint(Checkpoint {
                             rows_read: partial_outcome.row_count,
                             pyramids,
@@ -1250,10 +1253,11 @@ pub fn load_progressive_with_budget(
         Storage::Spill(sniff) => load_spilled(path, &sniff, cache_dir, Some(&mut on_checkpoint))
             .map(|(_outcome, dataset, _ambiguous)| dataset),
         Storage::InMemory => {
+            let mut pyramid_cursor = PyramidCursor::default();
             let (outcome, columns_text) =
                 open_path_capturing_all_columns_with_progress(path, |partial, columns| {
                     if let Ok((dataset, _ambiguous)) = build_dataset(partial, columns) {
-                        let pyramids = pyramids_for_dataset(&dataset);
+                        let pyramids = pyramid_cursor.update(&dataset);
                         on_checkpoint(Checkpoint {
                             rows_read: partial.row_count,
                             pyramids,
@@ -1263,6 +1267,119 @@ pub fn load_progressive_with_budget(
                 })?;
             build_dataset(&outcome, &columns_text).map(|(dataset, _ambiguous)| dataset)
         }
+    }
+}
+
+/// Per-column pyramid state carried between successive progressive
+/// checkpoints (docs/ROADMAP.md M3, issue #90), so a later, larger
+/// checkpoint's pyramid is built by *extending* the previous checkpoint's
+/// own pyramid ([`extend_pyramid`]) instead of re-aggregating every sample
+/// read so far from scratch every time — `super::csv`'s row-count-doubling
+/// checkpoint schedule made that `O(n log n)` of pure waste across a full
+/// progressive load.
+///
+/// A non-`f64` numeric column also needs its `f64` conversion — normally
+/// [`crate::series::SeriesValues::to_f64_vec`] — recomputed at every
+/// checkpoint. This cursor grows that conversion incrementally instead
+/// (only the newly arrived rows, via
+/// [`crate::series::SeriesValues::f64_at`]), so a checkpoint never re-walks
+/// rows it already converted.
+///
+/// Reset (`Default::default()`) once per progressive load; never shared
+/// across two different files or two different columns.
+#[derive(Default)]
+struct PyramidCursor {
+    columns: Vec<Option<PyramidCursorColumn>>,
+}
+
+/// One column's incremental state: the pyramid built so far, the sample
+/// count it covers, and — for a non-`f64` numeric column only — the
+/// running `f64` conversion `extend_pyramid` is fed. `f64_cache` is always
+/// `None` for an `f64` column, which is read straight off
+/// [`crate::series::SeriesValues::as_f64_slice`] and never copied.
+struct PyramidCursorColumn {
+    pyramid: Vec<Vec<Bucket>>,
+    len: usize,
+    f64_cache: Option<Vec<f64>>,
+}
+
+impl PyramidCursor {
+    /// Updates every column's pyramid for `dataset`'s current (larger) set
+    /// of rows, in `dataset.columns` order — the same shape and, bucket for
+    /// bucket, the same values [`pyramids_for_dataset(dataset)`] would
+    /// produce (`tests::load_with_outcome_progressive_checkpoint_pyramids_match_build_pyramid_on_the_same_prefix`
+    /// locks the equivalence), just without re-walking rows this cursor has
+    /// already seen.
+    fn update(&mut self, dataset: &Dataset) -> Vec<Option<Vec<Vec<Bucket>>>> {
+        let ticks = dataset.time.to_pyramid_ticks();
+        if self.columns.len() != dataset.columns.len() {
+            self.columns.resize_with(dataset.columns.len(), || None);
+        }
+
+        dataset
+            .columns
+            .iter()
+            .zip(self.columns.iter_mut())
+            .map(|(series, state)| Self::update_column(series.values(), &ticks, state))
+            .collect()
+    }
+
+    fn update_column(
+        values: &SeriesValues,
+        ticks: &[i128],
+        state: &mut Option<PyramidCursorColumn>,
+    ) -> Option<Vec<Vec<Bucket>>> {
+        if matches!(values.dtype(), Dtype::Bool | Dtype::String) {
+            *state = None;
+            return None;
+        }
+
+        if let Some(samples) = values.as_f64_slice() {
+            let pyramid = match state.take().filter(|s| s.len <= samples.len()) {
+                Some(PyramidCursorColumn { pyramid, len, .. }) => {
+                    extend_pyramid(pyramid, len, samples, ticks)
+                }
+                None => build_pyramid(samples, ticks),
+            };
+            *state = Some(PyramidCursorColumn {
+                pyramid: pyramid.clone(),
+                len: samples.len(),
+                f64_cache: None,
+            });
+            return Some(pyramid);
+        }
+
+        // Non-`f64` numeric column: grow the cached conversion by exactly
+        // the rows added since the last checkpoint, never re-converting
+        // the whole column.
+        let total = values.len();
+        let previous = state
+            .take()
+            .filter(|s| s.f64_cache.as_ref().is_some_and(|c| c.len() <= total));
+        let mut cache = previous
+            .as_ref()
+            .and_then(|s| s.f64_cache.clone())
+            .unwrap_or_default();
+        for i in cache.len()..total {
+            cache.push(
+                values
+                    .f64_at(i)
+                    .expect("dtype checked non-bool/string above"),
+            );
+        }
+
+        let pyramid = match previous {
+            Some(PyramidCursorColumn { pyramid, len, .. }) => {
+                extend_pyramid(pyramid, len, &cache, ticks)
+            }
+            None => build_pyramid(&cache, ticks),
+        };
+        *state = Some(PyramidCursorColumn {
+            pyramid: pyramid.clone(),
+            len: cache.len(),
+            f64_cache: Some(cache),
+        });
+        Some(pyramid)
     }
 }
 

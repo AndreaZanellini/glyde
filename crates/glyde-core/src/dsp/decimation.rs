@@ -137,6 +137,83 @@ fn merge_buckets(left: Bucket, right: Bucket) -> Bucket {
     }
 }
 
+/// Extends a pyramid previously built over `samples[..previous_len]` (by
+/// [`build_pyramid`] or by this function itself) to cover all of `samples`,
+/// bucket-for-bucket identical to calling `build_pyramid(samples,
+/// timestamps)` from scratch — but touching only the buckets that new
+/// samples can actually change, never re-aggregating the ones that cannot
+/// (docs/ROADMAP.md M3's progressive checkpoint schedule calls this once per
+/// checkpoint as a file loads; re-running `build_pyramid` on every larger
+/// prefix is `O(n log n)` of pure waste across a full load — issue #90).
+///
+/// `previous` must be exactly what `build_pyramid(&samples[..previous_len],
+/// &timestamps[..previous_len])` would return (or the empty pyramid, when
+/// `previous_len` is `0`, in which case this is equivalent to calling
+/// [`build_pyramid`] directly). Golden rule: level *k*'s buckets are
+/// grouped from the start of the array in fixed [`PYRAMID_FACTOR`]-sized
+/// chunks (`slice::chunks`), so a bucket's contents depend only on its
+/// position, never on how the call was split up — every bucket fully
+/// contained in `samples[..previous_len_rounded_down_to_a_bucket_boundary]`
+/// is therefore already final and is kept as-is; only the last, possibly
+/// partial bucket at each level (and everything built on top of it) is
+/// recomputed, from the raw samples up.
+pub fn extend_pyramid(
+    mut previous: Vec<Vec<Bucket>>,
+    previous_len: usize,
+    samples: &[f64],
+    timestamps: &[i128],
+) -> Vec<Vec<Bucket>> {
+    debug_assert_eq!(
+        samples.len(),
+        timestamps.len(),
+        "samples and timestamps must be the same length"
+    );
+    debug_assert!(
+        previous_len <= samples.len(),
+        "previous_len must be a prefix length of the current samples"
+    );
+
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    if previous_len == 0 || previous.is_empty() {
+        return build_pyramid(samples, timestamps);
+    }
+
+    // Level 0: every bucket fully inside the previous checkpoint's complete
+    // groups is final; only the raw-sample tail from the last complete
+    // group onward needs (re)bucketing.
+    let mut complete = previous_len / PYRAMID_FACTOR;
+    previous[0].truncate(complete);
+    previous[0].extend(bucket_level_from_samples(
+        &samples[complete * PYRAMID_FACTOR..],
+        &timestamps[complete * PYRAMID_FACTOR..],
+    ));
+
+    // Existing higher levels: the same "keep the final prefix, recompute
+    // the tail from the level below" step, one level at a time — the tail
+    // of children is small (only what changed) so this never re-copies a
+    // level's already-final prefix.
+    let mut level = 1;
+    while level < previous.len() {
+        let level_complete = complete / PYRAMID_FACTOR;
+        let tail_children = previous[level - 1][level_complete * PYRAMID_FACTOR..].to_vec();
+        previous[level].truncate(level_complete);
+        previous[level].extend(bucket_level_from_buckets(&tail_children));
+        complete = level_complete;
+        level += 1;
+    }
+
+    // The pyramid may need to grow taller now that there is more data,
+    // exactly mirroring `build_pyramid`'s own growth condition.
+    while previous.last().expect("previous is non-empty").len() >= PYRAMID_FACTOR {
+        let next = bucket_level_from_buckets(previous.last().expect("checked above"));
+        previous.push(next);
+    }
+
+    previous
+}
+
 /// Resolves the viewport `range` (inclusive, in the same tick units as
 /// `timestamps`) into one [`Bucket`] per pixel column, using `pyramid` where
 /// available.
