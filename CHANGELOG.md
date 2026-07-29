@@ -31,6 +31,25 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `blocking-decision` issue rather than decided here.
 
 ### Changed
+- **Opening a large file spends less CPU on background indexing while it's
+  still loading, so the rest of the app stays more responsive.** As a file
+  loads, Glyde periodically refreshes the plot's zoomed-out overview so it
+  visibly fills in rather than appearing all at once. Until now, each of
+  those refreshes rebuilt the overview completely from scratch — for the
+  last refresh on a big file, that meant redoing the same aggregation work
+  the first eight refreshes had already done, over and over. Glyde now
+  extends the previous refresh's own overview with only the newly-read rows
+  instead, producing the identical result for less work. This is
+  background-indexing overhead only — a fully loaded file's plot and its
+  values are unaffected either way.
+
+  **Assumption made:** none — this is a pure performance change with no
+  effect on what is shown. The rare case where a whole-number column holds
+  values too large for exact plotting precision still logs that once per
+  value, same as before (`docs/SPEC.md` §1.4) — just once per value overall
+  now, rather than repeated at every refresh while the file is loading.
+  (issue #90)
+
 - **Reopening a file you've already viewed builds its plot's zoomed-out
   overview faster, instead of redoing that work from scratch every time.**
   When Glyde opens a file, it precomputes a multi-resolution "overview" of

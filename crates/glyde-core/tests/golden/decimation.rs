@@ -19,7 +19,9 @@
 //! Never loosen an assertion here to make an implementation pass — if one
 //! looks wrong, that is a `blocking-decision` issue, not an edit.
 
-use glyde_core::dsp::decimation::{build_pyramid, decimate_viewport, Bucket, PYRAMID_FACTOR};
+use glyde_core::dsp::decimation::{
+    build_pyramid, decimate_viewport, extend_pyramid, Bucket, PYRAMID_FACTOR,
+};
 
 /// A tiny deterministic PRNG (xorshift64*) so "random data" fixtures are
 /// reproducible without adding a `rand` dependency to the workspace.
@@ -297,4 +299,67 @@ fn no_aliasing_1khz_sine_at_100khz_decimated_to_500_columns_shows_a_constant_env
             bucket.min
         );
     }
+}
+
+/// docs/ROADMAP.md M3's progressive checkpoint schedule calls
+/// [`build_pyramid`] again on every larger prefix as a file loads (issue
+/// #90). [`extend_pyramid`] exists to avoid re-aggregating from scratch
+/// each time; this test is its correctness contract: at every checkpoint,
+/// extending the previous checkpoint's own pyramid with only the samples
+/// added since must produce the *exact* same pyramid — bucket-for-bucket,
+/// level-for-level — as calling [`build_pyramid`] fresh over the whole
+/// prefix. Checkpoint sizes are deliberately irregular (not multiples of
+/// [`PYRAMID_FACTOR`]) so the boundary case — a previously-partial level-0
+/// bucket that new samples complete or extend — is exercised at every
+/// level, not just the last one.
+#[test]
+fn extend_pyramid_matches_a_full_rebuild_at_every_irregular_checkpoint() {
+    const CHECKPOINT_SIZES: &[usize] = &[
+        1, 3, 7, 8, 9, 17, 63, 64, 65, 500, 511, 512, 513, 4096, 4097, 5000, 10_000,
+    ];
+
+    let mut rng = Xorshift64::new(0x1DEA5);
+    let total = *CHECKPOINT_SIZES.last().expect("non-empty");
+    let samples: Vec<f64> = (0..total).map(|_| rng.next_f64() * 1000.0).collect();
+    let timestamps: Vec<i128> = (0..total as i128).collect();
+
+    let mut previous_pyramid: Vec<Vec<Bucket>> = Vec::new();
+    let mut previous_len = 0usize;
+
+    for &checkpoint_len in CHECKPOINT_SIZES {
+        let extended = extend_pyramid(
+            previous_pyramid.clone(),
+            previous_len,
+            &samples[..checkpoint_len],
+            &timestamps[..checkpoint_len],
+        );
+        let rebuilt = build_pyramid(&samples[..checkpoint_len], &timestamps[..checkpoint_len]);
+
+        assert_eq!(
+            extended, rebuilt,
+            "extend_pyramid over a prefix of {checkpoint_len} samples (grown from a previous \
+             checkpoint of {previous_len}) must exactly match build_pyramid over the same \
+             prefix computed from scratch"
+        );
+
+        previous_pyramid = extended;
+        previous_len = checkpoint_len;
+    }
+}
+
+/// A pyramid with no previous checkpoint (`previous_len == 0`) must behave
+/// exactly like [`build_pyramid`] — the first checkpoint of a progressive
+/// load has nothing to extend from.
+#[test]
+fn extend_pyramid_with_no_previous_checkpoint_matches_build_pyramid() {
+    const SAMPLE_COUNT: usize = 777;
+
+    let mut rng = Xorshift64::new(0xFACADE);
+    let samples: Vec<f64> = (0..SAMPLE_COUNT).map(|_| rng.next_f64() * 10.0).collect();
+    let timestamps: Vec<i128> = (0..SAMPLE_COUNT as i128).collect();
+
+    let extended = extend_pyramid(Vec::new(), 0, &samples, &timestamps);
+    let rebuilt = build_pyramid(&samples, &timestamps);
+
+    assert_eq!(extended, rebuilt);
 }

@@ -72,3 +72,7 @@ harness = false
 [[bench]]
 name = "welch"
 harness = false
+
+[[bench]]
+name = "progressive_pyramid"
+harness = false
