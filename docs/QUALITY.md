@@ -77,6 +77,9 @@ Build it *before* the features it protects. Minimum set for v1:
 55. Partitioned Parquet directory
 56. Parquet with dictionary-encoded strings
 
+**Grown post-M1 (per the growth rule below)**
+57. `YYYY-MM-DD HH:MM:SS` space-separated datetime (issue #82, `file-wont-open`)
+
 **Growth rule:** every `file-wont-open` issue must add its (anonymized) file to the corpus *with the fix in the same PR*. This is the product's growth engine.
 
 ---

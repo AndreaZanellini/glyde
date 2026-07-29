@@ -16,8 +16,8 @@
 //! (docs/SPEC.md §2, docs/ARCHITECTURE.md workspace layout `time/`).
 //!
 //! Timestamp parsing/formatting for [`TimestampFormat::Iso8601WithOffset`],
-//! [`TimestampFormat::Iso8601Naive`], the four epoch formats,
-//! [`TimestampFormat::DayFirst`]/[`TimestampFormat::MonthFirst`],
+//! [`TimestampFormat::Iso8601Naive`], [`TimestampFormat::DateTimeSpace`], the
+//! four epoch formats, [`TimestampFormat::DayFirst`]/[`TimestampFormat::MonthFirst`],
 //! [`TimestampFormat::LabViewEpoch`], and [`TimestampFormat::ExcelSerial`] —
 //! plus [`infer_timestamp_format`], which also recognizes when a column is a
 //! progressive numeric index rather than an absolute timestamp, and resolves
@@ -28,10 +28,9 @@
 //! detection) lands with M2's "Non-monotonic + duplicate timestamp detection"
 //! item. [`summarize_ticks`] is all three at once over a [`TickSource`], in
 //! memory that does not grow with the series (issue #85) — what
-//! `ingest::report` uses when opening a file. [`TimestampFormat::DateTimeSpace`] is a separate, not-yet-started M2
-//! roadmap item and stays `todo!()`. Never widen a golden test's tolerance or
-//! change its expectations to make an implementation pass — if one looks
-//! wrong, that is a `blocking-decision` issue, not an edit.
+//! `ingest::report` uses when opening a file. Never widen a golden test's
+//! tolerance or change its expectations to make an implementation pass — if
+//! one looks wrong, that is a `blocking-decision` issue, not an edit.
 //!
 //! `Timestamp` stores ticks as `i128`, never `f64` seconds (SPEC §2.1) — the
 //! type system enforces Golden Rule 1 (never degrade the raw data) at the
