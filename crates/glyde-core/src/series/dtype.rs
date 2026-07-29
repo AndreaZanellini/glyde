@@ -389,6 +389,33 @@ impl SeriesValues {
         }
     }
 
+    /// [`Self::f64_at`], but also emits the same [`warn_if_precision_loss`]
+    /// log [`Self::to_f64_vec`] does for an `i64`/`u64` value beyond the
+    /// exact range (SPEC §1.4) — for a caller that reads a series
+    /// value-by-value but, unlike the per-frame cursor-readout/plotting
+    /// path [`Self::f64_at`] exists for, only ever reads each index once
+    /// (e.g. `ingest::dataset`'s incremental pyramid cache, issue #90).
+    /// [`Self::f64_at`] deliberately does not carry this log itself: it is
+    /// called once per rendered sample per frame, and warning there would
+    /// mean re-logging the same value every frame it stays on screen.
+    pub fn f64_at_checked(&self, index: usize) -> Option<f64> {
+        match self {
+            SeriesValues::I64(v) => v.get(index).map(|&n| {
+                warn_if_precision_loss(n.unsigned_abs() as u128, n);
+                n as f64
+            }),
+            SeriesValues::U64(v) => v.get(index).map(|&n| {
+                warn_if_precision_loss(n as u128, n);
+                n as f64
+            }),
+            SeriesValues::Spilled(SpilledValues::I64(v)) => v.get(index).map(|n| {
+                warn_if_precision_loss(n.unsigned_abs() as u128, n);
+                n as f64
+            }),
+            other => other.f64_at(index),
+        }
+    }
+
     /// The `index`-th sample rendered exactly as its own dtype would print
     /// it (SPEC §4.1's "exact raw value" cursor readout — never routed
     /// through `f64`, so an `i64` beyond ±2⁵³ reads back exactly). `None`
@@ -539,5 +566,48 @@ mod tests {
             .to_f64_vec()
             .expect("i64 must convert");
         assert_eq!(result, vec![boundary as f64, -boundary as f64]);
+    }
+
+    // issue #90's incremental pyramid cache reads a growing column one index
+    // at a time via `f64_at_checked` rather than converting it whole via
+    // `to_f64_vec` — the two must agree value-for-value, including past the
+    // precision boundary, so a checkpoint's incremental cache is never a
+    // different number from what a full `to_f64_vec` conversion would give.
+    #[test]
+    fn f64_at_checked_of_i64_beyond_the_exact_range_matches_to_f64_vec() {
+        let huge = (1i64 << 53) + 1;
+        let values = SeriesValues::I64(vec![huge, -huge]);
+        let expected = values.to_f64_vec().expect("i64 must convert");
+
+        for (i, &expected) in expected.iter().enumerate() {
+            assert_eq!(values.f64_at_checked(i), Some(expected));
+        }
+    }
+
+    #[test]
+    fn f64_at_checked_of_u64_beyond_the_exact_range_matches_to_f64_vec() {
+        let huge = (1u64 << 53) + 1;
+        let values = SeriesValues::U64(vec![huge]);
+        let expected = values.to_f64_vec().expect("u64 must convert");
+
+        assert_eq!(values.f64_at_checked(0), Some(expected[0]));
+    }
+
+    #[test]
+    fn f64_at_checked_agrees_with_f64_at_for_every_numeric_dtype_within_exact_range() {
+        assert_eq!(
+            SeriesValues::I32(vec![42]).f64_at_checked(0),
+            SeriesValues::I32(vec![42]).f64_at(0)
+        );
+        assert_eq!(
+            SeriesValues::F64(vec![1.5]).f64_at_checked(0),
+            SeriesValues::F64(vec![1.5]).f64_at(0)
+        );
+        assert_eq!(SeriesValues::Bool(vec![true]).f64_at_checked(0), None);
+    }
+
+    #[test]
+    fn f64_at_checked_is_none_past_the_end() {
+        assert_eq!(SeriesValues::I64(vec![1]).f64_at_checked(5), None);
     }
 }

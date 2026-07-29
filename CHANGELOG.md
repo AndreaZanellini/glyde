@@ -44,7 +44,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
   values are unaffected either way.
 
   **Assumption made:** none — this is a pure performance change with no
-  effect on what is shown. (issue #90)
+  effect on what is shown. The rare case where a whole-number column holds
+  values too large for exact plotting precision still logs that once per
+  value, same as before (`docs/SPEC.md` §1.4) — just once per value overall
+  now, rather than repeated at every refresh while the file is loading.
+  (issue #90)
 
 - **Reopening a file you've already viewed builds its plot's zoomed-out
   overview faster, instead of redoing that work from scratch every time.**

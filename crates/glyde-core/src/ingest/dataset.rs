@@ -1282,8 +1282,11 @@ pub fn load_progressive_with_budget(
 /// [`crate::series::SeriesValues::to_f64_vec`] — recomputed at every
 /// checkpoint. This cursor grows that conversion incrementally instead
 /// (only the newly arrived rows, via
-/// [`crate::series::SeriesValues::f64_at`]), so a checkpoint never re-walks
-/// rows it already converted.
+/// [`crate::series::SeriesValues::f64_at_checked`], which — unlike
+/// [`crate::series::SeriesValues::f64_at`] — still emits SPEC §1.4's
+/// `i64`/`u64` precision-loss log, since each row is only ever converted
+/// once here rather than every frame), so a checkpoint never re-walks rows
+/// it already converted.
 ///
 /// Reset (`Default::default()`) once per progressive load; never shared
 /// across two different files or two different columns.
@@ -1363,7 +1366,7 @@ impl PyramidCursor {
         for i in cache.len()..total {
             cache.push(
                 values
-                    .f64_at(i)
+                    .f64_at_checked(i)
                     .expect("dtype checked non-bool/string above"),
             );
         }
@@ -1703,6 +1706,22 @@ mod tests {
         file
     }
 
+    /// [`many_rows_temp_csv`], but `value` is written as a plain integer
+    /// (no decimal point) so it infers as `i64`, not `f64` — the only way to
+    /// drive `PyramidCursor`'s non-`f64` incremental `f64` cache branch
+    /// (issue #90), which `many_rows_temp_csv`'s always-`f64` column never
+    /// reaches (that column takes the zero-copy `as_f64_slice` branch
+    /// instead).
+    fn many_rows_temp_csv_with_i64_column(row_count: u64) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        let mut text = String::from("index,value\n");
+        for i in 0..row_count {
+            text.push_str(&format!("{i},{}\n", i as i64 * 3 - 1_000_000));
+        }
+        std::io::Write::write_all(&mut file, text.as_bytes()).expect("write temp file");
+        file
+    }
+
     // docs/ROADMAP.md M3 "Background progressive build emitting partial
     // levels": every checkpoint's dataset must be a true prefix of the final
     // dataset — same values, just fewer rows — and the final result returned
@@ -1786,6 +1805,76 @@ mod tests {
                 let expected = crate::dsp::decimation::build_pyramid(&samples, &ticks);
                 assert_eq!(pyramid.as_ref(), Some(&expected));
             }
+        }
+    }
+
+    // `PyramidCursor::update_column` has a separate code path for a
+    // non-`f64` numeric column — an incrementally-grown `f64_cache` — that
+    // the `f64`-column test above never exercises (an `f64` column takes
+    // the zero-copy `as_f64_slice` branch instead). Same property, same
+    // fixture shape, but through `many_rows_temp_csv_with_i64_column` so the
+    // cache branch is what actually runs.
+    #[test]
+    fn load_with_outcome_progressive_checkpoint_pyramids_match_build_pyramid_for_a_non_f64_column()
+    {
+        let file = many_rows_temp_csv_with_i64_column(70_000);
+        let mut checkpoints: Vec<Checkpoint> = Vec::new();
+
+        load_with_outcome_progressive(file.path(), |checkpoint| checkpoints.push(checkpoint))
+            .expect("progressive load must succeed");
+
+        assert!(!checkpoints.is_empty());
+        for checkpoint in &checkpoints {
+            assert_eq!(checkpoint.dataset.columns.len(), 1);
+            let column = &checkpoint.dataset.columns[0];
+            assert!(
+                matches!(column.values(), SeriesValues::I64(_)),
+                "fixture's value column must infer as i64, not f64, to actually drive the \
+                 non-f64 incremental cache branch"
+            );
+
+            let ticks = checkpoint.dataset.time.to_pyramid_ticks();
+            let samples = column.values().to_f64_vec().expect("numeric column");
+            let expected = crate::dsp::decimation::build_pyramid(&samples, &ticks);
+            assert_eq!(checkpoint.pyramids[0].as_ref(), Some(&expected));
+        }
+    }
+
+    // Same property as above, over the spilled `SpillPreview` checkpoint
+    // path (a zero RAM budget forces every file to spill regardless of
+    // size — `spilled_ingest_integration.rs`'s established pattern), which
+    // has its own, separate `PyramidCursor` instance.
+    #[test]
+    fn a_spilled_progressive_load_checkpoint_pyramids_match_build_pyramid_for_a_non_f64_column() {
+        let file = many_rows_temp_csv_with_i64_column(70_000);
+        let cache_dir = tempfile::tempdir().expect("temp cache dir");
+        let mut checkpoints: Vec<Checkpoint> = Vec::new();
+
+        load_progressive_with_budget(
+            file.path(),
+            RamBudget::from_total_ram_bytes(0),
+            cache_dir.path(),
+            |checkpoint| checkpoints.push(checkpoint),
+        )
+        .expect("spilled progressive load must succeed");
+
+        assert!(
+            !checkpoints.is_empty(),
+            "a 70k-row fixture under a zero RAM budget must still checkpoint via the \
+             spilled preview path"
+        );
+        for checkpoint in &checkpoints {
+            assert_eq!(checkpoint.dataset.columns.len(), 1);
+            let column = &checkpoint.dataset.columns[0];
+            assert!(
+                matches!(column.values(), SeriesValues::I64(_)),
+                "fixture's value column must infer as i64 on the spilled preview path too"
+            );
+
+            let ticks = checkpoint.dataset.time.to_pyramid_ticks();
+            let samples = column.values().to_f64_vec().expect("numeric column");
+            let expected = crate::dsp::decimation::build_pyramid(&samples, &ticks);
+            assert_eq!(checkpoint.pyramids[0].as_ref(), Some(&expected));
         }
     }
 
