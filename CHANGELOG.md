@@ -11,6 +11,31 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **You can now correct the delimiter, decimal separator, or an ambiguous
+  day/month date reading directly in the inference bar, and the plot
+  re-indexes immediately.** The inference bar (the "Inference — N samples,
+  ..." strip above the plot) already told you what Glyde inferred; it now
+  lets you fix it when it's wrong. Expand the bar and you'll find a
+  "Correct…" dropdown next to the delimiter and decimal separator fields —
+  picking a different value reopens the file under that choice. When the
+  timestamp format is the genuinely ambiguous `DD/MM`/`MM/DD` case (SPEC
+  §2.1's "no field greater than 12 anywhere in the column"), a "Swap to
+  MM/DD" or "Swap to DD/MM" button appears next to it instead — SPEC §2.1's
+  own one-click-swap wording. A correction is never treated as a guess: it's
+  reported at full confidence and stays applied if you correct a second
+  field on the same file (corrections accumulate); opening a different file
+  starts from a clean slate.
+
+  **Assumption made:** encoding and time-column corrections are not covered
+  by this change — only the three fields this roadmap item's own maintainer
+  test names (delimiter, decimal separator, day/month swap). Correcting the
+  timestamp format to an arbitrary format (not just the day/month swap) is
+  also not covered. All three are filed as a follow-up (issue #97) rather
+  than folded into this change, since two of them raise their own design
+  questions (how to pick an encoding, how to pick a different time-index
+  column) rather than being mechanical.
+
 ### Fixed
 - **CSV files whose time column is written as `2026-01-01 00:00:00` (a space
   between date and time, no `T`) now open.** This is one of the most common

@@ -267,6 +267,34 @@ pub fn open_dataset_progressive(
     build_summary_and_report(outcome, dataset, timestamp_format_ambiguous)
 }
 
+/// [`open_dataset`] with [`super::IngestOverrides`] applied (docs/ROADMAP.md
+/// M4 "One-click correction of each field → triggers a re-index",
+/// docs/SPEC.md §1.2): each `Some` field in `overrides` bypasses its
+/// inference step and is reported at full confidence, since a deliberate
+/// user correction is never a guess (Golden Rule 2). `glyde-app`'s inference
+/// bar calls this to re-open the current file after a one-click correction.
+pub fn open_dataset_with_overrides(
+    path: &Path,
+    overrides: super::IngestOverrides,
+) -> Result<(OpenSummary, InferenceReport, Dataset)> {
+    let (outcome, dataset, timestamp_format_ambiguous) =
+        dataset::load_with_outcome_with_overrides(path, overrides)?;
+    build_summary_and_report(outcome, dataset, timestamp_format_ambiguous)
+}
+
+/// [`open_dataset_progressive`] with [`super::IngestOverrides`] applied — the
+/// entry point `glyde-app`'s background indexer actually calls, since its
+/// normal open always reports progress (docs/ROADMAP.md M3).
+pub fn open_dataset_progressive_with_overrides(
+    path: &Path,
+    overrides: super::IngestOverrides,
+    on_checkpoint: impl FnMut(Checkpoint),
+) -> Result<(OpenSummary, InferenceReport, Dataset)> {
+    let (outcome, dataset, timestamp_format_ambiguous) =
+        dataset::load_with_outcome_progressive_with_overrides(path, overrides, on_checkpoint)?;
+    build_summary_and_report(outcome, dataset, timestamp_format_ambiguous)
+}
+
 /// The summary/report-building half of [`open_dataset`], shared with
 /// [`open_dataset_progressive`] so the two never independently (and
 /// possibly divergently) derive the same fields from a parsed [`Dataset`].

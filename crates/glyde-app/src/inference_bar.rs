@@ -26,23 +26,49 @@
 //! clean file), but [`InferenceReport::has_low_confidence_field`] — decided
 //! in `glyde-core`, not here, per docs/ARCHITECTURE.md's Hard rule 2 — opens
 //! it expanded the moment any field could not be settled unambiguously, so
-//! nothing is ever guessed silently (Golden Rule 2). One-click correction of
-//! each field is a separate, later roadmap item.
+//! nothing is ever guessed silently (Golden Rule 2).
+//!
+//! docs/ROADMAP.md M4 "One-click correction of each field → triggers a
+//! re-index" (docs/SPEC.md §1.2): the delimiter and decimal separator each
+//! get a correction dropdown, and an ambiguous day/month timestamp format
+//! gets the exact "one-click swap" SPEC §2.1's ambiguity rule describes. A
+//! click returns a [`Correction`] out of [`show`]; `crate::app::GlydeApp`
+//! turns it into a re-open of the current file with the matching
+//! [`glyde_core::ingest::IngestOverrides`] field set — this module only ever
+//! renders and reports the click, it never re-indexes anything itself
+//! (docs/ARCHITECTURE.md Hard rule 2: no product logic in the UI layer).
+//! Encoding and time-column correction are not covered yet (issue #97).
 
-use glyde_core::ingest::{Confidence, InferenceReport};
+use glyde_core::ingest::{Confidence, DecimalSeparator, Delimiter, InferenceReport, InferredField};
+use glyde_core::time::TimestampFormat;
 use std::path::Path;
 
+/// A one-click field correction requested from the inference bar. See the
+/// module docs for how `crate::app::GlydeApp` acts on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Correction {
+    Delimiter(Delimiter),
+    DecimalSeparator(DecimalSeparator),
+    TimestampFormat(TimestampFormat),
+}
+
 /// Renders `report` as a collapsible header into `ui`, one row of field
-/// labels when expanded. `open_id_source` (the file path) keys the
+/// labels when expanded, returning the correction the user clicked this
+/// frame, if any. `open_id_source` (the file path) keys the
 /// collapsed/expanded state so each newly opened file gets its own fresh
 /// default — a low-confidence file always opens expanded even if the
 /// previous file's bar was left collapsed, and vice versa.
-pub fn show(ui: &mut egui::Ui, report: &InferenceReport, open_id_source: &Path) {
+pub fn show(
+    ui: &mut egui::Ui,
+    report: &InferenceReport,
+    open_id_source: &Path,
+) -> Option<Correction> {
     let low_confidence = report.has_low_confidence_field();
-    egui::CollapsingHeader::new(header_text(report, low_confidence))
+    let response = egui::CollapsingHeader::new(header_text(report, low_confidence))
         .id_salt(open_id_source)
         .default_open(low_confidence)
         .show(ui, |ui| {
+            let mut correction = None;
             ui.horizontal_wrapped(|ui| {
                 field_label(
                     ui,
@@ -50,34 +76,169 @@ pub fn show(ui: &mut egui::Ui, report: &InferenceReport, open_id_source: &Path) 
                     &report.encoding.value,
                     report.encoding.confidence,
                 );
-                field_label(
-                    ui,
-                    "delimiter",
-                    display_option(&report.delimiter.value),
-                    report.delimiter.confidence,
-                );
-                field_label(
-                    ui,
-                    "decimal separator",
-                    display_option(&report.decimal_separator.value),
-                    report.decimal_separator.confidence,
-                );
+                if let Some(picked) = delimiter_control(ui, &report.delimiter) {
+                    correction = Some(Correction::Delimiter(picked));
+                }
+                if let Some(picked) = decimal_separator_control(ui, &report.decimal_separator) {
+                    correction = Some(Correction::DecimalSeparator(picked));
+                }
                 field_label(
                     ui,
                     "time column",
                     display_option(&report.time_column.value),
                     report.time_column.confidence,
                 );
-                field_label(
-                    ui,
-                    "timestamp format",
-                    display_option(&report.timestamp_format.value),
-                    report.timestamp_format.confidence,
-                );
+                if let Some(picked) = timestamp_format_control(ui, &report.timestamp_format) {
+                    correction = Some(Correction::TimestampFormat(picked));
+                }
                 ui.label(format!("{} samples", report.sample_count));
                 ui.label(format!("sampling: {:?}", report.sampling_class));
             });
+            correction
         });
+    response.body_returned.flatten()
+}
+
+/// Every delimiter a user can pick in the correction dropdown, in the same
+/// priority order `glyde_core::ingest::infer_delimiter` tries them.
+const DELIMITER_OPTIONS: [Delimiter; 5] = [
+    Delimiter::Comma,
+    Delimiter::Semicolon,
+    Delimiter::Tab,
+    Delimiter::Pipe,
+    Delimiter::Whitespace,
+];
+
+fn delimiter_display(delimiter: Delimiter) -> &'static str {
+    match delimiter {
+        Delimiter::Comma => "Comma (,)",
+        Delimiter::Semicolon => "Semicolon (;)",
+        Delimiter::Tab => "Tab",
+        Delimiter::Pipe => "Pipe (|)",
+        Delimiter::Whitespace => "Whitespace",
+    }
+}
+
+/// The delimiter label text renders as (`Delimiter::as_str`, via
+/// `CsvParseOutcome`), read back into the typed value the dropdown needs to
+/// mark the current selection — `None` only for a value this UI has never
+/// produced itself (defensive; every inferred label is one of
+/// [`DELIMITER_OPTIONS`]).
+fn delimiter_from_label(label: &str) -> Option<Delimiter> {
+    DELIMITER_OPTIONS
+        .into_iter()
+        .find(|delimiter| delimiter.as_str() == label)
+}
+
+/// Renders the delimiter field's label plus a correction dropdown, returning
+/// the newly picked delimiter if the user chose one different from the
+/// current value this frame (docs/ROADMAP.md M4, SPEC §1.2).
+fn delimiter_control(
+    ui: &mut egui::Ui,
+    field: &InferredField<Option<String>>,
+) -> Option<Delimiter> {
+    let current = field.value.as_deref().and_then(delimiter_from_label);
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        ui.label(field_text(
+            "delimiter",
+            display_option(&field.value),
+            field.confidence,
+        ));
+        egui::ComboBox::from_id_salt("inference-bar-delimiter-correction")
+            .selected_text("Correct…")
+            .show_ui(ui, |ui| {
+                for candidate in DELIMITER_OPTIONS {
+                    let is_current = current == Some(candidate);
+                    if ui
+                        .selectable_label(is_current, delimiter_display(candidate))
+                        .clicked()
+                        && !is_current
+                    {
+                        picked = Some(candidate);
+                    }
+                }
+            });
+    });
+    picked
+}
+
+fn decimal_separator_display(separator: DecimalSeparator) -> &'static str {
+    match separator {
+        DecimalSeparator::Dot => "Dot (.)",
+        DecimalSeparator::Comma => "Comma (,)",
+    }
+}
+
+fn decimal_separator_from_label(label: &str) -> Option<DecimalSeparator> {
+    [DecimalSeparator::Dot, DecimalSeparator::Comma]
+        .into_iter()
+        .find(|separator| separator.as_str() == label)
+}
+
+/// [`delimiter_control`], for the decimal separator field.
+fn decimal_separator_control(
+    ui: &mut egui::Ui,
+    field: &InferredField<Option<String>>,
+) -> Option<DecimalSeparator> {
+    let current = field
+        .value
+        .as_deref()
+        .and_then(decimal_separator_from_label);
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        ui.label(field_text(
+            "decimal separator",
+            display_option(&field.value),
+            field.confidence,
+        ));
+        egui::ComboBox::from_id_salt("inference-bar-decimal-separator-correction")
+            .selected_text("Correct…")
+            .show_ui(ui, |ui| {
+                for candidate in [DecimalSeparator::Dot, DecimalSeparator::Comma] {
+                    let is_current = current == Some(candidate);
+                    if ui
+                        .selectable_label(is_current, decimal_separator_display(candidate))
+                        .clicked()
+                        && !is_current
+                    {
+                        picked = Some(candidate);
+                    }
+                }
+            });
+    });
+    picked
+}
+
+/// SPEC §2.1's ambiguity-rule UX exactly: "mark the inference low
+/// confidence, and open the inference bar expanded with a one-click swap."
+/// The swap only appears when the detected format is one half of the
+/// `DD/MM`/`MM/DD` ambiguity — every other timestamp format has no
+/// day/month reading to swap, so no button renders for it (issue #97 tracks
+/// correcting to an arbitrary format).
+fn timestamp_format_control(
+    ui: &mut egui::Ui,
+    field: &InferredField<Option<String>>,
+) -> Option<TimestampFormat> {
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        ui.label(field_text(
+            "timestamp format",
+            display_option(&field.value),
+            field.confidence,
+        ));
+        let swap = match field.value.as_deref() {
+            Some("dd_mm_yyyy") => Some(("Swap to MM/DD", TimestampFormat::MonthFirst)),
+            Some("mm_dd_yyyy") => Some(("Swap to DD/MM", TimestampFormat::DayFirst)),
+            _ => None,
+        };
+        if let Some((label, target)) = swap {
+            if ui.button(label).clicked() {
+                picked = Some(target);
+            }
+        }
+    });
+    picked
 }
 
 /// The header shown whether the bar is collapsed or expanded — discreet
@@ -218,5 +379,51 @@ mod tests {
 
         assert!(!header_text(&high, high.has_low_confidence_field()).contains("low confidence"));
         assert!(header_text(&low, low.has_low_confidence_field()).contains("low confidence"));
+    }
+
+    // docs/ROADMAP.md M4: rendering a frame with no user interaction must
+    // never report a correction — only an actual click does.
+    #[test]
+    fn show_reports_no_correction_when_nothing_was_clicked() {
+        let report = sample_report(Confidence::Low);
+        let ctx = egui::Context::default();
+        let mut correction = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                correction = show(ui, &report, Path::new("/some/file.csv"));
+            });
+        });
+
+        assert_eq!(correction, None);
+    }
+
+    // Every delimiter label the inference bar can display must read back to
+    // the exact same `Delimiter` value — the round trip the correction
+    // dropdown depends on to mark the current selection.
+    #[test]
+    fn delimiter_from_label_round_trips_every_delimiter_s_own_label() {
+        for delimiter in DELIMITER_OPTIONS {
+            assert_eq!(delimiter_from_label(delimiter.as_str()), Some(delimiter));
+        }
+    }
+
+    #[test]
+    fn delimiter_from_label_is_none_for_an_unrecognized_label() {
+        assert_eq!(delimiter_from_label("?"), None);
+    }
+
+    #[test]
+    fn decimal_separator_from_label_round_trips_every_separator_s_own_label() {
+        for separator in [DecimalSeparator::Dot, DecimalSeparator::Comma] {
+            assert_eq!(
+                decimal_separator_from_label(separator.as_str()),
+                Some(separator)
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_separator_from_label_is_none_for_an_unrecognized_label() {
+        assert_eq!(decimal_separator_from_label("?"), None);
     }
 }

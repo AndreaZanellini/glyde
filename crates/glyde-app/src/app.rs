@@ -29,9 +29,12 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use glyde_core::dsp::decimation::Bucket;
-use glyde_core::ingest::{Dataset, InferenceReport, OpenSummary};
+use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, OpenSummary};
 
-use crate::plumbing::{spawn_index_job, spawn_open_dialog, IndexingMessage};
+use crate::inference_bar::Correction;
+use crate::plumbing::{
+    spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog, IndexingMessage,
+};
 use crate::{inference_bar, views};
 
 /// One numeric column's min/max pyramid, or `None` for a non-numeric column
@@ -100,6 +103,13 @@ pub struct GlydeApp {
     /// must not overwrite the current status (SPEC §6: single file at a
     /// time; see `crate::plumbing` module docs).
     generation: u64,
+    /// SPEC §1.2 "[each field is] correctable in one click; correcting
+    /// triggers a re-index" (docs/ROADMAP.md M4): every correction the user
+    /// has made to the file currently open, applied on top of automatic
+    /// inference the next time it is (re-)indexed. Reset to
+    /// [`IngestOverrides::default`] whenever a *different* file is opened —
+    /// a correction never follows from one file to the next.
+    overrides: IngestOverrides,
 }
 
 impl Default for GlydeApp {
@@ -110,6 +120,7 @@ impl Default for GlydeApp {
             tx,
             rx,
             generation: 0,
+            overrides: IngestOverrides::default(),
         }
     }
 }
@@ -124,11 +135,40 @@ impl GlydeApp {
     fn open(&mut self, path: PathBuf) {
         tracing::info!(path = %path.display(), "user requested to open file");
         self.generation += 1;
+        self.overrides = IngestOverrides::default();
         self.status = Status::Loading {
             path: path.clone(),
             partial: None,
         };
         spawn_index_job(self.generation, path, self.tx.clone());
+    }
+
+    /// A one-click field correction from the inference bar (docs/ROADMAP.md
+    /// M4, SPEC §1.2): folds `correction` into the running set of overrides
+    /// for the current file and re-indexes it from scratch under them —
+    /// exactly [`Self::open`]'s job, minus resetting `overrides` itself and
+    /// starting from a fresh [`Status::Loading`] with nothing carried over,
+    /// same as any other new open (partial progress from the pre-correction
+    /// read would be stale under the new reading).
+    fn apply_correction(&mut self, path: PathBuf, correction: Correction) {
+        match correction {
+            Correction::Delimiter(delimiter) => self.overrides.delimiter = Some(delimiter),
+            Correction::DecimalSeparator(separator) => {
+                self.overrides.decimal_separator = Some(separator)
+            }
+            Correction::TimestampFormat(format) => self.overrides.timestamp_format = Some(format),
+        }
+        tracing::info!(
+            path = %path.display(),
+            overrides = ?self.overrides,
+            "user corrected an inferred field; re-indexing"
+        );
+        self.generation += 1;
+        self.status = Status::Loading {
+            path: path.clone(),
+            partial: None,
+        };
+        spawn_index_job_with_overrides(self.generation, path, self.overrides, self.tx.clone());
     }
 
     /// Drains every [`IndexingMessage`] currently queued, keeping only the
@@ -227,6 +267,8 @@ impl eframe::App for GlydeApp {
             });
         });
 
+        let mut pending_correction: Option<(PathBuf, Correction)> = None;
+
         egui::CentralPanel::default().show(ctx, |ui| match &self.status {
             Status::Idle => {
                 ui.centered_and_justified(|ui| {
@@ -280,8 +322,11 @@ impl eframe::App for GlydeApp {
                 ui.heading(path.display().to_string());
                 // SPEC §1.2 mandatory UX / docs/ROADMAP.md M4 "Inference bar
                 // widget: persistent and discreet; opens expanded when any
-                // inference is low-confidence".
-                inference_bar::show(ui, report, path);
+                // inference is low-confidence; each field correctable in one
+                // click, correcting triggers a re-index".
+                if let Some(correction) = inference_bar::show(ui, report, path) {
+                    pending_correction = Some((path.clone(), correction));
+                }
                 if summary.skipped_row_count > 0 {
                     ui.label(format!("{} rows skipped", summary.skipped_row_count));
                 }
@@ -296,13 +341,19 @@ impl eframe::App for GlydeApp {
                 );
             }
         });
+
+        if let Some((path, correction)) = pending_correction {
+            self.apply_correction(path, correction);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glyde_core::ingest::{Confidence, InferredField, SamplingClass, TimeAxis};
+    use glyde_core::ingest::{
+        Confidence, DecimalSeparator, Delimiter, InferredField, SamplingClass, TimeAxis,
+    };
     use glyde_core::series::{Series, SeriesValues};
     use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
 
@@ -497,6 +548,108 @@ mod tests {
                 path: loaded_path, ..
             } => assert_eq!(loaded_path, &path),
             _ => panic!("expected a current-generation message to be applied"),
+        }
+    }
+
+    // docs/ROADMAP.md M4 "One-click correction of each field → triggers a
+    // re-index": `open` must start every newly opened file from a clean
+    // slate — a correction made on the previous file must never leak into
+    // the next one.
+    #[test]
+    fn open_resets_overrides_left_over_from_a_previous_file() {
+        let mut app = GlydeApp::new();
+        app.overrides.delimiter = Some(Delimiter::Pipe);
+
+        app.open(PathBuf::from("does-not-exist-glyde-app-test.csv"));
+
+        assert_eq!(app.overrides, IngestOverrides::default());
+    }
+
+    // A correction must accumulate on top of previous ones for the same
+    // file (swapping the delimiter must not forget an earlier decimal
+    // separator correction), and must bump the generation so a stale
+    // in-flight reply from before the correction is dropped like any other
+    // superseded message.
+    #[test]
+    fn apply_correction_accumulates_overrides_and_bumps_the_generation() {
+        let mut app = GlydeApp::new();
+        app.generation = 1;
+        let path = PathBuf::from("does-not-exist-glyde-app-test.csv");
+
+        app.apply_correction(path.clone(), Correction::Delimiter(Delimiter::Semicolon));
+        assert_eq!(app.overrides.delimiter, Some(Delimiter::Semicolon));
+        assert!(app.overrides.decimal_separator.is_none());
+        assert_eq!(app.generation, 2);
+
+        app.apply_correction(path, Correction::DecimalSeparator(DecimalSeparator::Comma));
+        assert_eq!(
+            app.overrides.delimiter,
+            Some(Delimiter::Semicolon),
+            "a later correction must not clear an earlier one"
+        );
+        assert_eq!(
+            app.overrides.decimal_separator,
+            Some(DecimalSeparator::Comma)
+        );
+        assert_eq!(app.generation, 3);
+    }
+
+    /// End-to-end: a real correction on a real file must reach the
+    /// background indexer and change what comes back — the roadmap's own
+    /// maintainer test ("swap delimiter / decimal / date order → plot
+    /// updates"), exercised through `GlydeApp` rather than `glyde-core`
+    /// directly.
+    #[test]
+    fn apply_correction_re_indexes_the_file_with_the_override_applied() {
+        let mut app = GlydeApp::new();
+        app.generation = 1;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("comma-decimal.csv");
+        std::fs::write(
+            &path,
+            "timestamp;value\n2026-01-01T00:00:00Z;1,5\n2026-01-01T00:00:01Z;2,5\n",
+        )
+        .expect("write fixture");
+
+        app.apply_correction(
+            path.clone(),
+            Correction::DecimalSeparator(DecimalSeparator::Comma),
+        );
+
+        assert_eq!(app.generation, 2);
+        match &app.status {
+            Status::Loading {
+                path: loading_path, ..
+            } => assert_eq!(loading_path, &path),
+            _ => panic!("a correction must switch immediately to Loading"),
+        }
+
+        let _started = app
+            .rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected a Started message");
+        match app
+            .rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected a Completed message")
+        {
+            IndexingMessage::Completed {
+                generation,
+                report,
+                dataset,
+                ..
+            } => {
+                assert_eq!(generation, 2);
+                assert_eq!(report.decimal_separator.value.as_deref(), Some(","));
+                assert_eq!(report.decimal_separator.confidence, Confidence::High);
+                assert_eq!(
+                    dataset.columns[0].values(),
+                    &SeriesValues::F64(vec![1.5, 2.5]),
+                    "the comma-decimal override must actually change the parsed values, \
+                     not just the reported confidence"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
         }
     }
 }

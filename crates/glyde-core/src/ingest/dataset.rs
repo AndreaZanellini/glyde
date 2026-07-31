@@ -46,6 +46,7 @@ use super::csv::{
     CsvParseOutcome, RowFields, Sniff, FIRST_PROGRESS_CHECKPOINT_ROWS,
 };
 use super::infer::{log_dtype_choice, normalize_decimal_field, ColumnDtypeChoice, ColumnDtypeScan};
+use super::IngestOverrides;
 use crate::budget::RamBudget;
 use crate::dsp::decimation::{build_pyramid, extend_pyramid, Bucket};
 use crate::index::level0::{self, CacheKey};
@@ -54,7 +55,7 @@ use crate::index::spill::{SpillStringsWriter, SpillVec, SpillVecWriter};
 use crate::series::{Anomalies, Dtype, NanRunScan, Series, SeriesValues, SpilledValues};
 use crate::time::{
     infer_timestamp_format, parse_timestamp, TickSource, TimeUnit, Timestamp, TimestampFormat,
-    TimestampFormatScan, TICK_CHUNK_LEN,
+    TimestampFormatInference, TimestampFormatScan, TICK_CHUNK_LEN,
 };
 use crate::{GlydeError, Result};
 use std::borrow::Cow;
@@ -411,7 +412,27 @@ pub fn load(path: &Path) -> Result<Dataset> {
 /// whatever the host machine's RAM happens to select — the same split
 /// [`RamBudget::from_total_ram_bytes`] exists for.
 pub fn load_with_budget(path: &Path, budget: RamBudget, cache_dir: &Path) -> Result<Dataset> {
-    load_with_outcome_using(path, budget, Some(cache_dir))
+    load_with_outcome_using(path, budget, Some(cache_dir), IngestOverrides::default())
+        .map(|(_outcome, dataset, _ambiguous)| dataset)
+}
+
+/// [`load`] with [`IngestOverrides`] applied (docs/ROADMAP.md M4 "One-click
+/// correction of each field → triggers a re-index"): each `Some` field bypasses
+/// its inference step and settles the parse outright.
+pub fn load_with_overrides(path: &Path, overrides: IngestOverrides) -> Result<Dataset> {
+    load_with_outcome_with_overrides(path, overrides).map(|(_outcome, dataset, _ambiguous)| dataset)
+}
+
+/// [`load_with_overrides`] against an explicit budget and spill directory,
+/// for tests that need to exercise a specific storage choice under an
+/// override rather than whatever the host machine's RAM happens to select.
+pub fn load_with_overrides_and_budget(
+    path: &Path,
+    overrides: IngestOverrides,
+    budget: RamBudget,
+    cache_dir: &Path,
+) -> Result<Dataset> {
+    load_with_outcome_using(path, budget, Some(cache_dir), overrides)
         .map(|(_outcome, dataset, _ambiguous)| dataset)
 }
 
@@ -427,7 +448,12 @@ pub fn load_with_budget(path: &Path, budget: RamBudget, cache_dir: &Path) -> Res
 /// `load()` back to back, each re-reading and re-decoding the whole file).
 pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset, bool)> {
     let cache_dir = os_spill_dir();
-    load_with_outcome_using(path, RamBudget::from_system(), cache_dir.as_deref())
+    load_with_outcome_using(
+        path,
+        RamBudget::from_system(),
+        cache_dir.as_deref(),
+        IngestOverrides::default(),
+    )
 }
 
 /// [`load_with_outcome`] against an explicit budget and spill directory.
@@ -436,7 +462,23 @@ pub(crate) fn load_with_outcome_with_budget(
     budget: RamBudget,
     cache_dir: &Path,
 ) -> Result<(CsvParseOutcome, Dataset, bool)> {
-    load_with_outcome_using(path, budget, Some(cache_dir))
+    load_with_outcome_using(path, budget, Some(cache_dir), IngestOverrides::default())
+}
+
+/// [`load_with_outcome`] with [`IngestOverrides`] applied — `ingest::report::
+/// open_dataset_with_overrides` uses this the same way `open_dataset` uses
+/// [`load_with_outcome`].
+pub(crate) fn load_with_outcome_with_overrides(
+    path: &Path,
+    overrides: IngestOverrides,
+) -> Result<(CsvParseOutcome, Dataset, bool)> {
+    let cache_dir = os_spill_dir();
+    load_with_outcome_using(
+        path,
+        RamBudget::from_system(),
+        cache_dir.as_deref(),
+        overrides,
+    )
 }
 
 /// The OS-standard spill directory, or `None` when this machine has no
@@ -468,7 +510,12 @@ enum Storage {
 /// Runs the SPEC §5.1 affordability check for `path` and reports the storage
 /// it selected at `info` (Golden Rule 2: a decision taken on the user's
 /// behalf is never silent).
-fn choose_storage(path: &Path, budget: RamBudget, cache_dir: Option<&Path>) -> Result<Storage> {
+fn choose_storage(
+    path: &Path,
+    budget: RamBudget,
+    cache_dir: Option<&Path>,
+    overrides: IngestOverrides,
+) -> Result<Storage> {
     let file_bytes = std::fs::metadata(path)
         .map_err(|source| GlydeError::Io {
             path: path.to_path_buf(),
@@ -476,7 +523,7 @@ fn choose_storage(path: &Path, budget: RamBudget, cache_dir: Option<&Path>) -> R
         })?
         .len();
 
-    let sniff = super::csv::sniff_path(path)?;
+    let sniff = super::csv::sniff_path(path, overrides)?;
     let footprint = sniff.footprint(file_bytes);
 
     if budget.affords(footprint.estimated_bytes) {
@@ -514,17 +561,38 @@ fn load_with_outcome_using(
     path: &Path,
     budget: RamBudget,
     cache_dir: Option<&Path>,
+    overrides: IngestOverrides,
 ) -> Result<(CsvParseOutcome, Dataset, bool)> {
-    match choose_storage(path, budget, cache_dir)? {
+    match choose_storage(path, budget, cache_dir, overrides)? {
         Storage::InMemory => {
-            let (outcome, columns_text) = open_path_capturing_all_columns(path)?;
-            let (dataset, ambiguous) = build_dataset(&outcome, &columns_text)?;
+            let (outcome, columns_text) = open_path_capturing_all_columns(path, overrides)?;
+            let (dataset, ambiguous) = build_dataset(&outcome, &columns_text, overrides)?;
             Ok((outcome, dataset, ambiguous))
         }
         Storage::Spill(sniff) => {
             let cache_dir = cache_dir.expect("choose_storage refuses to spill without a cache dir");
-            load_spilled(path, &sniff, cache_dir, None)
+            load_spilled(path, &sniff, cache_dir, None, overrides)
         }
+    }
+}
+
+/// SPEC §2.1's timestamp-format inference, or the user's override
+/// (docs/ROADMAP.md M4 "One-click correction ... triggers a re-index")
+/// settled outright instead. An override is never `ambiguous` — it is a
+/// deliberate choice, not a guess (Golden Rule 2) — and it applies even when
+/// the auto-inference would have found no absolute-timestamp format at all,
+/// so a column mis-read as a progressive index can be corrected to an
+/// absolute one too.
+fn resolve_timestamp_format<S: AsRef<str>>(
+    fields: &[S],
+    timestamp_format_override: Option<TimestampFormat>,
+) -> Option<TimestampFormatInference> {
+    match timestamp_format_override {
+        Some(format) => Some(TimestampFormatInference {
+            format,
+            ambiguous: false,
+        }),
+        None => infer_timestamp_format(fields),
     }
 }
 
@@ -538,6 +606,7 @@ fn load_with_outcome_using(
 fn build_dataset(
     outcome: &CsvParseOutcome,
     columns_text: &[ColumnText],
+    overrides: IngestOverrides,
 ) -> Result<(Dataset, bool)> {
     if outcome.column_names.len() < 2 {
         return Err(GlydeError::SingleColumnFile);
@@ -546,37 +615,38 @@ fn build_dataset(
     let time_column_name = outcome.column_names[0].clone();
     let time_fields: Vec<&str> = columns_text[0].iter().collect();
 
-    let (time, timestamp_format_ambiguous) = match infer_timestamp_format(&time_fields) {
-        Some(format_inference) => {
-            let mut timestamps = Vec::with_capacity(time_fields.len());
-            for field in &time_fields {
-                timestamps.push(parse_timestamp(field, format_inference.format)?);
+    let (time, timestamp_format_ambiguous) =
+        match resolve_timestamp_format(&time_fields, overrides.timestamp_format) {
+            Some(format_inference) => {
+                let mut timestamps = Vec::with_capacity(time_fields.len());
+                for field in &time_fields {
+                    timestamps.push(parse_timestamp(field, format_inference.format)?);
+                }
+                (
+                    TimeAxis::Absolute {
+                        timestamps: Timestamps::Memory(timestamps),
+                        format: format_inference.format,
+                    },
+                    format_inference.ambiguous,
+                )
             }
-            (
-                TimeAxis::Absolute {
-                    timestamps: Timestamps::Memory(timestamps),
-                    format: format_inference.format,
-                },
-                format_inference.ambiguous,
-            )
-        }
-        // SPEC §2.1: no recognized absolute-timestamp format matched every
-        // field, so this is a progressive numeric index (corpus case 35) —
-        // unless it isn't even that, which is a real error, not a silent
-        // empty plot.
-        None => {
-            let mut values = Vec::with_capacity(time_fields.len());
-            for field in &time_fields {
-                values.push(parse_progressive_value(field)?);
+            // SPEC §2.1: no recognized absolute-timestamp format matched every
+            // field, so this is a progressive numeric index (corpus case 35) —
+            // unless it isn't even that, which is a real error, not a silent
+            // empty plot.
+            None => {
+                let mut values = Vec::with_capacity(time_fields.len());
+                for field in &time_fields {
+                    values.push(parse_progressive_value(field)?);
+                }
+                (
+                    TimeAxis::Progressive {
+                        values: ProgressiveValues::Memory(values),
+                    },
+                    false,
+                )
             }
-            (
-                TimeAxis::Progressive {
-                    values: ProgressiveValues::Memory(values),
-                },
-                false,
-            )
-        }
-    };
+        };
 
     let columns = outcome.column_names[1..]
         .iter()
@@ -643,6 +713,7 @@ fn load_spilled(
     sniff: &Sniff,
     cache_dir: &Path,
     on_checkpoint: Option<&mut dyn FnMut(Checkpoint)>,
+    overrides: IngestOverrides,
 ) -> Result<(CsvParseOutcome, Dataset, bool)> {
     let column_names = sniff.column_names().to_vec();
     if column_names.len() < 2 {
@@ -665,7 +736,16 @@ fn load_spilled(
         Ok(())
     })?;
 
-    let timestamp_format = time_scan.finish();
+    // docs/ROADMAP.md M4: a user's timestamp-format override settles the
+    // question outright, the same as `resolve_timestamp_format` does for the
+    // in-memory path — never ambiguous, since it is a deliberate choice.
+    let timestamp_format = match overrides.timestamp_format {
+        Some(format) => Some(TimestampFormatInference {
+            format,
+            ambiguous: false,
+        }),
+        None => time_scan.finish(),
+    };
     let choices: Vec<ColumnDtypeChoice> = dtype_scans.iter().map(ColumnDtypeScan::finish).collect();
 
     // --- Pass 2: type every row straight into its spill file ----------------
@@ -1191,23 +1271,50 @@ pub struct Checkpoint {
 /// checkpointing and the complete plot appears when the read finishes.
 pub(crate) fn load_with_outcome_progressive(
     path: &Path,
+    on_checkpoint: impl FnMut(Checkpoint),
+) -> Result<(CsvParseOutcome, Dataset, bool)> {
+    load_with_outcome_progressive_using(path, IngestOverrides::default(), on_checkpoint)
+}
+
+/// [`load_with_outcome_progressive`] with [`IngestOverrides`] applied
+/// (docs/ROADMAP.md M4) — `ingest::report::open_dataset_progressive_with_overrides`
+/// uses this the same way `open_dataset_progressive` uses
+/// [`load_with_outcome_progressive`].
+pub(crate) fn load_with_outcome_progressive_with_overrides(
+    path: &Path,
+    overrides: IngestOverrides,
+    on_checkpoint: impl FnMut(Checkpoint),
+) -> Result<(CsvParseOutcome, Dataset, bool)> {
+    load_with_outcome_progressive_using(path, overrides, on_checkpoint)
+}
+
+fn load_with_outcome_progressive_using(
+    path: &Path,
+    overrides: IngestOverrides,
     mut on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<(CsvParseOutcome, Dataset, bool)> {
     let cache_dir = os_spill_dir();
-    match choose_storage(path, RamBudget::from_system(), cache_dir.as_deref())? {
+    match choose_storage(
+        path,
+        RamBudget::from_system(),
+        cache_dir.as_deref(),
+        overrides,
+    )? {
         Storage::Spill(sniff) => {
             let cache_dir = cache_dir
                 .as_deref()
                 .expect("choose_storage refuses to spill without a cache dir");
-            load_spilled(path, &sniff, cache_dir, Some(&mut on_checkpoint))
+            load_spilled(path, &sniff, cache_dir, Some(&mut on_checkpoint), overrides)
         }
         Storage::InMemory => {
             let mut pyramid_cursor = PyramidCursor::default();
             let (outcome, columns_text) = open_path_capturing_all_columns_with_progress(
                 path,
+                overrides,
                 |partial_outcome, partial_columns| match build_dataset(
                     partial_outcome,
                     partial_columns,
+                    overrides,
                 ) {
                     Ok((dataset, _ambiguous)) => {
                         let pyramids = pyramid_cursor.update(&dataset);
@@ -1227,7 +1334,8 @@ pub(crate) fn load_with_outcome_progressive(
                 },
             )?;
 
-            let (dataset, timestamp_format_ambiguous) = build_dataset(&outcome, &columns_text)?;
+            let (dataset, timestamp_format_ambiguous) =
+                build_dataset(&outcome, &columns_text, overrides)?;
             Ok((outcome, dataset, timestamp_format_ambiguous))
         }
     }
@@ -1249,14 +1357,19 @@ pub fn load_progressive_with_budget(
     cache_dir: &Path,
     mut on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<Dataset> {
-    match choose_storage(path, budget, Some(cache_dir))? {
-        Storage::Spill(sniff) => load_spilled(path, &sniff, cache_dir, Some(&mut on_checkpoint))
-            .map(|(_outcome, dataset, _ambiguous)| dataset),
+    let overrides = IngestOverrides::default();
+    match choose_storage(path, budget, Some(cache_dir), overrides)? {
+        Storage::Spill(sniff) => {
+            load_spilled(path, &sniff, cache_dir, Some(&mut on_checkpoint), overrides)
+                .map(|(_outcome, dataset, _ambiguous)| dataset)
+        }
         Storage::InMemory => {
             let mut pyramid_cursor = PyramidCursor::default();
-            let (outcome, columns_text) =
-                open_path_capturing_all_columns_with_progress(path, |partial, columns| {
-                    if let Ok((dataset, _ambiguous)) = build_dataset(partial, columns) {
+            let (outcome, columns_text) = open_path_capturing_all_columns_with_progress(
+                path,
+                overrides,
+                |partial, columns| {
+                    if let Ok((dataset, _ambiguous)) = build_dataset(partial, columns, overrides) {
                         let pyramids = pyramid_cursor.update(&dataset);
                         on_checkpoint(Checkpoint {
                             rows_read: partial.row_count,
@@ -1264,8 +1377,9 @@ pub fn load_progressive_with_budget(
                             dataset,
                         });
                     }
-                })?;
-            build_dataset(&outcome, &columns_text).map(|(dataset, _ambiguous)| dataset)
+                },
+            )?;
+            build_dataset(&outcome, &columns_text, overrides).map(|(dataset, _ambiguous)| dataset)
         }
     }
 }

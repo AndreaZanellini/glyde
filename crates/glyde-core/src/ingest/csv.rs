@@ -221,12 +221,43 @@ impl Sniff {
 }
 
 /// Runs SPEC §1.2's inference chain over `head_text`, a file's decoded
-/// bounded head sample ([`bounded_head_sample`]).
-fn sniff_from_head(encoding: infer::EncodingInference, head_text: &str) -> Sniff {
+/// bounded head sample ([`bounded_head_sample`]). `overrides` (docs/ROADMAP.md
+/// M4) settles a field outright instead of running its inference step: a
+/// deliberate user correction is reported at [`Confidence::High`], never as a
+/// guess, regardless of what the auto-inference would have scored it.
+fn sniff_from_head(
+    encoding: infer::EncodingInference,
+    head_text: &str,
+    overrides: super::IngestOverrides,
+) -> Sniff {
     let encoding_confidence = encoding.confidence();
-    let delimiter_inference = infer::infer_delimiter(head_text);
-    let delimiter = delimiter_inference.delimiter;
-    let decimal_inference = infer::infer_decimal_separator(head_text, delimiter);
+    let (delimiter, delimiter_confidence) = match overrides.delimiter {
+        Some(delimiter) => {
+            info!(
+                delimiter = delimiter.as_str(),
+                "delimiter set by user correction, bypassing inference (docs/ROADMAP.md M4)"
+            );
+            (delimiter, Confidence::High)
+        }
+        None => {
+            let inference = infer::infer_delimiter(head_text);
+            (inference.delimiter, inference.confidence())
+        }
+    };
+    let (decimal_separator, decimal_separator_confidence) = match overrides.decimal_separator {
+        Some(separator) => {
+            info!(
+                decimal_separator = separator.as_str(),
+                "decimal separator set by user correction, bypassing inference \
+                 (docs/ROADMAP.md M4)"
+            );
+            (separator, Confidence::High)
+        }
+        None => {
+            let inference = infer::infer_decimal_separator(head_text, delimiter);
+            (inference.separator, inference.confidence())
+        }
+    };
     let header = infer::infer_header(head_text, delimiter);
     let data_start_row = header
         .header_row_index
@@ -239,9 +270,9 @@ fn sniff_from_head(encoding: infer::EncodingInference, head_text: &str) -> Sniff
         encoding,
         encoding_confidence,
         delimiter,
-        delimiter_confidence: delimiter_inference.confidence(),
-        decimal_separator: decimal_inference.separator,
-        decimal_separator_confidence: decimal_inference.confidence(),
+        delimiter_confidence,
+        decimal_separator,
+        decimal_separator_confidence,
         data_start_row,
         head_sample_bytes: head_text.len(),
         head_sample_data_rows: head_text.lines().skip(data_start_row).count(),
@@ -251,21 +282,25 @@ fn sniff_from_head(encoding: infer::EncodingInference, head_text: &str) -> Sniff
 
 /// Sniffs `bytes` (SPEC §1.2), decoding only as much of it as the head
 /// sample needs.
-fn sniff_bytes(bytes: &[u8]) -> Result<Sniff> {
+fn sniff_bytes(bytes: &[u8], overrides: super::IngestOverrides) -> Result<Sniff> {
     if bytes.is_empty() {
         return Err(GlydeError::EmptyFile);
     }
     let encoding = infer::detect_encoding(bytes);
     let head_bytes = &bytes[..bytes.len().min(infer::HEAD_SAMPLE_BYTES)];
     let head_text = infer::decode(head_bytes, &encoding);
-    Ok(sniff_from_head(encoding, bounded_head_sample(&head_text)))
+    Ok(sniff_from_head(
+        encoding,
+        bounded_head_sample(&head_text),
+        overrides,
+    ))
 }
 
 /// Sniffs the file at `path` by reading only its head sample — never the
 /// whole file (SPEC §1.2 "a bounded head sample, never the whole file"), so
 /// this is safe to call before the RAM-budget decision on a file of any
 /// size.
-pub(crate) fn sniff_path(path: &Path) -> Result<Sniff> {
+pub(crate) fn sniff_path(path: &Path, overrides: super::IngestOverrides) -> Result<Sniff> {
     let mut file = File::open(path).map_err(|source| GlydeError::Io {
         path: path.to_path_buf(),
         source,
@@ -285,7 +320,7 @@ pub(crate) fn sniff_path(path: &Path) -> Result<Sniff> {
         filled += read;
     }
     head.truncate(filled);
-    sniff_bytes(&head)
+    sniff_bytes(&head, overrides)
 }
 
 /// Parses `bytes` as delimited text (SPEC §1.1) in one streaming pass:
@@ -299,7 +334,13 @@ pub(crate) fn sniff_path(path: &Path) -> Result<Sniff> {
 /// a `panic!`; an empty input is the only rejected input, reported as
 /// [`GlydeError::EmptyFile`].
 pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
-    parse_bytes(bytes, Capture::None, None).map(|(outcome, _)| outcome)
+    parse_bytes(
+        bytes,
+        Capture::None,
+        None,
+        super::IngestOverrides::default(),
+    )
+    .map(|(outcome, _)| outcome)
 }
 
 /// Parses `bytes` exactly like [`parse`], additionally capturing every kept
@@ -313,7 +354,12 @@ pub(crate) fn parse_capturing_column(
     bytes: &[u8],
     column_index: usize,
 ) -> Result<(CsvParseOutcome, ColumnText)> {
-    let (outcome, mut columns) = parse_bytes(bytes, Capture::Column(column_index), None)?;
+    let (outcome, mut columns) = parse_bytes(
+        bytes,
+        Capture::Column(column_index),
+        None,
+        super::IngestOverrides::default(),
+    )?;
     Ok((outcome, columns.pop().unwrap_or_default()))
 }
 
@@ -326,8 +372,9 @@ pub(crate) fn parse_capturing_column(
 /// once [`Sniff::footprint`] says it fits the RAM budget (issue #75).
 pub(crate) fn parse_capturing_all_columns(
     bytes: &[u8],
+    overrides: super::IngestOverrides,
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
-    parse_bytes(bytes, Capture::All, None)
+    parse_bytes(bytes, Capture::All, None, overrides)
 }
 
 /// [`parse_capturing_all_columns`], additionally invoking `on_chunk` with a
@@ -348,9 +395,10 @@ pub(crate) fn parse_capturing_all_columns(
 /// to add.
 pub(crate) fn parse_capturing_all_columns_with_progress(
     bytes: &[u8],
+    overrides: super::IngestOverrides,
     mut on_chunk: impl FnMut(&CsvParseOutcome, &[ColumnText]),
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
-    parse_bytes(bytes, Capture::All, Some(&mut on_chunk))
+    parse_bytes(bytes, Capture::All, Some(&mut on_chunk), overrides)
 }
 
 /// The first checkpoint [`parse_capturing_all_columns_with_progress`] fires
@@ -410,8 +458,9 @@ fn parse_bytes(
     bytes: &[u8],
     capture: Capture,
     on_chunk: Option<ChunkCallback>,
+    overrides: super::IngestOverrides,
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
-    let sniff = sniff_bytes(bytes)?;
+    let sniff = sniff_bytes(bytes, overrides)?;
     let text = infer::decode(bytes, &sniff.encoding);
     parse_rows(text.as_bytes(), &sniff, capture, on_chunk)
 }
@@ -700,19 +749,21 @@ pub(crate) fn open_path_capturing_column(
 /// [`parse_capturing_all_columns`]).
 pub(crate) fn open_path_capturing_all_columns(
     path: &Path,
+    overrides: super::IngestOverrides,
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
     let mmap = map_file(path)?;
-    parse_capturing_all_columns(&mmap)
+    parse_capturing_all_columns(&mmap, overrides)
 }
 
 /// [`open_path_capturing_all_columns`], additionally checkpointing progress
 /// (see [`parse_capturing_all_columns_with_progress`]).
 pub(crate) fn open_path_capturing_all_columns_with_progress(
     path: &Path,
+    overrides: super::IngestOverrides,
     on_chunk: impl FnMut(&CsvParseOutcome, &[ColumnText]),
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
     let mmap = map_file(path)?;
-    parse_capturing_all_columns_with_progress(&mmap, on_chunk)
+    parse_capturing_all_columns_with_progress(&mmap, overrides, on_chunk)
 }
 
 /// Memory-maps `path` read-only. The mapping only backs the caller's parse;
@@ -893,6 +944,61 @@ mod tests {
         std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
+    // docs/ROADMAP.md M4 "One-click correction of each field → triggers a
+    // re-index": an overridden delimiter must win over whatever
+    // `infer_delimiter` would have picked, and be reported at full
+    // confidence — a deliberate user choice is never "low confidence"
+    // (Golden Rule 2), regardless of how consistent the auto-inference would
+    // have scored it.
+    #[test]
+    fn delimiter_override_wins_over_inference_and_is_reported_at_high_confidence() {
+        // A clean, unambiguously comma-delimited sample: auto-inference would
+        // confidently pick `Comma`.
+        let bytes = b"timestamp,value\n2026-01-01T00:00:00Z,1.5\n2026-01-01T00:00:01Z,2.5\n";
+
+        let auto = parse_capturing_all_columns(bytes, super::super::IngestOverrides::default())
+            .expect("auto-inferred parse must succeed")
+            .0;
+        assert_eq!(auto.delimiter, Delimiter::Comma);
+
+        let (overridden, _columns) = parse_capturing_all_columns(
+            bytes,
+            super::super::IngestOverrides {
+                delimiter: Some(Delimiter::Semicolon),
+                ..Default::default()
+            },
+        )
+        .expect("an overridden delimiter must still parse (the whole line becomes one field)");
+
+        assert_eq!(overridden.delimiter, Delimiter::Semicolon);
+        assert_eq!(overridden.delimiter_confidence, Confidence::High);
+    }
+
+    // Same as above, for the decimal separator: overriding it must win over
+    // `infer_decimal_separator`'s joint delimiter/decimal read and be
+    // reported at full confidence.
+    #[test]
+    fn decimal_separator_override_wins_over_inference_and_is_reported_at_high_confidence() {
+        let bytes = b"timestamp,value\n2026-01-01T00:00:00Z,1.5\n2026-01-01T00:00:01Z,2.5\n";
+
+        let auto = parse_capturing_all_columns(bytes, super::super::IngestOverrides::default())
+            .expect("auto-inferred parse must succeed")
+            .0;
+        assert_eq!(auto.decimal_separator, DecimalSeparator::Dot);
+
+        let (overridden, _columns) = parse_capturing_all_columns(
+            bytes,
+            super::super::IngestOverrides {
+                decimal_separator: Some(DecimalSeparator::Comma),
+                ..Default::default()
+            },
+        )
+        .expect("an overridden decimal separator must still parse");
+
+        assert_eq!(overridden.decimal_separator, DecimalSeparator::Comma);
+        assert_eq!(overridden.decimal_separator_confidence, Confidence::High);
+    }
+
     // Corpus case 20 (QUALITY.md §1.20): every row, including the header,
     // ends in a trailing delimiter, plus blank trailing lines. Neither the
     // trailing empty field nor the blank lines are ragged rows: every row
@@ -934,7 +1040,9 @@ mod tests {
     fn parse_capturing_all_columns_skips_ragged_rows_and_keeps_columns_aligned() {
         let bytes = corpus_bytes("case-21-ragged-rows.csv");
 
-        let (outcome, columns) = parse_capturing_all_columns(&bytes).expect("case 21 must parse");
+        let (outcome, columns) =
+            parse_capturing_all_columns(&bytes, super::super::IngestOverrides::default())
+                .expect("case 21 must parse");
 
         assert_eq!(outcome.column_names, vec!["timestamp", "value", "pressure"]);
         assert_eq!(outcome.row_count, 3);
@@ -1097,11 +1205,14 @@ mod tests {
         let bytes = many_rows_csv(70_000);
         let mut checkpoints: Vec<u64> = Vec::new();
 
-        let (outcome, _columns) =
-            parse_capturing_all_columns_with_progress(&bytes, |snapshot, _columns| {
+        let (outcome, _columns) = parse_capturing_all_columns_with_progress(
+            &bytes,
+            super::super::IngestOverrides::default(),
+            |snapshot, _columns| {
                 checkpoints.push(snapshot.row_count);
-            })
-            .expect("many-row CSV must parse");
+            },
+        )
+        .expect("many-row CSV must parse");
 
         assert_eq!(outcome.row_count, 70_000);
         assert_eq!(
@@ -1120,9 +1231,13 @@ mod tests {
         let bytes = many_rows_csv(10);
         let mut checkpoint_count = 0;
 
-        parse_capturing_all_columns_with_progress(&bytes, |_snapshot, _columns| {
-            checkpoint_count += 1;
-        })
+        parse_capturing_all_columns_with_progress(
+            &bytes,
+            super::super::IngestOverrides::default(),
+            |_snapshot, _columns| {
+                checkpoint_count += 1;
+            },
+        )
         .expect("small CSV must parse");
 
         assert_eq!(
@@ -1137,13 +1252,16 @@ mod tests {
         let bytes = many_rows_csv(70_000);
         let mut first_checkpoint: Option<(CsvParseOutcome, Vec<ColumnText>)> = None;
 
-        let (final_outcome, final_columns) =
-            parse_capturing_all_columns_with_progress(&bytes, |snapshot, columns| {
+        let (final_outcome, final_columns) = parse_capturing_all_columns_with_progress(
+            &bytes,
+            super::super::IngestOverrides::default(),
+            |snapshot, columns| {
                 if first_checkpoint.is_none() {
                     first_checkpoint = Some((snapshot.clone(), columns.to_vec()));
                 }
-            })
-            .expect("many-row CSV must parse");
+            },
+        )
+        .expect("many-row CSV must parse");
 
         let (checkpoint_outcome, checkpoint_columns) =
             first_checkpoint.expect("at least one checkpoint must have fired");
@@ -1168,10 +1286,15 @@ mod tests {
         let bytes = many_rows_csv(70_000);
 
         let (outcome_without_progress, columns_without_progress) =
-            parse_capturing_all_columns(&bytes).expect("parse without progress");
+            parse_capturing_all_columns(&bytes, super::super::IngestOverrides::default())
+                .expect("parse without progress");
         let (outcome_with_progress, columns_with_progress) =
-            parse_capturing_all_columns_with_progress(&bytes, |_snapshot, _columns| {})
-                .expect("parse with progress");
+            parse_capturing_all_columns_with_progress(
+                &bytes,
+                super::super::IngestOverrides::default(),
+                |_snapshot, _columns| {},
+            )
+            .expect("parse with progress");
 
         assert_eq!(outcome_without_progress, outcome_with_progress);
         assert_eq!(columns_without_progress.len(), columns_with_progress.len());
