@@ -57,11 +57,26 @@ use std::path::Path;
 /// field is a settled, deliberate choice, so it is always reported at
 /// [`Confidence::High`] — a user's own correction is never "low confidence"
 /// the way a guess can be (Golden Rule 2).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// Derives `Hash` so a cache key (`index::level0::CacheKey::with_overrides_signature`)
+/// can be scoped to it: a corrected re-open of the same, byte-for-byte
+/// unchanged file must never collide with a pyramid cached under a
+/// different (or absent) set of overrides.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct IngestOverrides {
     pub delimiter: Option<Delimiter>,
     pub decimal_separator: Option<DecimalSeparator>,
     pub timestamp_format: Option<TimestampFormat>,
+}
+
+/// A plain hash of `overrides`, for scoping a cache key to it
+/// (`index::level0::CacheKey::with_overrides_signature`) without that
+/// lower-level module depending on this one's types.
+fn overrides_signature(overrides: IngestOverrides) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    overrides.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// A single ingested source format (ARCH hard rule 5): adding a format means

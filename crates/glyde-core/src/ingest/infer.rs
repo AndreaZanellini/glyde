@@ -210,7 +210,7 @@ pub fn decode<'a>(bytes: &'a [u8], inference: &EncodingInference) -> Cow<'a, str
 }
 
 /// A field delimiter candidate (SPEC §1.2.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Delimiter {
     Comma,
     Semicolon,
@@ -380,7 +380,7 @@ pub fn infer_delimiter(sample: &str) -> DelimiterInference {
 }
 
 /// `.` or `,` as a decimal separator (SPEC §1.2.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DecimalSeparator {
     Dot,
     Comma,

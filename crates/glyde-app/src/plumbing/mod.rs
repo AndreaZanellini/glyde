@@ -226,7 +226,7 @@ fn run_index_job(
             let pyramids = if dataset.is_spilled() {
                 vec![None; dataset.columns.len()]
             } else {
-                glyde_core::ingest::pyramids_for_dataset_cached(&path, &dataset)
+                glyde_core::ingest::pyramids_for_dataset_cached(&path, &dataset, overrides)
             };
             let _ = tx.send(IndexingMessage::Completed {
                 generation,

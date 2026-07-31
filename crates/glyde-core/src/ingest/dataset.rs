@@ -749,7 +749,17 @@ fn load_spilled(
     let choices: Vec<ColumnDtypeChoice> = dtype_scans.iter().map(ColumnDtypeScan::finish).collect();
 
     // --- Pass 2: type every row straight into its spill file ----------------
-    let stem = CacheKey::for_path(path)?.cache_stem();
+    // `.with_overrides_signature`: these spill files are always freshly
+    // written on this call (never read-and-reused within it), so nothing
+    // reachable today collides across two different overrides for the same
+    // path — but scoping the stem consistently with the pyramid cache keeps
+    // that true if a later reopen ever starts reading them back (issue #92's
+    // Level 0 read-through wiring, not yet wired into the open path) rather
+    // than leaving the same class of staleness bug latent for that PR to
+    // rediscover.
+    let stem = CacheKey::for_path(path)?
+        .with_overrides_signature(super::overrides_signature(overrides))
+        .cache_stem();
     let mut time_writer = TimeAxisSpillWriter::create(
         cache_dir,
         &stem,
@@ -1530,13 +1540,16 @@ pub fn pyramids_for_dataset(dataset: &Dataset) -> Vec<Option<Vec<Vec<Bucket>>>> 
 
 /// [`pyramids_for_dataset`], but reusing a previous completed open's cached
 /// pyramid for each numeric column when `path` names an unchanged file
-/// (path + size + mtime match what was cached), and writing the cache after
-/// building on a miss — so a second, completed open of the same file skips
-/// the pyramid aggregation entirely instead of redoing it (issue #81;
-/// docs/ROADMAP.md M3 "reopening rebuilds the pyramid from cached Level 0
-/// rather than loading it too"). Each column gets its own cache entry,
-/// keyed by [`CacheKey::with_column`], so a multi-column file's columns
-/// never overwrite each other's cache.
+/// (path + size + mtime match what was cached) *and* `overrides` matches
+/// what produced the cached entry, and writing the cache after building on a
+/// miss — so a second, completed open of the same file skips the pyramid
+/// aggregation entirely instead of redoing it (issue #81; docs/ROADMAP.md M3
+/// "reopening rebuilds the pyramid from cached Level 0 rather than loading it
+/// too"). Each column gets its own cache entry, keyed by
+/// [`CacheKey::with_column`] and [`CacheKey::with_overrides_signature`], so a
+/// multi-column file's columns never overwrite each other's cache, and a
+/// one-click correction (docs/ROADMAP.md M4) of the same, byte-for-byte
+/// unchanged file never collides with the pre-correction cache entry either.
 ///
 /// A cache miss or a cache read/write failure both fall back to an ordinary
 /// uncached [`build_pyramid`] rather than failing the open — a cache is an
@@ -1557,9 +1570,12 @@ pub fn pyramids_for_dataset(dataset: &Dataset) -> Vec<Option<Vec<Vec<Bucket>>>> 
 pub fn pyramids_for_dataset_cached(
     path: &Path,
     dataset: &Dataset,
+    overrides: IngestOverrides,
 ) -> Vec<Option<Vec<Vec<Bucket>>>> {
     match os_spill_dir() {
-        Some(cache_dir) => pyramids_for_dataset_cached_with_cache_dir(path, dataset, &cache_dir),
+        Some(cache_dir) => {
+            pyramids_for_dataset_cached_with_cache_dir(path, dataset, &cache_dir, overrides)
+        }
         None => pyramids_for_dataset(dataset),
     }
 }
@@ -1571,10 +1587,11 @@ pub fn pyramids_for_dataset_cached_with_cache_dir(
     path: &Path,
     dataset: &Dataset,
     cache_dir: &Path,
+    overrides: IngestOverrides,
 ) -> Vec<Option<Vec<Vec<Bucket>>>> {
     let ticks = dataset.time.to_pyramid_ticks();
     let key = match CacheKey::for_path(path) {
-        Ok(key) => key,
+        Ok(key) => key.with_overrides_signature(super::overrides_signature(overrides)),
         Err(err) => {
             warn!(
                 path = %path.display(),

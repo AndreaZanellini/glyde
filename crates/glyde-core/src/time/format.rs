@@ -99,7 +99,7 @@ impl Timestamp {
 /// Every absolute-timestamp format `open()` must recognize (SPEC §2.1).
 /// Progressive numeric indices (no absolute time meaning) are not a
 /// `TimestampFormat` — they carry no calendar value to round-trip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TimestampFormat {
     /// RFC 3339 / ISO 8601 with a UTC or explicit offset, e.g.
     /// `2026-07-22T14:30:00+02:00`.

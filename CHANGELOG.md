@@ -27,6 +27,17 @@ Versioning: [Semantic Versioning](https://semver.org/).
   field on the same file (corrections accumulate); opening a different file
   starts from a clean slate.
 
+  Correcting a field re-opens the same file path with different content —
+  same path, size, and modification time as before, but a different plot —
+  which used to confuse the plot's zoomed-out overview cache: it keys a
+  cached overview by path/size/modification-time only, on the assumption
+  that an unchanged file always parses the same way. That assumption is now
+  false the moment a correction exists, and the mismatch could surface as
+  wrong data on the plot after a correction, or a crash. The cache is now
+  also keyed by which correction produced the data, so a corrected re-open
+  always gets its own overview instead of a stale one from before the
+  correction (or vice versa on a later un-corrected reopen).
+
   **Assumption made:** encoding and time-column corrections are not covered
   by this change — only the three fields this roadmap item's own maintainer
   test names (delimiter, decimal separator, day/month swap). Correcting the
