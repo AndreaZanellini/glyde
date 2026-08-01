@@ -31,10 +31,10 @@ mod report;
 
 pub use csv::{open_path, parse, CsvParseOutcome, CsvReader};
 pub use dataset::{
-    load, load_progressive, load_progressive_with_budget, load_with_budget,
-    progressive_tick_to_value, progressive_value_to_tick, pyramids_for_dataset,
-    pyramids_for_dataset_cached, pyramids_for_dataset_cached_with_cache_dir, Checkpoint, Dataset,
-    ProgressiveValues, TimeAxis, Timestamps, PROGRESSIVE_TICK_SCALE,
+    load, load_progressive, load_progressive_with_budget, load_with_budget, load_with_overrides,
+    load_with_overrides_and_budget, progressive_tick_to_value, progressive_value_to_tick,
+    pyramids_for_dataset, pyramids_for_dataset_cached, pyramids_for_dataset_cached_with_cache_dir,
+    Checkpoint, Dataset, ProgressiveValues, TimeAxis, Timestamps, PROGRESSIVE_TICK_SCALE,
 };
 pub use infer::{
     decode, detect_encoding, infer_column, infer_decimal_separator, infer_delimiter, infer_header,
@@ -42,12 +42,42 @@ pub use infer::{
     DtypeInference, EncodingInference, EncodingSource, HeaderInference, HEAD_SAMPLE_BYTES,
 };
 pub use report::{
-    inspect, open_dataset, open_dataset_progressive, open_dataset_with_budget, InferenceReport,
-    InferredField, OpenSummary, SamplingClass,
+    inspect, open_dataset, open_dataset_progressive, open_dataset_progressive_with_overrides,
+    open_dataset_with_budget, open_dataset_with_overrides, InferenceReport, InferredField,
+    OpenSummary, SamplingClass,
 };
 
+use crate::time::TimestampFormat;
 use crate::{GlydeError, Result};
 use std::path::Path;
+
+/// User-chosen corrections that bypass the corresponding SPEC §1.2 inference
+/// step (docs/ROADMAP.md M4 "One-click correction of each field → triggers a
+/// re-index"). Each `None` field keeps the automatic inference; each `Some`
+/// field is a settled, deliberate choice, so it is always reported at
+/// [`Confidence::High`] — a user's own correction is never "low confidence"
+/// the way a guess can be (Golden Rule 2).
+///
+/// Derives `Hash` so a cache key (`index::level0::CacheKey::with_overrides_signature`)
+/// can be scoped to it: a corrected re-open of the same, byte-for-byte
+/// unchanged file must never collide with a pyramid cached under a
+/// different (or absent) set of overrides.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct IngestOverrides {
+    pub delimiter: Option<Delimiter>,
+    pub decimal_separator: Option<DecimalSeparator>,
+    pub timestamp_format: Option<TimestampFormat>,
+}
+
+/// A plain hash of `overrides`, for scoping a cache key to it
+/// (`index::level0::CacheKey::with_overrides_signature`) without that
+/// lower-level module depending on this one's types.
+fn overrides_signature(overrides: IngestOverrides) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    overrides.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// A single ingested source format (ARCH hard rule 5): adding a format means
 /// adding one `ingest/<format>.rs` implementing this trait plus one registry

@@ -11,6 +11,50 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **You can now correct the delimiter, decimal separator, or an ambiguous
+  day/month date reading directly in the inference bar, and the plot
+  re-indexes immediately — but only when Glyde is actually unsure.** The
+  inference bar (the "Inference — N samples, ..." strip above the plot)
+  already told you what Glyde inferred; it now lets you fix it when it's
+  genuinely uncertain. A "Correct…" dropdown appears next to the delimiter
+  or decimal separator field *only* when that specific field is flagged low
+  confidence; a clean, unambiguous file (the common case) shows plain labels
+  and nothing to click, on purpose — there is nothing to correct, and a
+  control sitting next to an already-correct value would only invite
+  breaking something that already works. The delimiter dropdown also never
+  offers "whitespace" as a choice: unlike every other delimiter, picking it
+  wrong doesn't fail predictably, so it isn't offered as a one-click option.
+  When the timestamp format is the genuinely ambiguous `DD/MM`/`MM/DD` case
+  (SPEC §2.1's "no field greater than 12 anywhere in the column"), a "Swap to
+  MM/DD" or "Swap to DD/MM" button appears next to it instead — SPEC §2.1's
+  own one-click-swap wording, and, same as the other two, only when the read
+  is genuinely ambiguous, not merely because the format happens to be
+  day/month-shaped. A correction is never treated as a guess: it's reported
+  at full confidence and stays applied if you correct a second field on the
+  same file (corrections accumulate); opening a different file starts from a
+  clean slate.
+
+  Correcting a field re-opens the same file path with different content —
+  same path, size, and modification time as before, but a different plot —
+  which used to confuse the plot's zoomed-out overview cache: it keys a
+  cached overview by path/size/modification-time only, on the assumption
+  that an unchanged file always parses the same way. That assumption is now
+  false the moment a correction exists, and the mismatch could surface as
+  wrong data on the plot after a correction, or a crash. The cache is now
+  also keyed by which correction produced the data, so a corrected re-open
+  always gets its own overview instead of a stale one from before the
+  correction (or vice versa on a later un-corrected reopen).
+
+  **Assumption made:** encoding and time-column corrections are not covered
+  by this change — only the three fields this roadmap item's own maintainer
+  test names (delimiter, decimal separator, day/month swap). Correcting the
+  timestamp format to an arbitrary format (not just the day/month swap) is
+  also not covered. All three are filed as a follow-up (issue #97) rather
+  than folded into this change, since two of them raise their own design
+  questions (how to pick an encoding, how to pick a different time-index
+  column) rather than being mechanical.
+
 ### Fixed
 - **CSV files whose time column is written as `2026-01-01 00:00:00` (a space
   between date and time, no `T`) now open.** This is one of the most common

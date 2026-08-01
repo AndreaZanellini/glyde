@@ -129,7 +129,7 @@ them, so CI stays green while honoring "written first."
 
 - [x] `InferenceReport` surfaced to the UI: encoding, delimiter, decimal, time column, timestamp format, sample count, sampling class, per-field confidence → SPEC §1.2 (mandatory UX) · proven by: report-struct snapshot + manual
 - [x] Inference bar widget: persistent and discreet; opens expanded when any inference is low-confidence → SPEC §1.2, §2.1 · proven by: manual on corpus 28 (ambiguous dates → expanded)
-- [ ] One-click correction of each field → triggers a re-index → SPEC §1.2 · proven by: manual (swap delimiter / decimal / date order → plot updates)
+- [x] One-click correction of each field → triggers a re-index → SPEC §1.2 · proven by: manual (swap delimiter / decimal / date order → plot updates) · `glyde_core::ingest::IngestOverrides` threads a settled delimiter/decimal-separator/timestamp-format choice through both the in-memory and spilled ingestion paths, reported at full confidence; the inference bar offers a correction dropdown for delimiter and decimal separator, and SPEC §2.1's exact "one-click swap" for the `DD/MM`/`MM/DD` ambiguity case. **Residual, split out**: encoding correction, time-column correction, and correcting to an arbitrary (non-swap) timestamp format are not covered — tracked as a `backlog` follow-up (issue #97), since two of the three raise their own design questions rather than being mechanical
 - [ ] Skipped-rows detail surface ("N rows skipped — view details") → SPEC §1.3 · proven by: manual on corpus 21 (ragged)
 - [ ] Timestamp affordances: "not monotonic — [Sort]/[Keep as-is]", timezone label (honored or "naive local") → SPEC §2.1 · proven by: manual on corpus 36; corpus 24 (tz displayed)
 

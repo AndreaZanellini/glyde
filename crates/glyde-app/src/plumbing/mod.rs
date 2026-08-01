@@ -46,7 +46,7 @@ use std::sync::mpsc::Sender;
 use std::thread;
 
 use glyde_core::dsp::decimation::Bucket;
-use glyde_core::ingest::{Dataset, InferenceReport, OpenSummary};
+use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, OpenSummary};
 
 /// One numeric column's min/max pyramid, or `None` for a non-numeric column
 /// — parallel to `Dataset::columns` (see `glyde_core::ingest::Checkpoint::pyramids`).
@@ -120,9 +120,22 @@ impl IndexingMessage {
 /// `tx`, tagged with `generation`. Returns immediately — the caller (the UI
 /// thread) never blocks on the file read.
 pub fn spawn_index_job(generation: u64, path: PathBuf, tx: Sender<IndexingMessage>) {
+    spawn_index_job_with_overrides(generation, path, IngestOverrides::default(), tx)
+}
+
+/// [`spawn_index_job`] with [`IngestOverrides`] applied (docs/ROADMAP.md M4
+/// "One-click correction of each field → triggers a re-index"):
+/// `crate::app::GlydeApp` calls this to re-open the current file after the
+/// user corrects a field in the inference bar.
+pub fn spawn_index_job_with_overrides(
+    generation: u64,
+    path: PathBuf,
+    overrides: IngestOverrides,
+    tx: Sender<IndexingMessage>,
+) {
     thread::Builder::new()
         .name("glyde-indexer".to_string())
-        .spawn(move || run_index_job(generation, path, &tx))
+        .spawn(move || run_index_job(generation, path, overrides, &tx))
         .expect("failed to spawn the background indexer thread");
 }
 
@@ -138,7 +151,7 @@ pub fn spawn_open_dialog(generation: u64, tx: Sender<IndexingMessage>) {
         .name("glyde-file-dialog".to_string())
         .spawn(move || {
             if let Some(path) = rfd::FileDialog::new().pick_file() {
-                run_index_job(generation, path, &tx);
+                run_index_job(generation, path, IngestOverrides::default(), &tx);
             }
         })
         .expect("failed to spawn the file dialog thread");
@@ -147,7 +160,12 @@ pub fn spawn_open_dialog(generation: u64, tx: Sender<IndexingMessage>) {
 /// The indexer thread's body, split out from [`spawn_index_job`] so tests can
 /// run it synchronously against a real corpus fixture without waiting on
 /// thread scheduling.
-fn run_index_job(generation: u64, path: PathBuf, tx: &Sender<IndexingMessage>) {
+fn run_index_job(
+    generation: u64,
+    path: PathBuf,
+    overrides: IngestOverrides,
+    tx: &Sender<IndexingMessage>,
+) {
     let _ = tx.send(IndexingMessage::Started {
         generation,
         path: path.clone(),
@@ -180,15 +198,19 @@ fn run_index_job(generation: u64, path: PathBuf, tx: &Sender<IndexingMessage>) {
     // levels": every checkpoint along the way is forwarded as its own
     // `Progress` message, so the UI thread can render a growing plot instead
     // of only a spinner while a large file is still being read.
-    match glyde_core::ingest::open_dataset_progressive(&path, |checkpoint| {
-        let _ = tx.send(IndexingMessage::Progress {
-            generation,
-            path: path.clone(),
-            dataset: Box::new(checkpoint.dataset),
-            pyramids: checkpoint.pyramids,
-            rows_read: checkpoint.rows_read,
-        });
-    }) {
+    match glyde_core::ingest::open_dataset_progressive_with_overrides(
+        &path,
+        overrides,
+        |checkpoint| {
+            let _ = tx.send(IndexingMessage::Progress {
+                generation,
+                path: path.clone(),
+                dataset: Box::new(checkpoint.dataset),
+                pyramids: checkpoint.pyramids,
+                rows_read: checkpoint.rows_read,
+            });
+        },
+    ) {
         Ok((summary, report, dataset)) => {
             tracing::info!(
                 path = %path.display(),
@@ -204,7 +226,7 @@ fn run_index_job(generation: u64, path: PathBuf, tx: &Sender<IndexingMessage>) {
             let pyramids = if dataset.is_spilled() {
                 vec![None; dataset.columns.len()]
             } else {
-                glyde_core::ingest::pyramids_for_dataset_cached(&path, &dataset)
+                glyde_core::ingest::pyramids_for_dataset_cached(&path, &dataset, overrides)
             };
             let _ = tx.send(IndexingMessage::Completed {
                 generation,

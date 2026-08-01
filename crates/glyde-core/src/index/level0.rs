@@ -80,6 +80,19 @@ pub struct CacheKey {
     /// form — `Option<u32>` makes the two kinds hash and compare unequal by
     /// construction, not by convention.
     column: Option<u32>,
+    /// A fingerprint of whatever `crate::ingest::IngestOverrides` produced
+    /// the dataset this key caches (docs/ROADMAP.md M4 "One-click
+    /// correction of each field → triggers a re-index"), `0` for the
+    /// no-overrides case. Path + size + mtime alone assume a given file
+    /// always parses to the same dataset — true for every reader until a
+    /// caller can request a *different* parse of the same, byte-for-byte
+    /// unchanged file (a corrected delimiter/decimal-separator/timestamp
+    /// format). Without this field, a corrected re-open would collide with
+    /// the cache entry written under the pre-correction reading (or vice
+    /// versa) and silently serve stale buckets. A plain `u64` rather than
+    /// `IngestOverrides` itself so this module — the lower-level indexing
+    /// primitive — never has to depend on `crate::ingest`'s types.
+    overrides_signature: u64,
 }
 
 impl CacheKey {
@@ -105,6 +118,7 @@ impl CacheKey {
             source_size: metadata.len(),
             source_mtime_unix_nanos,
             column: None,
+            overrides_signature: 0,
         })
     }
 
@@ -115,6 +129,20 @@ impl CacheKey {
     pub fn with_column(&self, column_index: usize) -> Self {
         Self {
             column: Some(column_index as u32),
+            ..self.clone()
+        }
+    }
+
+    /// Scopes this key to the [`crate::ingest::IngestOverrides`] that
+    /// produced the dataset being cached (docs/ROADMAP.md M4), so a
+    /// corrected re-open of the same, byte-for-byte unchanged file never
+    /// collides with the cache entry a different set of overrides (or no
+    /// overrides at all) wrote for it. `signature` is a plain hash of the
+    /// overrides — see the field's own doc comment for why this takes a
+    /// `u64` rather than the `IngestOverrides` type itself.
+    pub fn with_overrides_signature(&self, signature: u64) -> Self {
+        Self {
+            overrides_signature: signature,
             ..self.clone()
         }
     }

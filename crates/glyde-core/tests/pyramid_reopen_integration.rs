@@ -21,7 +21,10 @@
 //! are out of scope here — split into a follow-up issue, same as #80/#88/#90
 //! split adjacent M3 concerns.
 
-use glyde_core::ingest::{pyramids_for_dataset, pyramids_for_dataset_cached_with_cache_dir};
+use glyde_core::ingest::{
+    pyramids_for_dataset, pyramids_for_dataset_cached_with_cache_dir, IngestOverrides,
+};
+use glyde_core::time::TimestampFormat;
 
 fn multi_column_csv(row_count: usize) -> tempfile::NamedTempFile {
     multi_column_csv_with(row_count, |t| {
@@ -51,8 +54,12 @@ fn a_second_open_serves_every_columns_pyramid_from_cache() {
     let cache_dir = tempfile::tempdir().expect("temp cache dir");
 
     let uncached = pyramids_for_dataset(&dataset);
-    let first_open =
-        pyramids_for_dataset_cached_with_cache_dir(file.path(), &dataset, cache_dir.path());
+    let first_open = pyramids_for_dataset_cached_with_cache_dir(
+        file.path(),
+        &dataset,
+        cache_dir.path(),
+        IngestOverrides::default(),
+    );
 
     assert_eq!(
         first_open, uncached,
@@ -79,8 +86,12 @@ fn a_second_open_serves_every_columns_pyramid_from_cache() {
         "the other dataset must actually build a different pyramid, or this test proves nothing"
     );
 
-    let second_open =
-        pyramids_for_dataset_cached_with_cache_dir(file.path(), &other_dataset, cache_dir.path());
+    let second_open = pyramids_for_dataset_cached_with_cache_dir(
+        file.path(),
+        &other_dataset,
+        cache_dir.path(),
+        IngestOverrides::default(),
+    );
     assert_eq!(
         second_open, first_open,
         "the second open must serve the cache written under `file`'s path, not rebuild from \
@@ -94,8 +105,12 @@ fn two_columns_of_the_same_file_do_not_share_a_cached_pyramid() {
     let dataset = glyde_core::ingest::load(file.path()).expect("load must succeed");
     let cache_dir = tempfile::tempdir().expect("temp cache dir");
 
-    let cached =
-        pyramids_for_dataset_cached_with_cache_dir(file.path(), &dataset, cache_dir.path());
+    let cached = pyramids_for_dataset_cached_with_cache_dir(
+        file.path(),
+        &dataset,
+        cache_dir.path(),
+        IngestOverrides::default(),
+    );
 
     assert_eq!(cached.len(), 2, "the fixture has two numeric data columns");
     assert_ne!(
@@ -106,4 +121,80 @@ fn two_columns_of_the_same_file_do_not_share_a_cached_pyramid() {
     // over that same column would produce.
     let uncached = pyramids_for_dataset(&dataset);
     assert_eq!(cached, uncached);
+}
+
+/// A file whose date is genuinely ambiguous between `DD/MM` and `MM/DD`
+/// (day and month both ≤ 12) on every row — the same shape as torture-corpus
+/// case 28, built large enough here for a multi-level pyramid. Only the
+/// time-of-day varies row to row, so every row's date component is
+/// identical and the whole column stays ambiguous throughout.
+fn ambiguous_date_csv(row_count: usize) -> tempfile::NamedTempFile {
+    let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+    let mut text = String::from("time,value\n");
+    for i in 0..row_count {
+        let h = i / 3600;
+        let m = (i / 60) % 60;
+        let s = i % 60;
+        text.push_str(&format!(
+            "05/07/2026 {h:02}:{m:02}:{s:02},{}\n",
+            i as f64 * 0.5
+        ));
+    }
+    std::io::Write::write_all(&mut file, text.as_bytes()).expect("write temp file");
+    file
+}
+
+// docs/ROADMAP.md M4 "One-click correction of each field → triggers a
+// re-index": correcting a field (e.g. the ambiguous day/month swap) changes
+// the dataset a path parses to *without the file on disk changing at all* —
+// same path, same size, same mtime, the exact "unchanged file" signal
+// `pyramids_for_dataset_cached` otherwise trusts to serve a cache hit
+// (`a_second_open_serves_every_columns_pyramid_from_cache`, above, locks that
+// trust deliberately for the *un-corrected* case). A corrected re-open must
+// not collide with the pyramid cached under the pre-correction reading: the
+// stale buckets would carry the wrong timestamps for the corrected dataset's
+// own ticks — silently wrong at best, an out-of-range query on a total
+// mismatch at worst.
+#[test]
+fn different_overrides_for_the_same_path_do_not_share_a_cached_pyramid() {
+    let file = ambiguous_date_csv(2_000);
+    let cache_dir = tempfile::tempdir().expect("temp cache dir");
+
+    let default_dataset = glyde_core::ingest::load(file.path()).expect("load must succeed");
+    let default_cached = pyramids_for_dataset_cached_with_cache_dir(
+        file.path(),
+        &default_dataset,
+        cache_dir.path(),
+        IngestOverrides::default(),
+    );
+    assert!(
+        default_cached[0]
+            .as_ref()
+            .is_some_and(|levels| levels.len() > 1),
+        "the fixture must be large enough to produce a multi-level pyramid"
+    );
+
+    let overrides = IngestOverrides {
+        timestamp_format: Some(TimestampFormat::MonthFirst),
+        ..Default::default()
+    };
+    let overridden_dataset = glyde_core::ingest::load_with_overrides(file.path(), overrides)
+        .expect("a month-first override must still open the same file");
+    assert_ne!(
+        overridden_dataset.time, default_dataset.time,
+        "swapping day/month must actually change the parsed ticks, or this test proves nothing"
+    );
+
+    let overridden_cached = pyramids_for_dataset_cached_with_cache_dir(
+        file.path(),
+        &overridden_dataset,
+        cache_dir.path(),
+        overrides,
+    );
+    let uncached = pyramids_for_dataset(&overridden_dataset);
+    assert_eq!(
+        overridden_cached, uncached,
+        "a corrected re-open of the same path must build (and cache) its own pyramid, never \
+         silently serve back the pyramid cached under a different set of overrides"
+    );
 }
