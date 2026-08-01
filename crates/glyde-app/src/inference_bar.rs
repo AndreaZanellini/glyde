@@ -38,6 +38,31 @@
 //! renders and reports the click, it never re-indexes anything itself
 //! (docs/ARCHITECTURE.md Hard rule 2: no product logic in the UI layer).
 //! Encoding and time-column correction are not covered yet (issue #97).
+//!
+//! **Every correction control is gated to its own field's confidence**: a
+//! high-confidence field renders as a plain label, nothing more. A clean,
+//! unambiguous file (the common case) never shows a single correctable
+//! control — there is nothing to correct, and offering one anyway invites
+//! fiddling with a setting that already works (maintainer review: "I don't
+//! want to leave the user the possibility to change something that breaks
+//! the app or is useless in most cases"). This mirrors the one rule the
+//! date-order swap already followed by construction (it only ever appeared
+//! for the ambiguous `DD/MM`/`MM/DD` case); delimiter and decimal separator
+//! now follow the same rule explicitly.
+//!
+//! [`Delimiter::Whitespace`] is deliberately absent from the delimiter
+//! correction options. Unlike every other candidate, it does not fail
+//! predictably when wrong: a byte delimiter simply absent from the file
+//! collapses every row to one field and reports `SingleColumnFile` quickly,
+//! but whitespace is present in almost every real file (quoted text,
+//! multi-word categorical values), so an incorrect whitespace split can
+//! produce a wildly inflated, content-dependent field count instead. That
+//! usually — but not provably always, since the affordability check only
+//! samples a bounded head sample (SPEC §1.2) — still routes to the budgeted
+//! spill path rather than exceeding the RAM budget outright, but it is a
+//! probabilistic safety net, not a guarantee, and even the guaranteed case
+//! commits to a slow, unindicated full-file scan before reporting back.
+//! Not worth offering as a one-click option.
 
 use glyde_core::ingest::{Confidence, DecimalSeparator, Delimiter, InferenceReport, InferredField};
 use glyde_core::time::TimestampFormat;
@@ -101,12 +126,12 @@ pub fn show(
 
 /// Every delimiter a user can pick in the correction dropdown, in the same
 /// priority order `glyde_core::ingest::infer_delimiter` tries them.
-const DELIMITER_OPTIONS: [Delimiter; 5] = [
+/// [`Delimiter::Whitespace`] is deliberately excluded — see the module docs.
+const DELIMITER_OPTIONS: [Delimiter; 4] = [
     Delimiter::Comma,
     Delimiter::Semicolon,
     Delimiter::Tab,
     Delimiter::Pipe,
-    Delimiter::Whitespace,
 ];
 
 fn delimiter_display(delimiter: Delimiter) -> &'static str {
@@ -130,9 +155,12 @@ fn delimiter_from_label(label: &str) -> Option<Delimiter> {
         .find(|delimiter| delimiter.as_str() == label)
 }
 
-/// Renders the delimiter field's label plus a correction dropdown, returning
-/// the newly picked delimiter if the user chose one different from the
-/// current value this frame (docs/ROADMAP.md M4, SPEC §1.2).
+/// Renders the delimiter field's label, plus a correction dropdown when (and
+/// only when) [`Confidence::Low`] — a confidently-inferred delimiter is
+/// almost always right, and offering a control next to it anyway would
+/// invite fiddling with a setting that already works (see the module docs).
+/// Returns the newly picked delimiter if the user chose one different from
+/// the current value this frame (docs/ROADMAP.md M4, SPEC §1.2).
 fn delimiter_control(
     ui: &mut egui::Ui,
     field: &InferredField<Option<String>>,
@@ -145,20 +173,22 @@ fn delimiter_control(
             display_option(&field.value),
             field.confidence,
         ));
-        egui::ComboBox::from_id_salt("inference-bar-delimiter-correction")
-            .selected_text("Correct…")
-            .show_ui(ui, |ui| {
-                for candidate in DELIMITER_OPTIONS {
-                    let is_current = current == Some(candidate);
-                    if ui
-                        .selectable_label(is_current, delimiter_display(candidate))
-                        .clicked()
-                        && !is_current
-                    {
-                        picked = Some(candidate);
+        if field.confidence == Confidence::Low {
+            egui::ComboBox::from_id_salt("inference-bar-delimiter-correction")
+                .selected_text("Correct…")
+                .show_ui(ui, |ui| {
+                    for candidate in DELIMITER_OPTIONS {
+                        let is_current = current == Some(candidate);
+                        if ui
+                            .selectable_label(is_current, delimiter_display(candidate))
+                            .clicked()
+                            && !is_current
+                        {
+                            picked = Some(candidate);
+                        }
                     }
-                }
-            });
+                });
+        }
     });
     picked
 }
@@ -176,7 +206,8 @@ fn decimal_separator_from_label(label: &str) -> Option<DecimalSeparator> {
         .find(|separator| separator.as_str() == label)
 }
 
-/// [`delimiter_control`], for the decimal separator field.
+/// [`delimiter_control`], for the decimal separator field — same
+/// low-confidence-only gating.
 fn decimal_separator_control(
     ui: &mut egui::Ui,
     field: &InferredField<Option<String>>,
@@ -192,29 +223,34 @@ fn decimal_separator_control(
             display_option(&field.value),
             field.confidence,
         ));
-        egui::ComboBox::from_id_salt("inference-bar-decimal-separator-correction")
-            .selected_text("Correct…")
-            .show_ui(ui, |ui| {
-                for candidate in [DecimalSeparator::Dot, DecimalSeparator::Comma] {
-                    let is_current = current == Some(candidate);
-                    if ui
-                        .selectable_label(is_current, decimal_separator_display(candidate))
-                        .clicked()
-                        && !is_current
-                    {
-                        picked = Some(candidate);
+        if field.confidence == Confidence::Low {
+            egui::ComboBox::from_id_salt("inference-bar-decimal-separator-correction")
+                .selected_text("Correct…")
+                .show_ui(ui, |ui| {
+                    for candidate in [DecimalSeparator::Dot, DecimalSeparator::Comma] {
+                        let is_current = current == Some(candidate);
+                        if ui
+                            .selectable_label(is_current, decimal_separator_display(candidate))
+                            .clicked()
+                            && !is_current
+                        {
+                            picked = Some(candidate);
+                        }
                     }
-                }
-            });
+                });
+        }
     });
     picked
 }
 
 /// SPEC §2.1's ambiguity-rule UX exactly: "mark the inference low
 /// confidence, and open the inference bar expanded with a one-click swap."
-/// The swap only appears when the detected format is one half of the
-/// `DD/MM`/`MM/DD` ambiguity — every other timestamp format has no
-/// day/month reading to swap, so no button renders for it (issue #97 tracks
+/// The swap only appears when confidence is [`Confidence::Low`] *and* the
+/// detected format is one half of the `DD/MM`/`MM/DD` ambiguity — a
+/// day-first or month-first read settled by a genuine field > 12 (corpus
+/// cases 26/27) is confidently correct and gets no swap button, same as
+/// every other high-confidence field. Every other timestamp format has no
+/// day/month reading to swap in the first place (issue #97 tracks
 /// correcting to an arbitrary format).
 fn timestamp_format_control(
     ui: &mut egui::Ui,
@@ -227,14 +263,16 @@ fn timestamp_format_control(
             display_option(&field.value),
             field.confidence,
         ));
-        let swap = match field.value.as_deref() {
-            Some("dd_mm_yyyy") => Some(("Swap to MM/DD", TimestampFormat::MonthFirst)),
-            Some("mm_dd_yyyy") => Some(("Swap to DD/MM", TimestampFormat::DayFirst)),
-            _ => None,
-        };
-        if let Some((label, target)) = swap {
-            if ui.button(label).clicked() {
-                picked = Some(target);
+        if field.confidence == Confidence::Low {
+            let swap = match field.value.as_deref() {
+                Some("dd_mm_yyyy") => Some(("Swap to MM/DD", TimestampFormat::MonthFirst)),
+                Some("mm_dd_yyyy") => Some(("Swap to DD/MM", TimestampFormat::DayFirst)),
+                _ => None,
+            };
+            if let Some((label, target)) = swap {
+                if ui.button(label).clicked() {
+                    picked = Some(target);
+                }
             }
         }
     });
@@ -425,5 +463,76 @@ mod tests {
     #[test]
     fn decimal_separator_from_label_is_none_for_an_unrecognized_label() {
         assert_eq!(decimal_separator_from_label("?"), None);
+    }
+
+    // docs/ROADMAP.md M4 follow-up (maintainer review: "I don't want to
+    // leave the user the possibility to change something that breaks the
+    // app or is useless in most cases"): a confidently-inferred field must
+    // render as a plain label only — no correction control at all. `time_column`
+    // (which has no control of its own) is forced Low in both variants so the
+    // bar stays expanded either way, isolating exactly what the field under
+    // test's own confidence adds to the render.
+    #[test]
+    fn delimiter_correction_control_only_renders_when_the_field_is_low_confidence() {
+        let mut high = sample_report(Confidence::High);
+        high.time_column.confidence = Confidence::Low;
+        let mut low = high.clone();
+        low.delimiter.confidence = Confidence::Low;
+
+        let high_shapes = render_shape_count(&high);
+        let low_shapes = render_shape_count(&low);
+
+        assert!(
+            low_shapes > high_shapes,
+            "a low-confidence delimiter must render a correction control a high-confidence \
+             one does not (high: {high_shapes} shapes, low: {low_shapes} shapes)"
+        );
+    }
+
+    #[test]
+    fn decimal_separator_correction_control_only_renders_when_the_field_is_low_confidence() {
+        let mut high = sample_report(Confidence::High);
+        high.time_column.confidence = Confidence::Low;
+        let mut low = high.clone();
+        low.decimal_separator.confidence = Confidence::Low;
+
+        let high_shapes = render_shape_count(&high);
+        let low_shapes = render_shape_count(&low);
+
+        assert!(
+            low_shapes > high_shapes,
+            "a low-confidence decimal separator must render a correction control a \
+             high-confidence one does not (high: {high_shapes} shapes, low: {low_shapes} shapes)"
+        );
+    }
+
+    // Corpus cases 26/27's shape: the format genuinely is `DayFirst`, but a
+    // field > 12 confidently settled it — that must render no swap button,
+    // unlike case 28's genuinely ambiguous `DayFirst` fallback.
+    #[test]
+    fn timestamp_format_swap_button_only_renders_when_the_field_is_low_confidence() {
+        let mut high = sample_report(Confidence::High);
+        high.time_column.confidence = Confidence::Low;
+        high.timestamp_format.value = Some("dd_mm_yyyy".to_string());
+        let mut low = high.clone();
+        low.timestamp_format.confidence = Confidence::Low;
+
+        let high_shapes = render_shape_count(&high);
+        let low_shapes = render_shape_count(&low);
+
+        assert!(
+            low_shapes > high_shapes,
+            "a genuinely ambiguous day-first read must render the swap button; a confidently \
+             disambiguated one (corpus cases 26/27) must not (high: {high_shapes} shapes, \
+             low: {low_shapes} shapes)"
+        );
+    }
+
+    // The OOM investigation on PR #98 found `Whitespace` uniquely unsafe: it
+    // doesn't fail predictably the way an absent byte delimiter does, so it
+    // must never be offered as a correction target, low-confidence or not.
+    #[test]
+    fn delimiter_options_excludes_whitespace() {
+        assert!(!DELIMITER_OPTIONS.contains(&Delimiter::Whitespace));
     }
 }

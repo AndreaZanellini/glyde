@@ -14,18 +14,26 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ### Added
 - **You can now correct the delimiter, decimal separator, or an ambiguous
   day/month date reading directly in the inference bar, and the plot
-  re-indexes immediately.** The inference bar (the "Inference — N samples,
-  ..." strip above the plot) already told you what Glyde inferred; it now
-  lets you fix it when it's wrong. Expand the bar and you'll find a
-  "Correct…" dropdown next to the delimiter and decimal separator fields —
-  picking a different value reopens the file under that choice. When the
-  timestamp format is the genuinely ambiguous `DD/MM`/`MM/DD` case (SPEC
-  §2.1's "no field greater than 12 anywhere in the column"), a "Swap to
+  re-indexes immediately — but only when Glyde is actually unsure.** The
+  inference bar (the "Inference — N samples, ..." strip above the plot)
+  already told you what Glyde inferred; it now lets you fix it when it's
+  genuinely uncertain. A "Correct…" dropdown appears next to the delimiter
+  or decimal separator field *only* when that specific field is flagged low
+  confidence; a clean, unambiguous file (the common case) shows plain labels
+  and nothing to click, on purpose — there is nothing to correct, and a
+  control sitting next to an already-correct value would only invite
+  breaking something that already works. The delimiter dropdown also never
+  offers "whitespace" as a choice: unlike every other delimiter, picking it
+  wrong doesn't fail predictably, so it isn't offered as a one-click option.
+  When the timestamp format is the genuinely ambiguous `DD/MM`/`MM/DD` case
+  (SPEC §2.1's "no field greater than 12 anywhere in the column"), a "Swap to
   MM/DD" or "Swap to DD/MM" button appears next to it instead — SPEC §2.1's
-  own one-click-swap wording. A correction is never treated as a guess: it's
-  reported at full confidence and stays applied if you correct a second
-  field on the same file (corrections accumulate); opening a different file
-  starts from a clean slate.
+  own one-click-swap wording, and, same as the other two, only when the read
+  is genuinely ambiguous, not merely because the format happens to be
+  day/month-shaped. A correction is never treated as a guess: it's reported
+  at full confidence and stays applied if you correct a second field on the
+  same file (corrections accumulate); opening a different file starts from a
+  clean slate.
 
   Correcting a field re-opens the same file path with different content —
   same path, size, and modification time as before, but a different plot —
