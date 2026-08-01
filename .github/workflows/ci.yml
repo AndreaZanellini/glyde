@@ -107,10 +107,24 @@ jobs:
     runs-on: macos-14
     env:
       # docs/QUALITY.md §3 asks for a 20 GB memory-gate fixture. GitHub-hosted
-      # runners provide 14 GB of SSD, so the full-size run belongs to the
-      # maintainer's manual ritual (docs/QUALITY.md §5); CI proves the same
-      # invariant on the largest fixture that fits. See issue #61.
-      GLYDE_BENCH_FIXTURE_GB: "0.1"
+      # runners provide ~14 GB of SSD, so the full-size run stays in the
+      # maintainer's manual ritual (docs/QUALITY.md §5). What CI has to prove
+      # is the *invariant*, and that only means something on a fixture larger
+      # than the cap the gate asserts against: macos-14 has 7 GB of RAM, so
+      # SPEC §5's min(25% RAM, 4 GB) budget is ~1.75 GB there. 4 GB is ~2.3x
+      # that cap — a file that cannot be materialized in memory even once,
+      # which is the bug class this gate exists to catch. The old 0.1 was
+      # pinned by #75: at the ~2.5x materialization multiplier measured there,
+      # anything larger turned the job red. #75 landed, so the pin is gone.
+      # See issue #83.
+      #
+      # Disk: the 4 GB CSV plus ~2.9 GB of spill files is the peak. The gate
+      # runs *before* the criterion benches and reclaims its fixture straight
+      # after, so it never shares the SSD with the two 1 GB fixtures those
+      # benches generate for themselves. If a runner image ever shrinks the
+      # disk, lower this to 3 rather than back to 0.1 — anything above ~2 GB
+      # still exceeds the cap and keeps the gate meaningful.
+      GLYDE_BENCH_FIXTURE_GB: "4"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -120,14 +134,25 @@ jobs:
       # Large fixtures are generated, never committed. See docs/QUALITY.md §3.
       - name: Generate large synthetic fixtures
         run: cargo run --release -p glyde-devtools --bin generate_fixtures -- --size-gb "$GLYDE_BENCH_FIXTURE_GB"
+      # The memory gate runs before the criterion benches, and its fixture and
+      # spill files are reclaimed immediately after, so the multi-GB fixture
+      # never shares the disk with the benches' own 1 GB ones
+      # (benches/first_plot.rs, benches/index_build.rs). See issue #83.
+      - name: Peak memory gate
+        run: cargo run --release -p glyde-devtools --bin memory_gate -- --size-gb "$GLYDE_BENCH_FIXTURE_GB"
+      - name: Reclaim the memory-gate fixture and its spill files
+        if: always()
+        run: |
+          rm -rf testdata/generated
+          rm -rf "$HOME/Library/Caches/com.glyde.Glyde"
+          df -h .
       # Absolute SPEC §5 ceilings are asserted inside each bench and fail the
       # build when breached. The QUALITY §3.2 ">15% vs main" comparison is NOT
       # run here: hosted runners are too noisy for a 15% threshold to mean
-      # anything. It belongs on the SPEC §5 reference machine. See issue #61.
+      # anything — docs/QUALITY.md §3 and §5 now say so too, and §5 carries the
+      # reference-machine recipe. See issues #61, #83.
       - name: Criterion benchmarks (build-blocking budgets)
         run: cargo bench -p glyde-core
-      - name: Peak memory gate
-        run: cargo run --release -p glyde-devtools --bin memory_gate -- --size-gb "$GLYDE_BENCH_FIXTURE_GB"
 
   deny:
     name: Licenses & advisories

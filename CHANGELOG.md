@@ -75,6 +75,23 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `blocking-decision` issue rather than decided here.
 
 ### Changed
+- **The memory guard-rail test in CI now runs on a file bigger than the memory
+  limit it is meant to protect.** Glyde's most important automated check opens
+  a large synthetic file headlessly and fails the build if memory use crosses
+  the limit the spec sets. That check had been running on a 100 MB file —
+  small enough to fit inside the limit several times over, so it could not
+  have caught the very problem it exists to catch. It now runs on a 4 GB file
+  against a ~1.75 GB limit on the CI machine: a file that cannot be held in
+  memory in one piece at all. The check also runs before the other benchmarks
+  now and deletes its file immediately afterwards, so the CI machine's disk
+  never has to hold every large test file at the same time.
+- **The "no benchmark may get more than 15% slower" rule is now written down
+  where it actually happens.** It was documented as an automatic check but ran
+  nowhere: rented CI machines are too noisy for a 15% threshold to mean
+  anything, so it would have either cried wolf constantly or been widened
+  until it never fired. It is now part of the pre-release ritual on the
+  reference machine, with the exact commands to run, alongside the full-size
+  20 GB memory run.
 - **Opening a large file spends less CPU on background indexing while it's
   still loading, so the rest of the app stays more responsive.** As a file
   loads, Glyde periodically refreshes the plot's zoomed-out overview so it
