@@ -124,6 +124,36 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `blocking-decision` issue rather than decided here.
 
 ### Changed
+- **The memory guard-rail test in CI now also checks the drawing index, not
+  just the file open — and the last two places that could have quietly
+  reloaded a whole file are gone.** Opening a huge file was already proven not
+  to grow Glyde's memory with the file's size. Building the min/max index that
+  the plot is actually drawn from was not: it asked for every timestamp and
+  every value of a column in one piece, which for a file streamed to disk
+  means pulling the whole thing back into memory — the exact problem the
+  streaming was there to avoid. Nothing you could do in the app reached that
+  code yet, which is why nobody had seen it; it was one wiring change away
+  from being reachable, and no test would have caught it. The index is now
+  built by reading each column back in small pieces, the guard-rail check in
+  CI builds a real index before it measures, and a new test fails the build if
+  index-building ever starts growing with file size again. Measured on a 1 GB
+  file: the whole open-plus-index cycle peaks at 91 MB, of which 85 MB is the
+  index itself and ~7 MB is everything else, flat regardless of file size.
+  The index is bit-for-bit the same one as before — same buckets, same peaks
+  and troughs, same handling of missing values — this only changes how it is
+  read, never what it computes. (issue #88)
+
+  **Assumptions made:** (1) the guard-rail check builds an index for *one* of
+  its test file's eight columns by default, not all eight. Reading is now
+  bounded, but the finished index still costs about 9 bytes per value per
+  column, so indexing all eight columns of a 4 GB file would exceed the memory
+  limit on its own merits and would say nothing about the bug this check
+  exists to catch. That remaining cost is now filed as issue #102, with the
+  measurements. (2) Files streamed to disk still get no index in the app
+  itself — the plot falls back to reading only what is on screen, exactly as
+  before. Turning that on is a separate decision that depends on #102, so this
+  change deliberately does not make it.
+
 - **The memory guard-rail test in CI now runs on a file bigger than the memory
   limit it is meant to protect.** Glyde's most important automated check opens
   a large synthetic file headlessly and fails the build if memory use crosses

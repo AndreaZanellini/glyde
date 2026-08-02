@@ -59,7 +59,9 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::CacheKey;
-use crate::dsp::decimation::{build_pyramid, Bucket};
+use crate::dsp::decimation::{build_pyramid, build_pyramid_streaming, Bucket};
+use crate::series::SampleSource;
+use crate::time::TickSource;
 use crate::{GlydeError, Result};
 
 const MAGIC: &[u8; 8] = b"GLYDEPYR";
@@ -96,6 +98,30 @@ pub fn build_or_open(
         return Ok(pyramid);
     }
     build(cache_dir, key, samples, timestamps)
+}
+
+/// [`build_or_open`] for a *spilled* column (issue #88): identical caching
+/// behaviour, but a miss rebuilds through
+/// [`crate::dsp::decimation::build_pyramid_streaming`], which reads the
+/// samples and ticks in bounded chunks instead of taking one slice over each
+/// memory-mapped column. A hit is the same cache read either way — it never
+/// touches the source data at all.
+pub fn build_or_open_streaming<S, T>(
+    cache_dir: &Path,
+    key: &CacheKey,
+    samples: &S,
+    timestamps: &T,
+) -> Result<Vec<Vec<Bucket>>>
+where
+    S: SampleSource + ?Sized,
+    T: TickSource + ?Sized,
+{
+    if let Some(pyramid) = try_open(cache_dir, key)? {
+        return Ok(pyramid);
+    }
+    let pyramid = build_pyramid_streaming(samples, timestamps)?;
+    write_cache(cache_dir, key, &pyramid)?;
+    Ok(pyramid)
 }
 
 /// Builds a new pyramid from `samples`/`timestamps` via [`build_pyramid`],

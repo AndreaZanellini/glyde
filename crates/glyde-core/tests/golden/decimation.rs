@@ -20,8 +20,13 @@
 //! looks wrong, that is a `blocking-decision` issue, not an edit.
 
 use glyde_core::dsp::decimation::{
-    build_pyramid, decimate_viewport, extend_pyramid, Bucket, PYRAMID_FACTOR,
+    build_pyramid, build_pyramid_streaming, decimate_viewport, extend_pyramid, Bucket,
+    PYRAMID_FACTOR,
 };
+use glyde_core::series::SampleSource;
+use glyde_core::time::TickSource;
+use glyde_core::Result;
+use std::ops::Range;
 
 /// A tiny deterministic PRNG (xorshift64*) so "random data" fixtures are
 /// reproducible without adding a `rand` dependency to the workspace.
@@ -362,4 +367,221 @@ fn extend_pyramid_with_no_previous_checkpoint_matches_build_pyramid() {
     let rebuilt = build_pyramid(&samples, &timestamps);
 
     assert_eq!(extended, rebuilt);
+}
+
+/// A [`SampleSource`]/[`TickSource`] pair that hands its data over in
+/// deliberately awkward chunk sizes, so the streaming builder is exercised
+/// across chunk boundaries that do *not* line up with [`PYRAMID_FACTOR`].
+/// Stands in for a spilled column (`ingest::dataset`) without needing a file,
+/// exactly as `time::ticks`' own `ChunkedTicks` does for the Δt scans.
+struct ChunkedSamples {
+    samples: Vec<f64>,
+    chunk_len: usize,
+}
+
+impl SampleSource for ChunkedSamples {
+    fn sample_count(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn visit_sample_chunks(
+        &self,
+        range: Range<usize>,
+        visit: &mut dyn FnMut(&[f64]) -> Result<()>,
+    ) -> Result<()> {
+        visit_in_chunks(&self.samples, range, self.chunk_len, visit)
+    }
+}
+
+struct ChunkedTicks {
+    ticks: Vec<i128>,
+    chunk_len: usize,
+}
+
+impl TickSource for ChunkedTicks {
+    fn tick_count(&self) -> usize {
+        self.ticks.len()
+    }
+
+    fn visit_tick_chunks(
+        &self,
+        range: Range<usize>,
+        visit: &mut dyn FnMut(&[i128]) -> Result<()>,
+    ) -> Result<()> {
+        visit_in_chunks(&self.ticks, range, self.chunk_len, visit)
+    }
+}
+
+fn visit_in_chunks<T>(
+    values: &[T],
+    range: Range<usize>,
+    chunk_len: usize,
+    visit: &mut dyn FnMut(&[T]) -> Result<()>,
+) -> Result<()> {
+    let start = range.start.min(values.len());
+    let end = range.end.min(values.len());
+    if start >= end {
+        return Ok(());
+    }
+    for chunk in values[start..end].chunks(chunk_len.max(1)) {
+        visit(chunk)?;
+    }
+    Ok(())
+}
+
+/// The streaming builder's whole correctness contract (issue #88): reading a
+/// column in bounded chunks — which is what lets a spilled, memory-mapped
+/// column be aggregated without making every page of it resident — must
+/// produce the *exact* same pyramid as [`build_pyramid`] over the same data
+/// held whole in memory. Bucket-for-bucket, level-for-level, for every
+/// combination of sample-chunk and tick-chunk size, including sizes that are
+/// coprime with [`PYRAMID_FACTOR`] and with each other, so a bucket's contents
+/// can never depend on how the read happened to be split up.
+#[test]
+fn build_pyramid_streaming_matches_build_pyramid_at_every_chunk_size() {
+    // Deliberately awkward: primes, one, exactly PYRAMID_FACTOR, one either
+    // side of it, and sizes larger than the data itself.
+    const CHUNK_SIZES: &[usize] = &[1, 2, 3, 5, 7, 8, 9, 13, 64, 65, 1_000, 10_000];
+    const SAMPLE_COUNT: usize = 5_000;
+
+    let mut rng = Xorshift64::new(0xB0117);
+    let samples: Vec<f64> = (0..SAMPLE_COUNT).map(|_| rng.next_f64() * 1000.0).collect();
+    let timestamps: Vec<i128> = (0..SAMPLE_COUNT as i128).map(|i| i * 7).collect();
+
+    let expected = build_pyramid(&samples, &timestamps);
+    assert!(
+        expected.len() > 1,
+        "the fixture must produce a multi-level pyramid, not just level 0"
+    );
+
+    for &sample_chunk in CHUNK_SIZES {
+        for &tick_chunk in CHUNK_SIZES {
+            let streamed = build_pyramid_streaming(
+                &ChunkedSamples {
+                    samples: samples.clone(),
+                    chunk_len: sample_chunk,
+                },
+                &ChunkedTicks {
+                    ticks: timestamps.clone(),
+                    chunk_len: tick_chunk,
+                },
+            )
+            .expect("an in-memory chunked source never fails");
+
+            assert_eq!(
+                streamed, expected,
+                "streaming {SAMPLE_COUNT} samples {sample_chunk} at a time against ticks read \
+                 {tick_chunk} at a time must produce exactly the pyramid build_pyramid produces \
+                 over the same data held whole"
+            );
+        }
+    }
+}
+
+/// NaN handling is part of the bucket definition (`nan_count` counted, the
+/// min/max envelope left to the real samples), so the streaming path must
+/// reproduce it exactly — including a bucket that is *entirely* NaN, whose
+/// envelope stays `+∞`/`−∞` and must survive being merged across a chunk
+/// boundary rather than being collapsed to a real number.
+#[test]
+fn build_pyramid_streaming_preserves_nan_counts_and_envelopes_across_chunk_boundaries() {
+    const SAMPLE_COUNT: usize = 400;
+
+    // Every sample of buckets 2 and 5 is NaN; elsewhere every third sample is.
+    let samples: Vec<f64> = (0..SAMPLE_COUNT)
+        .map(|i| {
+            let bucket = i / PYRAMID_FACTOR;
+            if bucket == 2 || bucket == 5 || i % 3 == 0 {
+                f64::NAN
+            } else {
+                i as f64
+            }
+        })
+        .collect();
+    let timestamps: Vec<i128> = (0..SAMPLE_COUNT as i128).collect();
+
+    let expected = build_pyramid(&samples, &timestamps);
+
+    for chunk_len in [1usize, 3, 5, 8, 17] {
+        let streamed = build_pyramid_streaming(
+            &ChunkedSamples {
+                samples: samples.clone(),
+                chunk_len,
+            },
+            &ChunkedTicks {
+                ticks: timestamps.clone(),
+                chunk_len,
+            },
+        )
+        .expect("an in-memory chunked source never fails");
+
+        assert_eq!(streamed.len(), expected.len());
+        for (level, (streamed_level, expected_level)) in
+            streamed.iter().zip(expected.iter()).enumerate()
+        {
+            assert_eq!(streamed_level.len(), expected_level.len());
+            for (index, (got, want)) in streamed_level.iter().zip(expected_level.iter()).enumerate()
+            {
+                assert_eq!(
+                    got.min.to_bits(),
+                    want.min.to_bits(),
+                    "level {level} bucket {index} min differs when streamed {chunk_len} at a time"
+                );
+                assert_eq!(
+                    got.max.to_bits(),
+                    want.max.to_bits(),
+                    "level {level} bucket {index} max differs when streamed {chunk_len} at a time"
+                );
+                assert_eq!(got.nan_count, want.nan_count);
+                assert_eq!(got.first_ts, want.first_ts);
+                assert_eq!(got.last_ts, want.last_ts);
+            }
+        }
+    }
+}
+
+/// The degenerate shapes SPEC §1.4 requires to render: an empty column has no
+/// pyramid at all, and a single sample is one single-sample level-0 bucket —
+/// both exactly as [`build_pyramid`] already reports them.
+#[test]
+fn build_pyramid_streaming_matches_build_pyramid_on_empty_and_single_sample_columns() {
+    for sample_count in [0usize, 1, 2, 7, 8] {
+        let samples: Vec<f64> = (0..sample_count).map(|i| i as f64).collect();
+        let timestamps: Vec<i128> = (0..sample_count as i128).collect();
+
+        let streamed = build_pyramid_streaming(
+            &ChunkedSamples {
+                samples: samples.clone(),
+                chunk_len: 1,
+            },
+            &ChunkedTicks {
+                ticks: timestamps.clone(),
+                chunk_len: 1,
+            },
+        )
+        .expect("an in-memory chunked source never fails");
+
+        assert_eq!(
+            streamed,
+            build_pyramid(&samples, &timestamps),
+            "a {sample_count}-sample column must stream to the same pyramid it builds to"
+        );
+    }
+}
+
+/// A slice is itself a [`SampleSource`]/[`TickSource`], so the streaming entry
+/// point is usable on the small-file path too — and must agree there as well,
+/// which is what makes it safe for `ingest` to route *any* dataset through it.
+#[test]
+fn build_pyramid_streaming_over_plain_slices_matches_build_pyramid() {
+    const SAMPLE_COUNT: usize = 3_000;
+
+    let mut rng = Xorshift64::new(0x5115);
+    let samples: Vec<f64> = (0..SAMPLE_COUNT).map(|_| rng.next_f64() * 42.0).collect();
+    let timestamps: Vec<i128> = (0..SAMPLE_COUNT as i128).map(|i| i * 3 + 100).collect();
+
+    let streamed = build_pyramid_streaming(samples.as_slice(), timestamps.as_slice())
+        .expect("an in-memory slice source never fails");
+
+    assert_eq!(streamed, build_pyramid(&samples, &timestamps));
 }

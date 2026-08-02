@@ -24,11 +24,21 @@
 //! "the whole file was materialized in RAM" bugs, which blow the cap at a
 //! few hundred MB already (issue #58), so a smaller fixture still exercises
 //! the invariant that matters.
+//!
+//! **The pyramid is part of what is measured** (issue #88). Opening a file is
+//! only half of what the app does with it: it then builds the min/max pyramid
+//! the time view renders from, which reads every sample and every tick. Until
+//! this gate covered that too, the flat-RSS property was only ever proven for
+//! the path that skips it, and a whole-column read there would have gone
+//! unnoticed. `--pyramid-columns` decides how many of the fixture's numeric
+//! columns get one; see its own documentation for why the default is not "all
+//! of them".
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use glyde_core::budget::RamBudget;
-use glyde_core::ingest;
+use glyde_core::dsp::decimation::{build_pyramid_streaming, Bucket};
+use glyde_core::ingest::{self, Dataset};
 use glyde_devtools::{fixture_path, write_csv_fixture, PeakRssSampler};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -63,6 +73,50 @@ struct Args {
     /// path, not passing a large number here.
     #[arg(long)]
     budget_gb: Option<f64>,
+
+    /// How many of the fixture's numeric columns to build a full min/max
+    /// pyramid for, with the peak-RSS sampler still running (issue #88). `0`
+    /// measures the open alone, as this gate did before.
+    ///
+    /// The default is 1, not "every column", and deliberately so: reading the
+    /// source columns to build a pyramid is bounded, but the pyramid it
+    /// produces is not — about 9 bytes per sample per column across all
+    /// levels, which for this gate's 8-column fixture would be a multiple of
+    /// the SPEC §5 cap on its own and would say nothing about the bug class
+    /// this gate exists to catch. One column proves the *reading* is bounded;
+    /// bounding the pyramid's own size is issue #102.
+    #[arg(long, default_value_t = 1)]
+    pyramid_columns: usize,
+}
+
+/// Builds a full pyramid for up to `column_limit` of `dataset`'s numeric
+/// columns, through the bounded-chunk reader so a spilled column is never made
+/// resident (issue #88). Returns the pyramids themselves — the caller must
+/// keep them alive until the RSS sampler stops, or their cost is not measured.
+fn build_gate_pyramids(dataset: &Dataset, column_limit: usize) -> Result<Vec<Vec<Vec<Bucket>>>> {
+    let mut pyramids = Vec::new();
+    for (index, series) in dataset.columns.iter().enumerate() {
+        if pyramids.len() >= column_limit {
+            break;
+        }
+        let Some(samples) = series.values().sample_source() else {
+            continue; // bool/string: no numeric plot, no pyramid
+        };
+        let pyramid = build_pyramid_streaming(&samples, &dataset.time)
+            .with_context(|| format!("building the pyramid for column {index}"))?;
+        pyramids.push(pyramid);
+    }
+    Ok(pyramids)
+}
+
+/// Total bytes the built pyramids occupy, so the printed line separates the
+/// pyramid's own unavoidable `O(rows)` cost from everything else.
+fn pyramid_bytes(pyramids: &[Vec<Vec<Bucket>>]) -> usize {
+    pyramids
+        .iter()
+        .flat_map(|levels| levels.iter())
+        .map(|level| level.len() * std::mem::size_of::<Bucket>())
+        .sum()
 }
 
 fn main() -> Result<()> {
@@ -95,6 +149,7 @@ fn main() -> Result<()> {
         file_bytes,
         cap_bytes = budget.cap_bytes(),
         planning_cap_bytes = planning_budget.map(|b| b.cap_bytes()),
+        pyramid_columns = args.pyramid_columns,
         "memory_gate: opening fixture"
     );
 
@@ -106,7 +161,22 @@ fn main() -> Result<()> {
         }
         None => ingest::open_dataset(&path),
     };
+    // Build the pyramid *while the sampler is still running* and keep it alive
+    // until it stops: this is the whole point of measuring it (issue #88).
+    let pyramids = match open_result.as_ref() {
+        Ok((_summary, _report, dataset)) => {
+            Some(build_gate_pyramids(dataset, args.pyramid_columns))
+        }
+        Err(_) => None,
+    };
+    let pyramid_summary = pyramids.as_ref().map(|built| {
+        built
+            .as_ref()
+            .map(|pyramids| (pyramids.len(), pyramid_bytes(pyramids)))
+            .map_err(|err| err.to_string())
+    });
     let peak_bytes = sampler.stop();
+    drop(pyramids);
 
     // Propagate an open failure after the sampler is stopped, not before —
     // the peak RSS up to the point of failure is still useful in the error.
@@ -120,11 +190,23 @@ fn main() -> Result<()> {
     };
     drop(dataset);
 
+    let (pyramided_columns, pyramid_byte_count) = pyramid_summary
+        .expect("the open succeeded, so the pyramid build was attempted")
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("building pyramids over fixture {}", path.display()))?;
+    anyhow::ensure!(
+        pyramided_columns == args.pyramid_columns,
+        "memory_gate: asked for {} pyramided columns but only {pyramided_columns} of the \
+         fixture's columns are numeric",
+        args.pyramid_columns
+    );
+
     let cap_bytes = budget.cap_bytes();
     let ratio = peak_bytes as f64 / file_bytes.max(1) as f64;
 
     println!(
         "memory_gate: {row_count} rows, file {file_bytes} bytes, storage {storage}, \
+         {pyramided_columns} pyramided columns ({pyramid_byte_count} bytes of buckets), \
          peak RSS {peak_bytes} bytes ({ratio:.2}x file size), cap {cap_bytes} bytes"
     );
 

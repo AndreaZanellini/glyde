@@ -26,6 +26,21 @@
 //! and large-file cases. Never widen a golden test's tolerance or change its
 //! expectations to make an implementation pass — if one looks wrong, that is
 //! a `blocking-decision` issue, not an edit.
+//!
+//! [`build_pyramid_streaming`] (issue #88) is the one addition to that shape,
+//! and it does not change it: the slice-taking signatures above are untouched
+//! and stay the golden-tested engine, while the streaming entry point feeds
+//! the *same* bucket accumulator from a [`SampleSource`]/[`TickSource`] pair
+//! read in bounded chunks. It exists because handing `build_pyramid` one
+//! contiguous slice over a spilled, memory-mapped column makes every page of
+//! that column resident — the residency issue #85 removed from the time axis
+//! — and a golden test locks the two paths to bucket-for-bucket equality at
+//! every chunk size, so there is still exactly one aggregation definition
+//! (docs/ARCHITECTURE.md Hard rule 4).
+
+use crate::series::SampleSource;
+use crate::time::TickSource;
+use crate::Result;
 
 /// One pyramid bucket: `(min, max, first_ts, last_ts, nan_count)` over the
 /// raw samples/time-range it aggregates (ARCH §The index).
@@ -62,25 +77,166 @@ pub fn build_pyramid(samples: &[f64], timestamps: &[i128]) -> Vec<Vec<Bucket>> {
         return Vec::new();
     }
 
-    let mut levels = vec![bucket_level_from_samples(samples, timestamps)];
+    grow_levels(bucket_level_from_samples(samples, timestamps))
+}
 
+/// Builds the same pyramid [`build_pyramid`] builds — bucket for bucket, level
+/// for level — but reading `samples` and `timestamps` in bounded chunks
+/// instead of taking one contiguous slice over each (issue #88).
+///
+/// This is the entry point for a *spilled* column (issue #75): its samples and
+/// its ticks are memory-mapped files, and handing `build_pyramid` a slice over
+/// them makes every page resident as the aggregation walks it end to end — 8
+/// bytes per sample plus 16 per tick, proportional to file size, which cannot
+/// fit SPEC §5's flat `min(25% RAM, 4 GB)` cap. Reading through
+/// [`SampleSource`]/[`TickSource`] leaves those pages in the OS page cache
+/// instead, so the only memory this call adds beyond the pyramid it returns is
+/// two fixed-size chunk buffers.
+///
+/// The pyramid itself is still `O(rows)` — about 9 bytes per sample across all
+/// levels — so this bounds the *input*, not the output (issue #102).
+///
+/// Both sources must hold the same number of elements and `timestamps` must be
+/// non-decreasing, exactly as [`build_pyramid`] requires. Fails only if a
+/// source's own read fails (a spilled column's file being unreadable); an
+/// in-memory source cannot fail.
+pub fn build_pyramid_streaming<S, T>(samples: &S, timestamps: &T) -> Result<Vec<Vec<Bucket>>>
+where
+    S: SampleSource + ?Sized,
+    T: TickSource + ?Sized,
+{
+    let sample_count = samples.sample_count();
+    debug_assert_eq!(
+        sample_count,
+        timestamps.tick_count(),
+        "samples and timestamps must be the same length"
+    );
+
+    if sample_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Ticks drive the outer loop and samples the inner one, so each tick chunk
+    // is paired with exactly the sample range it covers — the two sources are
+    // free to chunk differently (and do: a spilled column and an in-memory one
+    // have different natural chunk sizes), and neither ever has to be
+    // materialized whole to line them up.
+    let mut level0 = Level0Builder::for_sample_count(sample_count);
+    let mut position = 0usize;
+    timestamps.visit_tick_chunks(0..sample_count, &mut |tick_chunk| {
+        let start = position;
+        position += tick_chunk.len();
+        let mut offset = 0usize;
+        samples.visit_sample_chunks(start..position, &mut |sample_chunk| {
+            let end = offset + sample_chunk.len();
+            level0.push_chunk(sample_chunk, &tick_chunk[offset..end]);
+            offset = end;
+            Ok(())
+        })?;
+        debug_assert_eq!(
+            offset,
+            tick_chunk.len(),
+            "the sample source must yield exactly as many samples as there are ticks"
+        );
+        Ok(())
+    })?;
+
+    Ok(grow_levels(level0.finish()))
+}
+
+/// Aggregates a finished level 0 into the levels above it, [`PYRAMID_FACTOR`]
+/// children at a time, until the top level is too short to group further.
+/// Shared by [`build_pyramid`] and [`build_pyramid_streaming`] so the two can
+/// only ever differ in how level 0 was *read*, never in how it is aggregated.
+fn grow_levels(level0: Vec<Bucket>) -> Vec<Vec<Bucket>> {
+    if level0.is_empty() {
+        return Vec::new();
+    }
+
+    let mut levels = vec![level0];
     while levels.last().expect("levels is never empty").len() >= PYRAMID_FACTOR {
         let next = bucket_level_from_buckets(levels.last().expect("levels is never empty"));
         levels.push(next);
     }
-
     levels
 }
 
-/// Groups raw samples into level-0 buckets of [`PYRAMID_FACTOR`] samples each
-/// (the final group may be smaller — only ever the *last* group, since
-/// [`slice::chunks`] processes elements strictly in order).
+/// Groups raw samples into level-0 buckets of [`PYRAMID_FACTOR`] samples each,
+/// fed either all at once ([`build_pyramid`]) or a chunk at a time
+/// ([`build_pyramid_streaming`]).
+///
+/// A bucket's contents depend only on its position — buckets are the fixed
+/// [`PYRAMID_FACTOR`]-sized groups counted from the start of the column, the
+/// same grouping [`slice::chunks`] produces — so carrying a partially filled
+/// bucket across a chunk boundary is what makes the streamed result identical
+/// to the whole-slice one. Only the very last bucket of the column can be
+/// short.
+struct Level0Builder {
+    buckets: Vec<Bucket>,
+    /// The bucket currently being filled, and how many samples are in it
+    /// (always `1..PYRAMID_FACTOR` while `Some`: a bucket is pushed the moment
+    /// it fills).
+    pending: Option<(Bucket, usize)>,
+}
+
+impl Level0Builder {
+    fn for_sample_count(sample_count: usize) -> Self {
+        Self {
+            // Exact, not a growth guess: level 0 always has this many buckets,
+            // so the accumulator never reallocates (and never spikes to 1.5x
+            // its own size doing so) as it fills.
+            buckets: Vec::with_capacity(sample_count.div_ceil(PYRAMID_FACTOR)),
+            pending: None,
+        }
+    }
+
+    /// Adds one contiguous run of samples, in row order, continuing from
+    /// whatever the previous run left half-finished.
+    fn push_chunk(&mut self, samples: &[f64], timestamps: &[i128]) {
+        debug_assert_eq!(
+            samples.len(),
+            timestamps.len(),
+            "samples and timestamps must be the same length"
+        );
+
+        let mut offset = 0;
+        while offset < samples.len() {
+            let filled = self.pending.map_or(0, |(_, filled)| filled);
+            let take = (PYRAMID_FACTOR - filled).min(samples.len() - offset);
+            let end = offset + take;
+            let piece = raw_range_bucket(&samples[offset..end], &timestamps[offset..end]);
+
+            self.pending = Some(match self.pending.take() {
+                Some((partial, filled)) => (merge_buckets(partial, piece), filled + take),
+                None => (piece, take),
+            });
+            offset = end;
+
+            if self
+                .pending
+                .is_some_and(|(_, filled)| filled == PYRAMID_FACTOR)
+            {
+                let (bucket, _) = self.pending.take().expect("checked as Some above");
+                self.buckets.push(bucket);
+            }
+        }
+    }
+
+    /// The finished level 0, including a final short bucket if the column's
+    /// length is not a multiple of [`PYRAMID_FACTOR`].
+    fn finish(mut self) -> Vec<Bucket> {
+        if let Some((bucket, _)) = self.pending.take() {
+            self.buckets.push(bucket);
+        }
+        self.buckets
+    }
+}
+
+/// [`Level0Builder`] over one whole slice — the in-memory case.
 fn bucket_level_from_samples(samples: &[f64], timestamps: &[i128]) -> Vec<Bucket> {
-    samples
-        .chunks(PYRAMID_FACTOR)
-        .zip(timestamps.chunks(PYRAMID_FACTOR))
-        .map(|(sample_chunk, ts_chunk)| raw_range_bucket(sample_chunk, ts_chunk))
-        .collect()
+    let mut builder = Level0Builder::for_sample_count(samples.len());
+    builder.push_chunk(samples, timestamps);
+    builder.finish()
 }
 
 /// Aggregates one pyramid level into the next, exactly — min-of-mins,
