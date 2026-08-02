@@ -76,9 +76,10 @@ use glyde_core::time::{format_timestamp, Timestamp};
 /// (issue #92): `Some` for a completed, non-spilled load's column whose raw
 /// samples are served from the on-disk Level-0 cache — [`column_f64_samples`]
 /// prefers it over both the zero-copy `f64` path and `sample_cache`, since
-/// the cache already holds exactly the converted values a reopen would
-/// otherwise redo the conversion for. `&[]` for a still-loading partial
-/// dataset, which has no cache of its own yet.
+/// the cache holds exactly the converted values, already mapped, so the
+/// reopen that produced it never had to convert them again
+/// (`ingest::derived_caches_for_dataset_cached`). `&[]` for a still-loading
+/// partial dataset, which has no cache of its own yet.
 pub fn show(
     ui: &mut egui::Ui,
     dataset: &Dataset,

@@ -214,13 +214,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
   plot has zoomed in far enough to show individual raw sample points rather
   than the min/max overview — still recomputed their samples from scratch on
   every reopen. Glyde now caches those raw samples the same way, to the same
-  on-disk cache keyed by path, size, and modification time, so a reopen no
-  longer redoes that conversion either. Nothing changes about what is drawn
+  on-disk cache keyed by path, size, and modification time.
+  For a file with whole-number columns (counts, IDs, raw ADC readings), those
+  values have to be converted before they can be plotted, one value at a
+  time; a reopen now does **none** of that conversion work, where before it
+  did all of it. Nothing changes about what is drawn
   — the cached values are exactly what a fresh read would produce, proven by
   a test that opens the same file twice under deliberately mismatched
   in-memory data and confirms the second open still serves the correct,
   cached values rather than recomputing from whatever happened to be passed
-  in. (issue #92, the follow-up the entry above left open)
+  in, and by a second test that counts the conversion work itself: a first
+  open converts each column exactly once, a reopen not at all. (issue #92,
+  the follow-up the entry above left open)
 
   **Assumption made:** this covers the same scope the entry above does —
   files small enough to load into memory outright, not the disk-streamed

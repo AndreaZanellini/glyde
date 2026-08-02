@@ -256,21 +256,27 @@ fn run_index_job(
             // unchanged file skips rebuilding it.
             // issue #92: same treatment for the raw-sample Level-0 cache —
             // never built over a spilled dataset, served from (and written
-            // to) the on-disk cache otherwise.
+            // to) the on-disk cache otherwise. Both come from one call, which
+            // is what keeps a non-`f64` column from being converted twice per
+            // open (and at all on a reopen) — see
+            // `derived_caches_for_dataset_cached`.
             let (pyramids, level0_caches) = if dataset.is_spilled() {
                 (
                     vec![None; dataset.columns.len()],
                     (0..dataset.columns.len()).map(|_| None).collect(),
                 )
             } else {
-                let pyramids =
-                    glyde_core::ingest::pyramids_for_dataset_cached(&path, &dataset, overrides);
-                let level0_caches =
-                    glyde_core::ingest::level0_for_dataset_cached(&path, &dataset, overrides)
+                let (pyramids, level0_caches) =
+                    glyde_core::ingest::derived_caches_for_dataset_cached(
+                        &path, &dataset, overrides,
+                    );
+                (
+                    pyramids,
+                    level0_caches
                         .into_iter()
                         .map(|cache| cache.map(Arc::new))
-                        .collect();
-                (pyramids, level0_caches)
+                        .collect(),
+                )
             };
             let _ = tx.send(IndexingMessage::Completed {
                 generation,

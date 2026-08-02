@@ -1935,100 +1935,227 @@ pub fn pyramids_for_dataset_cached_with_cache_dir(
         .collect()
 }
 
-/// `dataset`'s own raw `(timestamp, value)` pairs, one entry per column in
-/// `dataset.columns` order, served from (and written to) the on-disk Level-0
-/// cache — the raw-sample counterpart of [`pyramids_for_dataset_cached`]
-/// (issue #92, split from #81: "Level-0 typed spill cache … reopen is
-/// instant"). `None` at an index whose column is non-numeric, or when the
-/// cache could not be read or written for that column (a cache is an
-/// optimization, never a requirement to open a file
-/// (docs/ARCHITECTURE.md §The index)) — [`views::time::column_f64_samples`]
-/// in `glyde-app` falls back to the in-memory dataset in either case, so a
-/// miss here never blocks rendering.
+/// One entry per column in `Dataset::columns` order: that column's min/max
+/// pyramid, or `None` when it is non-numeric (see [`Checkpoint::pyramids`]).
+pub type ColumnPyramids = Vec<Option<Vec<Vec<Bucket>>>>;
+
+/// One entry per column in `Dataset::columns` order: that column's raw
+/// `(timestamp, value)` pairs as a memory-mapped [`Level0Cache`], or `None`
+/// when it is non-numeric or its cache could not be read or written.
+pub type ColumnLevel0Caches = Vec<Option<Level0Cache>>;
+
+/// Both derived caches of one completed open, in `Dataset::columns` order —
+/// what [`derived_caches_for_dataset_cached`] returns.
+pub type DerivedCaches = (ColumnPyramids, ColumnLevel0Caches);
+
+/// Both of a completed, non-spilled open's derived caches — every column's
+/// min/max pyramid and its raw `(timestamp, value)` pairs — served from (and
+/// written to) the on-disk caches (issue #92, split from #81: "Level-0 typed
+/// spill cache … reopen is instant"). `None` at an index whose column is
+/// non-numeric, or whose cache could not be read or written: a cache is an
+/// optimization, never a requirement to open a file (docs/ARCHITECTURE.md
+/// §The index), and `glyde-app` falls back to the in-memory dataset for
+/// either case, so a miss here never blocks rendering.
 ///
-/// Unlike [`pyramids_for_dataset`], there is no "uncached" counterpart: a
-/// [`Level0Cache`] is always backed by memory-mapped files, so a caller with
-/// no writable cache directory gets `None` for every column rather than an
-/// in-memory equivalent.
+/// **The two are built together, in this order, on purpose.** Both need the
+/// column as `&[f64]`, which for any non-`f64` dtype means a
+/// [`crate::series::SeriesValues::to_f64_vec`] conversion of the whole column
+/// — per element, with SPEC §1.4's precision-loss check on every `i64`/`u64`
+/// value. Building them through two independent passes would pay that twice
+/// per open, and pay it again on every *reopen* despite both caches hitting.
+/// So, per column:
+///
+/// 1. Level 0 is resolved first, and only *converts* if its cache misses.
+/// 2. The pyramid is then built from the Level-0 cache's own memory-mapped
+///    `samples()`/`timestamps()` — which are exactly the converted values,
+///    already on disk — rather than from a second conversion. This is what
+///    docs/ARCHITECTURE.md §"Where Level 0 actually lives" describes: "the
+///    large-file path memory-maps the Level-0 cache and hands these functions
+///    a real slice over the mapped bytes".
+///
+/// The result: a reopen of an unchanged file converts nothing at all, and a
+/// first open converts each column exactly once, never twice.
 ///
 /// Each column gets its own cache entry, keyed by [`CacheKey::with_column`]
-/// and [`CacheKey::with_overrides_signature`], for the same reasons
-/// [`pyramids_for_dataset_cached_with_cache_dir`] does.
+/// and [`CacheKey::with_overrides_signature`], so a multi-column file's
+/// columns never overwrite each other's cache and a one-click correction
+/// (docs/ROADMAP.md M4) of the same, byte-for-byte unchanged file never
+/// collides with the pre-correction entry.
 ///
 /// Resolves the OS-standard cache directory itself; see
-/// [`level0_for_dataset_cached_with_cache_dir`] for a version that takes an
-/// explicit one (tests; a system with no OS cache directory falls back to
-/// `None` for every column).
+/// [`derived_caches_for_dataset_cached_with_cache_dir`] for a version taking
+/// an explicit one (tests; a system with no OS cache directory falls back to
+/// an uncached pyramid build and `None` for every Level-0 entry).
 ///
-/// Callers must not call this over a [`Dataset::is_spilled`] dataset, for
-/// the same reason [`pyramids_for_dataset`] warns against it: it walks every
-/// raw sample end to end via [`crate::series::SeriesValues::to_f64_vec`] for
-/// any non-`f64` column, which would make every page of a memory-mapped
-/// spill file resident (issue #88).
-pub fn level0_for_dataset_cached(
+/// Callers must not call this over a [`Dataset::is_spilled`] dataset. Reading
+/// one is bounded as of issue #88, but both caches would still *produce*
+/// something proportional to file size — the pyramid ~9 bytes per sample per
+/// column in RAM, the Level-0 cache a whole second copy of the column on disk
+/// and mapped — against SPEC §5's flat cap (issue #102).
+pub fn derived_caches_for_dataset_cached(
     path: &Path,
     dataset: &Dataset,
     overrides: IngestOverrides,
-) -> Vec<Option<Level0Cache>> {
+) -> DerivedCaches {
     match os_spill_dir() {
         Some(cache_dir) => {
-            level0_for_dataset_cached_with_cache_dir(path, dataset, &cache_dir, overrides)
+            derived_caches_for_dataset_cached_with_cache_dir(path, dataset, &cache_dir, overrides)
         }
-        None => (0..dataset.columns.len()).map(|_| None).collect(),
+        None => (
+            pyramids_for_dataset(dataset),
+            (0..dataset.columns.len()).map(|_| None).collect(),
+        ),
     }
 }
 
-/// [`level0_for_dataset_cached`] against an explicit cache directory, for
-/// tests that need a temp directory rather than the real OS cache dir — the
-/// same split [`pyramids_for_dataset_cached_with_cache_dir`] provides for
-/// [`pyramids_for_dataset_cached`].
-pub fn level0_for_dataset_cached_with_cache_dir(
+/// [`derived_caches_for_dataset_cached`] against an explicit cache directory,
+/// for tests that need a temp directory rather than the real OS cache dir —
+/// the same split [`load_with_budget`] provides for [`load`].
+pub fn derived_caches_for_dataset_cached_with_cache_dir(
     path: &Path,
     dataset: &Dataset,
     cache_dir: &Path,
     overrides: IngestOverrides,
-) -> Vec<Option<Level0Cache>> {
-    let ticks = dataset.time.to_pyramid_ticks();
+) -> DerivedCaches {
     let key = match CacheKey::for_path(path) {
         Ok(key) => key.with_overrides_signature(super::overrides_signature(overrides)),
         Err(err) => {
             warn!(
                 path = %path.display(),
                 error = %err,
-                "could not read this file's metadata to key its level 0 cache; the raw-sample \
-                 view will read from the in-memory dataset instead (issue #92)"
+                "could not read this file's metadata to key its derived caches; the pyramid will \
+                 be rebuilt and not cached, and the raw-sample view will read from the in-memory \
+                 dataset (issues #81, #92)"
             );
-            return (0..dataset.columns.len()).map(|_| None).collect();
+            return (
+                pyramids_for_dataset(dataset),
+                (0..dataset.columns.len()).map(|_| None).collect(),
+            );
         }
     };
 
+    let ticks = dataset.time.to_pyramid_ticks();
     dataset
         .columns
         .iter()
         .enumerate()
         .map(|(index, series)| {
-            let samples: Cow<'_, [f64]> = match series.values().as_f64_slice() {
-                // Already `f64`: hand the level 0 cache the samples
-                // themselves rather than a freshly allocated copy of them.
-                Some(samples) => Cow::Borrowed(samples),
-                None => Cow::Owned(series.values().to_f64_vec()?),
-            };
-            let column_key = key.with_column(index);
-            match level0::build_or_open(cache_dir, &column_key, &samples, &ticks) {
-                Ok(cache) => Some(cache),
-                Err(err) => {
-                    warn!(
-                        path = %path.display(),
-                        column = index,
-                        error = %err,
-                        "level 0 cache read/write failed for this column; the raw-sample view \
-                         will read from the in-memory dataset instead (issue #92)"
-                    );
-                    None
-                }
-            }
+            derived_caches_for_column(
+                path,
+                cache_dir,
+                &key.with_column(index),
+                index,
+                series,
+                &ticks,
+            )
         })
-        .collect()
+        .unzip()
+}
+
+/// One column's pyramid and Level-0 cache, converting the column to `f64` at
+/// most once — see [`derived_caches_for_dataset_cached`] for why the order
+/// matters.
+fn derived_caches_for_column(
+    path: &Path,
+    cache_dir: &Path,
+    column_key: &CacheKey,
+    index: usize,
+    series: &Series,
+    ticks: &[i128],
+) -> (Option<Vec<Vec<Bucket>>>, Option<Level0Cache>) {
+    // Step 1: Level 0, without converting anything if it is already cached.
+    let level0 = match level0::try_open(cache_dir, column_key) {
+        Ok(Some(cache)) => Some(cache),
+        Ok(None) => None,
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                column = index,
+                error = %err,
+                "level 0 cache could not be read for this column; rebuilding it (issue #92)"
+            );
+            None
+        }
+    };
+
+    // A cache hit means the converted samples are already on disk and mapped:
+    // the pyramid is built from those, so nothing is converted twice, and a
+    // reopen converts nothing at all.
+    if let Some(level0) = level0 {
+        let pyramid = build_or_open_pyramid(
+            path,
+            cache_dir,
+            column_key,
+            index,
+            level0.samples(),
+            level0.timestamps(),
+        );
+        return (Some(pyramid), Some(level0));
+    }
+
+    // Step 2: a miss. Convert once (or borrow, when the column is already
+    // `f64`), write Level 0, then build the pyramid from what Level 0 mapped
+    // back rather than from the conversion again.
+    let samples: Cow<'_, [f64]> = match series.values().as_f64_slice() {
+        Some(samples) => Cow::Borrowed(samples),
+        None => match series.values().to_f64_vec() {
+            Some(samples) => Cow::Owned(samples),
+            // Non-numeric: no pyramid and no Level 0, exactly as before.
+            None => return (None, None),
+        },
+    };
+
+    match level0::build(cache_dir, column_key, &samples, ticks) {
+        Ok(level0) => {
+            let pyramid = build_or_open_pyramid(
+                path,
+                cache_dir,
+                column_key,
+                index,
+                level0.samples(),
+                level0.timestamps(),
+            );
+            (Some(pyramid), Some(level0))
+        }
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                column = index,
+                error = %err,
+                "level 0 cache could not be written for this column; the raw-sample view will \
+                 read from the in-memory dataset instead (issue #92)"
+            );
+            let pyramid =
+                build_or_open_pyramid(path, cache_dir, column_key, index, &samples, ticks);
+            (Some(pyramid), None)
+        }
+    }
+}
+
+/// [`pyramid::build_or_open`] with this module's "a cache failure is a warn,
+/// not an error" handling — shared by every cached pyramid path here so the
+/// fallback is written once.
+fn build_or_open_pyramid(
+    path: &Path,
+    cache_dir: &Path,
+    column_key: &CacheKey,
+    index: usize,
+    samples: &[f64],
+    ticks: &[i128],
+) -> Vec<Vec<Bucket>> {
+    match pyramid::build_or_open(cache_dir, column_key, samples, ticks) {
+        Ok(levels) => levels,
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                column = index,
+                error = %err,
+                "pyramid cache read/write failed for this column; falling back to an uncached \
+                 build (issue #81)"
+            );
+            build_pyramid(samples, ticks)
+        }
+    }
 }
 
 #[cfg(test)]
