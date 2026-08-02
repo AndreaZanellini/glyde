@@ -189,10 +189,13 @@ fn run_index_job(
     // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1": one parse
     // produces both the inference summary and the materialized dataset
     // `views::time::show` renders (issue #58). An open that produces a
-    // summary but fails to materialize as a dataset (e.g. a
-    // progressive-index column whose fields aren't actually numeric,
-    // `GlydeError::NonNumericTimeIndex`) still has nothing to show, so it is
-    // reported as a failed open rather than a summary with no plot.
+    // summary but fails to materialize as a dataset still has nothing to
+    // show, so it is reported as a failed open rather than a summary with no
+    // plot. Since issue #94 that no longer includes a time column whose
+    // fields are neither timestamps nor numbers: SPEC §1.3 "never abort the
+    // load" means ingestion substitutes a row-ordinal index and reports both
+    // time fields low-confidence, so such a file arrives here as an ordinary
+    // (if loudly flagged) success with a real plot behind it.
     //
     // docs/ROADMAP.md M3 "Background progressive build emitting partial
     // levels": every checkpoint along the way is forwarded as its own
