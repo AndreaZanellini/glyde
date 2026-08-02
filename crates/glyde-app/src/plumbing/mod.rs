@@ -43,14 +43,24 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::thread;
 
 use glyde_core::dsp::decimation::Bucket;
-use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, OpenSummary};
+use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary};
 
 /// One numeric column's min/max pyramid, or `None` for a non-numeric column
 /// — parallel to `Dataset::columns` (see `glyde_core::ingest::Checkpoint::pyramids`).
 type Pyramids = Vec<Option<Vec<Vec<Bucket>>>>;
+
+/// One numeric column's cached raw `(timestamp, value)` pairs, or `None` for
+/// a non-numeric column or a cache miss — parallel to `Dataset::columns`,
+/// the raw-sample counterpart of [`Pyramids`] (issue #92). `Arc`-wrapped
+/// solely so [`IndexingMessage`] stays `Clone` (a memory-mapped
+/// [`Level0Cache`] itself is not, since [`memmap2::Mmap`] isn't); every
+/// column's cache still has exactly one owner in practice, `Arc::new` here
+/// is not for sharing.
+type Level0Caches = Vec<Option<Arc<Level0Cache>>>;
 
 /// Progress emitted by a background indexing job, polled by the UI thread.
 /// `generation` identifies which open request this message belongs to (see
@@ -88,15 +98,21 @@ pub enum IndexingMessage {
     /// came from the spilled storage path (`Dataset::is_spilled`);
     /// `views::time::show` falls back to querying raw samples directly for
     /// the affected columns, which stays bounded to whatever range is
-    /// actually on screen.
+    /// actually on screen. `level0_caches` is the same dataset's raw samples
+    /// served from (and written to) the on-disk Level-0 cache (issue #92) —
+    /// also `None` per column on the spilled path, for the same reason
+    /// `pyramids` is; `views::time::show` prefers it over `dataset`'s own
+    /// in-memory column whenever it is `Some`, so a reopened file's deep-zoom
+    /// raw-sample view is cache-backed too, not just its pyramid.
     ///
-    /// *Reading* a spilled column to build a pyramid is bounded as of issue
-    /// #88 (`ingest::pyramids_for_dataset` streams it), so that is no longer
-    /// what stops this. What stops it is the pyramid it would produce: ~9
-    /// bytes per sample per column, held owned in RAM, which is proportional
-    /// to file size and so cannot fit SPEC §5's flat cap on the very files
-    /// that spill (issue #102). Turning this on is R5/#92's call, once #102
-    /// says what a spilled file's pyramid is allowed to cost.
+    /// *Reading* a spilled column is bounded as of issue #88
+    /// (`ingest::pyramids_for_dataset` streams it), so that is no longer what
+    /// keeps both of these off the spilled path. What keeps them off it is
+    /// what they would produce: a pyramid costs ~9 bytes per sample per
+    /// column held owned in RAM, and a Level-0 cache is a whole second copy
+    /// of the column's `(timestamp, value)` pairs — both proportional to file
+    /// size, so neither fits SPEC §5's flat cap on the very files that spill
+    /// (issue #102). Turning either on is a call for #102 to settle first.
     Completed {
         generation: u64,
         path: PathBuf,
@@ -104,6 +120,7 @@ pub enum IndexingMessage {
         report: Box<InferenceReport>,
         dataset: Box<Dataset>,
         pyramids: Pyramids,
+        level0_caches: Level0Caches,
     },
     /// `path` failed to open; `message` is the human-readable reason.
     Failed {
@@ -237,10 +254,29 @@ fn run_index_job(
             // issue #81: a non-spilled dataset's pyramid is served from (and
             // written to) the on-disk pyramid cache, so reopening an
             // unchanged file skips rebuilding it.
-            let pyramids = if dataset.is_spilled() {
-                vec![None; dataset.columns.len()]
+            // issue #92: same treatment for the raw-sample Level-0 cache —
+            // never built over a spilled dataset, served from (and written
+            // to) the on-disk cache otherwise. Both come from one call, which
+            // is what keeps a non-`f64` column from being converted twice per
+            // open (and at all on a reopen) — see
+            // `derived_caches_for_dataset_cached`.
+            let (pyramids, level0_caches) = if dataset.is_spilled() {
+                (
+                    vec![None; dataset.columns.len()],
+                    (0..dataset.columns.len()).map(|_| None).collect(),
+                )
             } else {
-                glyde_core::ingest::pyramids_for_dataset_cached(&path, &dataset, overrides)
+                let (pyramids, level0_caches) =
+                    glyde_core::ingest::derived_caches_for_dataset_cached(
+                        &path, &dataset, overrides,
+                    );
+                (
+                    pyramids,
+                    level0_caches
+                        .into_iter()
+                        .map(|cache| cache.map(Arc::new))
+                        .collect(),
+                )
             };
             let _ = tx.send(IndexingMessage::Completed {
                 generation,
@@ -249,6 +285,7 @@ fn run_index_job(
                 report: Box::new(report),
                 dataset: Box::new(dataset),
                 pyramids,
+                level0_caches,
             });
         }
         Err(err) => {
@@ -303,6 +340,7 @@ mod tests {
                 report,
                 dataset,
                 pyramids,
+                level0_caches,
             } => {
                 assert_eq!(generation, 7);
                 assert_eq!(completed_path, path);
@@ -315,6 +353,12 @@ mod tests {
                 assert!(
                     pyramids.iter().all(Option::is_some),
                     "an in-memory dataset's completed pyramid must be built for every numeric column"
+                );
+                assert_eq!(level0_caches.len(), 2);
+                assert!(
+                    level0_caches.iter().all(Option::is_some),
+                    "an in-memory dataset's completed level0 cache must be built for every \
+                     numeric column (issue #92)"
                 );
             }
             other => panic!("expected Completed, got {other:?}"),

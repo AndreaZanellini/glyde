@@ -208,6 +208,38 @@ Versioning: [Semantic Versioning](https://semver.org/).
   memory (which stream from disk instead, see below) do not benefit from
   this yet either — that remains open as its own follow-up (issue #92).
 
+- **Reopening a file also speeds up how it looks when you zoom all the way
+  in, not just the initial zoomed-out overview.** The entry above sped up
+  the min/max overview a reopened file builds; deep-zoomed views — where the
+  plot has zoomed in far enough to show individual raw sample points rather
+  than the min/max overview — still recomputed their samples from scratch on
+  every reopen. Glyde now caches those raw samples the same way, to the same
+  on-disk cache keyed by path, size, and modification time.
+  For a file with whole-number columns (counts, IDs, raw ADC readings), those
+  values have to be converted before they can be plotted, one value at a
+  time; a reopen now does **none** of that conversion work, where before it
+  did all of it. Nothing changes about what is drawn
+  — the cached values are exactly what a fresh read would produce, proven by
+  a test that opens the same file twice under deliberately mismatched
+  in-memory data and confirms the second open still serves the correct,
+  cached values rather than recomputing from whatever happened to be passed
+  in, and by a second test that counts the conversion work itself: a first
+  open converts each column exactly once, a reopen not at all. (issue #92,
+  the follow-up the entry above left open)
+
+  **Assumption made:** this covers the same scope the entry above does —
+  files small enough to load into memory outright, not the disk-streamed
+  path for very large files, for the same reason (issue #88: walking a
+  streamed file's raw samples end to end to build a cache would reintroduce
+  the proportional-memory problem the disk-streaming path exists to avoid).
+  A still-loading file's growing preview is also unaffected — only a
+  *completed* open builds and reads this cache. And this still does not make
+  reopening a file skip re-reading it from disk in the first place: the file
+  itself is always re-parsed on every open; only the per-column pyramid
+  overview and now the raw samples are served from cache instead of
+  recomputed. Skipping the re-parse itself is a bigger, separate question,
+  not attempted here.
+
 - **Panning and zooming a large file is now smooth, and a one-sample spike
   never disappears.** The time-domain plot used to draw every single raw
   sample on every frame, however many rows the file had — fine for a small

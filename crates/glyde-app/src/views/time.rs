@@ -38,9 +38,13 @@
 //! they route to the state timeline (SPEC §4.3, docs/ROADMAP.md M6), not
 //! yet built.
 
+use std::sync::Arc;
+
 use egui_plot::{GridMark, Legend, Line, Plot, PlotBounds, PlotPoints, Points};
 use glyde_core::dsp::decimation::{decimate_viewport, Bucket};
-use glyde_core::ingest::{progressive_tick_to_value, progressive_value_to_tick, Dataset, TimeAxis};
+use glyde_core::ingest::{
+    progressive_tick_to_value, progressive_value_to_tick, Dataset, Level0Cache, TimeAxis,
+};
 use glyde_core::series::{Series, SeriesValues, ViewKind};
 use glyde_core::time::{format_timestamp, Timestamp};
 
@@ -68,13 +72,21 @@ use glyde_core::time::{format_timestamp, Timestamp};
 /// per-frame cost existed here too, just for `to_f64_vec()` instead of
 /// `to_pyramid_ticks()`, and was missed the first time because the PR's own
 /// bench fixture happened to use an `f64` column, the one dtype this cost
-/// doesn't apply to.
+/// doesn't apply to. `level0_caches` is `dataset.columns`-parallel too
+/// (issue #92): `Some` for a completed, non-spilled load's column whose raw
+/// samples are served from the on-disk Level-0 cache — [`column_f64_samples`]
+/// prefers it over both the zero-copy `f64` path and `sample_cache`, since
+/// the cache holds exactly the converted values, already mapped, so the
+/// reopen that produced it never had to convert them again
+/// (`ingest::derived_caches_for_dataset_cached`). `&[]` for a still-loading
+/// partial dataset, which has no cache of its own yet.
 pub fn show(
     ui: &mut egui::Ui,
     dataset: &Dataset,
     pyramids: &[Option<Vec<Vec<Bucket>>>],
     ticks: &[i128],
     sample_cache: &[Option<Vec<f64>>],
+    level0_caches: &[Option<Arc<Level0Cache>>],
 ) {
     let fit_clicked = ui.button("Fit to data").clicked();
 
@@ -147,7 +159,11 @@ pub fn show(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let cached = sample_cache.get(column_index).and_then(Option::as_ref);
-            let samples = column_f64_samples(series.values(), cached);
+            let level0 = level0_caches
+                .get(column_index)
+                .and_then(Option::as_ref)
+                .map(Arc::as_ref);
+            let samples = column_f64_samples(series.values(), cached, level0);
             let buckets = decimate_viewport(pyramid, samples, ticks, range, pixel_columns);
 
             if converged {
@@ -377,23 +393,35 @@ fn series_color(index: usize) -> egui::Color32 {
 
 /// `values` as an `f64` slice for [`decimate_viewport`] (which needs direct
 /// index access over the *whole* column, not just what is on screen):
-/// zero-copy via [`SeriesValues::as_f64_slice`] when the column is already
-/// `f64`; otherwise `cached` — a converted copy [`cache_column_samples`]
-/// already built for this column once, at the last status change, not this
-/// frame. Never calls [`SeriesValues::to_f64_vec`] itself: doing the
-/// conversion here, inline, was the exact per-frame O(n) cost (worse still
-/// for `i64`/`u64`, which additionally run `warn_if_precision_loss` per
-/// element) a PR #91 review caught this function reintroducing for every
-/// non-`f64` numeric dtype, the same class of mistake `ticks`' own doc
-/// comment on [`show`] already covers for `TimeAxis::to_pyramid_ticks`.
-/// `bool`/`string` columns never reach here (callers only invoke this for
+/// `level0` — a memory-mapped [`Level0Cache`] entry served from (and written
+/// to) the on-disk cache (issue #92) — first when present, since it already
+/// holds exactly the converted values this column would otherwise need to
+/// re-derive on every reopen; then zero-copy via
+/// [`SeriesValues::as_f64_slice`] when the column is already `f64`;
+/// otherwise `cached` — a converted copy [`cache_column_samples`] already
+/// built for this column once, at the last status change, not this frame.
+/// Never calls [`SeriesValues::to_f64_vec`] itself: doing the conversion
+/// here, inline, was the exact per-frame O(n) cost (worse still for
+/// `i64`/`u64`, which additionally run `warn_if_precision_loss` per element)
+/// a PR #91 review caught this function reintroducing for every non-`f64`
+/// numeric dtype, the same class of mistake `ticks`' own doc comment on
+/// [`show`] already covers for `TimeAxis::to_pyramid_ticks`. `bool`/`string`
+/// columns never reach here (callers only invoke this for
 /// [`ViewKind::TimeDomain`] series, which excludes them by construction) —
-/// `cached` being `None` for a numeric column would be a caller bug (the
-/// cache is dataset-columns-parallel), so this falls back to empty rather
-/// than panicking, matching Golden Rule 2's "never guess silently" only in
-/// spirit: an empty column draws nothing rather than crashing, which is the
-/// crash-free target SPEC §6 asks for even on a caller error.
-fn column_f64_samples<'a>(values: &'a SeriesValues, cached: Option<&'a Vec<f64>>) -> &'a [f64] {
+/// `cached` being `None` for a numeric column with no `level0` entry either
+/// would be a caller bug (the cache is dataset-columns-parallel), so this
+/// falls back to empty rather than panicking, matching Golden Rule 2's
+/// "never guess silently" only in spirit: an empty column draws nothing
+/// rather than crashing, which is the crash-free target SPEC §6 asks for
+/// even on a caller error.
+fn column_f64_samples<'a>(
+    values: &'a SeriesValues,
+    cached: Option<&'a Vec<f64>>,
+    level0: Option<&'a Level0Cache>,
+) -> &'a [f64] {
+    if let Some(cache) = level0 {
+        return cache.samples();
+    }
     match values.as_f64_slice() {
         Some(slice) => slice,
         None => cached.map(Vec::as_slice).unwrap_or(&[]),
@@ -728,7 +756,7 @@ mod render_tests {
 
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &pyramids, &ticks, &sample_cache);
+                show(ui, &dataset, &pyramids, &ticks, &sample_cache, &[]);
             });
         });
 
@@ -757,7 +785,7 @@ mod render_tests {
 
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &[], &[], &[]);
+                show(ui, &dataset, &[], &[], &[], &[]);
             });
         });
 
@@ -819,7 +847,7 @@ mod render_tests {
         let sample_cache = cache_column_samples(&dataset);
         let output = egui::Context::default().run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &pyramids, &ticks, &sample_cache);
+                show(ui, &dataset, &pyramids, &ticks, &sample_cache, &[]);
             });
         });
         assert!(!output.shapes.is_empty());
@@ -877,7 +905,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &pyramids, &ticks, &sample_cache);
+                show(ui, &dataset, &pyramids, &ticks, &sample_cache, &[]);
             });
         });
 
@@ -927,7 +955,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &pyramids, &ticks, &sample_cache);
+                show(ui, &dataset, &pyramids, &ticks, &sample_cache, &[]);
             });
         });
 
@@ -1386,7 +1414,7 @@ mod tests {
     fn column_f64_samples_is_zero_copy_for_an_f64_series_even_with_no_cache() {
         let values = SeriesValues::F64(vec![1.0, 2.0, 3.0]);
 
-        let samples = column_f64_samples(&values, None);
+        let samples = column_f64_samples(&values, None, None);
 
         assert_eq!(samples, &[1.0, 2.0, 3.0]);
     }
@@ -1396,7 +1424,7 @@ mod tests {
         let values = SeriesValues::I64(vec![1, 2, 3]);
         let cached = vec![1.0, 2.0, 3.0];
 
-        let samples = column_f64_samples(&values, Some(&cached));
+        let samples = column_f64_samples(&values, Some(&cached), None);
 
         // Not merely equal in value — this asserts it is `cached`'s own
         // allocation, i.e. `column_f64_samples` never itself calls
@@ -1408,7 +1436,7 @@ mod tests {
     fn column_f64_samples_of_a_non_f64_dtype_with_no_cache_falls_back_to_empty() {
         let values = SeriesValues::I64(vec![1, 2, 3]);
 
-        let samples = column_f64_samples(&values, None);
+        let samples = column_f64_samples(&values, None, None);
 
         assert!(samples.is_empty());
     }
@@ -1416,9 +1444,33 @@ mod tests {
     #[test]
     fn column_f64_samples_of_a_non_numeric_series_is_empty() {
         let values = SeriesValues::Bool(vec![true, false]);
-        let samples = column_f64_samples(&values, None);
+        let samples = column_f64_samples(&values, None, None);
 
         assert!(samples.is_empty());
+    }
+
+    /// Issue #92: when a `Level0Cache` entry is present, it wins over both
+    /// the zero-copy `f64` slice and `sample_cache` — the whole point of
+    /// wiring it in is that a reopen should read *from* the cache rather
+    /// than falling back to re-deriving from the in-memory dataset.
+    #[test]
+    fn column_f64_samples_prefers_the_level0_cache_over_both_other_sources() {
+        use glyde_core::index::level0::{build, CacheKey};
+
+        let cache_dir = tempfile::tempdir().expect("temp cache dir");
+        let source_file = tempfile::NamedTempFile::new().expect("temp file");
+        let key = CacheKey::for_path(source_file.path()).expect("stat the temp file");
+        let cache_samples = [9.0, 8.0, 7.0];
+        let cache_ticks = [0i128, 1, 2];
+        let level0 = build(cache_dir.path(), &key, &cache_samples, &cache_ticks)
+            .expect("building a level0 cache must succeed");
+
+        let values = SeriesValues::F64(vec![1.0, 2.0, 3.0]);
+        let cached = vec![1.0, 2.0, 3.0];
+
+        let samples = column_f64_samples(&values, Some(&cached), Some(&level0));
+
+        assert_eq!(samples, &[9.0, 8.0, 7.0]);
     }
 
     #[test]
