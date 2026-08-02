@@ -85,12 +85,18 @@ pub enum IndexingMessage {
     /// (docs/ROADMAP.md M4), and `dataset` is every sample, ready for
     /// [`crate::views::time::show`]. `pyramids` is the completed dataset's
     /// own min/max pyramid (issue #80) — `None` per column when `dataset`
-    /// came from the spilled storage path (`Dataset::is_spilled`), since
-    /// building one there would walk every raw sample of a memory-mapped
-    /// column end to end, making every page of a large file resident just to
-    /// draw it (issue #88); `views::time::show` falls back to querying raw
-    /// samples directly for the affected columns, which stays bounded to
-    /// whatever range is actually on screen.
+    /// came from the spilled storage path (`Dataset::is_spilled`);
+    /// `views::time::show` falls back to querying raw samples directly for
+    /// the affected columns, which stays bounded to whatever range is
+    /// actually on screen.
+    ///
+    /// *Reading* a spilled column to build a pyramid is bounded as of issue
+    /// #88 (`ingest::pyramids_for_dataset` streams it), so that is no longer
+    /// what stops this. What stops it is the pyramid it would produce: ~9
+    /// bytes per sample per column, held owned in RAM, which is proportional
+    /// to file size and so cannot fit SPEC §5's flat cap on the very files
+    /// that spill (issue #102). Turning this on is R5/#92's call, once #102
+    /// says what a spilled file's pyramid is allowed to cost.
     Completed {
         generation: u64,
         path: PathBuf,
@@ -226,7 +232,7 @@ fn run_index_job(
                 sampling_class = ?summary.sampling_class,
                 "file opened"
             );
-            // issue #88: a spilled dataset's pyramid is never built from the
+            // issue #102: a spilled dataset's pyramid is never built from the
             // completed load — see the `Completed` variant's doc comment.
             // issue #81: a non-spilled dataset's pyramid is served from (and
             // written to) the on-disk pyramid cache, so reopening an

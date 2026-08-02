@@ -48,7 +48,7 @@ use super::csv::{
 use super::infer::{log_dtype_choice, normalize_decimal_field, ColumnDtypeChoice, ColumnDtypeScan};
 use super::IngestOverrides;
 use crate::budget::RamBudget;
-use crate::dsp::decimation::{build_pyramid, extend_pyramid, Bucket};
+use crate::dsp::decimation::{build_pyramid, build_pyramid_streaming, extend_pyramid, Bucket};
 use crate::index::level0::{self, CacheKey};
 use crate::index::pyramid;
 use crate::index::spill::{SpillStringsWriter, SpillVec, SpillVecWriter};
@@ -254,6 +254,31 @@ impl ProgressiveValues {
     fn is_spilled(&self) -> bool {
         matches!(self, ProgressiveValues::Spilled(_))
     }
+
+    /// Hands `range`'s values to `visit` in bounded chunks, in row order —
+    /// the [`TickSource`] treatment applied to a progressive axis's own `f64`
+    /// values, so [`TimeAxis`]'s tick source never has to materialize a
+    /// spilled progressive column to scale it (issue #88).
+    fn visit_value_chunks(
+        &self,
+        range: std::ops::Range<usize>,
+        visit: &mut dyn FnMut(&[f64]) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            ProgressiveValues::Memory(values) => {
+                let start = range.start.min(values.len());
+                let end = range.end.min(values.len());
+                if start >= end {
+                    return Ok(());
+                }
+                for chunk in values[start..end].chunks(TICK_CHUNK_LEN) {
+                    visit(chunk)?;
+                }
+                Ok(())
+            }
+            ProgressiveValues::Spilled(values) => values.read_chunks(range, visit),
+        }
+    }
 }
 
 impl From<Vec<f64>> for ProgressiveValues {
@@ -338,6 +363,35 @@ impl TimeAxis {
                     .map(progressive_value_to_tick)
                     .collect(),
             ),
+        }
+    }
+}
+
+/// The bounded-memory counterpart of [`TimeAxis::to_pyramid_ticks`] (issue
+/// #88): the same ticks, in the same order, but handed over in fixed-size
+/// chunks so a spilled axis is never made resident whole — including a
+/// `Progressive` axis, whose fixed-point scaling `to_pyramid_ticks` can only
+/// deliver by allocating a whole second column.
+impl TickSource for TimeAxis {
+    fn tick_count(&self) -> usize {
+        self.len()
+    }
+
+    fn visit_tick_chunks(
+        &self,
+        range: std::ops::Range<usize>,
+        visit: &mut dyn FnMut(&[i128]) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            TimeAxis::Absolute { timestamps, .. } => timestamps.visit_tick_chunks(range, visit),
+            TimeAxis::Progressive { values } => {
+                let mut ticks = Vec::with_capacity(TICK_CHUNK_LEN);
+                values.visit_value_chunks(range, &mut |chunk| {
+                    ticks.clear();
+                    ticks.extend(chunk.iter().copied().map(progressive_value_to_tick));
+                    visit(&ticks)
+                })
+            }
         }
     }
 }
@@ -1693,13 +1747,30 @@ impl PyramidCursor {
 /// non-numeric; `Some` for every numeric one, built by the same golden-tested
 /// [`build_pyramid`] the pyramid used internally by [`load_with_outcome_progressive`]
 /// checkpoints uses. Public so `glyde-app` can build a final pyramid for a
-/// completed, in-memory dataset once progressive checkpointing has stopped
-/// (docs/ROADMAP.md M3, issue #80) — callers must not call this over a
-/// [`Dataset::is_spilled`] dataset: it walks every raw sample end to end via
-/// [`crate::series::SeriesValues::to_f64_vec`] for any non-`f64` column,
-/// which would make every page of a memory-mapped spill file resident
-/// (issue #88).
+/// completed dataset once progressive checkpointing has stopped
+/// (docs/ROADMAP.md M3, issue #80).
+///
+/// A [`Dataset::is_spilled`] dataset is read through
+/// [`build_pyramid_streaming`] instead (issue #88): its columns are
+/// memory-mapped files, and the whole-column slices the in-memory path hands
+/// [`build_pyramid`] would make every page of them resident — memory
+/// proportional to file size, against SPEC §5's flat cap. The two paths
+/// produce identical pyramids (locked by `tests/golden/decimation.rs` for the
+/// builders and `tests/spilled_pyramid_integration.rs` for this dispatch);
+/// only the residency differs. A spilled column whose read fails yields
+/// `None` for that column — a missing pyramid degrades rendering to an
+/// un-pyramided viewport scan, it never fails the open
+/// (docs/ARCHITECTURE.md §Error philosophy).
 pub fn pyramids_for_dataset(dataset: &Dataset) -> Vec<Option<Vec<Vec<Bucket>>>> {
+    if dataset.is_spilled() {
+        return dataset
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, series)| streaming_pyramid_for_column(dataset, index, series))
+            .collect();
+    }
+
     let ticks = dataset.time.to_pyramid_ticks();
     dataset
         .columns
@@ -1714,6 +1785,30 @@ pub fn pyramids_for_dataset(dataset: &Dataset) -> Vec<Option<Vec<Vec<Bucket>>>> 
                 .map(|samples| build_pyramid(&samples, &ticks)),
         })
         .collect()
+}
+
+/// One spilled column's pyramid, built by streaming both its samples and the
+/// time axis's ticks (issue #88). `None` for a non-numeric column, and for a
+/// column whose spill file could not be read — logged, never escalated.
+fn streaming_pyramid_for_column(
+    dataset: &Dataset,
+    index: usize,
+    series: &Series,
+) -> Option<Vec<Vec<Bucket>>> {
+    let samples = series.values().sample_source()?;
+    match build_pyramid_streaming(&samples, &dataset.time) {
+        Ok(pyramid) => Some(pyramid),
+        Err(err) => {
+            warn!(
+                column = index,
+                name = series.name(),
+                error = %err,
+                "could not read this spilled column back to build its pyramid; the view will \
+                 fall back to an un-pyramided viewport scan (issue #88)"
+            );
+            None
+        }
+    }
 }
 
 /// [`pyramids_for_dataset`], but reusing a previous completed open's cached
@@ -1739,12 +1834,10 @@ pub fn pyramids_for_dataset(dataset: &Dataset) -> Vec<Option<Vec<Vec<Bucket>>>> 
 /// an explicit one (tests; a system with no OS cache directory falls back
 /// to the same uncached path).
 ///
-/// Callers must not call this over a [`Dataset::is_spilled`] dataset, for
-/// the same reason [`pyramids_for_dataset`] warns against it: it walks
-/// every raw sample end to end, which would make every page of a
-/// memory-mapped spill file resident (issue #88, still open — Level 0's own
-/// cache wiring, which would let this cover the spilled case too, is
-/// intentionally out of scope here).
+/// A [`Dataset::is_spilled`] dataset takes the bounded-memory build on a
+/// cache miss, exactly as [`pyramids_for_dataset`] does (issue #88); the
+/// cached result is the same either way, since both builders produce the same
+/// pyramid.
 pub fn pyramids_for_dataset_cached(
     path: &Path,
     dataset: &Dataset,
@@ -1767,7 +1860,6 @@ pub fn pyramids_for_dataset_cached_with_cache_dir(
     cache_dir: &Path,
     overrides: IngestOverrides,
 ) -> Vec<Option<Vec<Vec<Bucket>>>> {
-    let ticks = dataset.time.to_pyramid_ticks();
     let key = match CacheKey::for_path(path) {
         Ok(key) => key.with_overrides_signature(super::overrides_signature(overrides)),
         Err(err) => {
@@ -1781,18 +1873,51 @@ pub fn pyramids_for_dataset_cached_with_cache_dir(
         }
     };
 
+    // Only the in-memory path wants the ticks as one slice; materializing them
+    // for a spilled dataset is exactly the residency this avoids (issue #88).
+    let spilled = dataset.is_spilled();
+    let ticks = if spilled {
+        Cow::Borrowed(&[] as &[i128])
+    } else {
+        dataset.time.to_pyramid_ticks()
+    };
     dataset
         .columns
         .iter()
         .enumerate()
         .map(|(index, series)| {
+            let column_key = key.with_column(index);
+
+            // A spilled column never gets materialized to be cached: both the
+            // build and the fallback read it in bounded chunks (issue #88).
+            if spilled {
+                let samples = series.values().sample_source()?;
+                return match pyramid::build_or_open_streaming(
+                    cache_dir,
+                    &column_key,
+                    &samples,
+                    &dataset.time,
+                ) {
+                    Ok(levels) => Some(levels),
+                    Err(err) => {
+                        warn!(
+                            path = %path.display(),
+                            column = index,
+                            error = %err,
+                            "pyramid cache read/write failed for this spilled column; falling \
+                             back to an uncached streaming build (issue #81)"
+                        );
+                        streaming_pyramid_for_column(dataset, index, series)
+                    }
+                };
+            }
+
             let samples: Cow<'_, [f64]> = match series.values().as_f64_slice() {
                 // Already `f64`: hand the pyramid cache the samples
                 // themselves rather than a freshly allocated copy of them.
                 Some(samples) => Cow::Borrowed(samples),
                 None => Cow::Owned(series.values().to_f64_vec()?),
             };
-            let column_key = key.with_column(index);
             match pyramid::build_or_open(cache_dir, &column_key, &samples, &ticks) {
                 Ok(levels) => Some(levels),
                 Err(err) => {

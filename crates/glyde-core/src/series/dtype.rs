@@ -173,7 +173,7 @@ const MAX_EXACT_F64_MAGNITUDE: u128 = 1u128 << 53;
 /// exactly (see [`SeriesValues::to_f64_vec`]'s doc comment). `original` is
 /// the source value, reported so the log line names the actual reading that
 /// lost precision, not just the fact that some value did.
-fn warn_if_precision_loss(magnitude: u128, original: impl std::fmt::Display) {
+pub(super) fn warn_if_precision_loss(magnitude: u128, original: impl std::fmt::Display) {
     if magnitude > MAX_EXACT_F64_MAGNITUDE {
         tracing::warn!(
             value = %original,

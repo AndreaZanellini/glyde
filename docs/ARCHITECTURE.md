@@ -174,6 +174,23 @@ Resolved as follows:
   Level-0 cache and hands these functions a real slice over the mapped
   bytes, rather than introducing a second implementation or a generic
   `RawSamples` trait for one call site.
+- **Amendment (issue #88): one *reading* protocol beside the locked
+  signatures, still one aggregation.** The bullet above holds for querying,
+  and `decimate_viewport`'s signature is unchanged. It did not hold for
+  *building*: a slice over a spilled column is only cheap if nobody walks it
+  end to end, and `build_pyramid` walks it end to end by definition, making
+  every page of a memory-mapped column resident — the same residency issue
+  #85 removed from the time axis, worth 8 bytes/sample per column plus 16
+  bytes/row of ticks. `dsp::decimation::build_pyramid_streaming` is therefore
+  an additional entry point taking a `series::SampleSource` and a
+  `time::TickSource` (the sample-side counterpart of the trait #85 already
+  introduced for ticks) and reading both in bounded chunks. This is not a
+  second implementation: both entry points feed the same private level-0
+  accumulator and the same level-growing step, and a golden test locks them to
+  bucket-for-bucket equality at every chunk size, so Hard rule 4 still holds.
+  `ingest::pyramids_for_dataset` picks between them by
+  `Dataset::is_spilled()` — the zero-copy slice path stays the in-memory
+  default, so no small-file cost was added.
 - **Pyramid levels are also spilled to disk** (`glyde_core::index::pyramid`,
   `docs/ROADMAP.md` M3 "Pyramid level spill"): reopening a large file reads
   the already-computed `Vec<Vec<Bucket>>` back from a cache file, keyed the
@@ -184,7 +201,10 @@ Resolved as follows:
   than mapping it in place. The win is skipping the aggregation pass (and
   not needing Level 0 open at all to redo it), not a zero-copy reopen.
 - **Deferred, tracked separately:** cache eviction (the cache directory only
-  ever grows, for Level 0, the pyramid, and the ingestion spill files alike).
+  ever grows, for Level 0, the pyramid, and the ingestion spill files alike);
+  and the size of an owned pyramid itself — ~9 bytes per sample per column
+  across all levels, which is proportional to file size and is what a
+  pyramid-accelerated view of a *spilled* file would hit first (issue #102).
 
 ### Where the raw `Dataset` lives (decision, issue #75)
 
