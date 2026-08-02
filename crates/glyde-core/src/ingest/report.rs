@@ -39,7 +39,7 @@
 //! ever puts the time column anywhere else.
 
 use super::csv::{open_path_capturing_column, CsvParseOutcome};
-use super::dataset::{self, Checkpoint, Dataset, TimeAxis};
+use super::dataset::{self, Checkpoint, Dataset, TimeAxis, TimeIndexInference};
 use super::infer::Confidence;
 use crate::time::{infer_timestamp_format, parse_timestamp, summarize_ticks, TimestampFormat};
 use crate::{GlydeError, Result};
@@ -228,8 +228,8 @@ pub fn inspect(path: &Path) -> Result<OpenSummary> {
 /// detection, and monotonicity checks `inspect` runs, so the two summaries
 /// agree by construction rather than by re-derivation.
 pub fn open_dataset(path: &Path) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    let (outcome, dataset, timestamp_format_ambiguous) = dataset::load_with_outcome(path)?;
-    build_summary_and_report(outcome, dataset, timestamp_format_ambiguous)
+    let (outcome, dataset, time_index) = dataset::load_with_outcome(path)?;
+    build_summary_and_report(outcome, dataset, time_index)
 }
 
 /// [`open_dataset`] against an explicit RAM budget and spill directory, so a
@@ -241,9 +241,9 @@ pub fn open_dataset_with_budget(
     budget: crate::budget::RamBudget,
     cache_dir: &Path,
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    let (outcome, dataset, timestamp_format_ambiguous) =
+    let (outcome, dataset, time_index) =
         dataset::load_with_outcome_with_budget(path, budget, cache_dir)?;
-    build_summary_and_report(outcome, dataset, timestamp_format_ambiguous)
+    build_summary_and_report(outcome, dataset, time_index)
 }
 
 /// [`open_dataset`], additionally invoking `on_checkpoint` with a
@@ -262,9 +262,9 @@ pub fn open_dataset_progressive(
     path: &Path,
     on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    let (outcome, dataset, timestamp_format_ambiguous) =
+    let (outcome, dataset, time_index) =
         dataset::load_with_outcome_progressive(path, on_checkpoint)?;
-    build_summary_and_report(outcome, dataset, timestamp_format_ambiguous)
+    build_summary_and_report(outcome, dataset, time_index)
 }
 
 /// [`open_dataset`] with [`super::IngestOverrides`] applied (docs/ROADMAP.md
@@ -277,9 +277,9 @@ pub fn open_dataset_with_overrides(
     path: &Path,
     overrides: super::IngestOverrides,
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    let (outcome, dataset, timestamp_format_ambiguous) =
+    let (outcome, dataset, time_index) =
         dataset::load_with_outcome_with_overrides(path, overrides)?;
-    build_summary_and_report(outcome, dataset, timestamp_format_ambiguous)
+    build_summary_and_report(outcome, dataset, time_index)
 }
 
 /// [`open_dataset_progressive`] with [`super::IngestOverrides`] applied — the
@@ -290,9 +290,9 @@ pub fn open_dataset_progressive_with_overrides(
     overrides: super::IngestOverrides,
     on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    let (outcome, dataset, timestamp_format_ambiguous) =
+    let (outcome, dataset, time_index) =
         dataset::load_with_outcome_progressive_with_overrides(path, overrides, on_checkpoint)?;
-    build_summary_and_report(outcome, dataset, timestamp_format_ambiguous)
+    build_summary_and_report(outcome, dataset, time_index)
 }
 
 /// The summary/report-building half of [`open_dataset`], shared with
@@ -301,7 +301,7 @@ pub fn open_dataset_progressive_with_overrides(
 fn build_summary_and_report(
     outcome: CsvParseOutcome,
     dataset: Dataset,
-    timestamp_format_ambiguous: bool,
+    time_index: TimeIndexInference,
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
     let (
         time_column,
@@ -349,16 +349,27 @@ fn build_summary_and_report(
     // SPEC §2.1: a column's *name* is only as trustworthy as the header
     // detection that produced it (`HeaderInference::ambiguous`) — an
     // ambiguous header means `time_column`'s value is itself a guess.
-    let time_column_confidence = if outcome.header_ambiguous {
+    //
+    // Issue #94: a row-ordinal fallback is the other way this field cannot be
+    // trusted. The file *has* a first column; Glyde simply could not read it
+    // as an index and substituted row numbers, so reporting "no time column"
+    // at full confidence (the way corpus case 35's genuine progressive index
+    // is reported) would be exactly the silent guess Golden Rule 2 forbids.
+    // Low confidence here is what opens the inference bar expanded on first
+    // render (SPEC §1.2) instead of leaving the substitution to the log.
+    let time_column_confidence = if outcome.header_ambiguous || time_index.row_ordinal_fallback {
         Confidence::Low
     } else {
         Confidence::High
     };
     // A progressive index has no timestamp format to be ambiguous about, so
     // it is reported with full confidence rather than inheriting whatever
-    // `timestamp_format_ambiguous` happened to default to.
+    // `timestamp_format_ambiguous` happened to default to — unless there is no
+    // format precisely because none could be read (issue #94), which is a
+    // missing answer rather than a non-question.
     let timestamp_format_confidence = match &dataset.time {
-        TimeAxis::Absolute { .. } if timestamp_format_ambiguous => Confidence::Low,
+        TimeAxis::Absolute { .. } if time_index.timestamp_format_ambiguous => Confidence::Low,
+        _ if time_index.row_ordinal_fallback => Confidence::Low,
         _ => Confidence::High,
     };
 

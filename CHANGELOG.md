@@ -56,6 +56,33 @@ Versioning: [Semantic Versioning](https://semver.org/).
   column) rather than being mechanical.
 
 ### Fixed
+- **A file whose time column Glyde cannot read now opens anyway, plotted
+  against row numbers, and says so.** Until now, a first column that was
+  neither a timestamp Glyde recognizes nor a plain number took the entire file
+  down: no plot, no inference bar, nothing to correct from — just an error
+  message. That is the worst possible outcome for a file that may be perfectly
+  good apart from one column, and `docs/SPEC.md` §1.3 is explicit that
+  malformed data must never abort a load. Such a file now opens with the plot's
+  horizontal axis running 0, 1, 2, … over the rows in file order, and the
+  inference bar opens expanded with "time column" and "timestamp format" both
+  marked low confidence, so the substitution is never mistaken for a confident
+  reading of your timestamps. Every row is kept and no sample value is touched
+  — only the horizontal axis changes. The log records which value defeated the
+  reader and how many rows were affected. Added to the torture corpus as case
+  58 (`01-Jan-2026 00:00:00`, a real export format outside Glyde's v1 list).
+  (issue #94)
+
+  **Assumption made:** the decision is taken per column, not per row — a
+  column that is numeric except for a single `N/A` cell is treated as
+  unreadable in its entirety rather than dropping that one row. That is
+  deliberate: silently deleting a row from a file you believe is complete is a
+  worse failure than plotting against row numbers, and every row survives
+  either way. The narrower behaviour (keep real timestamps, skip and count
+  just the unreadable rows, as `docs/SPEC.md` §1.3 does for ragged rows) is a
+  strictly better outcome where it applies and is worth a follow-up issue; it
+  needs its own call on how many bad rows are too many before the column is
+  demoted, so it is not decided here.
+
 - **CSV files whose time column is written as `2026-01-01 00:00:00` (a space
   between date and time, no `T`) now open.** This is one of the most common
   timestamp shapes in real-world exports — SQL dumps, `pandas.to_csv()`

@@ -446,7 +446,9 @@ pub fn load_with_overrides_and_budget(
 /// [`super::InferenceReport`] for it share one read of the file instead of
 /// independent ones (issue #58: the app used to call `inspect()` and
 /// `load()` back to back, each re-reading and re-decoding the whole file).
-pub(crate) fn load_with_outcome(path: &Path) -> Result<(CsvParseOutcome, Dataset, bool)> {
+pub(crate) fn load_with_outcome(
+    path: &Path,
+) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     let cache_dir = os_spill_dir();
     load_with_outcome_using(
         path,
@@ -461,7 +463,7 @@ pub(crate) fn load_with_outcome_with_budget(
     path: &Path,
     budget: RamBudget,
     cache_dir: &Path,
-) -> Result<(CsvParseOutcome, Dataset, bool)> {
+) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     load_with_outcome_using(path, budget, Some(cache_dir), IngestOverrides::default())
 }
 
@@ -471,7 +473,7 @@ pub(crate) fn load_with_outcome_with_budget(
 pub(crate) fn load_with_outcome_with_overrides(
     path: &Path,
     overrides: IngestOverrides,
-) -> Result<(CsvParseOutcome, Dataset, bool)> {
+) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     let cache_dir = os_spill_dir();
     load_with_outcome_using(
         path,
@@ -562,7 +564,7 @@ fn load_with_outcome_using(
     budget: RamBudget,
     cache_dir: Option<&Path>,
     overrides: IngestOverrides,
-) -> Result<(CsvParseOutcome, Dataset, bool)> {
+) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     match choose_storage(path, budget, cache_dir, overrides)? {
         Storage::InMemory => {
             let (outcome, columns_text) = open_path_capturing_all_columns(path, overrides)?;
@@ -607,7 +609,7 @@ fn build_dataset(
     outcome: &CsvParseOutcome,
     columns_text: &[ColumnText],
     overrides: IngestOverrides,
-) -> Result<(Dataset, bool)> {
+) -> Result<(Dataset, TimeIndexInference)> {
     if outcome.column_names.len() < 2 {
         return Err(GlydeError::SingleColumnFile);
     }
@@ -615,38 +617,47 @@ fn build_dataset(
     let time_column_name = outcome.column_names[0].clone();
     let time_fields: Vec<&str> = columns_text[0].iter().collect();
 
-    let (time, timestamp_format_ambiguous) =
-        match resolve_timestamp_format(&time_fields, overrides.timestamp_format) {
-            Some(format_inference) => {
-                let mut timestamps = Vec::with_capacity(time_fields.len());
-                for field in &time_fields {
-                    timestamps.push(parse_timestamp(field, format_inference.format)?);
-                }
+    let (time, inference) = match resolve_timestamp_format(&time_fields, overrides.timestamp_format)
+    {
+        Some(format_inference) => {
+            let mut timestamps = Vec::with_capacity(time_fields.len());
+            for field in &time_fields {
+                timestamps.push(parse_timestamp(field, format_inference.format)?);
+            }
+            (
+                TimeAxis::Absolute {
+                    timestamps: Timestamps::Memory(timestamps),
+                    format: format_inference.format,
+                },
+                TimeIndexInference {
+                    timestamp_format_ambiguous: format_inference.ambiguous,
+                    row_ordinal_fallback: false,
+                },
+            )
+        }
+        // SPEC §2.1: no recognized absolute-timestamp format matched every
+        // field, so this is a progressive numeric index (corpus case 35) —
+        // unless it isn't even that, in which case the column is not a time
+        // index at all and the row ordinal stands in for it (issue #94).
+        None => match parse_progressive_values(&time_fields) {
+            Ok(values) => (
+                TimeAxis::Progressive {
+                    values: ProgressiveValues::Memory(values),
+                },
+                TimeIndexInference::default(),
+            ),
+            Err(rejection) => {
+                rejection.log(&time_column_name);
                 (
-                    TimeAxis::Absolute {
-                        timestamps: Timestamps::Memory(timestamps),
-                        format: format_inference.format,
+                    row_ordinal_axis(time_fields.len()),
+                    TimeIndexInference {
+                        timestamp_format_ambiguous: false,
+                        row_ordinal_fallback: true,
                     },
-                    format_inference.ambiguous,
                 )
             }
-            // SPEC §2.1: no recognized absolute-timestamp format matched every
-            // field, so this is a progressive numeric index (corpus case 35) —
-            // unless it isn't even that, which is a real error, not a silent
-            // empty plot.
-            None => {
-                let mut values = Vec::with_capacity(time_fields.len());
-                for field in &time_fields {
-                    values.push(parse_progressive_value(field)?);
-                }
-                (
-                    TimeAxis::Progressive {
-                        values: ProgressiveValues::Memory(values),
-                    },
-                    false,
-                )
-            }
-        };
+        },
+    };
 
     let columns = outcome.column_names[1..]
         .iter()
@@ -670,13 +681,30 @@ fn build_dataset(
             time_column_name,
             columns,
         },
-        timestamp_format_ambiguous,
+        inference,
     ))
 }
 
+/// What ingestion settled about the time index beyond the axis itself — the
+/// two things `super::report` needs to describe an open in SPEC §1.2's
+/// inference bar but cannot re-derive from a finished [`Dataset`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TimeIndexInference {
+    /// SPEC §2.1's day-vs-month ambiguity rule fired: the format is the
+    /// documented default, not a discriminated match, so the inference bar
+    /// reports it low-confidence with a one-click swap.
+    pub(crate) timestamp_format_ambiguous: bool,
+    /// Issue #94: the declared time column matched no timestamp format *and*
+    /// is not numeric either, so it cannot be a time index at all and the row
+    /// ordinal stands in for it. The load still succeeds — SPEC §1.3 "never
+    /// abort the load" — and the inference bar reports both time fields at
+    /// low confidence so the substitution is never silent (Golden Rule 2).
+    pub(crate) row_ordinal_fallback: bool,
+}
+
 /// SPEC §2.1's progressive numeric index: a plain number with no
-/// absolute-time meaning. A field that is not even that is a real error, not
-/// a silent empty plot.
+/// absolute-time meaning. A field that is not even that is not a time index
+/// value at all — see [`TimeIndexRejection`].
 fn parse_progressive_value(field: &str) -> Result<f64> {
     field
         .trim()
@@ -684,6 +712,84 @@ fn parse_progressive_value(field: &str) -> Result<f64> {
         .map_err(|_| GlydeError::NonNumericTimeIndex {
             input: field.to_string(),
         })
+}
+
+/// Reads a whole time column as SPEC §2.1's progressive numeric index, or
+/// reports why it is not one (issue #94).
+fn parse_progressive_values(fields: &[&str]) -> std::result::Result<Vec<f64>, TimeIndexRejection> {
+    let mut values = Vec::with_capacity(fields.len());
+    let mut rejection = TimeIndexRejection::default();
+    for field in fields {
+        match parse_progressive_value(field) {
+            Ok(value) => {
+                if rejection.is_empty() {
+                    values.push(value);
+                }
+            }
+            Err(_) => rejection.observe(field),
+        }
+    }
+
+    if rejection.is_empty() {
+        Ok(values)
+    } else {
+        // The partially-filled `values` is dropped: a rejected column produces
+        // row ordinals for *every* row, never a mix of the two.
+        Err(rejection.with_total(fields.len()))
+    }
+}
+
+/// Why a time column is not a time index (issue #94): how many of its fields
+/// parse as neither a timestamp nor a number, and the first one that did not
+/// — so the `warn` log names the value the user has to look at, and says
+/// whether the whole column is unreadable or just one stray row.
+#[derive(Debug, Default, Clone)]
+struct TimeIndexRejection {
+    first_offender: Option<String>,
+    unparseable_count: usize,
+    total_count: usize,
+}
+
+impl TimeIndexRejection {
+    fn is_empty(&self) -> bool {
+        self.unparseable_count == 0
+    }
+
+    fn observe(&mut self, field: &str) {
+        self.unparseable_count += 1;
+        if self.first_offender.is_none() {
+            self.first_offender = Some(field.to_string());
+        }
+    }
+
+    fn with_total(mut self, total_count: usize) -> Self {
+        self.total_count = total_count;
+        self
+    }
+
+    /// CLAUDE.md "every ingestion decision is logged": this one substitutes an
+    /// index the file does not contain, which is the loudest decision
+    /// ingestion can take on the user's behalf.
+    fn log(&self, column: &str) {
+        warn!(
+            time_column = %column,
+            first_unreadable_value = %self.first_offender.as_deref().unwrap_or(""),
+            unreadable_fields = self.unparseable_count,
+            total_fields = self.total_count,
+            "the time column matches no timestamp format (SPEC §2.1) and is not numeric either; \
+             opening with a row-ordinal index instead of refusing the file (SPEC §1.3 \"never \
+             abort the load\"), reported low-confidence in the inference bar"
+        );
+    }
+}
+
+/// Issue #94's index of last resort: row 0, 1, 2, … as an SPEC §2.1
+/// progressive numeric axis, so a file whose time column Glyde cannot read
+/// still opens, still plots, and still keeps its rows in source order.
+fn row_ordinal_axis(row_count: usize) -> TimeAxis {
+    TimeAxis::Progressive {
+        values: ProgressiveValues::Memory((0..row_count).map(|row| row as f64).collect()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -714,7 +820,7 @@ fn load_spilled(
     cache_dir: &Path,
     on_checkpoint: Option<&mut dyn FnMut(Checkpoint)>,
     overrides: IngestOverrides,
-) -> Result<(CsvParseOutcome, Dataset, bool)> {
+) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     let column_names = sniff.column_names().to_vec();
     if column_names.len() < 2 {
         return Err(GlydeError::SingleColumnFile);
@@ -724,11 +830,24 @@ fn load_spilled(
 
     // --- Pass 1: infer, retaining nothing -----------------------------------
     let mut time_scan = TimestampFormatScan::default();
+    // Issue #94: the same "is this column a progressive numeric index at all?"
+    // question the in-memory path answers with `parse_progressive_values`,
+    // asked incrementally so a spilled open reaches the same verdict without
+    // holding the column. Counting every offender (rather than stopping at the
+    // first) costs nothing but makes the `warn` log say whether the column is
+    // unreadable or merely has one stray row.
+    let mut time_rejection = TimeIndexRejection::default();
+    let mut time_field_count = 0usize;
     let mut dtype_scans: Vec<ColumnDtypeScan> = (0..data_column_count)
         .map(|_| ColumnDtypeScan::default())
         .collect();
     super::csv::stream_path(path, sniff, &mut |row: RowFields<'_>| {
-        time_scan.observe(row.get(0).unwrap_or_default());
+        let time_field = row.get(0).unwrap_or_default();
+        time_scan.observe(time_field);
+        time_field_count += 1;
+        if parse_progressive_value(time_field).is_err() {
+            time_rejection.observe(time_field);
+        }
         for (index, scan) in dtype_scans.iter_mut().enumerate() {
             let field = row.get(index + 1).unwrap_or_default();
             scan.observe(&normalize_decimal_field(field, decimal_separator));
@@ -748,6 +867,16 @@ fn load_spilled(
     };
     let choices: Vec<ColumnDtypeChoice> = dtype_scans.iter().map(ColumnDtypeScan::finish).collect();
 
+    // Issue #94: neither a timestamp format nor a number — the column is not a
+    // time index, so row ordinals stand in for it rather than the open failing.
+    let row_ordinal_fallback = timestamp_format.is_none() && !time_rejection.is_empty();
+    if row_ordinal_fallback {
+        time_rejection
+            .clone()
+            .with_total(time_field_count)
+            .log(&column_names[0]);
+    }
+
     // --- Pass 2: type every row straight into its spill file ----------------
     // `.with_overrides_signature`: these spill files are always freshly
     // written on this call (never read-and-reused within it), so nothing
@@ -764,6 +893,7 @@ fn load_spilled(
         cache_dir,
         &stem,
         timestamp_format.map(|inference| inference.format),
+        row_ordinal_fallback,
     )?;
     let mut column_writers: Vec<ColumnSpillWriter> = choices
         .iter()
@@ -819,7 +949,11 @@ fn load_spilled(
             time_column_name: column_names[0].clone(),
             columns,
         },
-        timestamp_format.is_some_and(|inference| inference.ambiguous),
+        TimeIndexInference {
+            timestamp_format_ambiguous: timestamp_format
+                .is_some_and(|inference| inference.ambiguous),
+            row_ordinal_fallback,
+        },
     ))
 }
 
@@ -832,6 +966,14 @@ fn load_spilled(
 enum TimeAxisSpillWriter {
     Absolute(Box<AbsoluteAxisSpillWriter>),
     Progressive(SpillVecWriter<f64>),
+    /// Issue #94: the time column is neither timestamps nor numbers, so the
+    /// row ordinal is written in its place. Structurally a `Progressive` axis
+    /// — the difference is that the values come from the row counter rather
+    /// than from the file, which is what the inference bar flags.
+    RowOrdinal {
+        values: SpillVecWriter<f64>,
+        next_row: u64,
+    },
 }
 
 /// [`TimeAxisSpillWriter::Absolute`]'s payload: SPEC §2.1's ticks, per-row
@@ -844,7 +986,12 @@ struct AbsoluteAxisSpillWriter {
 }
 
 impl TimeAxisSpillWriter {
-    fn create(cache_dir: &Path, stem: &str, format: Option<TimestampFormat>) -> Result<Self> {
+    fn create(
+        cache_dir: &Path,
+        stem: &str,
+        format: Option<TimestampFormat>,
+        row_ordinal_fallback: bool,
+    ) -> Result<Self> {
         match format {
             Some(format) => Ok(TimeAxisSpillWriter::Absolute(Box::new(
                 AbsoluteAxisSpillWriter {
@@ -854,6 +1001,10 @@ impl TimeAxisSpillWriter {
                     format,
                 },
             ))),
+            None if row_ordinal_fallback => Ok(TimeAxisSpillWriter::RowOrdinal {
+                values: SpillVecWriter::create(cache_dir, &format!("{stem}.tsprogressive"))?,
+                next_row: 0,
+            }),
             None => Ok(TimeAxisSpillWriter::Progressive(SpillVecWriter::create(
                 cache_dir,
                 &format!("{stem}.tsprogressive"),
@@ -881,6 +1032,15 @@ impl TimeAxisSpillWriter {
                 values.push(value)?;
                 Ok(TimeValue::Progressive(value))
             }
+            // Issue #94: the field is deliberately not read — pass 1 already
+            // established it is not an index value, and substituting the row
+            // ordinal is exactly the decision the inference bar reports.
+            TimeAxisSpillWriter::RowOrdinal { values, next_row } => {
+                let value = *next_row as f64;
+                values.push(value)?;
+                *next_row += 1;
+                Ok(TimeValue::Progressive(value))
+            }
         }
     }
 
@@ -894,7 +1054,8 @@ impl TimeAxisSpillWriter {
                 },
                 format: writer.format,
             }),
-            TimeAxisSpillWriter::Progressive(values) => Ok(TimeAxis::Progressive {
+            TimeAxisSpillWriter::Progressive(values)
+            | TimeAxisSpillWriter::RowOrdinal { values, .. } => Ok(TimeAxis::Progressive {
                 values: ProgressiveValues::Spilled(values.finish()?),
             }),
         }
@@ -1282,7 +1443,7 @@ pub struct Checkpoint {
 pub(crate) fn load_with_outcome_progressive(
     path: &Path,
     on_checkpoint: impl FnMut(Checkpoint),
-) -> Result<(CsvParseOutcome, Dataset, bool)> {
+) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     load_with_outcome_progressive_using(path, IngestOverrides::default(), on_checkpoint)
 }
 
@@ -1294,7 +1455,7 @@ pub(crate) fn load_with_outcome_progressive_with_overrides(
     path: &Path,
     overrides: IngestOverrides,
     on_checkpoint: impl FnMut(Checkpoint),
-) -> Result<(CsvParseOutcome, Dataset, bool)> {
+) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     load_with_outcome_progressive_using(path, overrides, on_checkpoint)
 }
 
@@ -1302,7 +1463,7 @@ fn load_with_outcome_progressive_using(
     path: &Path,
     overrides: IngestOverrides,
     mut on_checkpoint: impl FnMut(Checkpoint),
-) -> Result<(CsvParseOutcome, Dataset, bool)> {
+) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     let cache_dir = os_spill_dir();
     match choose_storage(
         path,
@@ -1645,6 +1806,43 @@ mod tests {
             .join("testdata")
             .join("corpus")
             .join(file_name)
+    }
+
+    // Issue #94: the column-level verdict itself, isolated from any file. A
+    // column of real numbers is a progressive index; one bad field makes the
+    // whole column not an index, and the rejection carries what the `warn` log
+    // needs to name the culprit.
+    #[test]
+    fn a_numeric_time_column_reads_as_a_progressive_index() {
+        let fields = ["0", "10", " 20 ", "30.5"];
+        let values = parse_progressive_values(&fields).expect("every field is a number");
+        assert_eq!(values, vec![0.0, 10.0, 20.0, 30.5]);
+    }
+
+    #[test]
+    fn an_unreadable_time_column_is_rejected_with_the_first_offender_named() {
+        let fields = ["0", "10", "01-Jan-2026 00:00:00", "30", "not a number"];
+        let rejection = parse_progressive_values(&fields).expect_err("two fields are not numbers");
+
+        assert_eq!(rejection.unparseable_count, 2);
+        assert_eq!(rejection.total_count, 5);
+        assert_eq!(
+            rejection.first_offender.as_deref(),
+            Some("01-Jan-2026 00:00:00")
+        );
+    }
+
+    #[test]
+    fn the_row_ordinal_axis_is_one_value_per_row_in_source_order() {
+        match row_ordinal_axis(4) {
+            TimeAxis::Progressive { values } => {
+                assert_eq!(values.as_slice(), &[0.0, 1.0, 2.0, 3.0]);
+            }
+            TimeAxis::Absolute { .. } => panic!("the fallback index has no absolute meaning"),
+        }
+        // A zero-row file still produces an axis rather than panicking on an
+        // empty range (SPEC §1.3: malformed input never panics).
+        assert_eq!(row_ordinal_axis(0).len(), 0);
     }
 
     // Corpus case 1: a clean comma-delimited, dot-decimal file with an ISO

@@ -79,6 +79,7 @@ Build it *before* the features it protects. Minimum set for v1:
 
 **Grown post-M1 (per the growth rule below)**
 57. `YYYY-MM-DD HH:MM:SS` space-separated datetime (issue #82, `file-wont-open`)
+58. Time column in a format Glyde does not recognize at all (`01-Jan-2026 00:00:00`) — must open against a row-ordinal index, never abort (issue #94, `bug`/`blocking-decision`)
 
 **Growth rule:** every `file-wont-open` issue must add its (anonymized) file to the corpus *with the fix in the same PR*. This is the product's growth engine.
 
