@@ -49,7 +49,7 @@ use super::infer::{log_dtype_choice, normalize_decimal_field, ColumnDtypeChoice,
 use super::IngestOverrides;
 use crate::budget::RamBudget;
 use crate::dsp::decimation::{build_pyramid, build_pyramid_streaming, extend_pyramid, Bucket};
-use crate::index::level0::{self, CacheKey};
+use crate::index::level0::{self, CacheKey, Level0Cache};
 use crate::index::pyramid;
 use crate::index::spill::{SpillStringsWriter, SpillVec, SpillVecWriter};
 use crate::series::{Anomalies, Dtype, NanRunScan, Series, SeriesValues, SpilledValues};
@@ -1929,6 +1929,102 @@ pub fn pyramids_for_dataset_cached_with_cache_dir(
                          uncached build (issue #81)"
                     );
                     Some(build_pyramid(&samples, &ticks))
+                }
+            }
+        })
+        .collect()
+}
+
+/// `dataset`'s own raw `(timestamp, value)` pairs, one entry per column in
+/// `dataset.columns` order, served from (and written to) the on-disk Level-0
+/// cache — the raw-sample counterpart of [`pyramids_for_dataset_cached`]
+/// (issue #92, split from #81: "Level-0 typed spill cache … reopen is
+/// instant"). `None` at an index whose column is non-numeric, or when the
+/// cache could not be read or written for that column (a cache is an
+/// optimization, never a requirement to open a file
+/// (docs/ARCHITECTURE.md §The index)) — [`views::time::column_f64_samples`]
+/// in `glyde-app` falls back to the in-memory dataset in either case, so a
+/// miss here never blocks rendering.
+///
+/// Unlike [`pyramids_for_dataset`], there is no "uncached" counterpart: a
+/// [`Level0Cache`] is always backed by memory-mapped files, so a caller with
+/// no writable cache directory gets `None` for every column rather than an
+/// in-memory equivalent.
+///
+/// Each column gets its own cache entry, keyed by [`CacheKey::with_column`]
+/// and [`CacheKey::with_overrides_signature`], for the same reasons
+/// [`pyramids_for_dataset_cached_with_cache_dir`] does.
+///
+/// Resolves the OS-standard cache directory itself; see
+/// [`level0_for_dataset_cached_with_cache_dir`] for a version that takes an
+/// explicit one (tests; a system with no OS cache directory falls back to
+/// `None` for every column).
+///
+/// Callers must not call this over a [`Dataset::is_spilled`] dataset, for
+/// the same reason [`pyramids_for_dataset`] warns against it: it walks every
+/// raw sample end to end via [`crate::series::SeriesValues::to_f64_vec`] for
+/// any non-`f64` column, which would make every page of a memory-mapped
+/// spill file resident (issue #88).
+pub fn level0_for_dataset_cached(
+    path: &Path,
+    dataset: &Dataset,
+    overrides: IngestOverrides,
+) -> Vec<Option<Level0Cache>> {
+    match os_spill_dir() {
+        Some(cache_dir) => {
+            level0_for_dataset_cached_with_cache_dir(path, dataset, &cache_dir, overrides)
+        }
+        None => (0..dataset.columns.len()).map(|_| None).collect(),
+    }
+}
+
+/// [`level0_for_dataset_cached`] against an explicit cache directory, for
+/// tests that need a temp directory rather than the real OS cache dir — the
+/// same split [`pyramids_for_dataset_cached_with_cache_dir`] provides for
+/// [`pyramids_for_dataset_cached`].
+pub fn level0_for_dataset_cached_with_cache_dir(
+    path: &Path,
+    dataset: &Dataset,
+    cache_dir: &Path,
+    overrides: IngestOverrides,
+) -> Vec<Option<Level0Cache>> {
+    let ticks = dataset.time.to_pyramid_ticks();
+    let key = match CacheKey::for_path(path) {
+        Ok(key) => key.with_overrides_signature(super::overrides_signature(overrides)),
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "could not read this file's metadata to key its level 0 cache; the raw-sample \
+                 view will read from the in-memory dataset instead (issue #92)"
+            );
+            return (0..dataset.columns.len()).map(|_| None).collect();
+        }
+    };
+
+    dataset
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, series)| {
+            let samples: Cow<'_, [f64]> = match series.values().as_f64_slice() {
+                // Already `f64`: hand the level 0 cache the samples
+                // themselves rather than a freshly allocated copy of them.
+                Some(samples) => Cow::Borrowed(samples),
+                None => Cow::Owned(series.values().to_f64_vec()?),
+            };
+            let column_key = key.with_column(index);
+            match level0::build_or_open(cache_dir, &column_key, &samples, &ticks) {
+                Ok(cache) => Some(cache),
+                Err(err) => {
+                    warn!(
+                        path = %path.display(),
+                        column = index,
+                        error = %err,
+                        "level 0 cache read/write failed for this column; the raw-sample view \
+                         will read from the in-memory dataset instead (issue #92)"
+                    );
+                    None
                 }
             }
         })

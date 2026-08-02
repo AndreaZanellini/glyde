@@ -29,9 +29,11 @@ mod dataset;
 mod infer;
 mod report;
 
+pub use crate::index::level0::Level0Cache;
 pub use csv::{open_path, parse, CsvParseOutcome, CsvReader};
 pub use dataset::{
-    load, load_progressive, load_progressive_with_budget, load_with_budget, load_with_overrides,
+    level0_for_dataset_cached, level0_for_dataset_cached_with_cache_dir, load, load_progressive,
+    load_progressive_with_budget, load_with_budget, load_with_overrides,
     load_with_overrides_and_budget, progressive_tick_to_value, progressive_value_to_tick,
     pyramids_for_dataset, pyramids_for_dataset_cached, pyramids_for_dataset_cached_with_cache_dir,
     Checkpoint, Dataset, ProgressiveValues, TimeAxis, Timestamps, PROGRESSIVE_TICK_SCALE,

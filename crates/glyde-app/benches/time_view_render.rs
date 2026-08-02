@@ -127,6 +127,7 @@ fn render_frame(ctx: &egui::Context, fixture: &Fixture) {
                 &fixture.pyramids,
                 &fixture.ticks,
                 &fixture.sample_cache,
+                &[],
             );
         });
     });

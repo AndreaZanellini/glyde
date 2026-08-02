@@ -26,10 +26,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use glyde_core::dsp::decimation::Bucket;
-use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, OpenSummary};
+use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary};
 
 use crate::inference_bar::Correction;
 use crate::plumbing::{
@@ -40,6 +41,11 @@ use crate::{inference_bar, views};
 /// One numeric column's min/max pyramid, or `None` for a non-numeric column
 /// — parallel to `Dataset::columns` (see `glyde_core::ingest::Checkpoint::pyramids`).
 type Pyramids = Vec<Option<Vec<Vec<Bucket>>>>;
+
+/// See `crate::plumbing::IndexingMessage::Completed`'s doc comment (issue
+/// #92) — the raw-sample counterpart of [`Pyramids`], only ever populated
+/// for a completed, non-spilled load.
+type Level0Caches = Vec<Option<Arc<Level0Cache>>>;
 
 /// The most recent background progress checkpoint for a file still being
 /// indexed (docs/ROADMAP.md M3 "Background progressive build emitting
@@ -93,6 +99,10 @@ enum Status {
         ticks: Vec<i128>,
         /// See [`PartialLoad::sample_cache`].
         sample_cache: Vec<Option<Vec<f64>>>,
+        /// See `crate::plumbing::IndexingMessage::Completed`'s doc comment
+        /// (issue #92) — `views::time::show` prefers this over `dataset`'s
+        /// own column, and over `sample_cache`, whenever an entry is `Some`.
+        level0_caches: Level0Caches,
     },
     Failed {
         path: PathBuf,
@@ -227,6 +237,7 @@ impl GlydeApp {
                     report,
                     dataset,
                     pyramids,
+                    level0_caches,
                     ..
                 } => {
                     let ticks = dataset.time.to_pyramid_ticks().into_owned();
@@ -239,6 +250,7 @@ impl GlydeApp {
                         pyramids,
                         ticks,
                         sample_cache,
+                        level0_caches,
                     }
                 }
                 IndexingMessage::Failed { path, message, .. } => Status::Failed { path, message },
@@ -302,6 +314,12 @@ impl eframe::App for GlydeApp {
                             &partial.pyramids,
                             &partial.ticks,
                             &partial.sample_cache,
+                            // A still-growing checkpoint has no level0 cache
+                            // of its own (issue #92's doc comment on
+                            // `IndexingMessage::Completed`) — it renders
+                            // straight from the in-memory dataset like it
+                            // always has, same as a `None` entry would.
+                            &[],
                         );
                     }
                     None => {
@@ -323,6 +341,7 @@ impl eframe::App for GlydeApp {
                 pyramids,
                 ticks,
                 sample_cache,
+                level0_caches,
             } => {
                 ui.heading(path.display().to_string());
                 // SPEC §1.2 mandatory UX / docs/ROADMAP.md M4 "Inference bar
@@ -337,7 +356,7 @@ impl eframe::App for GlydeApp {
                 }
                 // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1"; SPEC
                 // §3.1 decimation via `pyramids` (docs/ROADMAP.md M3, issue #80).
-                views::time::show(ui, dataset, pyramids, ticks, sample_cache);
+                views::time::show(ui, dataset, pyramids, ticks, sample_cache, level0_caches);
             }
             Status::Failed { path, message } => {
                 ui.colored_label(
@@ -453,6 +472,12 @@ mod tests {
         vec![None]
     }
 
+    /// [`sample_pyramids`]'s counterpart for `level0_caches` — a `Completed`
+    /// message's field, never a real on-disk cache for these fixtures.
+    fn sample_level0_caches() -> Level0Caches {
+        vec![None]
+    }
+
     /// The bug the generation guard exists to prevent: file A is slow to
     /// index, the user opens file B before A's background thread reports
     /// back, and A's late `Completed` message must not silently overwrite
@@ -475,6 +500,7 @@ mod tests {
                 report: sample_report(),
                 dataset: sample_dataset(),
                 pyramids: sample_pyramids(),
+                level0_caches: sample_level0_caches(),
             })
             .expect("channel send");
 
@@ -634,6 +660,7 @@ mod tests {
                 report: sample_report(),
                 dataset: sample_dataset(),
                 pyramids: sample_pyramids(),
+                level0_caches: sample_level0_caches(),
             })
             .expect("channel send");
 

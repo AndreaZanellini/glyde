@@ -40,8 +40,9 @@
 //! time, so a future chunked CSV reader can feed it row-by-row without ever
 //! materializing the whole column in memory. [`build`] is a convenience
 //! wrapper over the writer for callers that already have both slices (today,
-//! every caller — the small-file loader in [`crate::ingest::dataset`] — but
-//! not a reason to widen this module's own contract).
+//! every caller — [`crate::ingest::level0_for_dataset_cached_with_cache_dir`],
+//! wired into the completed-load open path per issue #92 — but not a reason
+//! to widen this module's own contract).
 
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -184,6 +185,29 @@ impl Level0Cache {
 
     pub fn sample_count(&self) -> usize {
         self.sample_count
+    }
+}
+
+/// Cheap: prints only the sample count, never the mapped contents — a cache
+/// can back a file with millions of samples, so an assertion failure message
+/// must not try to render every one of them.
+impl std::fmt::Debug for Level0Cache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Level0Cache")
+            .field("sample_count", &self.sample_count)
+            .finish()
+    }
+}
+
+/// Structural equality over the mapped contents, not the backing files —
+/// two caches (e.g. one freshly built, one reopened from disk) compare equal
+/// whenever their samples and timestamps do, which is what
+/// `tests/level0_reopen_integration.rs`'s cache-reuse assertions need.
+impl PartialEq for Level0Cache {
+    fn eq(&self, other: &Self) -> bool {
+        self.sample_count == other.sample_count
+            && self.timestamps() == other.timestamps()
+            && self.samples() == other.samples()
     }
 }
 
