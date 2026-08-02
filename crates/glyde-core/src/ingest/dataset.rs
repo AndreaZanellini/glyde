@@ -1838,6 +1838,14 @@ fn streaming_pyramid_for_column(
 /// cache miss, exactly as [`pyramids_for_dataset`] does (issue #88); the
 /// cached result is the same either way, since both builders produce the same
 /// pyramid.
+///
+/// **This or [`derived_caches_for_dataset_cached`]?** That one is what
+/// `glyde-app` calls for a completed, non-spilled open: it produces this
+/// pyramid *and* the Level-0 raw-sample cache, converting each column at most
+/// once between them. This one is the pyramid alone — the right choice when
+/// there is no Level-0 cache to build, which today means the spilled path
+/// (where a Level-0 cache would be a whole second copy of the column, issue
+/// #102) and the tests that exercise pyramid caching in isolation.
 pub fn pyramids_for_dataset_cached(
     path: &Path,
     dataset: &Dataset,
