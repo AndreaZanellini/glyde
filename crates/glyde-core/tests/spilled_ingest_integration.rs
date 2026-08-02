@@ -355,6 +355,53 @@ fn a_spilled_open_still_reports_progress_checkpoints() {
     }
 }
 
+// Issue #87 / SPEC §5.1 ("a clear explanation and the affordable alternative"):
+// a spilled open's checkpoints must say they are spilled, because that is the
+// only moment the app can explain the slowness to the user — a checkpoint's own
+// `dataset` is the bounded *in-memory* preview, so `Dataset::is_spilled` is
+// false on every progress update and only becomes true at the end.
+#[test]
+fn a_spilled_open_marks_every_checkpoint_as_spilled() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let path = write_mixed_dtype_fixture(dir.path(), 50_000);
+
+    let mut spilled_flags: Vec<bool> = Vec::new();
+    let mut preview_claims_spilled = false;
+    let dataset =
+        ingest::load_progressive_with_budget(&path, zero_budget(), cache.path(), |checkpoint| {
+            spilled_flags.push(checkpoint.spilled);
+            preview_claims_spilled |= checkpoint.dataset.is_spilled();
+        })
+        .expect("spilled progressive open must succeed");
+
+    assert!(dataset.is_spilled());
+    assert!(!spilled_flags.is_empty(), "the open must checkpoint at all");
+    assert!(
+        spilled_flags.iter().all(|&spilled| spilled),
+        "every checkpoint of a spilled open reports the storage decision: {spilled_flags:?}"
+    );
+    assert!(
+        !preview_claims_spilled,
+        "the flag cannot be replaced by `dataset.is_spilled()`: a checkpoint's \
+         dataset is the in-memory preview, which is not spilled"
+    );
+
+    // The negative control: the same fixture under a budget that affords it
+    // must not claim to be streaming from disk.
+    let mut in_memory_flags: Vec<bool> = Vec::new();
+    ingest::load_progressive_with_budget(&path, unlimited_budget(), cache.path(), |checkpoint| {
+        in_memory_flags.push(checkpoint.spilled);
+    })
+    .expect("in-memory progressive open must succeed");
+
+    assert!(!in_memory_flags.is_empty());
+    assert!(
+        in_memory_flags.iter().all(|&spilled| !spilled),
+        "an in-memory open must never report itself as spilled: {in_memory_flags:?}"
+    );
+}
+
 // The preview that makes the checkpoints above possible is bounded: past
 // `PREVIEW_MAX_ROWS` it stops growing, so a genuinely huge file cannot smuggle
 // an unbounded `Vec` back in through the progress path. A 250k-row fixture

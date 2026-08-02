@@ -68,13 +68,17 @@ pub enum IndexingMessage {
     /// in it, for a "N rows so far" progress readout. `pyramids` is that same
     /// checkpoint's own min/max pyramid (issue #80), exact over the rows read
     /// so far — never an approximation — so `views::time::show` can decimate
-    /// a still-growing plot exactly like a finished one.
+    /// a still-growing plot exactly like a finished one. `spilled` carries the
+    /// storage decision ingestion took before reading a byte (issue #75), so
+    /// the loading readout can explain a slow open while it is slow rather
+    /// than only in the log (issue #87, SPEC §5.1's "clear explanation").
     Progress {
         generation: u64,
         path: PathBuf,
         dataset: Box<Dataset>,
         pyramids: Pyramids,
         rows_read: u64,
+        spilled: bool,
     },
     /// `path` opened successfully; `summary` is what was inferred, `report`
     /// is the same inference surfaced as SPEC §1.2's mandatory UX fields
@@ -211,6 +215,7 @@ fn run_index_job(
                 dataset: Box::new(checkpoint.dataset),
                 pyramids: checkpoint.pyramids,
                 rows_read: checkpoint.rows_read,
+                spilled: checkpoint.spilled,
             });
         },
     ) {
@@ -350,11 +355,17 @@ mod tests {
                     dataset,
                     pyramids,
                     rows_read,
+                    spilled,
                 } => {
                     assert_eq!(generation, 3);
                     assert_eq!(progress_path, path);
                     assert_eq!(dataset.time.len(), rows_read as usize);
                     assert_eq!(pyramids.len(), dataset.columns.len());
+                    assert!(
+                        !spilled,
+                        "issue #87: a small fixture fits the RAM budget, so its \
+                         checkpoints must not claim the file is being streamed from disk"
+                    );
                     progress_rows_read.push(rows_read);
                 }
                 IndexingMessage::Completed { generation, .. } => {
@@ -454,6 +465,7 @@ mod tests {
                 ),
                 pyramids: Vec::new(),
                 rows_read: 6,
+                spilled: false,
             }
             .generation(),
             5
