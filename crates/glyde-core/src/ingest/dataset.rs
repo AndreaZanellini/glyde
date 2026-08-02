@@ -1371,6 +1371,9 @@ impl<'a> SpillPreview<'a> {
                 dataset,
                 pyramids,
                 rows_read,
+                // Issue #87: this preview exists *because* the file is being
+                // streamed to disk, so every checkpoint it emits says so.
+                spilled: true,
             });
         }
     }
@@ -1412,6 +1415,18 @@ pub struct Checkpoint {
     pub dataset: Dataset,
     pub pyramids: Vec<Option<Vec<Vec<Bucket>>>>,
     pub rows_read: u64,
+    /// Whether this open is streaming the file's samples to the on-disk cache
+    /// instead of holding them in memory (issue #75's `choose_storage`
+    /// decision, taken before a single row is read).
+    ///
+    /// A checkpoint's own `dataset` cannot answer this: a spilled open
+    /// checkpoints from a bounded *in-memory* preview (see [`SpillPreview`]),
+    /// so `Dataset::is_spilled` is `false` on every progress update and only
+    /// becomes `true` on the completed one. Issue #87: SPEC §5.1 owes the user
+    /// "a clear explanation and the affordable alternative" for that decision,
+    /// and the moment it needs explaining is while the open is slow — which is
+    /// exactly when only a checkpoint is available to carry it.
+    pub spilled: bool,
 }
 
 /// [`load_with_outcome`], additionally invoking `on_checkpoint` with a
@@ -1493,6 +1508,7 @@ fn load_with_outcome_progressive_using(
                             rows_read: partial_outcome.row_count,
                             pyramids,
                             dataset,
+                            spilled: false,
                         });
                     }
                     Err(err) => {
@@ -1546,6 +1562,7 @@ pub fn load_progressive_with_budget(
                             rows_read: partial.row_count,
                             pyramids,
                             dataset,
+                            spilled: false,
                         });
                     }
                 },

@@ -24,7 +24,7 @@
 //! a small text header, and its samples render as a plot via
 //! [`crate::views::time`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -62,6 +62,13 @@ struct PartialLoad {
     ticks: Vec<i128>,
     sample_cache: Vec<Option<Vec<f64>>>,
     rows_read: u64,
+    /// Issue #87: whether ingestion chose the on-disk spill path for this
+    /// file (SPEC §5.1). Drives [`loading_label`]'s explanation — the two
+    /// things the user notices about such an open (it is slower, and the plot
+    /// stops filling in past the preview cap) are consequences of a decision
+    /// Glyde took for them, so they are stated rather than left to look like
+    /// Glyde struggling.
+    spilled: bool,
 }
 
 /// What the central panel currently shows, driven by [`IndexingMessage`]s
@@ -197,6 +204,7 @@ impl GlydeApp {
                     dataset,
                     pyramids,
                     rows_read,
+                    spilled,
                     ..
                 } => {
                     let ticks = dataset.time.to_pyramid_ticks().into_owned();
@@ -209,6 +217,7 @@ impl GlydeApp {
                             ticks,
                             sample_cache,
                             rows_read,
+                            spilled,
                         }),
                     }
                 }
@@ -285,11 +294,7 @@ impl eframe::App for GlydeApp {
                     Some(partial) => {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(format!(
-                                "Indexing {}… {} rows so far",
-                                path.display(),
-                                partial.rows_read
-                            ));
+                            ui.label(loading_label(path, partial.rows_read, partial.spilled));
                         });
                         views::time::show(
                             ui,
@@ -345,6 +350,36 @@ impl eframe::App for GlydeApp {
         if let Some((path, correction)) = pending_correction {
             self.apply_correction(path, correction);
         }
+    }
+}
+
+/// The line shown next to the spinner while a file is still being indexed
+/// (split out from the render so it is unit-testable without an `egui::Ui`,
+/// the same way `inference_bar::field_text` is).
+///
+/// Issue #87 / SPEC §5.1: a file whose typed columns do not fit
+/// `min(25% RAM, 4 GB)` is streamed to the on-disk cache instead, a decision
+/// `ingest::choose_storage` takes on the user's behalf before reading a byte.
+/// It has two consequences the user can see — the open is slower (two passes
+/// over the source instead of one) and the plot stops filling in once the
+/// bounded preview is full — and until now both were explained only in the
+/// tracing log, which is nowhere a user looks. So a spilled open says what it
+/// is doing and why, while it is doing it.
+///
+/// Deliberately transient: it is not a new inference-bar field (SPEC §1.2
+/// freezes that list, and a storage choice is not an inference), and it does
+/// not survive the load, because once the file is open there is nothing left
+/// for the user to wonder about.
+fn loading_label(path: &Path, rows_read: u64, spilled: bool) -> String {
+    if spilled {
+        format!(
+            "Indexing {}… {rows_read} rows so far. This file is too large to hold in memory, \
+             so Glyde is streaming it to disk — expect a slower open, and a preview that stops \
+             growing before the complete plot appears.",
+            path.display(),
+        )
+    } else {
+        format!("Indexing {}… {rows_read} rows so far", path.display())
     }
 }
 
@@ -470,6 +505,7 @@ mod tests {
                 dataset: sample_dataset(),
                 pyramids: sample_pyramids(),
                 rows_read: 1,
+                spilled: false,
             })
             .expect("channel send");
 
@@ -482,9 +518,68 @@ mod tests {
             } => {
                 assert_eq!(loading_path, &path);
                 assert_eq!(partial.rows_read, 1);
+                assert!(!partial.spilled);
             }
             _ => panic!("expected a Loading status with a partial dataset attached"),
         }
+    }
+
+    /// Issue #87: the storage decision has to survive the trip from the
+    /// checkpoint to the thing that renders it, or the explanation never
+    /// reaches the user it is for.
+    #[test]
+    fn a_spilled_progress_message_carries_the_storage_decision_to_the_status() {
+        let mut app = GlydeApp::new();
+        app.generation = 1;
+
+        app.tx
+            .send(IndexingMessage::Progress {
+                generation: 1,
+                path: PathBuf::from("huge.csv"),
+                dataset: sample_dataset(),
+                pyramids: sample_pyramids(),
+                rows_read: 200_000,
+                spilled: true,
+            })
+            .expect("channel send");
+
+        app.drain_indexing_messages();
+
+        match &app.status {
+            Status::Loading {
+                partial: Some(partial),
+                ..
+            } => assert!(partial.spilled),
+            _ => panic!("expected a Loading status with a partial dataset attached"),
+        }
+    }
+
+    // Issue #87 / SPEC §5.1: the readout for an ordinary open says only what
+    // it is doing; a spilled one also says why it is slow and why the preview
+    // stops growing, since both are consequences of a decision Glyde took for
+    // the user (Golden Rule 2's "never silently").
+    #[test]
+    fn the_loading_label_explains_a_spilled_open_and_stays_quiet_otherwise() {
+        let path = PathBuf::from("recording.csv");
+
+        let ordinary = loading_label(&path, 40_000, false);
+        assert_eq!(ordinary, "Indexing recording.csv… 40000 rows so far");
+
+        let spilled = loading_label(&path, 40_000, true);
+        assert!(spilled.starts_with("Indexing recording.csv… 40000 rows so far"));
+        assert!(
+            spilled.contains("too large to hold in memory"),
+            "the explanation must name the reason, not just the symptom: {spilled}"
+        );
+        assert!(
+            spilled.contains("streaming it to disk"),
+            "SPEC §5.1's \"affordable alternative\" is what Glyde did instead: {spilled}"
+        );
+        assert!(
+            spilled.contains("stops growing"),
+            "the frozen preview is the other thing the user sees and must be \
+             explained too: {spilled}"
+        );
     }
 
     /// The same generation guard that protects `Completed` must protect
@@ -508,6 +603,7 @@ mod tests {
                 dataset: sample_dataset(),
                 pyramids: sample_pyramids(),
                 rows_read: 1,
+                spilled: false,
             })
             .expect("channel send");
 

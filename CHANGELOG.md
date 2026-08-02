@@ -12,6 +12,28 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **A file too large to fit in memory now tells you that is what is
+  happening, while it happens.** When you open a file whose data would not
+  fit in the memory budget, Glyde streams it to disk instead of holding it in
+  memory. That is a deliberate decision, and it has two consequences you can
+  see: the open takes noticeably longer, and the plot that fills in while it
+  loads stops growing before the file is finished. Until now, neither was
+  explained anywhere you would look — only in the log — so a big file just
+  looked like Glyde struggling. The line next to the loading spinner now
+  reads: *"Indexing … 40000 rows so far. This file is too large to hold in
+  memory, so Glyde is streaming it to disk — expect a slower open, and a
+  preview that stops growing before the complete plot appears."* It appears
+  only for files that actually take that path, and only while they are
+  loading; once the file is open, it goes away. (issue #87)
+
+  **Assumption made:** this is a transient status next to the progress
+  readout, not a new row in the inference bar. The inference bar's field list
+  is fixed by `docs/SPEC.md` §1.2 and is about *inference* — a storage choice
+  is not something Glyde guessed, so it does not belong there. A file that is
+  refused outright (no cache directory available at all) still shows only the
+  generic error message; making that one better is a separate, smaller
+  question.
+
 - **You can now correct the delimiter, decimal separator, or an ambiguous
   day/month date reading directly in the inference bar, and the plot
   re-indexes immediately — but only when Glyde is actually unsure.** The
