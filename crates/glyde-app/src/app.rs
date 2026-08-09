@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glyde_core::dsp::decimation::Bucket;
-use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary};
+use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache};
 
 use crate::inference_bar::Correction;
 use crate::plumbing::{
@@ -90,7 +90,6 @@ enum Status {
     },
     Loaded {
         path: PathBuf,
-        summary: Box<OpenSummary>,
         report: Box<InferenceReport>,
         dataset: Box<Dataset>,
         pyramids: Pyramids,
@@ -233,7 +232,6 @@ impl GlydeApp {
                 }
                 IndexingMessage::Completed {
                     path,
-                    summary,
                     report,
                     dataset,
                     pyramids,
@@ -244,7 +242,6 @@ impl GlydeApp {
                     let sample_cache = views::time::cache_column_samples(&dataset);
                     Status::Loaded {
                         path,
-                        summary,
                         report,
                         dataset,
                         pyramids,
@@ -335,7 +332,6 @@ impl eframe::App for GlydeApp {
             }
             Status::Loaded {
                 path,
-                summary,
                 report,
                 dataset,
                 pyramids,
@@ -350,9 +346,6 @@ impl eframe::App for GlydeApp {
                 // click, correcting triggers a re-index".
                 if let Some(correction) = inference_bar::show(ui, report, path) {
                     pending_correction = Some((path.clone(), correction));
-                }
-                if summary.skipped_row_count > 0 {
-                    ui.label(format!("{} rows skipped", summary.skipped_row_count));
                 }
                 // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1"; SPEC
                 // §3.1 decimation via `pyramids` (docs/ROADMAP.md M3, issue #80).
@@ -406,7 +399,8 @@ fn loading_label(path: &Path, rows_read: u64, spilled: bool) -> String {
 mod tests {
     use super::*;
     use glyde_core::ingest::{
-        Confidence, DecimalSeparator, Delimiter, InferredField, SamplingClass, TimeAxis,
+        Confidence, DecimalSeparator, Delimiter, InferredField, OpenSummary, SamplingClass,
+        TimeAxis,
     };
     use glyde_core::series::{Series, SeriesValues};
     use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
@@ -451,6 +445,8 @@ mod tests {
             },
             sample_count: 1,
             sampling_class: SamplingClass::Uniform,
+            skipped_row_count: 0,
+            skipped_row_details: Vec::new(),
         })
     }
 

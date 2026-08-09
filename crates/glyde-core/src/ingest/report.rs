@@ -38,7 +38,7 @@
 //! searching for a candidate among several. Worth revisiting if a real file
 //! ever puts the time column anywhere else.
 
-use super::csv::{open_path_capturing_column, CsvParseOutcome};
+use super::csv::{open_path_capturing_column, CsvParseOutcome, SkippedRowDetail};
 use super::dataset::{self, Checkpoint, Dataset, TimeAxis, TimeIndexInference};
 use super::infer::Confidence;
 use crate::time::{infer_timestamp_format, parse_timestamp, summarize_ticks, TimestampFormat};
@@ -119,6 +119,15 @@ pub struct InferenceReport {
     pub timestamp_format: InferredField<Option<String>>,
     pub sample_count: u64,
     pub sampling_class: SamplingClass,
+    /// SPEC §1.3 "rows ... skipped, counted ... surfaced in the inference
+    /// bar ('142 rows skipped — view details')" (docs/ROADMAP.md M4). Exact
+    /// and unbounded, unlike `skipped_row_details` below.
+    pub skipped_row_count: u64,
+    /// A bounded sample of why rows were skipped (see
+    /// `super::csv::MAX_SKIPPED_ROW_DETAILS`); use `skipped_row_count` for
+    /// the exact total, and [`Self::skipped_row_details_truncated`] to know
+    /// whether this list is a partial view of it.
+    pub skipped_row_details: Vec<SkippedRowDetail>,
 }
 
 impl InferenceReport {
@@ -132,6 +141,13 @@ impl InferenceReport {
             || self.decimal_separator.confidence == Confidence::Low
             || self.time_column.confidence == Confidence::Low
             || self.timestamp_format.confidence == Confidence::Low
+    }
+
+    /// True when more rows were skipped than `skipped_row_details` retains
+    /// — SPEC §1.3's "view details" then also needs to say "showing the
+    /// first N of M" rather than implying the list is exhaustive.
+    pub fn skipped_row_details_truncated(&self) -> bool {
+        self.skipped_row_count > self.skipped_row_details.len() as u64
     }
 }
 
@@ -396,6 +412,8 @@ fn build_summary_and_report(
         },
         sample_count: outcome.row_count,
         sampling_class,
+        skipped_row_count: outcome.skipped_row_count,
+        skipped_row_details: outcome.skipped_row_details,
     };
 
     Ok((summary, report, dataset))
@@ -509,6 +527,22 @@ mod tests {
         assert_eq!(report.encoding.confidence, Confidence::High);
         assert_eq!(report.delimiter.confidence, Confidence::High);
         assert_eq!(report.time_column.confidence, Confidence::High);
+    }
+
+    // docs/ROADMAP.md M4 "Skipped-rows detail surface", SPEC §1.3: the
+    // `InferenceReport` the UI actually renders must carry both the exact
+    // count and the bounded detail sample, not just `OpenSummary`'s count.
+    #[test]
+    fn open_dataset_reports_skipped_row_details_for_ragged_rows() {
+        let path = corpus_path("case-21-ragged-rows.csv");
+
+        let (_summary, report, _dataset) = open_dataset(&path).expect("case 21 must open");
+
+        assert_eq!(report.skipped_row_count, 2);
+        assert_eq!(report.skipped_row_details.len(), 2);
+        assert_eq!(report.skipped_row_details[0].line_number, 3);
+        assert_eq!(report.skipped_row_details[1].line_number, 4);
+        assert!(!report.skipped_row_details_truncated());
     }
 
     // No corpus case (the fixed 56-case set) exercises a header preamble

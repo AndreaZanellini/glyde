@@ -121,7 +121,48 @@ pub fn show(
             });
             correction
         });
+    // Rendered as a sibling of the collapsible header, not nested inside its
+    // body: SPEC §1.2's "opens expanded when any inference is low-confidence"
+    // trigger is specific to confidence, and most files with skipped rows
+    // are otherwise fully confident, so nesting this inside the collapsed
+    // body would bury "N rows skipped" behind a click most users would never
+    // make — a regression from the plain label this replaces, which was
+    // always visible regardless of the bar's collapsed state.
+    skipped_rows_detail(ui, report);
     response.body_returned.flatten()
+}
+
+/// SPEC §1.3 "rows ... skipped, counted, logged at `warn`, surfaced in the
+/// inference bar ('142 rows skipped — view details')" (docs/ROADMAP.md M4).
+/// Renders nothing at all for a clean file — same "no control unless there
+/// is something to show" rule the correction controls follow (see the
+/// module docs).
+fn skipped_rows_detail(ui: &mut egui::Ui, report: &InferenceReport) {
+    if report.skipped_row_count == 0 {
+        return;
+    }
+    egui::CollapsingHeader::new(format!(
+        "{} row{} skipped — view details",
+        report.skipped_row_count,
+        if report.skipped_row_count == 1 {
+            ""
+        } else {
+            "s"
+        }
+    ))
+    .id_salt("inference-bar-skipped-rows")
+    .default_open(false)
+    .show(ui, |ui| {
+        for detail in &report.skipped_row_details {
+            ui.label(format!("line {}: {}", detail.line_number, detail.reason));
+        }
+        if report.skipped_row_details_truncated() {
+            ui.label(format!(
+                "…and {} more",
+                report.skipped_row_count - report.skipped_row_details.len() as u64
+            ));
+        }
+    });
 }
 
 /// Every delimiter a user can pick in the correction dropdown, in the same
@@ -325,7 +366,7 @@ fn field_text(name: &str, value: &str, confidence: Confidence) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glyde_core::ingest::{InferredField, SamplingClass};
+    use glyde_core::ingest::{InferredField, SamplingClass, SkipReason, SkippedRowDetail};
 
     fn sample_report(timestamp_format_confidence: Confidence) -> InferenceReport {
         InferenceReport {
@@ -351,6 +392,25 @@ mod tests {
             },
             sample_count: 42,
             sampling_class: SamplingClass::Uniform,
+            skipped_row_count: 0,
+            skipped_row_details: Vec::new(),
+        }
+    }
+
+    /// [`sample_report`] with a nonzero skip count and one bounded detail —
+    /// what a real ragged-row file's report looks like, for the "view
+    /// details" render tests below.
+    fn sample_report_with_skipped_rows() -> InferenceReport {
+        InferenceReport {
+            skipped_row_count: 2,
+            skipped_row_details: vec![SkippedRowDetail {
+                line_number: 3,
+                reason: SkipReason::FieldCountMismatch {
+                    expected: 3,
+                    found: 2,
+                },
+            }],
+            ..sample_report(Confidence::High)
         }
     }
 
@@ -534,5 +594,36 @@ mod tests {
     #[test]
     fn delimiter_options_excludes_whitespace() {
         assert!(!DELIMITER_OPTIONS.contains(&Delimiter::Whitespace));
+    }
+
+    // SPEC §1.3 "surfaced in the inference bar ('142 rows skipped — view
+    // details')": a clean file (the common case) must render nothing extra
+    // for skipped rows at all.
+    #[test]
+    fn skipped_rows_detail_renders_nothing_for_a_clean_file() {
+        let clean = sample_report(Confidence::High);
+        let skipped = sample_report_with_skipped_rows();
+
+        let clean_shapes = render_shape_count(&clean);
+        let skipped_shapes = render_shape_count(&skipped);
+
+        assert!(
+            skipped_shapes > clean_shapes,
+            "a report with skipped rows must render the 'view details' affordance a clean \
+             report does not (clean: {clean_shapes} shapes, skipped: {skipped_shapes} shapes)"
+        );
+    }
+
+    #[test]
+    fn skipped_rows_detail_renders_without_panicking() {
+        let ctx = egui::Context::default();
+        let report = sample_report_with_skipped_rows();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, &report, Path::new("/some/file.csv"));
+            });
+        });
+
+        assert!(!output.shapes.is_empty());
     }
 }
