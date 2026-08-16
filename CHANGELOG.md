@@ -12,6 +12,40 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **The inference bar now tells you when a file's timestamps run out of
+  order, offers to fix it with one click, and always states whether your
+  timezone was honored or assumed.** Until now, a file with rows out of time
+  order (a logging hiccup, a merged export, a clock adjustment) opened and
+  plotted silently — the anomaly was only ever visible in the log. The bar
+  now shows *"timestamps not monotonic (N rows) — [Sort] [Keep as-is]"**
+  whenever this applies; clicking **Sort** re-opens the file with every
+  column reordered by ascending timestamp (a stable sort, so rows that
+  already share the exact same timestamp keep their original relative
+  order — SPEC §2.1's "duplicate timestamps ... preserved" survives a sort
+  intact), and clicking **Keep as-is** leaves the file exactly as it was
+  read, which is also what happens if you never click either button. The bar
+  also now always shows a **timezone** field: `"timezone: +02:00 (honored)"`
+  for a file whose timestamps carried an explicit UTC offset, or
+  `"timezone: naive local time"` when they did not — so a Glyde assumption
+  that used to be implicit (dates with no timezone are read as your own
+  local clock) is now a line you can actually see. (docs/ROADMAP.md M4)
+
+  **Assumptions made:** (1) sorting is only offered for a file small enough
+  to be held in memory — a file large enough to stream from disk opens
+  unsorted and the log explains why, since a streamed file's on-disk cache
+  cannot be reordered in place; making a huge file sortable is a materially
+  bigger change tracked as a follow-up rather than folded in here. (2) the
+  timezone field is a one-line, whole-column summary taken from the file's
+  first row; a file whose offset genuinely changes partway through (e.g. a
+  DST transition mid-file) is already handled correctly *per sample* on the
+  plot's own time axis and cursor readout — this field is only the
+  inference bar's short summary, not a claim that every row shares one
+  offset. (3) "Keep as-is" is a real, always-present button, not a dismiss
+  action with hidden state — clicking it changes nothing on purpose, since
+  "not reordering" is already what happens without it; it exists so the
+  choice SPEC §2.1 names is visibly offered, not only implied by the absence
+  of a Sort click.
+
 - **A file too large to fit in memory now tells you that is what is
   happening, while it happens.** When you open a file whose data would not
   fit in the memory budget, Glyde streams it to disk instead of holding it in

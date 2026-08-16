@@ -174,6 +174,7 @@ impl GlydeApp {
                 self.overrides.decimal_separator = Some(separator)
             }
             Correction::TimestampFormat(format) => self.overrides.timestamp_format = Some(format),
+            Correction::SortByTime => self.overrides.sort_by_time = true,
         }
         tracing::info!(
             path = %path.display(),
@@ -451,6 +452,9 @@ mod tests {
             },
             sample_count: 1,
             sampling_class: SamplingClass::Uniform,
+            non_monotonic_count: 0,
+            duplicate_timestamp_count: 0,
+            timezone: Some(glyde_core::ingest::TimezoneLabel::NaiveLocal),
         })
     }
 

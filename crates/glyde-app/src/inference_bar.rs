@@ -64,7 +64,9 @@
 //! commits to a slow, unindicated full-file scan before reporting back.
 //! Not worth offering as a one-click option.
 
-use glyde_core::ingest::{Confidence, DecimalSeparator, Delimiter, InferenceReport, InferredField};
+use glyde_core::ingest::{
+    Confidence, DecimalSeparator, Delimiter, InferenceReport, InferredField, TimezoneLabel,
+};
 use glyde_core::time::TimestampFormat;
 use std::path::Path;
 
@@ -75,6 +77,9 @@ pub enum Correction {
     Delimiter(Delimiter),
     DecimalSeparator(DecimalSeparator),
     TimestampFormat(TimestampFormat),
+    /// SPEC §2.1's "[Sort]" half of the "timestamps not monotonic —
+    /// [Sort]/[Keep as-is]" affordance.
+    SortByTime,
 }
 
 /// Renders `report` as a collapsible header into `ui`, one row of field
@@ -116,12 +121,67 @@ pub fn show(
                 if let Some(picked) = timestamp_format_control(ui, &report.timestamp_format) {
                     correction = Some(Correction::TimestampFormat(picked));
                 }
+                if let Some(text) = timezone_label_text(&report.timezone) {
+                    ui.label(text);
+                }
                 ui.label(format!("{} samples", report.sample_count));
                 ui.label(format!("sampling: {:?}", report.sampling_class));
+                if let Some(picked) = monotonicity_affordance(ui, report) {
+                    correction = Some(picked);
+                }
             });
             correction
         });
     response.body_returned.flatten()
+}
+
+/// SPEC §2.1's timezone label: `"timezone: +02:00 (honored)"` when the
+/// source carried an offset, `"timezone: naive local time"` when it did not.
+/// `None` when there is no absolute timestamp to have a timezone at all (a
+/// progressive numeric index), matching [`display_option`]'s "no placeholder
+/// row for a field that does not apply" precedent — unlike every other
+/// field here, a timezone genuinely has nothing to say for that axis kind,
+/// rather than an unknown value.
+fn timezone_label_text(timezone: &Option<TimezoneLabel>) -> Option<String> {
+    match timezone {
+        Some(TimezoneLabel::Honored(offset)) => Some(format!("timezone: {offset} (honored)")),
+        Some(TimezoneLabel::NaiveLocal) => Some("timezone: naive local time".to_string()),
+        None => None,
+    }
+}
+
+/// SPEC §2.1's non-monotonic-timestamp affordance, verbatim: "timestamps not
+/// monotonic — [Sort] / [Keep as-is]". Renders nothing when the axis is
+/// already in order (`non_monotonic_count == 0`) — same
+/// nothing-to-correct-here rule the delimiter/decimal-separator/timestamp-
+/// format controls follow (see the module docs), just keyed on a fact
+/// instead of a confidence level, since SPEC §2.1 gives monotonicity no
+/// separate confidence to gate on. "Sort" returns
+/// [`Correction::SortByTime`]; "Keep as-is" is the already-in-effect
+/// default (SPEC §2.1: rows are "not reordered silently" until this button
+/// is *not* the one clicked), so it reports no correction at all — clicking
+/// it changes nothing, which is the point.
+fn monotonicity_affordance(ui: &mut egui::Ui, report: &InferenceReport) -> Option<Correction> {
+    if report.non_monotonic_count == 0 {
+        return None;
+    }
+    let mut correction = None;
+    ui.horizontal(|ui| {
+        ui.label(format!(
+            "timestamps not monotonic ({} row{})",
+            report.non_monotonic_count,
+            if report.non_monotonic_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+        if ui.button("Sort").clicked() {
+            correction = Some(Correction::SortByTime);
+        }
+        let _ = ui.button("Keep as-is");
+    });
+    correction
 }
 
 /// Every delimiter a user can pick in the correction dropdown, in the same
@@ -351,6 +411,9 @@ mod tests {
             },
             sample_count: 42,
             sampling_class: SamplingClass::Uniform,
+            non_monotonic_count: 0,
+            duplicate_timestamp_count: 0,
+            timezone: Some(TimezoneLabel::NaiveLocal),
         }
     }
 
@@ -404,6 +467,71 @@ mod tests {
         assert_eq!(
             field_text("delimiter", ",", Confidence::Low),
             "delimiter: , (low confidence)"
+        );
+    }
+
+    // SPEC §2.1's two timezone readings must be told apart in the label
+    // text, and an axis with no timezone concept at all (progressive index)
+    // must render nothing rather than a misleading placeholder.
+    #[test]
+    fn timezone_label_text_distinguishes_honored_naive_and_not_applicable() {
+        assert_eq!(
+            timezone_label_text(&Some(TimezoneLabel::Honored("+02:00".to_string()))),
+            Some("timezone: +02:00 (honored)".to_string())
+        );
+        assert_eq!(
+            timezone_label_text(&Some(TimezoneLabel::NaiveLocal)),
+            Some("timezone: naive local time".to_string())
+        );
+        assert_eq!(timezone_label_text(&None), None);
+    }
+
+    // corpus 24's shape (docs/ROADMAP.md M4 "corpus 24 (tz displayed)"): a
+    // report with an honored offset must render that offset text somewhere
+    // in the bar.
+    #[test]
+    fn show_renders_the_honored_timezone_offset() {
+        let mut report = sample_report(Confidence::High);
+        // Forced low so the bar stays expanded regardless of the timezone
+        // field under test — same isolation pattern as
+        // `delimiter_correction_control_only_renders_when_the_field_is_low_confidence`.
+        report.time_column.confidence = Confidence::Low;
+        report.timezone = Some(TimezoneLabel::Honored("+02:00".to_string()));
+        let with_offset = render_shape_count(&report);
+        report.timezone = None;
+        let without = render_shape_count(&report);
+
+        assert!(
+            with_offset > without,
+            "an honored timezone offset must render something the no-timezone case does not"
+        );
+    }
+
+    // SPEC §2.1's "timestamps not monotonic — [Sort]/[Keep as-is]"
+    // affordance must render only when there is something to report — same
+    // nothing-to-correct-here rule the other one-click controls follow (see
+    // `monotonicity_affordance`'s own doc comment). This crate has no
+    // `egui_kittest` dependency to simulate an actual button click (no other
+    // control in this file is click-tested that way either — see
+    // `show_reports_no_correction_when_nothing_was_clicked` above), so this
+    // sticks to the same render-shape-count style as the rest of the file.
+    #[test]
+    fn monotonicity_affordance_only_renders_when_timestamps_are_non_monotonic() {
+        let mut clean = sample_report(Confidence::High);
+        // Forced low so the bar stays expanded regardless of monotonicity —
+        // same isolation pattern as the delimiter/decimal-separator tests
+        // above.
+        clean.time_column.confidence = Confidence::Low;
+        let mut non_monotonic = clean.clone();
+        non_monotonic.non_monotonic_count = 1;
+
+        let clean_shapes = render_shape_count(&clean);
+        let non_monotonic_shapes = render_shape_count(&non_monotonic);
+
+        assert!(
+            non_monotonic_shapes > clean_shapes,
+            "a non-monotonic report must render the Sort/Keep-as-is affordance a clean one \
+             does not (clean: {clean_shapes} shapes, non-monotonic: {non_monotonic_shapes} shapes)"
         );
     }
 
