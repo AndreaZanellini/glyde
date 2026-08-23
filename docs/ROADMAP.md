@@ -145,12 +145,12 @@ them, so CI stays green while honoring "written first."
 
 ## M5 — PSD (Welch, the differentiator)
 
-- [ ] Window functions (Hann/Hamming/rectangular) with correct power normalization → SPEC §3.2 · proven by: Welch golden — window-normalization (un-ignore)
-- [ ] Detrend (per-segment mean removal, constant) by default, documented → SPEC §3.2 · proven by: Welch golden — detrend (un-ignore)
-- [ ] Welch core on `rustfft`: default segment length (largest pow2 ≤ N/8, clamped [256, 65536]), 50% overlap, one-sided ×2 scaling (not DC/Nyquist), variance conservation → SPEC §3.2 · proven by: Welch golden — sinusoid, Parseval, one-sided, two-tone (un-ignore)
+- [x] Window functions (Hann/Hamming/rectangular) with correct power normalization → SPEC §3.2 · proven by: Welch golden — window-normalization (un-ignore)
+- [x] Detrend (per-segment mean removal, constant) by default, documented → SPEC §3.2 · proven by: Welch golden — detrend (un-ignore)
+- [x] Welch core on `rustfft`: default segment length (largest pow2 ≤ N/8, clamped [256, 65536]), 50% overlap, one-sided ×2 scaling (not DC/Nyquist), variance conservation → SPEC §3.2 · proven by: Welch golden — sinusoid, Parseval, one-sided, two-tone (un-ignore) · `welch`/`welch_segmented` load their input fully into the FFT buffer — no streaming, no budget check yet; that residual is the next item
 - [ ] Streaming Welch (accumulate segment periodograms, never load all); budget refusal + affordable alternative when the selection won't fit → SPEC §3.2, §5.1 · proven by: PSD-10M bench ≤ 1 s
-- [ ] `SegmentedUniform`: per-segment Welch, length-weighted average, no window crosses a gap, short segments excluded+reported; `Irregular`: PSD disabled with explanation + offer largest uniform sub-range → SPEC §3.3 · proven by: Welch golden — segmented (un-ignore) + corpus 39, 40
-- [ ] PSD always computed on raw samples, never the pyramid → SPEC §3.2 · proven by: Welch golden — raw-guarantee (bit-identical zoomed-in vs out, un-ignore)
+- [ ] `SegmentedUniform`: per-segment Welch, length-weighted average, no window crosses a gap, short segments excluded+reported; `Irregular`: PSD disabled with explanation + offer largest uniform sub-range → SPEC §3.3 · proven by: Welch golden — segmented (un-ignore) + corpus 39, 40 · **partially landed**: `welch_segmented` itself (length-weighted average, no window ever crosses a physical segment boundary, too-short segments excluded from the average) exists and the golden test is un-ignored; reporting the excluded segments and the `Irregular`-sampling product behavior (PSD disabled + offered sub-range) are not — no caller wires this in yet, since that is the PSD view item below
+- [x] PSD always computed on raw samples, never the pyramid → SPEC §3.2 · proven by: Welch golden — raw-guarantee (bit-identical zoomed-in vs out, un-ignore)
 - [ ] PSD view: time-view selection drives it; overlay or stacked with shared synchronized frequency axis; log/linear toggles both axes; "computed on" readout (samples, segments, window, Δf) → SPEC §4.2 · proven by: manual + snapshot
 
 > **MAINTAINER TEST — M5**

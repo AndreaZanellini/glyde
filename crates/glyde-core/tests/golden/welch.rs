@@ -13,12 +13,12 @@
 // limitations under the License.
 
 //! Welch PSD golden tests (docs/QUALITY.md §2 Welch PSD, docs/ROADMAP.md
-//! M1/M5). Every test here is `#[ignore]`d because
-//! `glyde_core::dsp::welch::{welch, welch_segmented}` are `todo!()` stubs
-//! (docs/ROADMAP.md M5); `cargo test -- --ignored --list` is the M1
-//! maintainer proof that the full golden-test set exists. Un-ignore each
-//! test only once the implementation makes it pass — never loosen an
-//! assertion to make that happen.
+//! M1/M5). Written `#[ignore]`d in M1, before
+//! `glyde_core::dsp::welch::{welch, welch_segmented}` existed, so that
+//! `cargo test -- --ignored --list` could stand as the M1 maintainer proof
+//! that the full golden-test set exists ahead of the implementation. Now
+//! un-ignored: never loosen an assertion to make one of these pass — if one
+//! looks wrong, that is a `blocking-decision` issue, not an edit.
 //!
 //! Expected values below are derived from the textbook DFT definition
 //! (Golden Rule 4), not copied from any implementation: for a real signal
@@ -68,7 +68,6 @@ fn sinusoid(bin: usize, segment_len: usize, amplitude: f64) -> Vec<f64> {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M5: Welch not implemented yet"]
 fn sinusoid_peak_lands_at_the_exact_bin_with_correct_amplitude() {
     const SAMPLE_RATE_HZ: f64 = 1000.0;
     const SEGMENT_LEN: usize = 1024;
@@ -112,7 +111,6 @@ fn sinusoid_peak_lands_at_the_exact_bin_with_correct_amplitude() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M5: Welch not implemented yet"]
 fn parseval_power_conservation_with_a_hann_window_matches_signal_variance() {
     // Large N so the sampling error of the variance estimate (~sqrt(2*ENBW/N)
     // for a Hann-windowed estimate) is well under the assertion tolerance —
@@ -149,7 +147,6 @@ fn parseval_power_conservation_with_a_hann_window_matches_signal_variance() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M5: Welch not implemented yet"]
 fn one_sided_scaling_doubles_every_bin_except_dc_and_nyquist() {
     const SAMPLE_RATE_HZ: f64 = 1000.0;
     const SEGMENT_LEN: usize = 1024;
@@ -206,7 +203,6 @@ fn one_sided_scaling_doubles_every_bin_except_dc_and_nyquist() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M5: Welch not implemented yet"]
 fn window_normalization_reports_the_same_total_power_across_windows() {
     const SAMPLE_RATE_HZ: f64 = 1000.0;
     const SEGMENT_LEN: usize = 8192;
@@ -246,7 +242,6 @@ fn window_normalization_reports_the_same_total_power_across_windows() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M5: Welch not implemented yet"]
 fn detrend_removes_the_leakage_skirt_from_a_large_dc_offset() {
     const SAMPLE_RATE_HZ: f64 = 1000.0;
     const SEGMENT_LEN: usize = 1024;
@@ -283,7 +278,6 @@ fn detrend_removes_the_leakage_skirt_from_a_large_dc_offset() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M5: Welch not implemented yet"]
 fn two_tones_resolve_at_their_exact_frequencies_with_correct_relative_levels() {
     const SAMPLE_RATE_HZ: f64 = 1000.0;
     const SEGMENT_LEN: usize = 1024;
@@ -331,7 +325,6 @@ fn two_tones_resolve_at_their_exact_frequencies_with_correct_relative_levels() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M5: Welch not implemented yet"]
 fn segmented_welch_averages_per_segment_periodograms_and_never_crosses_a_gap() {
     const SAMPLE_RATE_HZ: f64 = 1000.0;
     const SEGMENT_LEN: usize = 1024;
@@ -420,7 +413,6 @@ fn segmented_welch_averages_per_segment_periodograms_and_never_crosses_a_gap() {
 }
 
 #[test]
-#[ignore = "docs/ROADMAP.md M5: Welch not implemented yet"]
 fn raw_data_guarantee_zoomed_in_and_zoomed_out_selections_are_bit_identical() {
     // `welch`'s signature only accepts a raw `&[f64]` — there is no
     // pyramid/bucket type it could read instead (SPEC §3.2: "PSD is always
