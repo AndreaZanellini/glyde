@@ -27,7 +27,7 @@ mod state;
 pub use anomaly::{detect_nan_runs, Anomalies, NanRunScan};
 pub use dtype::{Dtype, SeriesValues, SpilledValues, ViewKind};
 pub use samples::{SampleSource, SeriesSamples, SAMPLE_CHUNK_LEN};
-pub use state::{bool_state_bands, BoolBand};
+pub use state::{bool_state_bands, BoolBand, BoolBandBuilder};
 
 /// One ingested column: its name, its values in their native dtype, and any
 /// anomalies flagged against it. SPEC §1.4: constant and single-sample

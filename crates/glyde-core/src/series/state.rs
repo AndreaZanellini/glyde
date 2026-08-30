@@ -33,9 +33,87 @@ pub struct BoolBand {
     pub value: bool,
 }
 
+/// The run [`BoolBandBuilder`] is still accumulating — not yet a [`BoolBand`]
+/// because its true end (what the *next* sample turns out to be, or that
+/// there is no next sample) isn't known yet.
+struct OpenRun {
+    start_tick: i128,
+    last_tick: i128,
+    value: bool,
+}
+
+/// Builds [`BoolBand`]s one sample at a time via [`Self::push`], so a caller
+/// can feed it a column too large to hold in memory at once — read back in
+/// bounded chunks (SPEC §5.1: "read in bounded chunks", the same discipline
+/// [`crate::index::spill::SpillVec::read_chunks`] already applies to a
+/// spilled column) — instead of collecting the whole column into a slice
+/// first just to call [`bool_state_bands`]. Samples must be pushed in
+/// original file order, covering every sample exactly once; call
+/// [`Self::finish`] after the last one to flush the still-open run.
+#[derive(Default)]
+pub struct BoolBandBuilder {
+    bands: Vec<BoolBand>,
+    open: Option<OpenRun>,
+}
+
+impl BoolBandBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feeds one more `(value, tick)` sample, in file order, into the run
+    /// currently being accumulated — closing it into a [`BoolBand`] first if
+    /// `value` differs from the run's own value (SPEC §4.3: a run holds
+    /// "until it changes", i.e. until the tick of the sample that changed
+    /// it).
+    pub fn push(&mut self, value: bool, tick: i128) {
+        match &mut self.open {
+            None => {
+                self.open = Some(OpenRun {
+                    start_tick: tick,
+                    last_tick: tick,
+                    value,
+                })
+            }
+            Some(run) if run.value == value => run.last_tick = tick,
+            Some(run) => {
+                self.bands.push(BoolBand {
+                    start_tick: run.start_tick,
+                    end_tick: tick,
+                    value: run.value,
+                });
+                *run = OpenRun {
+                    start_tick: tick,
+                    last_tick: tick,
+                    value,
+                };
+            }
+        }
+    }
+
+    /// Flushes the still-open run, if any, and returns every [`BoolBand`]
+    /// accumulated so far — its true end is unknown (see [`BoolBand`]'s own
+    /// doc comment), so it is closed at its own last pushed tick rather than
+    /// an invented one.
+    pub fn finish(mut self) -> Vec<BoolBand> {
+        if let Some(run) = self.open.take() {
+            self.bands.push(BoolBand {
+                start_tick: run.start_tick,
+                end_tick: run.last_tick,
+                value: run.value,
+            });
+        }
+        self.bands
+    }
+}
+
 /// Collapses `values`/`ticks` (`ticks[i]` is `values[i]`'s own timestamp,
 /// the same parallel-slice convention [`crate::dsp::decimation`] uses) into
-/// one [`BoolBand`] per maximal run of consecutive equal values (SPEC §4.3).
+/// one [`BoolBand`] per maximal run of consecutive equal values (SPEC §4.3),
+/// via [`BoolBandBuilder`] — the right choice for a column already resident
+/// in memory (a heap-backed [`crate::series::SeriesValues::Bool`]); a caller
+/// reading a column back in bounded chunks instead should drive
+/// [`BoolBandBuilder`] directly, one [`BoolBandBuilder::push`] per sample.
 ///
 /// `values` and `ticks` must be the same length; a length mismatch or an
 /// empty input yields no bands — there is no axis to place a band on, not an
@@ -46,29 +124,11 @@ pub fn bool_state_bands(values: &[bool], ticks: &[i128]) -> Vec<BoolBand> {
         return Vec::new();
     }
 
-    let mut bands = Vec::new();
-    let mut run_start = 0usize;
-    for index in 1..=values.len() {
-        let run_ended = index == values.len() || values[index] != values[run_start];
-        if !run_ended {
-            continue;
-        }
-        let end_tick = if index == values.len() {
-            // The last run: its true end is unknown, so this reports only
-            // its own last sample's tick (see the doc comment above).
-            ticks[index - 1]
-        } else {
-            // Holds until the next run's first sample.
-            ticks[index]
-        };
-        bands.push(BoolBand {
-            start_tick: ticks[run_start],
-            end_tick,
-            value: values[run_start],
-        });
-        run_start = index;
+    let mut builder = BoolBandBuilder::new();
+    for (&value, &tick) in values.iter().zip(ticks) {
+        builder.push(value, tick);
     }
-    bands
+    builder.finish()
 }
 
 #[cfg(test)]
@@ -202,5 +262,55 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // The whole point of `BoolBandBuilder` (split out for issue found on PR
+    // #113's own review: `cache_bool_bands` was materializing an entire
+    // spilled column into a `Vec<bool>` before calling `bool_state_bands`,
+    // defeating SPEC §5.1's "read in bounded chunks" for the one dtype path
+    // that only runs when a column didn't fit the memory budget) is that
+    // feeding it samples one at a time, or in arbitrarily-sized pieces, must
+    // give the exact same bands as handing `bool_state_bands` the whole
+    // slice at once — a caller reading a spilled column back through
+    // `SpillVec::read_chunks` has no choice but the former.
+    #[test]
+    fn builder_pushed_one_sample_at_a_time_matches_the_whole_slice_function() {
+        let values = [true, true, false, false, false, true, true, false];
+        let ticks = [0, 1, 2, 3, 4, 5, 6, 7];
+
+        let mut builder = BoolBandBuilder::new();
+        for (&value, &tick) in values.iter().zip(&ticks) {
+            builder.push(value, tick);
+        }
+
+        assert_eq!(builder.finish(), bool_state_bands(&values, &ticks));
+    }
+
+    // The same equivalence, but pushed in irregular chunks that deliberately
+    // split runs across a "chunk boundary" (mimicking a fixed-size
+    // `read_chunks` buffer that has no idea where a run starts or ends) —
+    // proving the builder's state correctly carries a still-open run across
+    // separate `push` calls rather than only working when called in a tight
+    // loop over one contiguous slice.
+    #[test]
+    fn builder_pushed_in_chunks_that_split_runs_matches_the_whole_slice_function() {
+        let values = [true, true, true, false, false, true, false, false, false];
+        let ticks = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let chunks: [&[bool]; 4] = [&values[0..2], &values[2..5], &values[5..6], &values[6..9]];
+        let tick_chunks: [&[i128]; 4] = [&ticks[0..2], &ticks[2..5], &ticks[5..6], &ticks[6..9]];
+
+        let mut builder = BoolBandBuilder::new();
+        for (value_chunk, tick_chunk) in chunks.iter().zip(&tick_chunks) {
+            for (&value, &tick) in value_chunk.iter().zip(*tick_chunk) {
+                builder.push(value, tick);
+            }
+        }
+
+        assert_eq!(builder.finish(), bool_state_bands(&values, &ticks));
+    }
+
+    #[test]
+    fn an_empty_builder_finishes_with_no_bands() {
+        assert_eq!(BoolBandBuilder::new().finish(), Vec::new());
     }
 }

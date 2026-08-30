@@ -35,8 +35,11 @@
 //!   the *whole* file instead — panning/zooming the time-domain view above
 //!   does not (yet) move these bands with it.
 use egui_plot::{Plot, PlotBounds, PlotPoints, Polygon};
+use glyde_core::index::spill::SpillVec;
 use glyde_core::ingest::{Dataset, TimeAxis};
-use glyde_core::series::{bool_state_bands, BoolBand, SeriesValues, SpilledValues};
+use glyde_core::series::{
+    bool_state_bands, BoolBand, BoolBandBuilder, SeriesValues, SpilledValues,
+};
 
 use super::time::{format_x_axis_tick, tick_to_seconds};
 
@@ -141,10 +144,8 @@ fn axis_bounds(ticks: &[i128], time: &TimeAxis) -> Option<(f64, f64)> {
 }
 
 /// Builds `bool_bands` for [`show`]: `dataset.columns`-parallel, `Some` with
-/// the column's [`BoolBand`]s for a `bool` column (heap-backed or spilled
-/// alike — a spilled `bool` column is `u8` on disk, `!= 0` read back, the
-/// same convention `SpilledValues::eq_in_memory` already uses), `None` for
-/// every other dtype. Callers compute this once per status change, mirroring
+/// the column's [`BoolBand`]s for a `bool` column, `None` for every other
+/// dtype. Callers compute this once per status change, mirroring
 /// `views::time::cache_column_samples` — see its own doc comment for why a
 /// per-frame call here would reintroduce issue #80's per-frame-O(n) mistake.
 pub fn cache_bool_bands(dataset: &Dataset, ticks: &[i128]) -> Vec<Option<Vec<BoolBand>>> {
@@ -154,12 +155,44 @@ pub fn cache_bool_bands(dataset: &Dataset, ticks: &[i128]) -> Vec<Option<Vec<Boo
         .map(|series| match series.values() {
             SeriesValues::Bool(values) => Some(bool_state_bands(values, ticks)),
             SeriesValues::Spilled(SpilledValues::Bool(values)) => {
-                let values: Vec<bool> = values.as_slice().iter().map(|&b| b != 0).collect();
-                Some(bool_state_bands(&values, ticks))
+                Some(bool_bands_from_spilled(values, ticks))
             }
             _ => None,
         })
         .collect()
+}
+
+/// [`cache_bool_bands`]'s spilled-column path: a spilled `bool` column is
+/// memory-mapped `u8` on disk (`!= 0` read back, the same convention
+/// `SpilledValues::eq_in_memory` already uses), and it is spilled — over the
+/// memory budget — precisely because it did not fit in memory (SPEC §5.1),
+/// so this reads it back through [`SpillVec::read_chunks`]'s fixed-size
+/// buffer and feeds each sample straight into a [`BoolBandBuilder`], the
+/// same "read in bounded chunks" discipline SPEC §5.1 requires of the
+/// original source file — never collecting the column into an owned
+/// `Vec<bool>` first, which would materialize the very data being spilled
+/// to avoid making resident (found on this PR's own review: freezing or
+/// crashing on a large file is "the single most serious class of bug in
+/// this product", CLAUDE.md).
+fn bool_bands_from_spilled(values: &SpillVec<u8>, ticks: &[i128]) -> Vec<BoolBand> {
+    let len = values.len().min(ticks.len());
+    let mut builder = BoolBandBuilder::new();
+    let mut index = 0usize;
+    let result = values.read_chunks(0..len, &mut |chunk: &[u8]| {
+        for &byte in chunk {
+            builder.push(byte != 0, ticks[index]);
+            index += 1;
+        }
+        Ok(())
+    });
+    if let Err(error) = result {
+        tracing::warn!(
+            %error,
+            "failed to read a spilled bool column back for its state-timeline \
+             lane; showing whatever bands were read before the error"
+        );
+    }
+    builder.finish()
 }
 
 /// Builds a minimal-but-real dataset with a `bool` column and runs [`show`]
@@ -330,5 +363,45 @@ mod tests {
             axis_bounds(&[0, 1_000_000_000, 3_000_000_000], &time),
             Some((0.0, 3.0))
         );
+    }
+
+    // Found on this PR's own review: `cache_bool_bands`'s spilled-column arm
+    // used to collect the whole mmap-backed column into an owned `Vec<bool>`
+    // before calling `bool_state_bands`, defeating SPEC §5.1's "read in
+    // bounded chunks" on the one dtype path that only runs when a column
+    // didn't fit the memory budget. This proves the real fix
+    // (`bool_bands_from_spilled`, reading back through
+    // `SpillVec::read_chunks`) against a genuine on-disk spilled column, not
+    // just the in-memory `BoolBandBuilder` unit tests already covering the
+    // builder itself — same expected bands `bool_state_bands` gives the
+    // in-memory equivalent.
+    #[test]
+    fn cache_bool_bands_reads_a_spilled_bool_column_through_bounded_chunks() {
+        use glyde_core::index::spill::SpillVecWriter;
+        use glyde_core::series::SpilledValues;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let values = [true, true, false, false, false, true, false];
+        let mut writer = SpillVecWriter::<u8>::create(dir.path(), "flag").expect("create");
+        for &value in &values {
+            writer.push(value as u8).expect("push");
+        }
+        let spilled = writer.finish().expect("finish");
+
+        let ticks: Vec<i128> = (0..values.len() as i128).collect();
+        let dataset = Dataset {
+            time: TimeAxis::Progressive {
+                values: ticks.iter().map(|&t| t as f64).collect::<Vec<_>>().into(),
+            },
+            time_column_name: "index".to_string(),
+            columns: vec![glyde_core::series::Series::new(
+                "flag",
+                SeriesValues::Spilled(SpilledValues::Bool(spilled)),
+            )],
+        };
+
+        let bands = cache_bool_bands(&dataset, &ticks);
+
+        assert_eq!(bands[0], Some(bool_state_bands(&values, &ticks)));
     }
 }
