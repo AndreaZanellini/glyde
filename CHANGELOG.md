@@ -12,6 +12,29 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **A `true`/`false` column now shows up as a strip of colored on/off bands
+  under the plot, instead of being silently left out.** Boolean columns
+  (however they're spelled in the source file — `true`/`false`, `0`/`1`,
+  `TRUE`/`FALSE`) have always been read and classified correctly, but until
+  now nothing actually drew them: they simply didn't appear anywhere. Open a
+  file with a boolean column and you'll now see a labeled lane with a blue
+  band wherever the value is `true` and a gray band wherever it's `false` —
+  one continuous band per run of the same value, not a mark per row. This is
+  the first piece of `docs/ROADMAP.md`'s state-timeline milestone (M6);
+  string/categorical columns, single-sample event markers, and sharing this
+  lane's pan/zoom with the plot above it are still to come.
+
+  **Assumptions made:**
+  - Each boolean lane is its own small, fixed view of the *whole* file — it
+    always shows every band and does not (yet) pan or zoom together with the
+    time-domain plot above it. Wiring the two together is a separate,
+    already-planned roadmap item.
+  - A run of the same value that reaches the very end of the file is drawn
+    extending to the right edge of the lane. Glyde only actually knows the
+    value as of the last sample in that run — whether it keeps holding
+    afterward is genuinely unknown — so this is a drawing choice for
+    visibility, not a claim about data past what was read.
+
 - **A file too large to fit in memory now tells you that is what is
   happening, while it happens.** When you open a file whose data would not
   fit in the memory budget, Glyde streams it to disk instead of holding it in

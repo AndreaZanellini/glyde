@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use glyde_core::dsp::decimation::Bucket;
 use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary};
+use glyde_core::series::BoolBand;
 
 use crate::inference_bar::Correction;
 use crate::plumbing::{
@@ -67,6 +68,9 @@ struct PartialLoad {
     pyramids: Pyramids,
     ticks: Vec<i128>,
     sample_cache: Vec<Option<Vec<f64>>>,
+    /// See [`Status::Loaded::bool_bands`] — the same once-per-status-change
+    /// caching, for a still-growing checkpoint.
+    bool_bands: Vec<Option<Vec<BoolBand>>>,
     rows_read: u64,
     /// Issue #87: whether ingestion chose the on-disk spill path for this
     /// file (SPEC §5.1). Drives [`loading_label`]'s explanation — the two
@@ -99,6 +103,12 @@ enum Status {
         ticks: Vec<i128>,
         /// See [`PartialLoad::sample_cache`].
         sample_cache: Vec<Option<Vec<f64>>>,
+        /// `dataset.columns`-parallel, `Some` with a `bool` column's on/off
+        /// bands (docs/ROADMAP.md M6, SPEC §4.3), computed once here rather
+        /// than by [`views::state_timeline::show`] on every frame — see
+        /// [`PartialLoad::sample_cache`]'s doc comment for why per-frame
+        /// would repeat issue #80's mistake.
+        bool_bands: Vec<Option<Vec<BoolBand>>>,
         /// See `crate::plumbing::IndexingMessage::Completed`'s doc comment
         /// (issue #92) — `views::time::show` prefers this over `dataset`'s
         /// own column, and over `sample_cache`, whenever an entry is `Some`.
@@ -219,6 +229,7 @@ impl GlydeApp {
                 } => {
                     let ticks = dataset.time.to_pyramid_ticks().into_owned();
                     let sample_cache = views::time::cache_column_samples(&dataset);
+                    let bool_bands = views::state_timeline::cache_bool_bands(&dataset, &ticks);
                     Status::Loading {
                         path,
                         partial: Some(PartialLoad {
@@ -226,6 +237,7 @@ impl GlydeApp {
                             pyramids,
                             ticks,
                             sample_cache,
+                            bool_bands,
                             rows_read,
                             spilled,
                         }),
@@ -242,6 +254,7 @@ impl GlydeApp {
                 } => {
                     let ticks = dataset.time.to_pyramid_ticks().into_owned();
                     let sample_cache = views::time::cache_column_samples(&dataset);
+                    let bool_bands = views::state_timeline::cache_bool_bands(&dataset, &ticks);
                     Status::Loaded {
                         path,
                         summary,
@@ -250,6 +263,7 @@ impl GlydeApp {
                         pyramids,
                         ticks,
                         sample_cache,
+                        bool_bands,
                         level0_caches,
                     }
                 }
@@ -321,6 +335,12 @@ impl eframe::App for GlydeApp {
                             // always has, same as a `None` entry would.
                             &[],
                         );
+                        views::state_timeline::show(
+                            ui,
+                            &partial.dataset,
+                            &partial.ticks,
+                            &partial.bool_bands,
+                        );
                     }
                     None => {
                         ui.centered_and_justified(|ui| {
@@ -341,6 +361,7 @@ impl eframe::App for GlydeApp {
                 pyramids,
                 ticks,
                 sample_cache,
+                bool_bands,
                 level0_caches,
             } => {
                 ui.heading(path.display().to_string());
@@ -357,6 +378,11 @@ impl eframe::App for GlydeApp {
                 // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1"; SPEC
                 // §3.1 decimation via `pyramids` (docs/ROADMAP.md M3, issue #80).
                 views::time::show(ui, dataset, pyramids, ticks, sample_cache, level0_caches);
+                // SPEC §4.3 / docs/ROADMAP.md M6 "Boolean series → on/off
+                // horizontal bands" (`string`/categorical bands, markers,
+                // and sharing this view's axis with the plot above are
+                // still-open M6 items, not yet built).
+                views::state_timeline::show(ui, dataset, ticks, bool_bands);
             }
             Status::Failed { path, message } => {
                 ui.colored_label(
