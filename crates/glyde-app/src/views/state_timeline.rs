@@ -34,7 +34,7 @@
 //!   Each lane here is a fixed, always-fit-to-data, non-interactive view of
 //!   the *whole* file instead — panning/zooming the time-domain view above
 //!   does not (yet) move these bands with it.
-use egui_plot::{Plot, PlotBounds, PlotPoints, Polygon};
+use egui_plot::{Plot, PlotBounds, PlotPoints, Polygon, VLine};
 use glyde_core::index::spill::SpillVec;
 use glyde_core::ingest::{Dataset, TimeAxis};
 use glyde_core::series::{BoolBand, BoolBandBuilder, BoolLane, SeriesValues, SpilledValues};
@@ -92,8 +92,20 @@ pub fn show(ui: &mut egui::Ui, dataset: &Dataset, ticks: &[i128], bool_bands: &[
                 plot_ui.set_plot_bounds(PlotBounds::from_min_max([axis_min, 0.0], [axis_max, 1.0]));
                 match bands {
                     BoolLane::Exact { bands, .. } => {
-                        for band in bands {
-                            draw_band(plot_ui, time, band, axis_max);
+                        for (index, band) in bands.iter().enumerate() {
+                            draw_band(plot_ui, time, band, index + 1 == bands.len(), axis_max);
+                        }
+                        // A state that changes again at the same timestamp has
+                        // zero duration. Draw it above the filled bands so the
+                        // change remains visible without inventing a duration.
+                        for band in bands.iter().take(bands.len().saturating_sub(1)) {
+                            if band.start_tick == band.end_tick {
+                                plot_ui.vline(
+                                    VLine::new(tick_to_seconds(time, band.start_tick))
+                                        .color(MIXED_COLOR)
+                                        .width(2.0_f32),
+                                );
+                            }
                         }
                     }
                     BoolLane::Overview { cells, .. } => {
@@ -154,19 +166,21 @@ fn draw_overview(
 
 /// Draws one [`BoolBand`] as a filled rectangle spanning its own vertical
 /// lane (`y` in `[0, 1]`, an arbitrary unit range — this view has no
-/// numeric axis, SPEC §4.3). A still-open final run (`end_tick ==
-/// start_tick`, see [`BoolBand`]'s own doc comment for why `bool_state_bands`
-/// reports it that way rather than inventing an end) is extended visually to
-/// `axis_max` — the same "known to hold at least this long" reading the
-/// lane's own always-fit bounds already commit to, not a new claim about the
-/// data.
-fn draw_band(plot_ui: &mut egui_plot::PlotUi, time: &TimeAxis, band: &BoolBand, axis_max: f64) {
+/// numeric axis, SPEC §4.3). Only the final still-open run is extended
+/// visually to `axis_max`; an earlier run may also have equal start/end ticks
+/// when two state changes share a timestamp.
+fn draw_band(
+    plot_ui: &mut egui_plot::PlotUi,
+    time: &TimeAxis,
+    band: &BoolBand,
+    is_last: bool,
+    axis_max: f64,
+) {
     let x0 = tick_to_seconds(time, band.start_tick);
-    let x1 = if band.end_tick != band.start_tick {
-        tick_to_seconds(time, band.end_tick)
-    } else {
-        axis_max
-    };
+    let x1 = band_end_seconds(time, band, is_last, axis_max);
+    if x0 == x1 {
+        return;
+    }
     let color = if band.value { ON_COLOR } else { OFF_COLOR };
     plot_ui.polygon(
         Polygon::new(PlotPoints::new(vec![
@@ -178,6 +192,14 @@ fn draw_band(plot_ui: &mut egui_plot::PlotUi, time: &TimeAxis, band: &BoolBand, 
         .fill_color(color)
         .stroke(egui::Stroke::NONE),
     );
+}
+
+fn band_end_seconds(time: &TimeAxis, band: &BoolBand, is_last: bool, axis_max: f64) -> f64 {
+    if is_last {
+        axis_max
+    } else {
+        tick_to_seconds(time, band.end_tick)
+    }
 }
 
 /// The full-file x-axis bounds (in plot seconds, [`tick_to_seconds`]'s
@@ -465,6 +487,19 @@ mod tests {
         };
 
         assert_eq!(axis_bounds(0, 3_000_000_000, &time), (0.0, 3.0));
+    }
+
+    #[test]
+    fn duplicate_timestamp_does_not_extend_a_closed_run() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        let bands = bool_state_bands(&[false, true, false], &[0, 0, 1]);
+        assert_eq!(bands.len(), 3);
+        assert_eq!(band_end_seconds(&time, &bands[0], false, 10.0), 0.0);
+        assert_eq!(band_end_seconds(&time, &bands[1], false, 10.0), 1.0);
+        assert_eq!(band_end_seconds(&time, &bands[2], true, 10.0), 10.0);
     }
 
     // Found on this PR's own review: `cache_bool_bands`'s spilled-column arm
