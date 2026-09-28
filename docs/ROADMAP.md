@@ -103,8 +103,9 @@ them, so CI stays green while honoring "written first."
 - [x] `glyde-devtools`: synthetic fixture generator + `memory_gate` headless peak-RSS harness → QUALITY §3, ARCH §devtools · proven by: `memory_gate` opens the generated fixture and asserts peak RSS against `budget::RamBudget` (issue #61 decision 1: CI fixture is sized by `--size-gb`, not literally 20 GB — a GitHub-hosted runner's 14 GB SSD cannot hold that; the true 20 GB run is manual QA, QUALITY §5). Wiring the `ci.yml` fixture size to this is the maintainer-applied diff on issue #61 (hard-denied file).
 - [x] `criterion` benches: index build (CSV 1 GB), viewport query per pyramid level; absolute ceilings, no in-CI regression comparison → QUALITY §3, SPEC §5 (issue #61 decision 2) · proven by: `index_build`/`viewport_query` assert against the SPEC §5 ceiling and fail the build on breach; the >15% vs-`main` comparison is a manual `cargo bench` run on the SPEC §5 reference machine, using criterion's own local-baseline comparison — not computed in CI (too noisy on shared runners). Two items from QUALITY §3's general benched-path list are out of scope here: Parquet index build (no `Reader` registered yet) and cold start (an app-level, windowed metric — no headless harness exists in `glyde-core`). Welch bench stays a stub; `dsp::welch` itself is `todo!()` until M5.
 
-> **M3 is closed** (verified 2026-08-02 against `main` at `92c586a`). Every
-> maintainer test below passes. The app renders through the pyramid (issue #80),
+> **M3 engineering work is closed** (automated checks verified 2026-08-02
+> against `main` at `92c586a`); the maintainer's hands-on tests below remain
+> pending. The app renders through the pyramid (issue #80),
 > both spill caches are wired into the open path so a reopen serves the pyramid
 > *and* the raw samples from disk (issues #81, #92), raw `Dataset` memory is
 > bounded and peak RSS is flat rather than a fraction of file size (issues #75,
@@ -113,8 +114,8 @@ them, so CI stays green while honoring "written first."
 >
 > **Four things M3 deliberately does not deliver**, each tracked and none
 > blocking M4: a reopen still re-parses the file's text, so the plot is instant
-> but the inference bar is re-derived (issue #106 — the one judgement call, taken
-> deliberately); a *spilled* file still gets no pyramid in the app, because the
+> but the inference bar is re-derived (issue #106 — an explicit scope assumption
+> that manual timing can veto); a *spilled* file still gets no pyramid in the app, because the
 > pyramid's own ~9 bytes/sample/column would breach the SPEC §5 cap on exactly
 > those files (issue #102); nothing benches pan/zoom frame time for a spilled
 > file (issue #107); and `time::detect_gaps`' return type is unbounded in

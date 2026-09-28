@@ -1,8 +1,10 @@
 # M3 Closeout — gap analysis and closure
 
-**Status: M3 is closed.** Verified 2026-08-02 against `main` at `92c586a`, with
-`cargo test --workspace` green (414 passed, 0 failed, 8 ignored — the Welch
-goldens waiting on M5).
+**Status: M3 engineering work is closed; maintainer manual QA is pending.**
+The automated checks were verified 2026-08-02 against `main` at `92c586a`,
+with `cargo test --workspace` green (414 passed, 0 failed, 8 ignored — the
+Welch goldens waiting on M5). These checks do not prove the five hands-on
+tests on the maintainer's own files.
 
 This document started on 2026-07-27 as a gap analysis: every M3 checkbox was
 ticked, but three of M3's five maintainer tests exercised the *app*, and the app
@@ -18,19 +20,20 @@ open, each with an issue. None of them block M4.
 
 ## 1. Verdict
 
-**M3's core was done. M3's product now is too.**
+**M3's core and app wiring are in place.** The manual checks below remain
+for the maintainer; the automated evidence does not substitute for them.
 
-| M3 maintainer test | Status | Gated by |
+| M3 maintainer test | Automated evidence | Manual status |
 |---|---|---|
-| First plot within ~2 s, indexing continuing in background | **Passes** | `first_plot` bench; progressive checkpoints reach the UI |
-| Scroll/zoom for 30 s → no stutter; memory under the cap | **Passes** | `memory_gate` at 4 GB in CI; `time_view_render` p99 gate — but see issue #107, the frame-time gate covers in-memory files only |
-| One-sample spike stays visible at every zoom level | **Passes** | decimation golden — spike preservation at 800 columns |
-| Zoom all the way in → converges to individual sample points | **Passes** | decimation golden — convergence; markers now conditional per SPEC §3.1 |
-| Close and reopen the big file → opens instantly (from cache) | **Passes, with a documented residual** | `pyramid_reopen_integration.rs`, `level0_reopen_integration.rs`. The *plot* is instant; the CSV text is still re-parsed on every open, so the inference bar is re-derived — issue #106 |
+| First plot within ~2 s, indexing continuing in background | `first_plot` bench; progressive checkpoints reach the UI | Pending on a real large file |
+| Scroll/zoom for 30 s → no stutter; memory under the cap | `memory_gate` at 4 GB in CI; `time_view_render` p99 gate covers in-memory files only (issue #107) | Pending on a spilled file |
+| One-sample spike stays visible at every zoom level | decimation golden — spike preservation at 800 columns | Pending |
+| Zoom all the way in → converges to individual sample points | decimation golden — convergence; markers now conditional per SPEC §3.1 | Pending |
+| Close and reopen the big file → opens instantly (from cache) | `pyramid_reopen_integration.rs`, `level0_reopen_integration.rs` prove cache reuse; CSV text is still re-parsed (issue #106) | End-to-end timing pending |
 
-The last row is the one judgement call in this document, and it is the
-maintainer's: M3 closes with the re-parse residual documented rather than staying
-open for it. The reasoning is in §6.1.
+The last row is an explicit scope assumption: M3 engineering work closes with
+the re-parse residual documented, while the manual reopen test and issue #106
+remain open. The reasoning is in §6.1.
 
 ---
 
@@ -253,11 +256,10 @@ M3, and issue #92 called it product-shaped rather than mechanical: it changes
 what "the raw `Dataset`" means across a reopen, which issue #75's Option B
 decision did not cover.
 
-**Decision: M3 closes with this documented.** The maintainer test's "opens
-instantly" is satisfied in the sense that matters for the performance contract —
-the index is not rebuilt — and the remaining cost is a bounded, streaming parse
-whose memory is already flat. Skipping it is an optimization for a later
-milestone, not an unfinished part of this one.
+**Scope assumption for this engineering closeout:** cache reuse is implemented,
+but the maintainer test's "opens instantly" has not been demonstrated end to
+end: the index is not rebuilt, while a bounded, streaming CSV parse still runs.
+Skipping that parse remains issue #106. Manual timing can veto this closeout.
 
 ### 6.2 A spilled file gets no pyramid in the app · issue #102
 

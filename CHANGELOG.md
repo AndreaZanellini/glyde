@@ -422,7 +422,7 @@ Versioning: [Semantic Versioning](https://semver.org/).
     is identical to before, including how invalid bytes are replaced.
 
 ### Documentation
-- **Milestone 3 is finished.** The status report below was written when M3's
+- **Milestone 3 engineering work is finished; hands-on checks remain.** The status report below was written when M3's
   engine existed but was not connected to the app; everything it listed as
   missing has since been built, and `docs/M3-CLOSEOUT.md` is now the record of
   that rather than a plan. All five of the things you were asked to check by
@@ -430,7 +430,8 @@ Versioning: [Semantic Versioning](https://semver.org/).
   filling in, scrolling and zooming stays smooth with memory under the limit, a
   one-sample spike stays visible however far out you zoom, zooming all the way
   in reaches the real individual samples, and reopening a file you have opened
-  before skips rebuilding its index.
+  before skips rebuilding its index. Automated checks cover those paths; the
+  maintainer's own-file smoke test and end-to-end reopen timing remain pending.
 
   **Four things M3 deliberately does not do**, all written down rather than
   quietly left out. (1) Reopening a file gives you an instant *plot*, but Glyde
