@@ -313,7 +313,7 @@ fn x_axis_seconds(time: &TimeAxis) -> Vec<f64> {
 /// A [`TimeAxis::Progressive`] index has no calendar meaning, so its tick is
 /// shown as a plain number, matching `egui_plot`'s own default axis
 /// formatting.
-fn format_x_axis_tick(ticks: &[i128], mark: GridMark, time: &TimeAxis) -> String {
+pub(crate) fn format_x_axis_tick(ticks: &[i128], mark: GridMark, time: &TimeAxis) -> String {
     match time {
         TimeAxis::Absolute { timestamps, format } => {
             let tick = seconds_to_tick(time, mark.value);
@@ -571,7 +571,7 @@ fn absolute_ticks_per_second(time: &TimeAxis) -> Option<i128> {
 /// Inverse of [`seconds_to_tick`]: a pyramid tick (e.g. a [`Bucket`]'s
 /// midpoint) as a plot-seconds x-coordinate, the same coordinate space
 /// [`x_axis_seconds`] produces for real samples.
-fn tick_to_seconds(time: &TimeAxis, tick: i128) -> f64 {
+pub(crate) fn tick_to_seconds(time: &TimeAxis, tick: i128) -> f64 {
     match absolute_ticks_per_second(time) {
         Some(ticks_per_second) => tick as f64 / ticks_per_second as f64,
         None => progressive_tick_to_value(tick),

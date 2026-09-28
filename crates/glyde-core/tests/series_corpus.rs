@@ -29,7 +29,7 @@
 //! trips the `dead_code` lint (each integration-test file is its own
 //! crate), so `corpus_dir()` is reproduced here in one line instead.
 
-use glyde_core::series::{Dtype, Series, SeriesValues, ViewKind};
+use glyde_core::series::{bool_state_bands, BoolBand, Dtype, Series, SeriesValues, ViewKind};
 use std::path::{Path, PathBuf};
 
 fn corpus_dir() -> PathBuf {
@@ -100,4 +100,56 @@ fn corpus_case_47_boolean_columns_parse_regardless_of_source_spelling() {
             "SPEC §1.4: a bool series must never route to the numeric time-domain plot"
         );
     }
+}
+
+// docs/ROADMAP.md M6 "Boolean series → on/off horizontal bands", SPEC §4.3:
+// end to end through the real ingestion pipeline (`ingest::load`, not the
+// hand-parsed rows the test above uses), proving `bool_state_bands` turns
+// corpus case 47's ISO-8601-second-resolution timestamps into the expected
+// on/off runs.
+#[test]
+fn corpus_case_47_bool_columns_collapse_into_state_bands() {
+    let path = corpus_dir().join("case-47-boolean-column.csv");
+    let dataset = glyde_core::ingest::load(&path).expect("case 47 must load");
+    let ticks = dataset.time.to_pyramid_ticks();
+
+    let flag_lower = dataset
+        .columns
+        .iter()
+        .find(|series| series.name() == "flag_lower")
+        .expect("case 47 has a flag_lower column");
+    let values = match flag_lower.values() {
+        SeriesValues::Bool(values) => values.as_slice(),
+        other => panic!("expected a bool column, got {other:?}"),
+    };
+
+    let bands = bool_state_bands(values, &ticks);
+
+    // true, false, true, false at one-second ticks 0..=3 (ISO seconds
+    // resolution, SPEC §2.1) — every sample its own run.
+    assert_eq!(
+        bands,
+        vec![
+            BoolBand {
+                start_tick: ticks[0],
+                end_tick: ticks[1],
+                value: true,
+            },
+            BoolBand {
+                start_tick: ticks[1],
+                end_tick: ticks[2],
+                value: false,
+            },
+            BoolBand {
+                start_tick: ticks[2],
+                end_tick: ticks[3],
+                value: true,
+            },
+            BoolBand {
+                start_tick: ticks[3],
+                end_tick: ticks[3],
+                value: false,
+            },
+        ]
+    );
 }
