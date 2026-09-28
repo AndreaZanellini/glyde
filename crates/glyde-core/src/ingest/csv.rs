@@ -581,16 +581,25 @@ fn parse_rows<R: BufRead>(
                 .from_reader(reader);
             let mut record = csv::StringRecord::new();
             let mut row_index = 0usize;
+            let mut next_line_number = 1usize;
             while acc.error.is_none() {
                 match reader.read_record(&mut record) {
                     Ok(true) => {
+                        // csv-core may report the line of the preceding CR
+                        // while a CRLF terminator is still being consumed.
+                        // The running physical count corrects that on
+                        // Windows; the parser position advances it over
+                        // blank lines skipped between records.
+                        let line_number = next_line_number.max(
+                            record
+                                .position()
+                                .map(|position| position.line() as usize)
+                                .unwrap_or(1),
+                        );
                         if row_index >= sniff.data_start_row {
                             record_kept_or_ragged(
                                 row_index,
-                                record
-                                    .position()
-                                    .map(|position| position.line() as usize)
-                                    .unwrap_or(row_index + 1),
+                                line_number,
                                 RowFields::Record(&record),
                                 expected_field_count,
                                 &mut capture,
@@ -603,10 +612,21 @@ fn parse_rows<R: BufRead>(
                                 &acc,
                             );
                         }
+                        let embedded_newlines: usize = record
+                            .iter()
+                            .map(|field| field.bytes().filter(|&byte| byte == b'\n').count())
+                            .sum();
+                        next_line_number = line_number.saturating_add(embedded_newlines + 1);
                         row_index += 1;
                     }
                     Ok(false) => break,
                     Err(reason) => {
+                        let line_number = next_line_number.max(
+                            reason
+                                .position()
+                                .map(|position| position.line() as usize)
+                                .unwrap_or(1),
+                        );
                         if row_index >= sniff.data_start_row {
                             warn!(
                                 row_index,
@@ -615,15 +635,13 @@ fn parse_rows<R: BufRead>(
                             );
                             record_skip(
                                 &mut acc,
-                                reason
-                                    .position()
-                                    .map(|position| position.line() as usize)
-                                    .unwrap_or(row_index + 1),
+                                line_number,
                                 SkipReason::Unparseable {
                                     message: reason.to_string(),
                                 },
                             );
                         }
+                        next_line_number = line_number.saturating_add(1);
                         row_index += 1;
                     }
                 }
@@ -1164,6 +1182,14 @@ mod tests {
     fn skipped_row_detail_uses_physical_line_after_a_quoted_newline() {
         let input = b"timestamp,value\n2026-01-01T00:00:00Z,\"first\nsecond\"\n2026-01-01T00:00:01Z,1\n2026-01-01T00:00:02Z\n";
         let outcome = parse(input).expect("quoted newline is a valid CSV record");
+        assert_eq!(outcome.skipped_row_count, 1);
+        assert_eq!(outcome.skipped_row_details[0].line_number, 5);
+    }
+
+    #[test]
+    fn skipped_row_detail_counts_crlf_and_quoted_newlines() {
+        let input = b"timestamp,value\r\n2026-01-01T00:00:00Z,\"first\r\nsecond\"\r\n2026-01-01T00:00:01Z,1\r\n2026-01-01T00:00:02Z\r\n";
+        let outcome = parse(input).expect("CRLF CSV must parse");
         assert_eq!(outcome.skipped_row_count, 1);
         assert_eq!(outcome.skipped_row_details[0].line_number, 5);
     }
