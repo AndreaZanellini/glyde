@@ -115,9 +115,11 @@ pub enum TimezoneLabel {
     /// discarded or converted. The `String` is a normalized `+HH:MM`
     /// display, e.g. `"+02:00"`.
     Honored(String),
-    /// No timezone in the source (every other timestamp format): SPEC
-    /// §2.1's "treat as naive local time" default, made explicit rather than
-    /// left for the user to assume.
+    /// A numeric counter with a defined UTC epoch, even though individual
+    /// values do not contain an explicit offset.
+    UtcImplicit,
+    /// No timezone in the source: SPEC §2.1's "treat as naive local time"
+    /// default, made explicit rather than left for the user to assume.
     NaiveLocal,
 }
 
@@ -453,15 +455,25 @@ fn build_summary_and_report(
 
 /// SPEC §2.1's timezone summary for an absolute-timestamp axis: `Honored`
 /// with the first parsed row's UTC offset for
-/// [`TimestampFormat::Iso8601WithOffset`] (the only in-scope format that
-/// carries one at all), `NaiveLocal` for every other absolute-timestamp
-/// format.
+/// [`TimestampFormat::Iso8601WithOffset`], `UtcImplicit` for counters with a
+/// defined UTC epoch, and `NaiveLocal` for dates without an offset (including
+/// Excel serial dates, which specify a calendar origin but no timezone).
 fn timezone_label(
     format: TimestampFormat,
     timestamps: &super::dataset::Timestamps,
 ) -> TimezoneLabel {
-    if format != TimestampFormat::Iso8601WithOffset {
-        return TimezoneLabel::NaiveLocal;
+    match format {
+        TimestampFormat::EpochSeconds
+        | TimestampFormat::EpochMillis
+        | TimestampFormat::EpochMicros
+        | TimestampFormat::EpochNanos
+        | TimestampFormat::LabViewEpoch => return TimezoneLabel::UtcImplicit,
+        TimestampFormat::Iso8601WithOffset => {}
+        TimestampFormat::Iso8601Naive
+        | TimestampFormat::DateTimeSpace
+        | TimestampFormat::DayFirst
+        | TimestampFormat::MonthFirst
+        | TimestampFormat::ExcelSerial => return TimezoneLabel::NaiveLocal,
     }
     match timestamps
         .iter()
@@ -690,6 +702,27 @@ mod tests {
 
         let (_summary, report, _dataset) = open_dataset(&path).expect("case 25 must open");
 
+        assert_eq!(report.timezone, Some(TimezoneLabel::NaiveLocal));
+    }
+
+    #[test]
+    fn numeric_utc_epochs_are_not_labeled_naive_local() {
+        for file in [
+            "case-29-epoch-seconds.csv",
+            "case-30-epoch-milliseconds.csv",
+            "case-31-epoch-microseconds.csv",
+            "case-32-epoch-nanoseconds.csv",
+            "case-34-labview-epoch.csv",
+        ] {
+            let (_, report, _) = open_dataset(&corpus_path(file)).expect(file);
+            assert_eq!(report.timezone, Some(TimezoneLabel::UtcImplicit), "{file}");
+        }
+    }
+
+    #[test]
+    fn excel_serial_date_has_no_utc_timezone() {
+        let (_, report, _) = open_dataset(&corpus_path("case-33-excel-serial-dates.csv"))
+            .expect("case 33 must open");
         assert_eq!(report.timezone, Some(TimezoneLabel::NaiveLocal));
     }
 

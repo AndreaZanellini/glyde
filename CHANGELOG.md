@@ -24,15 +24,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
   order — SPEC §2.1's "duplicate timestamps ... preserved" survives a sort
   intact), and clicking **Keep as-is** leaves the file exactly as it was
   read, which is also what happens if you never click either button. The bar
-  also now always shows a **timezone** field: `"timezone: +02:00 (honored)"`
-  for a file whose timestamps carried an explicit UTC offset, or
-  `"timezone: naive local time"` when they did not — so a Glyde assumption
-  that used to be implicit (dates with no timezone are read as your own
-  local clock) is now a line you can actually see. (docs/ROADMAP.md M4)
+  also shows a **timezone** field: `"timezone: +02:00 (honored)"` for an
+  explicit offset, `"timezone: UTC (implicit)"` for Unix/LabVIEW epoch
+  counters, and `"timezone: naive local time"` for dates with no timezone
+  (including Excel serial dates). For a file streamed to disk, the bar
+  explains that sorting is unavailable instead of offering a button that
+  cannot work. (docs/ROADMAP.md M4)
 
   **Assumptions made:** (1) sorting is only offered for a file small enough
   to be held in memory — a file large enough to stream from disk opens
-  unsorted and the log explains why, since a streamed file's on-disk cache
+  unsorted and the bar explains why, since a streamed file's on-disk cache
   cannot be reordered in place; making a huge file sortable is a materially
   bigger change tracked as a follow-up rather than folded in here. (2) the
   timezone field is a one-line, whole-column summary taken from the file's

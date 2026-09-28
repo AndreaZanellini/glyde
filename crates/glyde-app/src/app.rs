@@ -349,7 +349,9 @@ impl eframe::App for GlydeApp {
                 // widget: persistent and discreet; opens expanded when any
                 // inference is low-confidence; each field correctable in one
                 // click, correcting triggers a re-index".
-                if let Some(correction) = inference_bar::show(ui, report, path) {
+                if let Some(correction) =
+                    inference_bar::show(ui, report, path, !dataset.is_spilled())
+                {
                     pending_correction = Some((path.clone(), correction));
                 }
                 if summary.skipped_row_count > 0 {

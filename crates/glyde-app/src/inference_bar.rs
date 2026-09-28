@@ -92,11 +92,12 @@ pub fn show(
     ui: &mut egui::Ui,
     report: &InferenceReport,
     open_id_source: &Path,
+    can_sort: bool,
 ) -> Option<Correction> {
     let low_confidence = report.has_low_confidence_field();
     let response = egui::CollapsingHeader::new(header_text(report, low_confidence))
         .id_salt(open_id_source)
-        .default_open(low_confidence)
+        .default_open(low_confidence || report.non_monotonic_count > 0)
         .show(ui, |ui| {
             let mut correction = None;
             ui.horizontal_wrapped(|ui| {
@@ -126,7 +127,7 @@ pub fn show(
                 }
                 ui.label(format!("{} samples", report.sample_count));
                 ui.label(format!("sampling: {:?}", report.sampling_class));
-                if let Some(picked) = monotonicity_affordance(ui, report) {
+                if let Some(picked) = monotonicity_affordance(ui, report, can_sort) {
                     correction = Some(picked);
                 }
             });
@@ -136,7 +137,8 @@ pub fn show(
 }
 
 /// SPEC §2.1's timezone label: `"timezone: +02:00 (honored)"` when the
-/// source carried an offset, `"timezone: naive local time"` when it did not.
+/// source carried an offset, UTC for numeric UTC epochs, or naive local time
+/// for timestamps that declare no timezone.
 /// `None` when there is no absolute timestamp to have a timezone at all (a
 /// progressive numeric index), matching [`display_option`]'s "no placeholder
 /// row for a field that does not apply" precedent — unlike every other
@@ -145,6 +147,7 @@ pub fn show(
 fn timezone_label_text(timezone: &Option<TimezoneLabel>) -> Option<String> {
     match timezone {
         Some(TimezoneLabel::Honored(offset)) => Some(format!("timezone: {offset} (honored)")),
+        Some(TimezoneLabel::UtcImplicit) => Some("timezone: UTC (implicit)".to_string()),
         Some(TimezoneLabel::NaiveLocal) => Some("timezone: naive local time".to_string()),
         None => None,
     }
@@ -161,7 +164,11 @@ fn timezone_label_text(timezone: &Option<TimezoneLabel>) -> Option<String> {
 /// default (SPEC §2.1: rows are "not reordered silently" until this button
 /// is *not* the one clicked), so it reports no correction at all — clicking
 /// it changes nothing, which is the point.
-fn monotonicity_affordance(ui: &mut egui::Ui, report: &InferenceReport) -> Option<Correction> {
+fn monotonicity_affordance(
+    ui: &mut egui::Ui,
+    report: &InferenceReport,
+    can_sort: bool,
+) -> Option<Correction> {
     if report.non_monotonic_count == 0 {
         return None;
     }
@@ -176,8 +183,12 @@ fn monotonicity_affordance(ui: &mut egui::Ui, report: &InferenceReport) -> Optio
                 "s"
             }
         ));
-        if ui.button("Sort").clicked() {
-            correction = Some(Correction::SortByTime);
+        if can_sort {
+            if ui.button("Sort").clicked() {
+                correction = Some(Correction::SortByTime);
+            }
+        } else {
+            ui.label("sorting unavailable for files streamed to disk");
         }
         let _ = ui.button("Keep as-is");
     });
@@ -421,7 +432,7 @@ mod tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, report, Path::new("/some/file.csv"));
+                show(ui, report, Path::new("/some/file.csv"), true);
             });
         });
         output.shapes.len()
@@ -483,6 +494,10 @@ mod tests {
             timezone_label_text(&Some(TimezoneLabel::NaiveLocal)),
             Some("timezone: naive local time".to_string())
         );
+        assert_eq!(
+            timezone_label_text(&Some(TimezoneLabel::UtcImplicit)),
+            Some("timezone: UTC (implicit)".to_string())
+        );
         assert_eq!(timezone_label_text(&None), None);
     }
 
@@ -535,6 +550,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn non_monotonic_timestamps_open_the_bar_on_first_render() {
+        let clean = sample_report(Confidence::High);
+        let mut non_monotonic = clean.clone();
+        non_monotonic.non_monotonic_count = 1;
+        assert!(render_shape_count(&non_monotonic) > render_shape_count(&clean));
+    }
+
     // A collapsed bar's header text is the only thing a user sees without
     // clicking, so it must itself flag low confidence — never silently
     // collapse away the fact that something needs review (Golden Rule 2).
@@ -556,7 +579,7 @@ mod tests {
         let mut correction = None;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                correction = show(ui, &report, Path::new("/some/file.csv"));
+                correction = show(ui, &report, Path::new("/some/file.csv"), true);
             });
         });
 
