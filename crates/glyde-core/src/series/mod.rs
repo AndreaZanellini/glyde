@@ -22,10 +22,15 @@
 mod anomaly;
 mod dtype;
 mod samples;
+mod state;
 
 pub use anomaly::{detect_nan_runs, Anomalies, NanRunScan};
 pub use dtype::{Dtype, SeriesValues, SpilledValues, ViewKind};
 pub use samples::{SampleSource, SeriesSamples, SAMPLE_CHUNK_LEN};
+pub use state::{
+    bool_state_bands, BoolBand, BoolBandBuilder, BoolLane, BOOL_OVERVIEW_CELLS,
+    MAX_EXACT_BOOL_BANDS,
+};
 
 /// Apply `order[new_index] = old_index` without cloning a whole column.
 /// Cycles need only one bit per row, even for string columns whose contents
