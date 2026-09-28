@@ -16,8 +16,8 @@
 //! PSD of a 10M-sample selection ≤1s).
 //!
 //! `dsp::welch::{welch, welch_segmented}` are implemented (docs/ROADMAP.md M5
-//! "Welch core"), but both load their input fully into the FFT buffer — there
-//! is no streaming accumulation path yet. The 10M-sample budget this bench
+//! "Welch core"), but both require a resident input slice — there
+//! is no streaming source-based path yet. The 10M-sample budget this bench
 //! must assert against belongs to that streaming path (docs/ROADMAP.md M5
 //! "Streaming Welch"), so this stays a stub until that item lands; benching
 //! the current in-memory `welch` against a 10M-sample budget would measure

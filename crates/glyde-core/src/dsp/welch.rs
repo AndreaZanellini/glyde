@@ -29,8 +29,9 @@
 //! Still not covered here (docs/ROADMAP.md M5, separate items): streaming
 //! accumulation for a selection too large for the memory budget, and the
 //! `Irregular`-sampling product behavior (PSD disabled + offered sub-range).
-//! Both `welch` and `welch_segmented` load their inputs fully into the FFT
-//! buffer, matching every current golden test's fixture sizes.
+//! Both `welch` and `welch_segmented` require resident input slices, although
+//! their FFT scratch buffers are only one analysis window long. A future
+//! source-based entry point must read raw samples in bounded chunks.
 
 use super::detrend::{self, Detrend};
 use super::window::{self, Window};
@@ -114,17 +115,21 @@ pub fn welch(samples: &[f64], sample_rate_hz: f64, config: &WelchConfig) -> Psd 
     let bin_count = effective_len / 2 + 1;
     let mut accumulated = vec![0.0; bin_count];
     let mut segment_count = 0usize;
+    // Reuse both scratch buffers across windows. A large selection may have
+    // hundreds of overlapping windows; allocating two vectors per window
+    // would add avoidable latency to the PSD path.
+    let mut buffer = vec![0.0; effective_len];
+    let mut spectrum = vec![Complex::new(0.0, 0.0); effective_len];
 
     let mut start = 0usize;
     while start + effective_len <= samples.len() {
-        let mut buffer: Vec<f64> = samples[start..start + effective_len].to_vec();
+        buffer.copy_from_slice(&samples[start..start + effective_len]);
         detrend::apply(&mut buffer, config.detrend);
-        for (sample, &w) in buffer.iter_mut().zip(window_coeffs.iter()) {
-            *sample *= w;
+        for ((frequency_sample, &sample), &w) in
+            spectrum.iter_mut().zip(buffer.iter()).zip(&window_coeffs)
+        {
+            *frequency_sample = Complex::new(sample * w, 0.0);
         }
-
-        let mut spectrum: Vec<Complex<f64>> =
-            buffer.iter().map(|&x| Complex::new(x, 0.0)).collect();
         fft.process(&mut spectrum);
 
         for (bin, power) in accumulated.iter_mut().enumerate() {
@@ -186,13 +191,12 @@ fn sub_segment_step(segment_len: usize, overlap: f64) -> usize {
 /// from the average (the caller is responsible for reporting them, SPEC
 /// §3.3).
 pub fn welch_segmented(segments: &[&[f64]], sample_rate_hz: f64, config: &WelchConfig) -> Psd {
-    let qualifying: Vec<&[f64]> = segments
+    let mut qualifying = segments
         .iter()
         .copied()
-        .filter(|seg| seg.len() >= config.segment_len)
-        .collect();
+        .filter(|seg| seg.len() >= config.segment_len);
 
-    let Some(first) = qualifying.first() else {
+    let Some(first) = qualifying.next() else {
         return Psd {
             freqs: Vec::new(),
             power: Vec::new(),
@@ -202,11 +206,15 @@ pub fn welch_segmented(segments: &[&[f64]], sample_rate_hz: f64, config: &WelchC
     };
 
     let reference = welch(first, sample_rate_hz, config);
-    let mut weighted_power = vec![0.0; reference.power.len()];
-    let mut total_weight = 0.0f64;
-    let mut total_segment_count = 0usize;
+    let mut weighted_power: Vec<f64> = reference
+        .power
+        .iter()
+        .map(|&power| power * first.len() as f64)
+        .collect();
+    let mut total_weight = first.len() as f64;
+    let mut total_segment_count = reference.segment_count;
 
-    for seg in &qualifying {
+    for seg in qualifying {
         let psd = welch(seg, sample_rate_hz, config);
         let weight = seg.len() as f64;
         for (acc, &p) in weighted_power.iter_mut().zip(psd.power.iter()) {
