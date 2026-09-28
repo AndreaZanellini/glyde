@@ -70,7 +70,8 @@ impl BoolLane {
 struct Overview {
     min_tick: i128,
     max_tick: i128,
-    cells: Vec<u8>,
+    off_diff: Vec<i64>,
+    on_diff: Vec<i64>,
 }
 
 impl Overview {
@@ -88,10 +89,28 @@ impl Overview {
     fn record(&mut self, band: BoolBand) {
         let first = self.cell(band.start_tick.min(band.end_tick));
         let last = self.cell(band.start_tick.max(band.end_tick));
-        let bit = if band.value { 2 } else { 1 };
-        for cell in &mut self.cells[first..=last] {
-            *cell |= bit;
+        // Range updates are constant time even when a non-monotonic source
+        // jumps across the entire axis on every row. Materialize the masks
+        // once in finish(), after all runs have been seen.
+        let diff = if band.value {
+            &mut self.on_diff
+        } else {
+            &mut self.off_diff
+        };
+        diff[first] += 1;
+        diff[last + 1] -= 1;
+    }
+
+    fn finish(self) -> Vec<u8> {
+        let mut off = 0;
+        let mut on = 0;
+        let mut cells = Vec::with_capacity(BOOL_OVERVIEW_CELLS);
+        for index in 0..BOOL_OVERVIEW_CELLS {
+            off += self.off_diff[index];
+            on += self.on_diff[index];
+            cells.push(u8::from(off > 0) | (u8::from(on > 0) << 1));
         }
+        cells
     }
 }
 
@@ -133,7 +152,8 @@ impl BoolBandBuilder {
             overview: Some(Overview {
                 min_tick,
                 max_tick,
-                cells: vec![0; BOOL_OVERVIEW_CELLS],
+                off_diff: vec![0; BOOL_OVERVIEW_CELLS + 1],
+                on_diff: vec![0; BOOL_OVERVIEW_CELLS + 1],
             }),
             ..Self::default()
         }
@@ -215,10 +235,12 @@ impl BoolBandBuilder {
         }
         let overview = self.overview.expect("finish_lane needs a view builder");
         if self.summarized {
+            let min_tick = overview.min_tick;
+            let max_tick = overview.max_tick;
             BoolLane::Overview {
-                cells: overview.cells,
-                min_tick: overview.min_tick,
-                max_tick: overview.max_tick,
+                cells: overview.finish(),
+                min_tick,
+                max_tick,
             }
         } else {
             BoolLane::Exact {
@@ -478,5 +500,17 @@ mod tests {
             panic!("the view must be bounded");
         };
         assert_eq!(cells[0], 3);
+    }
+
+    #[test]
+    fn non_monotonic_transitions_cover_the_overview_without_repeated_cell_scans() {
+        let mut builder = BoolBandBuilder::for_view(0, 100);
+        for index in 0..=MAX_EXACT_BOOL_BANDS {
+            builder.push(index % 2 == 0, if index % 2 == 0 { 0 } else { 100 });
+        }
+        let BoolLane::Overview { cells, .. } = builder.finish_lane() else {
+            panic!("the view must be bounded");
+        };
+        assert!(cells.iter().all(|&cell| cell == 3));
     }
 }
