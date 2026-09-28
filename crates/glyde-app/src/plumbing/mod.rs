@@ -48,6 +48,9 @@ use std::thread;
 
 use glyde_core::dsp::decimation::Bucket;
 use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary};
+use glyde_core::series::BoolLane;
+
+use crate::views;
 
 /// One numeric column's min/max pyramid, or `None` for a non-numeric column
 /// — parallel to `Dataset::columns` (see `glyde_core::ingest::Checkpoint::pyramids`).
@@ -121,6 +124,10 @@ pub enum IndexingMessage {
         dataset: Box<Dataset>,
         pyramids: Pyramids,
         level0_caches: Level0Caches,
+        /// Prepared on the indexer thread so a large boolean column is never
+        /// scanned when the UI receives the completion message.
+        ticks: Vec<i128>,
+        bool_bands: Vec<Option<BoolLane>>,
     },
     /// `path` failed to open; `message` is the human-readable reason.
     Failed {
@@ -278,6 +285,8 @@ fn run_index_job(
                         .collect(),
                 )
             };
+            let ticks = dataset.time.to_pyramid_ticks().into_owned();
+            let bool_bands = views::state_timeline::cache_bool_bands(&dataset, &ticks);
             let _ = tx.send(IndexingMessage::Completed {
                 generation,
                 path,
@@ -286,6 +295,8 @@ fn run_index_job(
                 dataset: Box::new(dataset),
                 pyramids,
                 level0_caches,
+                ticks,
+                bool_bands,
             });
         }
         Err(err) => {
@@ -341,6 +352,7 @@ mod tests {
                 dataset,
                 pyramids,
                 level0_caches,
+                ..
             } => {
                 assert_eq!(generation, 7);
                 assert_eq!(completed_path, path);

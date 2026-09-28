@@ -27,9 +27,9 @@
 //! - `string`/categorical state bands (SPEC §4.3's other state-timeline
 //!   case; only `bool` columns are read by [`show`] today).
 //! - Markers (single-sample events on their own lane).
-//! - The "multiple states" collapse glyph for zoomed-out bands — every
-//!   band is always drawn in full here, which is correct (never loses an
-//!   event) but not yet decimation-aware.
+//! - Zooming into a mixed-state interval to recover its individual runs.
+//!   Dense files use a bounded overview that visibly marks mixed intervals;
+//!   interactive expansion is still a separate M6 item.
 //! - A single pannable/zoomable axis shared with [`super::time`]'s plot.
 //!   Each lane here is a fixed, always-fit-to-data, non-interactive view of
 //!   the *whole* file instead — panning/zooming the time-domain view above
@@ -37,9 +37,7 @@
 use egui_plot::{Plot, PlotBounds, PlotPoints, Polygon};
 use glyde_core::index::spill::SpillVec;
 use glyde_core::ingest::{Dataset, TimeAxis};
-use glyde_core::series::{
-    bool_state_bands, BoolBand, BoolBandBuilder, SeriesValues, SpilledValues,
-};
+use glyde_core::series::{BoolBand, BoolBandBuilder, BoolLane, SeriesValues, SpilledValues};
 
 use super::time::{format_x_axis_tick, tick_to_seconds};
 
@@ -54,6 +52,7 @@ const LANE_HEIGHT: f32 = 36.0;
 const ON_COLOR: egui::Color32 = egui::Color32::from_rgb(66, 133, 244);
 /// Fill color for a `false` band — a neutral, visibly "off" gray.
 const OFF_COLOR: egui::Color32 = egui::Color32::from_gray(60);
+const MIXED_COLOR: egui::Color32 = egui::Color32::from_rgb(205, 130, 45);
 
 /// Renders `dataset`'s `bool` columns as on/off band lanes (SPEC §4.3) into
 /// `ui`, one [`egui_plot::Plot`] per column. `bool_bands` is
@@ -63,16 +62,13 @@ const OFF_COLOR: egui::Color32 = egui::Color32::from_gray(60);
 /// as a parameter and computed by the caller once per status change — the
 /// same once-not-per-frame discipline [`super::time::show`] follows for the
 /// identical reason (see its own doc comment).
-pub fn show(
-    ui: &mut egui::Ui,
-    dataset: &Dataset,
-    ticks: &[i128],
-    bool_bands: &[Option<Vec<BoolBand>>],
-) {
+pub fn show(ui: &mut egui::Ui, dataset: &Dataset, ticks: &[i128], bool_bands: &[Option<BoolLane>]) {
     let time = &dataset.time;
-    let Some((axis_min, axis_max)) = axis_bounds(ticks, time) else {
+    let Some(first_lane) = bool_bands.iter().flatten().next() else {
         return;
     };
+    let (min_tick, max_tick) = first_lane.tick_bounds();
+    let (axis_min, axis_max) = axis_bounds(min_tick, max_tick, time);
 
     for (index, series) in dataset.columns.iter().enumerate() {
         let Some(Some(bands)) = bool_bands.get(index) else {
@@ -80,6 +76,9 @@ pub fn show(
         };
 
         ui.label(series.name());
+        if matches!(bands, BoolLane::Overview { .. }) {
+            ui.label("Multiple on/off states share some intervals at this scale");
+        }
         Plot::new(format!("state_timeline_{index}"))
             .height(LANE_HEIGHT)
             .show_axes([true, false])
@@ -91,10 +90,65 @@ pub fn show(
             .x_axis_formatter(move |mark, _range| format_x_axis_tick(ticks, mark, time))
             .show(ui, |plot_ui| {
                 plot_ui.set_plot_bounds(PlotBounds::from_min_max([axis_min, 0.0], [axis_max, 1.0]));
-                for band in bands {
-                    draw_band(plot_ui, time, band, axis_max);
+                match bands {
+                    BoolLane::Exact { bands, .. } => {
+                        for band in bands {
+                            draw_band(plot_ui, time, band, axis_max);
+                        }
+                    }
+                    BoolLane::Overview { cells, .. } => {
+                        draw_overview(plot_ui, cells, axis_min, axis_max, min_tick == max_tick);
+                    }
                 }
             });
+    }
+}
+
+/// Merge adjacent equal cells so rendering stays bounded even when the
+/// original column alternates on every sample. A mixed cell is conspicuous
+/// rather than dropping a short state that falls below one screen pixel.
+fn draw_overview(
+    plot_ui: &mut egui_plot::PlotUi,
+    cells: &[u8],
+    min: f64,
+    max: f64,
+    one_tick: bool,
+) {
+    let mut start = 0;
+    while start < cells.len() {
+        let mask = cells[start];
+        let mut end = start + 1;
+        while end < cells.len() && cells[end] == mask {
+            end += 1;
+        }
+        if mask != 0 {
+            let x0 = if one_tick {
+                min
+            } else {
+                min + (max - min) * start as f64 / cells.len() as f64
+            };
+            let x1 = if one_tick {
+                max
+            } else {
+                min + (max - min) * end as f64 / cells.len() as f64
+            };
+            let color = match mask {
+                1 => OFF_COLOR,
+                2 => ON_COLOR,
+                _ => MIXED_COLOR,
+            };
+            plot_ui.polygon(
+                Polygon::new(PlotPoints::new(vec![
+                    [x0, 0.0],
+                    [x1, 0.0],
+                    [x1, 1.0],
+                    [x0, 1.0],
+                ]))
+                .fill_color(color)
+                .stroke(egui::Stroke::NONE),
+            );
+        }
+        start = end;
     }
 }
 
@@ -108,7 +162,7 @@ pub fn show(
 /// data.
 fn draw_band(plot_ui: &mut egui_plot::PlotUi, time: &TimeAxis, band: &BoolBand, axis_max: f64) {
     let x0 = tick_to_seconds(time, band.start_tick);
-    let x1 = if band.end_tick > band.start_tick {
+    let x1 = if band.end_tick != band.start_tick {
         tick_to_seconds(time, band.end_tick)
     } else {
         axis_max
@@ -127,35 +181,49 @@ fn draw_band(plot_ui: &mut egui_plot::PlotUi, time: &TimeAxis, band: &BoolBand, 
 }
 
 /// The full-file x-axis bounds (in plot seconds, [`tick_to_seconds`]'s
-/// coordinate space) every lane always fits itself to — `None` for an empty
-/// axis, which draws nothing. A single-sample file (SPEC §1.4: a valid
+/// coordinate space) every lane always fits itself to. A single-sample file (SPEC §1.4: a valid
 /// input) has a zero-width range; it is padded symmetrically so the plot
 /// still has a nonzero span to fit, the same degenerate case
 /// `views::time::pad_if_degenerate` handles for the time-domain view.
-fn axis_bounds(ticks: &[i128], time: &TimeAxis) -> Option<(f64, f64)> {
-    let (&first, &last) = ticks.first().zip(ticks.last())?;
-    let min = tick_to_seconds(time, first);
-    let max = tick_to_seconds(time, last);
+fn axis_bounds(min_tick: i128, max_tick: i128, time: &TimeAxis) -> (f64, f64) {
+    let min = tick_to_seconds(time, min_tick);
+    let max = tick_to_seconds(time, max_tick);
     if (max - min).abs() > f64::EPSILON {
-        Some((min, max))
+        (min, max)
     } else {
-        Some((min - 1.0, max + 1.0))
+        (min - 1.0, max + 1.0)
     }
 }
 
 /// Builds `bool_bands` for [`show`]: `dataset.columns`-parallel, `Some` with
-/// the column's [`BoolBand`]s for a `bool` column, `None` for every other
-/// dtype. Callers compute this once per status change, mirroring
-/// `views::time::cache_column_samples` — see its own doc comment for why a
-/// per-frame call here would reintroduce issue #80's per-frame-O(n) mistake.
-pub fn cache_bool_bands(dataset: &Dataset, ticks: &[i128]) -> Vec<Option<Vec<BoolBand>>> {
+/// a bounded [`BoolLane`] for a `bool` column, `None` for every other dtype.
+/// The completed file is prepared on the indexer thread; progressive updates
+/// inspect only a capped preview. Rendering never scans the source column.
+pub fn cache_bool_bands(dataset: &Dataset, ticks: &[i128]) -> Vec<Option<BoolLane>> {
+    if !dataset.columns.iter().any(|series| {
+        matches!(
+            series.values(),
+            SeriesValues::Bool(_) | SeriesValues::Spilled(SpilledValues::Bool(_))
+        )
+    }) {
+        return vec![None; dataset.columns.len()];
+    }
+    let Some((&min_tick, &max_tick)) = ticks.iter().min().zip(ticks.iter().max()) else {
+        return vec![None; dataset.columns.len()];
+    };
     dataset
         .columns
         .iter()
         .map(|series| match series.values() {
-            SeriesValues::Bool(values) => Some(bool_state_bands(values, ticks)),
+            SeriesValues::Bool(values) => {
+                let mut builder = BoolBandBuilder::for_view(min_tick, max_tick);
+                for (&value, &tick) in values.iter().zip(ticks) {
+                    builder.push(value, tick);
+                }
+                Some(builder.finish_lane())
+            }
             SeriesValues::Spilled(SpilledValues::Bool(values)) => {
-                Some(bool_bands_from_spilled(values, ticks))
+                Some(bool_bands_from_spilled(values, ticks, min_tick, max_tick))
             }
             _ => None,
         })
@@ -174,9 +242,14 @@ pub fn cache_bool_bands(dataset: &Dataset, ticks: &[i128]) -> Vec<Option<Vec<Boo
 /// to avoid making resident (found on this PR's own review: freezing or
 /// crashing on a large file is "the single most serious class of bug in
 /// this product", CLAUDE.md).
-fn bool_bands_from_spilled(values: &SpillVec<u8>, ticks: &[i128]) -> Vec<BoolBand> {
+fn bool_bands_from_spilled(
+    values: &SpillVec<u8>,
+    ticks: &[i128],
+    min_tick: i128,
+    max_tick: i128,
+) -> BoolLane {
     let len = values.len().min(ticks.len());
-    let mut builder = BoolBandBuilder::new();
+    let mut builder = BoolBandBuilder::for_view(min_tick, max_tick);
     let mut index = 0usize;
     let result = values.read_chunks(0..len, &mut |chunk: &[u8]| {
         for &byte in chunk {
@@ -192,7 +265,7 @@ fn bool_bands_from_spilled(values: &SpillVec<u8>, ticks: &[i128]) -> Vec<BoolBan
              lane; showing whatever bands were read before the error"
         );
     }
-    builder.finish()
+    builder.finish_lane()
 }
 
 /// Builds a minimal-but-real dataset with a `bool` column and runs [`show`]
@@ -224,6 +297,39 @@ mod render_tests {
                 Series::new("value", SeriesValues::F64(vec![1.0, 2.0, 1.5, 3.0])),
             ],
         }
+    }
+
+    #[test]
+    fn frequent_state_changes_render_a_bounded_number_of_shapes() {
+        let len = glyde_core::series::MAX_EXACT_BOOL_BANDS * 3;
+        let dataset = Dataset {
+            time: TimeAxis::Progressive {
+                values: (0..len)
+                    .map(|index| index as f64)
+                    .collect::<Vec<_>>()
+                    .into(),
+            },
+            time_column_name: "index".to_string(),
+            columns: vec![Series::new(
+                "flag",
+                SeriesValues::Bool((0..len).map(|index| index % 2 == 0).collect()),
+            )],
+        };
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        let lanes = cache_bool_bands(&dataset, &ticks);
+        assert!(matches!(lanes[0], Some(BoolLane::Overview { .. })));
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, &dataset, &ticks, &lanes);
+            });
+        });
+        assert!(
+            output.shapes.len() < 3000,
+            "the lane must not draw every run: {} shapes",
+            output.shapes.len()
+        );
     }
 
     #[test]
@@ -306,6 +412,7 @@ mod render_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glyde_core::series::bool_state_bands;
     use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
 
     #[test]
@@ -329,17 +436,15 @@ mod tests {
 
         let bands = cache_bool_bands(&dataset, &ticks);
 
-        assert_eq!(bands[0], Some(bool_state_bands(&[true, false], &ticks)));
+        assert_eq!(
+            bands[0],
+            Some(BoolLane::Exact {
+                bands: bool_state_bands(&[true, false], &ticks),
+                min_tick: 0,
+                max_tick: 1,
+            })
+        );
         assert_eq!(bands[1], None);
-    }
-
-    #[test]
-    fn axis_bounds_of_an_empty_tick_slice_is_none() {
-        let time = TimeAxis::Progressive {
-            values: vec![].into(),
-        };
-
-        assert_eq!(axis_bounds(&[], &time), None);
     }
 
     #[test]
@@ -349,7 +454,7 @@ mod tests {
             format: TimestampFormat::EpochSeconds,
         };
 
-        assert_eq!(axis_bounds(&[5], &time), Some((4.0, 6.0)));
+        assert_eq!(axis_bounds(5, 5, &time), (4.0, 6.0));
     }
 
     #[test]
@@ -359,10 +464,7 @@ mod tests {
             format: TimestampFormat::EpochNanos,
         };
 
-        assert_eq!(
-            axis_bounds(&[0, 1_000_000_000, 3_000_000_000], &time),
-            Some((0.0, 3.0))
-        );
+        assert_eq!(axis_bounds(0, 3_000_000_000, &time), (0.0, 3.0));
     }
 
     // Found on this PR's own review: `cache_bool_bands`'s spilled-column arm
@@ -402,6 +504,13 @@ mod tests {
 
         let bands = cache_bool_bands(&dataset, &ticks);
 
-        assert_eq!(bands[0], Some(bool_state_bands(&values, &ticks)));
+        assert_eq!(
+            bands[0],
+            Some(BoolLane::Exact {
+                bands: bool_state_bands(&values, &ticks),
+                min_tick: 0,
+                max_tick: values.len() as i128 - 1,
+            })
+        );
     }
 }

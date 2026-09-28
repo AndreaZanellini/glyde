@@ -33,6 +33,68 @@ pub struct BoolBand {
     pub value: bool,
 }
 
+/// The fixed-size overview used when a series changes state too often to
+/// retain and draw every run. Each nonzero cell records every state seen in
+/// that part of the time axis; `3` means both states occurred and must be
+/// drawn as a visible multiple-states glyph, not silently dropped.
+pub const BOOL_OVERVIEW_CELLS: usize = 2048;
+pub const MAX_EXACT_BOOL_BANDS: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoolLane {
+    Exact {
+        bands: Vec<BoolBand>,
+        min_tick: i128,
+        max_tick: i128,
+    },
+    Overview {
+        cells: Vec<u8>,
+        min_tick: i128,
+        max_tick: i128,
+    },
+}
+
+impl BoolLane {
+    pub fn tick_bounds(&self) -> (i128, i128) {
+        match self {
+            BoolLane::Exact {
+                min_tick, max_tick, ..
+            }
+            | BoolLane::Overview {
+                min_tick, max_tick, ..
+            } => (*min_tick, *max_tick),
+        }
+    }
+}
+
+struct Overview {
+    min_tick: i128,
+    max_tick: i128,
+    cells: Vec<u8>,
+}
+
+impl Overview {
+    fn cell(&self, tick: i128) -> usize {
+        if self.max_tick <= self.min_tick {
+            return 0;
+        }
+        let span = self.max_tick.saturating_sub(self.min_tick) as f64;
+        let offset = tick.saturating_sub(self.min_tick) as f64;
+        ((offset / span) * (BOOL_OVERVIEW_CELLS - 1) as f64)
+            .floor()
+            .clamp(0.0, (BOOL_OVERVIEW_CELLS - 1) as f64) as usize
+    }
+
+    fn record(&mut self, band: BoolBand) {
+        let first = self.cell(band.start_tick.min(band.end_tick));
+        let last = self.cell(band.start_tick.max(band.end_tick));
+        let bit = if band.value { 2 } else { 1 };
+        for cell in &mut self.cells[first..=last] {
+            *cell |= bit;
+        }
+    }
+}
+
 /// The run [`BoolBandBuilder`] is still accumulating — not yet a [`BoolBand`]
 /// because its true end (what the *next* sample turns out to be, or that
 /// there is no next sample) isn't known yet.
@@ -54,11 +116,42 @@ struct OpenRun {
 pub struct BoolBandBuilder {
     bands: Vec<BoolBand>,
     open: Option<OpenRun>,
+    overview: Option<Overview>,
+    summarized: bool,
 }
 
 impl BoolBandBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bounded-memory form for a whole-file, fixed-axis view. It retains
+    /// exact runs while they fit, then switches to a 2048-cell overview.
+    /// Every on/off occurrence remains visible through a mixed-state cell.
+    pub fn for_view(min_tick: i128, max_tick: i128) -> Self {
+        Self {
+            overview: Some(Overview {
+                min_tick,
+                max_tick,
+                cells: vec![0; BOOL_OVERVIEW_CELLS],
+            }),
+            ..Self::default()
+        }
+    }
+
+    fn emit(&mut self, band: BoolBand) {
+        if let Some(overview) = &mut self.overview {
+            overview.record(band);
+            if !self.summarized {
+                self.bands.push(band);
+                if self.bands.len() > MAX_EXACT_BOOL_BANDS {
+                    self.bands.clear();
+                    self.summarized = true;
+                }
+            }
+        } else {
+            self.bands.push(band);
+        }
     }
 
     /// Feeds one more `(value, tick)` sample, in file order, into the run
@@ -77,16 +170,17 @@ impl BoolBandBuilder {
             }
             Some(run) if run.value == value => run.last_tick = tick,
             Some(run) => {
-                self.bands.push(BoolBand {
+                let band = BoolBand {
                     start_tick: run.start_tick,
                     end_tick: tick,
                     value: run.value,
-                });
+                };
                 *run = OpenRun {
                     start_tick: tick,
                     last_tick: tick,
                     value,
                 };
+                self.emit(band);
             }
         }
     }
@@ -96,14 +190,43 @@ impl BoolBandBuilder {
     /// doc comment), so it is closed at its own last pushed tick rather than
     /// an invented one.
     pub fn finish(mut self) -> Vec<BoolBand> {
+        debug_assert!(
+            self.overview.is_none(),
+            "use finish_lane for a view builder"
+        );
         if let Some(run) = self.open.take() {
-            self.bands.push(BoolBand {
+            self.emit(BoolBand {
                 start_tick: run.start_tick,
                 end_tick: run.last_tick,
                 value: run.value,
             });
         }
         self.bands
+    }
+
+    /// Finishes a builder created with [`Self::for_view`].
+    pub fn finish_lane(mut self) -> BoolLane {
+        if let Some(run) = self.open.take() {
+            self.emit(BoolBand {
+                start_tick: run.start_tick,
+                end_tick: run.last_tick,
+                value: run.value,
+            });
+        }
+        let overview = self.overview.expect("finish_lane needs a view builder");
+        if self.summarized {
+            BoolLane::Overview {
+                cells: overview.cells,
+                min_tick: overview.min_tick,
+                max_tick: overview.max_tick,
+            }
+        } else {
+            BoolLane::Exact {
+                bands: self.bands,
+                min_tick: overview.min_tick,
+                max_tick: overview.max_tick,
+            }
+        }
     }
 }
 
@@ -312,5 +435,48 @@ mod tests {
     #[test]
     fn an_empty_builder_finishes_with_no_bands() {
         assert_eq!(BoolBandBuilder::new().finish(), Vec::new());
+    }
+
+    #[test]
+    fn many_transitions_use_bounded_overview_without_losing_either_state() {
+        let len = MAX_EXACT_BOOL_BANDS * 3;
+        let mut builder = BoolBandBuilder::for_view(0, len as i128 - 1);
+        for index in 0..len {
+            builder.push(index % 2 == 0, index as i128);
+        }
+        let BoolLane::Overview { cells, .. } = builder.finish_lane() else {
+            panic!("frequently changing data must use the bounded overview");
+        };
+        assert_eq!(cells.len(), BOOL_OVERVIEW_CELLS);
+        assert!(cells.contains(&3));
+        assert!(cells.iter().all(|&cell| cell != 0));
+    }
+
+    #[test]
+    fn a_few_transitions_keep_their_exact_ticks() {
+        let mut builder = BoolBandBuilder::for_view(0, 10);
+        builder.push(true, 0);
+        builder.push(false, 7);
+        builder.push(false, 10);
+        assert_eq!(
+            builder.finish_lane(),
+            BoolLane::Exact {
+                bands: bool_state_bands(&[true, false, false], &[0, 7, 10]),
+                min_tick: 0,
+                max_tick: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_timestamps_with_many_transitions_still_show_both_states() {
+        let mut builder = BoolBandBuilder::for_view(42, 42);
+        for index in 0..=MAX_EXACT_BOOL_BANDS {
+            builder.push(index % 2 == 0, 42);
+        }
+        let BoolLane::Overview { cells, .. } = builder.finish_lane() else {
+            panic!("the view must be bounded");
+        };
+        assert_eq!(cells[0], 3);
     }
 }

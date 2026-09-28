@@ -18,16 +18,20 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `TRUE`/`FALSE`) have always been read and classified correctly, but until
   now nothing actually drew them: they simply didn't appear anywhere. Open a
   file with a boolean column and you'll now see a labeled lane with a blue
-  band wherever the value is `true` and a gray band wherever it's `false` —
-  one continuous band per run of the same value, not a mark per row. This is
+  band wherever the value is `true` and a gray band wherever it's `false`.
+  When state changes are too dense to draw individually, an amber band marks
+  intervals containing both states; the number of drawing objects stays
+  bounded even for a very large file. This is
   the first piece of `docs/ROADMAP.md`'s state-timeline milestone (M6);
   string/categorical columns, single-sample event markers, and sharing this
   lane's pan/zoom with the plot above it are still to come.
 
   **Assumptions made:**
   - Each boolean lane is its own small, fixed view of the *whole* file — it
-    always shows every band and does not (yet) pan or zoom together with the
-    time-domain plot above it. Wiring the two together is a separate,
+    shows exact bands for ordinary files and a mixed-state overview for very
+    dense files. It does not (yet) pan or zoom together with the
+    time-domain plot above it. Expanding the overview and wiring the two
+    views together are separate,
     already-planned roadmap item.
   - A run of the same value that reaches the very end of the file is drawn
     extending to the right edge of the lane. Glyde only actually knows the
