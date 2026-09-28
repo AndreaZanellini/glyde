@@ -13,7 +13,9 @@
 // limitations under the License.
 
 //! The three SPEC §4 visualizations (docs/ARCHITECTURE.md workspace layout
-//! `views/`). Only [`time`] exists so far (docs/ROADMAP.md M2 "Time-domain
-//! view v1"); `psd` and `state_timeline` land with M5 and M6.
+//! `views/`). [`time`] (docs/ROADMAP.md M2 "Time-domain view v1") and
+//! [`state_timeline`] (M6, `bool` columns only so far) exist; `psd` lands
+//! with M5.
 
+pub mod state_timeline;
 pub mod time;
