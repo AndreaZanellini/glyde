@@ -31,9 +31,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
     in memory — the same RAM-budget caution that already applies to the rest
     of ingestion. Past the cap, the list ends with "…and N more" rather than
     silently stopping without saying so.
-  - **Line numbers are 1-based and count from the top of the file, including
-    the header row** — matching how a text editor would number them, not the
-    0-based row index Glyde's own logs use internally.
+  - **Line numbers are 1-based physical lines from the top of the file,
+    including the header row** — matching a text editor even when a quoted
+    CSV field spans multiple lines, not Glyde's 0-based record index.
 
 - **A file too large to fit in memory now tells you that is what is
   happening, while it happens.** When you open a file whose data would not

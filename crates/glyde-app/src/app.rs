@@ -20,8 +20,8 @@
 //! thread.
 //!
 //! This is the M2 "single egui window" + "Time-domain view v1" slice
-//! (docs/ROADMAP.md): a file opens off-thread, its [`OpenSummary`] renders as
-//! a small text header, and its samples render as a plot via
+//! (docs/ROADMAP.md): a file opens off-thread, its inference report renders
+//! in the inference bar, and its samples render as a plot via
 //! [`crate::views::time`].
 
 use std::path::{Path, PathBuf};

@@ -587,6 +587,10 @@ fn parse_rows<R: BufRead>(
                         if row_index >= sniff.data_start_row {
                             record_kept_or_ragged(
                                 row_index,
+                                record
+                                    .position()
+                                    .map(|position| position.line() as usize)
+                                    .unwrap_or(row_index + 1),
                                 RowFields::Record(&record),
                                 expected_field_count,
                                 &mut capture,
@@ -611,7 +615,10 @@ fn parse_rows<R: BufRead>(
                             );
                             record_skip(
                                 &mut acc,
-                                row_index,
+                                reason
+                                    .position()
+                                    .map(|position| position.line() as usize)
+                                    .unwrap_or(row_index + 1),
                                 SkipReason::Unparseable {
                                     message: reason.to_string(),
                                 },
@@ -626,6 +633,7 @@ fn parse_rows<R: BufRead>(
             let mut reader = reader;
             let mut line = String::new();
             let mut row_index = 0usize;
+            let mut line_number = 0usize;
             while acc.error.is_none() {
                 line.clear();
                 let read = reader
@@ -637,6 +645,7 @@ fn parse_rows<R: BufRead>(
                 if read == 0 {
                     break;
                 }
+                line_number += 1;
                 let fields: Vec<&str> = line.split_whitespace().collect();
                 if fields.is_empty() {
                     continue;
@@ -644,6 +653,7 @@ fn parse_rows<R: BufRead>(
                 if row_index >= sniff.data_start_row {
                     record_kept_or_ragged(
                         row_index,
+                        line_number,
                         RowFields::Split(&fields),
                         expected_field_count,
                         &mut capture,
@@ -719,14 +729,15 @@ struct ParseAccumulator {
     error: Option<GlydeError>,
 }
 
-/// Records `reason` against `row_index` in `acc`'s bounded detail sample
+/// Records `reason` against the source's physical 1-based line number in
+/// `acc`'s bounded detail sample
 /// (SPEC §1.3 "view details"), always incrementing the exact
 /// `skipped_row_count` regardless of whether the cap has been reached.
-fn record_skip(acc: &mut ParseAccumulator, row_index: usize, reason: SkipReason) {
+fn record_skip(acc: &mut ParseAccumulator, line_number: usize, reason: SkipReason) {
     acc.skipped_row_count += 1;
     if acc.skipped_row_details.len() < MAX_SKIPPED_ROW_DETAILS {
         acc.skipped_row_details.push(SkippedRowDetail {
-            line_number: row_index + 1,
+            line_number,
             reason,
         });
     }
@@ -739,6 +750,7 @@ fn record_skip(acc: &mut ParseAccumulator, row_index: usize, reason: SkipReason)
 /// (issue #75).
 fn record_kept_or_ragged(
     row_index: usize,
+    line_number: usize,
     fields: RowFields<'_>,
     expected_field_count: usize,
     capture: &mut Capture,
@@ -753,7 +765,7 @@ fn record_kept_or_ragged(
         );
         record_skip(
             acc,
-            row_index,
+            line_number,
             SkipReason::FieldCountMismatch {
                 expected: expected_field_count,
                 found: fields.len(),
@@ -1146,6 +1158,14 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn skipped_row_detail_uses_physical_line_after_a_quoted_newline() {
+        let input = b"timestamp,value\n2026-01-01T00:00:00Z,\"first\nsecond\"\n2026-01-01T00:00:01Z,1\n2026-01-01T00:00:02Z\n";
+        let outcome = parse(input).expect("quoted newline is a valid CSV record");
+        assert_eq!(outcome.skipped_row_count, 1);
+        assert_eq!(outcome.skipped_row_details[0].line_number, 5);
     }
 
     // Same fixture, capturing every column: proves the multi-column capture
