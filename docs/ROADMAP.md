@@ -113,10 +113,10 @@ them, so CI stays green while honoring "written first."
 > cap it asserts (issue #83).
 >
 > **Four things M3 deliberately does not deliver**, each tracked and none
-> blocking M4: a reopen still re-parses the file's text, so the plot is instant
+> blocking M4: a reopen still re-parses the file's text, although it reuses plot caches,
 > but the inference bar is re-derived (issue #106 — an explicit scope assumption
-> that manual timing can veto); a *spilled* file still gets no pyramid in the app, because the
-> pyramid's own ~9 bytes/sample/column would breach the SPEC §5 cap on exactly
+> that manual timing can veto); a *spilled* file still gets no pyramid in the
+> app, because the pyramid's own ~9 bytes/sample/column would breach the SPEC §5 cap on exactly
 > those files (issue #102); nothing benches pan/zoom frame time for a spilled
 > file (issue #107); and `time::detect_gaps`' return type is unbounded in
 > principle, which M8 must settle before its gap view relies on it (issue #103).
