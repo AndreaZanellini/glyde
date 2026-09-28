@@ -27,6 +27,48 @@ pub use anomaly::{detect_nan_runs, Anomalies, NanRunScan};
 pub use dtype::{Dtype, SeriesValues, SpilledValues, ViewKind};
 pub use samples::{SampleSource, SeriesSamples, SAMPLE_CHUNK_LEN};
 
+/// Apply `order[new_index] = old_index` without cloning a whole column.
+/// Cycles need only one bit per row, even for string columns whose contents
+/// may be much larger than the column's pointer array.
+pub(crate) fn reorder_in_place<T>(values: &mut [T], order: &[usize]) {
+    debug_assert_eq!(values.len(), order.len());
+    let mut visited = vec![false; values.len()];
+    for start in 0..values.len() {
+        if visited[start] {
+            continue;
+        }
+        let mut current = start;
+        loop {
+            visited[current] = true;
+            let source = order[current];
+            if source == start {
+                break;
+            }
+            values.swap(current, source);
+            current = source;
+        }
+    }
+}
+
+#[cfg(test)]
+mod reorder_tests {
+    use super::reorder_in_place;
+
+    #[test]
+    fn permutes_multiple_cycles_without_requiring_clone() {
+        struct NonClone(u8);
+        let mut values = [
+            NonClone(0),
+            NonClone(1),
+            NonClone(2),
+            NonClone(3),
+            NonClone(4),
+        ];
+        reorder_in_place(&mut values, &[2, 0, 1, 4, 3]);
+        assert_eq!(values.map(|value| value.0), [2, 0, 1, 4, 3]);
+    }
+}
+
 /// One ingested column: its name, its values in their native dtype, and any
 /// anomalies flagged against it. SPEC §1.4: constant and single-sample
 /// series are valid `Series` values and must be able to render like any

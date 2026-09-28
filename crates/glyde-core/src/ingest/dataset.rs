@@ -173,7 +173,7 @@ impl Timestamps {
     fn reorder(&mut self, order: &[usize]) {
         match self {
             Timestamps::Memory(timestamps) => {
-                *timestamps = order.iter().map(|&index| timestamps[index]).collect();
+                crate::series::reorder_in_place(timestamps, order);
             }
             Timestamps::Spilled { .. } => {
                 debug_assert!(
@@ -278,7 +278,7 @@ impl ProgressiveValues {
     fn reorder(&mut self, order: &[usize]) {
         match self {
             ProgressiveValues::Memory(values) => {
-                *values = order.iter().map(|&index| values[index]).collect();
+                crate::series::reorder_in_place(values, order);
             }
             ProgressiveValues::Spilled(_) => {
                 debug_assert!(
@@ -796,7 +796,7 @@ fn build_dataset(
 /// SPEC §2.1's "[Sort]" affordance: reorders `dataset`'s time axis and every
 /// column so timestamps become non-decreasing, applying one permutation to
 /// all of them in lockstep so each sample stays paired with its own row. A
-/// stable sort, so rows that already share a tick value (SPEC §2.1's
+/// tie-preserving ordering, so rows that already share a tick value (SPEC §2.1's
 /// "duplicate timestamps ... preserved") keep their original relative order
 /// among themselves rather than being shuffled.
 ///
@@ -813,7 +813,9 @@ fn sort_dataset_by_time(dataset: &mut Dataset) {
 
     let ticks = dataset.time.to_pyramid_ticks();
     let mut order: Vec<usize> = (0..tick_count).collect();
-    order.sort_by_key(|&index| ticks[index]);
+    // Include the source index in the comparison: equal timestamps retain
+    // their original order while the sort itself needs no merge buffer.
+    order.sort_unstable_by(|&a, &b| ticks[a].cmp(&ticks[b]).then(a.cmp(&b)));
 
     dataset.time.reorder(&order);
     for series in &mut dataset.columns {

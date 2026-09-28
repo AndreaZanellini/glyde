@@ -19,10 +19,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   plotted silently — the anomaly was only ever visible in the log. The bar
   now shows *"timestamps not monotonic (N rows) — [Sort] [Keep as-is]"**
   whenever this applies; clicking **Sort** re-opens the file with every
-  column reordered by ascending timestamp (a stable sort, so rows that
-  already share the exact same timestamp keep their original relative
-  order — SPEC §2.1's "duplicate timestamps ... preserved" survives a sort
-  intact), and clicking **Keep as-is** leaves the file exactly as it was
+  column reordered by ascending timestamp (rows with equal timestamps keep
+  their original relative order, as SPEC §2.1 requires), and clicking
+  **Keep as-is** leaves the file exactly as it was
   read, which is also what happens if you never click either button. The bar
   also shows a **timezone** field: `"timezone: +02:00 (honored)"` for an
   explicit offset, `"timezone: UTC (implicit)"` for Unix/LabVIEW epoch
@@ -30,6 +29,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   (including Excel serial dates). For a file streamed to disk, the bar
   explains that sorting is unavailable instead of offering a button that
   cannot work. (docs/ROADMAP.md M4)
+
+  The in-memory correction permutes columns in place, including string
+  columns, instead of allocating a full second copy of each column.
 
   **Assumptions made:** (1) sorting is only offered for a file small enough
   to be held in memory — a file large enough to stream from disk opens

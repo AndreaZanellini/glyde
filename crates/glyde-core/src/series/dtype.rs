@@ -377,23 +377,19 @@ impl SeriesValues {
     /// reaching this on a spilled dataset (`Dataset::is_spilled` is checked
     /// before a sort is attempted).
     pub(crate) fn reorder(&mut self, order: &[usize]) {
-        fn permuted<T: Clone>(values: &[T], order: &[usize]) -> Vec<T> {
-            order.iter().map(|&index| values[index].clone()).collect()
-        }
-
         match self {
-            SeriesValues::Bool(v) => *v = permuted(v, order),
-            SeriesValues::I8(v) => *v = permuted(v, order),
-            SeriesValues::I16(v) => *v = permuted(v, order),
-            SeriesValues::I32(v) => *v = permuted(v, order),
-            SeriesValues::I64(v) => *v = permuted(v, order),
-            SeriesValues::U8(v) => *v = permuted(v, order),
-            SeriesValues::U16(v) => *v = permuted(v, order),
-            SeriesValues::U32(v) => *v = permuted(v, order),
-            SeriesValues::U64(v) => *v = permuted(v, order),
-            SeriesValues::F32(v) => *v = permuted(v, order),
-            SeriesValues::F64(v) => *v = permuted(v, order),
-            SeriesValues::String(v) => *v = permuted(v, order),
+            SeriesValues::Bool(v) => super::reorder_in_place(v, order),
+            SeriesValues::I8(v) => super::reorder_in_place(v, order),
+            SeriesValues::I16(v) => super::reorder_in_place(v, order),
+            SeriesValues::I32(v) => super::reorder_in_place(v, order),
+            SeriesValues::I64(v) => super::reorder_in_place(v, order),
+            SeriesValues::U8(v) => super::reorder_in_place(v, order),
+            SeriesValues::U16(v) => super::reorder_in_place(v, order),
+            SeriesValues::U32(v) => super::reorder_in_place(v, order),
+            SeriesValues::U64(v) => super::reorder_in_place(v, order),
+            SeriesValues::F32(v) => super::reorder_in_place(v, order),
+            SeriesValues::F64(v) => super::reorder_in_place(v, order),
+            SeriesValues::String(v) => super::reorder_in_place(v, order),
             SeriesValues::Spilled(_) => {
                 debug_assert!(
                     false,
