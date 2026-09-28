@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glyde_core::dsp::decimation::Bucket;
-use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary};
+use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache};
 use glyde_core::series::BoolLane;
 
 use crate::inference_bar::Correction;
