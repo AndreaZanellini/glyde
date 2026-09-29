@@ -104,6 +104,36 @@ Versioning: [Semantic Versioning](https://semver.org/).
   questions (how to pick an encoding, how to pick a different time-index
   column) rather than being mechanical.
 
+- **PSD (Welch) math now exists in the engine, but nothing in the app calls it
+  yet — this entry changes nothing you can see or click.** `docs/ROADMAP.md`
+  M5's "Window functions", "Detrend", and "Welch core" items:
+  `glyde-core::dsp::welch::{welch, welch_segmented}` compute a proper
+  one-sided power spectral density — Hann/Hamming/rectangular windows with
+  correct power normalization, per-segment mean removal, Welch's
+  overlapping-segment average, one-sided ×2 scaling that never doubles DC or
+  Nyquist — in place of the `todo!()` placeholders they were. It is locked by
+  the eight Welch golden tests written back in M1: a known sinusoid's power
+  lands at the exact frequency bin with the textbook value, Parseval's
+  theorem recovers a noise signal's true variance, a large DC offset's
+  spectral leakage disappears once detrended, two simultaneous tones resolve
+  independently at their correct relative levels, differently-shaped windows
+  report the same total power for the same signal, an averaged-segment PSD
+  never lets an analysis window cross a physical gap between segments, and
+  PSD is bit-identical whether it's handed a full-file slice or an
+  independently copied selection — never read from a decimated view. All
+  eight are un-ignored and passing for the first time.
+
+  **Assumptions made:**
+  1. `welch`/`welch_segmented` load their entire input into the FFT buffer;
+     neither streams nor checks the memory budget yet. That's a separate
+     roadmap item (M5 "Streaming Welch"), tracked by the still-stubbed
+     `welch` benchmark, and is why nothing in the app reaches this code —
+     that wiring is the M5 "PSD view" item, still to come.
+  2. Hann and Hamming use the standard *symmetric* form (the one textbooks
+     use for analyzing a fixed-length segment), not the *periodic* form used
+     for FIR filter design. `docs/SPEC.md` §3.2 doesn't say which; symmetric
+     is the conventional default for this use.
+
 ### Fixed
 - **A file whose time column Glyde cannot read now opens anyway, plotted
   against row numbers, and says so.** Until now, a first column that was
