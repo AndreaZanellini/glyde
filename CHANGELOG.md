@@ -12,6 +12,29 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **When Glyde drops a row while opening a file, you can now see exactly
+  which rows and why, right in the inference bar.** Until now, only a bare
+  "N rows skipped" count appeared next to the plot, with no way to look
+  closer. That count has moved into the inference bar and gained a
+  "— view details" section: expand it to see each skipped row's line number
+  and the reason (the wrong number of fields, or a line that could not be
+  read at all — for example a truncated last line). Nothing changes for a
+  clean file — the section only appears once at least one row was actually
+  skipped — and it stays visible even while the rest of the inference bar is
+  collapsed, exactly like the count it replaces, so it is never hidden behind
+  an extra click. (docs/ROADMAP.md M4, docs/SPEC.md §1.3)
+
+  **Assumptions made:**
+  - **The detail list is capped at 50 rows**, even though the count itself
+    stays exact no matter how many rows were skipped. A file with, say, 5,000
+    ragged rows would otherwise ask "view details" to hold an unbounded list
+    in memory — the same RAM-budget caution that already applies to the rest
+    of ingestion. Past the cap, the list ends with "…and N more" rather than
+    silently stopping without saying so.
+  - **Line numbers are 1-based physical lines from the top of the file,
+    including the header row** — matching a text editor even when a quoted
+    CSV field spans multiple lines, not Glyde's 0-based record index.
+
 - **A `true`/`false` column now shows up as a strip of colored on/off bands
   under the plot, instead of being silently left out.** Boolean columns
   (however they're spelled in the source file — `true`/`false`, `0`/`1`,
@@ -32,7 +55,7 @@ Versioning: [Semantic Versioning](https://semver.org/).
     dense files. It does not (yet) pan or zoom together with the
     time-domain plot above it. Expanding the overview and wiring the two
     views together are separate,
-    already-planned roadmap item.
+    already-planned roadmap items.
   - A run of the same value that reaches the very end of the file is drawn
     extending to the right edge of the lane. Glyde only actually knows the
     value as of the last sample in that run — whether it keeps holding
