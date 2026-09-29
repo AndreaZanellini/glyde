@@ -12,6 +12,32 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **A `true`/`false` column now shows up as a strip of colored on/off bands
+  under the plot, instead of being silently left out.** Boolean columns
+  (however they're spelled in the source file — `true`/`false`, `0`/`1`,
+  `TRUE`/`FALSE`) have always been read and classified correctly, but until
+  now nothing actually drew them: they simply didn't appear anywhere. Open a
+  file with a boolean column and you'll now see a labeled lane with a blue
+  band wherever the value is `true` and a gray band wherever it's `false`.
+  When state changes are too dense to draw individually, an amber band marks
+  intervals containing both states; the number of drawing objects stays
+  bounded even for a very large file. This is
+  the first piece of `docs/ROADMAP.md`'s state-timeline milestone (M6);
+  string/categorical columns, single-sample event markers, and sharing this
+  lane's pan/zoom with the plot above it are still to come.
+
+  **Assumptions made:**
+  - Each boolean lane is its own small, fixed view of the *whole* file — it
+    shows exact bands for ordinary files and a mixed-state overview for very
+    dense files. It does not (yet) pan or zoom together with the
+    time-domain plot above it. Expanding the overview and wiring the two
+    views together are separate, already-planned roadmap items.
+  - A run of the same value that reaches the very end of the file is drawn
+    extending to the right edge of the lane. Glyde only actually knows the
+    value as of the last sample in that run — whether it keeps holding
+    afterward is genuinely unknown — so this is a drawing choice for
+    visibility, not a claim about data past what was read.
+
 - **When Glyde drops a row while opening a file, you can now see exactly
   which rows and why, right in the inference bar.** Until now, only a bare
   "N rows skipped" count appeared next to the plot, with no way to look
@@ -35,32 +61,42 @@ Versioning: [Semantic Versioning](https://semver.org/).
     including the header row** — matching a text editor even when a quoted
     CSV field spans multiple lines, not Glyde's 0-based record index.
 
-- **A `true`/`false` column now shows up as a strip of colored on/off bands
-  under the plot, instead of being silently left out.** Boolean columns
-  (however they're spelled in the source file — `true`/`false`, `0`/`1`,
-  `TRUE`/`FALSE`) have always been read and classified correctly, but until
-  now nothing actually drew them: they simply didn't appear anywhere. Open a
-  file with a boolean column and you'll now see a labeled lane with a blue
-  band wherever the value is `true` and a gray band wherever it's `false`.
-  When state changes are too dense to draw individually, an amber band marks
-  intervals containing both states; the number of drawing objects stays
-  bounded even for a very large file. This is
-  the first piece of `docs/ROADMAP.md`'s state-timeline milestone (M6);
-  string/categorical columns, single-sample event markers, and sharing this
-  lane's pan/zoom with the plot above it are still to come.
+- **The inference bar now tells you when a file's timestamps run out of
+  order, offers to fix it with one click, and always states whether your
+  timezone was honored or assumed.** Until now, a file with rows out of time
+  order (a logging hiccup, a merged export, a clock adjustment) opened and
+  plotted silently — the anomaly was only ever visible in the log. The bar
+  now shows *"timestamps not monotonic (N rows) — [Sort] [Keep as-is]"**
+  whenever this applies; clicking **Sort** re-opens the file with every
+  column reordered by ascending timestamp (rows with equal timestamps keep
+  their original relative order, as SPEC §2.1 requires), and clicking
+  **Keep as-is** leaves the file exactly as it was
+  read, which is also what happens if you never click either button. The bar
+  also shows a **timezone** field: `"timezone: +02:00 (honored)"` for an
+  explicit offset, `"timezone: UTC (implicit)"` for Unix/LabVIEW epoch
+  counters, and `"timezone: naive local time"` for dates with no timezone
+  (including Excel serial dates). For a file streamed to disk, the bar
+  explains that sorting is unavailable instead of offering a button that
+  cannot work. (docs/ROADMAP.md M4)
 
-  **Assumptions made:**
-  - Each boolean lane is its own small, fixed view of the *whole* file — it
-    shows exact bands for ordinary files and a mixed-state overview for very
-    dense files. It does not (yet) pan or zoom together with the
-    time-domain plot above it. Expanding the overview and wiring the two
-    views together are separate,
-    already-planned roadmap items.
-  - A run of the same value that reaches the very end of the file is drawn
-    extending to the right edge of the lane. Glyde only actually knows the
-    value as of the last sample in that run — whether it keeps holding
-    afterward is genuinely unknown — so this is a drawing choice for
-    visibility, not a claim about data past what was read.
+  The in-memory correction permutes columns in place, including string
+  columns, instead of allocating a full second copy of each column.
+
+  **Assumptions made:** (1) sorting is only offered for a file small enough
+  to be held in memory — a file large enough to stream from disk opens
+  unsorted and the bar explains why, since a streamed file's on-disk cache
+  cannot be reordered in place; making a huge file sortable is a materially
+  bigger change tracked as a follow-up rather than folded in here. (2) the
+  timezone field is a one-line, whole-column summary taken from the file's
+  first row; a file whose offset genuinely changes partway through (e.g. a
+  DST transition mid-file) is already handled correctly *per sample* on the
+  plot's own time axis and cursor readout — this field is only the
+  inference bar's short summary, not a claim that every row shares one
+  offset. (3) "Keep as-is" is a real, always-present button, not a dismiss
+  action with hidden state — clicking it changes nothing on purpose, since
+  "not reordering" is already what happens without it; it exists so the
+  choice SPEC §2.1 names is visibly offered, not only implied by the absence
+  of a Sort click.
 
 - **A file too large to fit in memory now tells you that is what is
   happening, while it happens.** When you open a file whose data would not

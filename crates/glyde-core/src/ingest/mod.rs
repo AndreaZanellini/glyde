@@ -50,7 +50,7 @@ pub use infer::{
 pub use report::{
     inspect, open_dataset, open_dataset_progressive, open_dataset_progressive_with_overrides,
     open_dataset_with_budget, open_dataset_with_overrides, InferenceReport, InferredField,
-    OpenSummary, SamplingClass,
+    OpenSummary, SamplingClass, TimezoneLabel,
 };
 
 use crate::time::TimestampFormat;
@@ -73,6 +73,14 @@ pub struct IngestOverrides {
     pub delimiter: Option<Delimiter>,
     pub decimal_separator: Option<DecimalSeparator>,
     pub timestamp_format: Option<TimestampFormat>,
+    /// SPEC §2.1's "[Sort]" affordance for a non-monotonic time axis: rows
+    /// are reordered by ascending timestamp instead of kept in source order.
+    /// Unlike the other three fields, this is not a bypassed inference — it
+    /// is a data transform, and only ever applied on the in-memory ingestion
+    /// path (`dataset::build_dataset`); a spilled open logs a warning and
+    /// opens unsorted instead, since a spill file cannot be permuted in
+    /// place (see `dataset::choose_storage`).
+    pub sort_by_time: bool,
 }
 
 /// A plain hash of `overrides`, for scoping a cache key to it

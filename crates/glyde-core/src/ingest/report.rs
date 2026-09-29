@@ -102,6 +102,39 @@ pub struct InferredField<T> {
     pub confidence: Confidence,
 }
 
+/// SPEC §2.1's timezone rule, summarized for the inference bar: "if the
+/// source carries one, honor it and display it. If not, treat as naive local
+/// time and label it as such." A per-row offset is already honored and
+/// redisplayed by `crate::time::format_timestamp` (the axis and cursor
+/// readout, `glyde-app::views::time`) — this is the one-line, whole-column
+/// summary the inference bar shows instead, taken from the first parsed row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TimezoneLabel {
+    /// The source carried an explicit UTC offset (SPEC §2.1
+    /// [`TimestampFormat::Iso8601WithOffset`]), honored rather than
+    /// discarded or converted. The `String` is a normalized `+HH:MM`
+    /// display, e.g. `"+02:00"`.
+    Honored(String),
+    /// A numeric counter with a defined UTC epoch, even though individual
+    /// values do not contain an explicit offset.
+    UtcImplicit,
+    /// No timezone in the source: SPEC §2.1's "treat as naive local time"
+    /// default, made explicit rather than left for the user to assume.
+    NaiveLocal,
+}
+
+/// A UTC offset in seconds as SPEC §2.1's `+HH:MM`/`-HH:MM` display text,
+/// e.g. `7200` -> `"+02:00"`, `0` -> `"+00:00"`.
+fn format_utc_offset(offset_seconds: i32) -> String {
+    let sign = if offset_seconds < 0 { '-' } else { '+' };
+    let magnitude = offset_seconds.unsigned_abs();
+    format!(
+        "{sign}{:02}:{:02}",
+        magnitude / 3600,
+        (magnitude % 3600) / 60
+    )
+}
+
 /// docs/ARCHITECTURE.md's `InferenceReport` (docs/ROADMAP.md M4 "surfaced to
 /// the UI"): the SPEC §1.2 mandatory inference-bar fields — encoding,
 /// delimiter, decimal separator, time column, timestamp format, sample
@@ -109,7 +142,10 @@ pub struct InferredField<T> {
 /// where SPEC §1.2/§2.1 define a real ambiguity signal for it.
 /// `sample_count` and `sampling_class` are facts derived from the
 /// already-parsed data, not guesses among competing readings, so they carry
-/// no separate confidence field.
+/// no separate confidence field. `non_monotonic_count`, `duplicate_count`,
+/// and `timezone` are SPEC §2.1's remaining timestamp affordances — likewise
+/// facts about the already-parsed axis, not a competing reading to have a
+/// confidence about.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InferenceReport {
     pub encoding: InferredField<String>,
@@ -128,6 +164,15 @@ pub struct InferenceReport {
     /// the exact total, and [`Self::skipped_row_details_truncated`] to know
     /// whether this list is a partial view of it.
     pub skipped_row_details: Vec<SkippedRowDetail>,
+    /// SPEC §2.1: "non-monotonic timestamps: detected, counted, logged" —
+    /// the inference bar's "[Sort]/[Keep as-is]" affordance shows when this
+    /// is greater than zero.
+    pub non_monotonic_count: u64,
+    /// SPEC §2.1: "duplicate timestamps: preserved, flagged."
+    pub duplicate_timestamp_count: u64,
+    /// `None` when there is no absolute timestamp to have a timezone at all
+    /// (a progressive numeric index, or the issue #94 row-ordinal fallback).
+    pub timezone: Option<TimezoneLabel>,
 }
 
 impl InferenceReport {
@@ -326,6 +371,7 @@ fn build_summary_and_report(
         gap_count,
         non_monotonic_count,
         duplicate_timestamp_count,
+        timezone,
     ) = match &dataset.time {
         TimeAxis::Absolute { timestamps, format } => {
             // Read as a `TickSource`, never as one whole slice (issue #85): a
@@ -341,11 +387,14 @@ fn build_summary_and_report(
                 stats.gap_count as u64,
                 stats.monotonicity.non_monotonic_count as u64,
                 stats.monotonicity.duplicate_count as u64,
+                Some(timezone_label(*format, timestamps)),
             )
         }
         // SPEC §2.1: a progressive numeric index has no absolute-time
         // meaning (corpus case 35) — same as `inspect`'s `None` arm above.
-        TimeAxis::Progressive { .. } => (None, None, SamplingClass::ProgressiveIndex, 0, 0, 0),
+        TimeAxis::Progressive { .. } => {
+            (None, None, SamplingClass::ProgressiveIndex, 0, 0, 0, None)
+        }
     };
 
     let summary = OpenSummary {
@@ -414,15 +463,51 @@ fn build_summary_and_report(
         sampling_class,
         skipped_row_count: outcome.skipped_row_count,
         skipped_row_details: outcome.skipped_row_details,
+        non_monotonic_count,
+        duplicate_timestamp_count,
+        timezone,
     };
 
     Ok((summary, report, dataset))
+}
+
+/// SPEC §2.1's timezone summary for an absolute-timestamp axis: `Honored`
+/// with the first parsed row's UTC offset for
+/// [`TimestampFormat::Iso8601WithOffset`], `UtcImplicit` for counters with a
+/// defined UTC epoch, and `NaiveLocal` for dates without an offset (including
+/// Excel serial dates, which specify a calendar origin but no timezone).
+fn timezone_label(
+    format: TimestampFormat,
+    timestamps: &super::dataset::Timestamps,
+) -> TimezoneLabel {
+    match format {
+        TimestampFormat::EpochSeconds
+        | TimestampFormat::EpochMillis
+        | TimestampFormat::EpochMicros
+        | TimestampFormat::EpochNanos
+        | TimestampFormat::LabViewEpoch => return TimezoneLabel::UtcImplicit,
+        TimestampFormat::Iso8601WithOffset => {}
+        TimestampFormat::Iso8601Naive
+        | TimestampFormat::DateTimeSpace
+        | TimestampFormat::DayFirst
+        | TimestampFormat::MonthFirst
+        | TimestampFormat::ExcelSerial => return TimezoneLabel::NaiveLocal,
+    }
+    match timestamps
+        .iter()
+        .next()
+        .and_then(|timestamp| timestamp.offset_seconds)
+    {
+        Some(offset_seconds) => TimezoneLabel::Honored(format_utc_offset(offset_seconds)),
+        None => TimezoneLabel::NaiveLocal,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ingest::dataset::load;
+    use crate::ingest::IngestOverrides;
     use std::path::PathBuf;
 
     fn corpus_path(file_name: &str) -> PathBuf {
@@ -603,5 +688,147 @@ mod tests {
         let (_summary, report, _dataset) = open_dataset(&path).expect("case 28 must open");
 
         assert!(report.has_low_confidence_field());
+    }
+
+    // SPEC §2.1's "non-monotonic ... counted" and "duplicate ... flagged"
+    // must reach `InferenceReport`, not stop at `OpenSummary` (the same gap
+    // the timestamp-format-ambiguity review follow-up above closed for that
+    // field).
+    #[test]
+    fn inference_report_carries_the_non_monotonic_count_for_corpus_case_36() {
+        let path = corpus_path("case-36-non-monotonic-timestamps.csv");
+
+        let (_summary, report, _dataset) = open_dataset(&path).expect("case 36 must open");
+
+        assert_eq!(report.non_monotonic_count, 1);
+        assert_eq!(report.duplicate_timestamp_count, 0);
+    }
+
+    #[test]
+    fn inference_report_carries_the_duplicate_count_for_corpus_case_37() {
+        let path = corpus_path("case-37-duplicate-timestamps.csv");
+
+        let (_summary, report, _dataset) = open_dataset(&path).expect("case 37 must open");
+
+        assert_eq!(report.non_monotonic_count, 0);
+        assert_eq!(report.duplicate_timestamp_count, 1);
+    }
+
+    // SPEC §2.1: "if the source carries [a timezone], honor it and display
+    // it" — corpus case 24's `+02:00` offset must reach `InferenceReport`.
+    #[test]
+    fn inference_report_honors_the_timezone_for_corpus_case_24() {
+        let path = corpus_path("case-24-iso8601-with-timezone.csv");
+
+        let (_summary, report, _dataset) = open_dataset(&path).expect("case 24 must open");
+
+        assert_eq!(
+            report.timezone,
+            Some(TimezoneLabel::Honored("+02:00".to_string()))
+        );
+    }
+
+    // SPEC §2.1: "if not, treat as naive local time and label it as such" —
+    // corpus case 25 has no offset at all.
+    #[test]
+    fn inference_report_reports_naive_local_for_corpus_case_25() {
+        let path = corpus_path("case-25-iso8601-naive.csv");
+
+        let (_summary, report, _dataset) = open_dataset(&path).expect("case 25 must open");
+
+        assert_eq!(report.timezone, Some(TimezoneLabel::NaiveLocal));
+    }
+
+    #[test]
+    fn numeric_utc_epochs_are_not_labeled_naive_local() {
+        for file in [
+            "case-29-epoch-seconds.csv",
+            "case-30-epoch-milliseconds.csv",
+            "case-31-epoch-microseconds.csv",
+            "case-32-epoch-nanoseconds.csv",
+            "case-34-labview-epoch.csv",
+        ] {
+            let (_, report, _) = open_dataset(&corpus_path(file)).expect(file);
+            assert_eq!(report.timezone, Some(TimezoneLabel::UtcImplicit), "{file}");
+        }
+    }
+
+    #[test]
+    fn excel_serial_date_has_no_utc_timezone() {
+        let (_, report, _) = open_dataset(&corpus_path("case-33-excel-serial-dates.csv"))
+            .expect("case 33 must open");
+        assert_eq!(report.timezone, Some(TimezoneLabel::NaiveLocal));
+    }
+
+    // A progressive numeric index (corpus case 35) has no timezone concept
+    // at all — `None`, not a guessed `NaiveLocal`.
+    #[test]
+    fn inference_report_timezone_is_none_for_a_progressive_index() {
+        let path = corpus_path("case-35-progressive-integer-index.csv");
+
+        let (_summary, report, _dataset) = open_dataset(&path).expect("case 35 must open");
+
+        assert_eq!(report.timezone, None);
+    }
+
+    // SPEC §2.1's "[Sort]" affordance, end to end: opening corpus case 36
+    // with `IngestOverrides::sort_by_time` set must reorder both the time
+    // axis and its paired `value` column, and the resulting report must show
+    // the axis as monotonic again.
+    #[test]
+    fn sort_by_time_override_reorders_rows_and_clears_the_non_monotonic_count() {
+        let path = corpus_path("case-36-non-monotonic-timestamps.csv");
+        let overrides = IngestOverrides {
+            sort_by_time: true,
+            ..IngestOverrides::default()
+        };
+
+        let (_summary, report, dataset) =
+            open_dataset_with_overrides(&path, overrides).expect("case 36 must open sorted");
+
+        assert_eq!(report.non_monotonic_count, 0);
+        // Case 36's two out-of-order rows share the exact same timestamp
+        // (both `00:00:01`); before sorting they are not adjacent (a
+        // `00:00:02` row sits between them), so `MonotonicityReport`'s
+        // consecutive-pair definition counts that as one backward step, not
+        // a duplicate. Sorting makes them adjacent, and a genuine duplicate
+        // that scrambled order was hiding is exactly what SPEC §2.1's
+        // "duplicate timestamps: preserved, flagged" should now surface —
+        // sorting must never silently drop it.
+        assert_eq!(report.duplicate_timestamp_count, 1);
+
+        let TimeAxis::Absolute { timestamps, .. } = &dataset.time else {
+            panic!("case 36's time index is an absolute timestamp column");
+        };
+        let ticks: Vec<i128> = timestamps.iter().map(|timestamp| timestamp.ticks).collect();
+        assert!(
+            ticks.windows(2).all(|pair| pair[0] <= pair[1]),
+            "ticks must be non-decreasing after sorting: {ticks:?}"
+        );
+
+        let crate::series::SeriesValues::F64(values) = dataset.columns[0].values() else {
+            panic!("case 36's value column is f64");
+        };
+        // Original rows (timestamp, value): (0,10.0) (1,10.1) (2,10.2)
+        // (1,10.3) (3,10.4) (4,10.5). A stable sort by ascending timestamp
+        // keeps the two t=1 rows in their original relative order (10.1
+        // before 10.3), so `value` reorders to this exact sequence.
+        assert_eq!(values, &vec![10.0, 10.1, 10.3, 10.2, 10.4, 10.5]);
+    }
+
+    // Without the override, case 36 must open unsorted exactly as before —
+    // `sort_by_time` defaults to `false` and never changes behavior on its
+    // own.
+    #[test]
+    fn without_the_override_corpus_case_36_stays_unsorted() {
+        let path = corpus_path("case-36-non-monotonic-timestamps.csv");
+
+        let (_summary, report, dataset) = open_dataset(&path).expect("case 36 must open");
+
+        assert_eq!(report.non_monotonic_count, 1);
+        let crate::series::SeriesValues::F64(values) = dataset.columns[0].values() else {
+            panic!("case 36's value column is f64");
+        };
+        assert_eq!(values, &vec![10.0, 10.1, 10.2, 10.3, 10.4, 10.5]);
     }
 }

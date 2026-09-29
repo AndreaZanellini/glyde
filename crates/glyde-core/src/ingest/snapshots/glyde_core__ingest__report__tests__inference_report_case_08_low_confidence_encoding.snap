@@ -35,4 +35,11 @@ InferenceReport {
     sampling_class: Uniform,
     skipped_row_count: 0,
     skipped_row_details: [],
+    non_monotonic_count: 0,
+    duplicate_timestamp_count: 0,
+    timezone: Some(
+        Honored(
+            "+00:00",
+        ),
+    ),
 }

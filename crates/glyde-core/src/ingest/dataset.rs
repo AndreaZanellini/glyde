@@ -165,6 +165,24 @@ impl Timestamps {
     fn is_spilled(&self) -> bool {
         matches!(self, Timestamps::Spilled { .. })
     }
+
+    /// [`SeriesValues::reorder`]'s counterpart for the time axis itself
+    /// (SPEC §2.1's "[Sort]" affordance): `order[i]` is the original index of
+    /// the timestamp that should end up at position `i`. Only defined for
+    /// [`Timestamps::Memory`] — see [`sort_dataset_by_time`]'s doc comment.
+    fn reorder(&mut self, order: &[usize]) {
+        match self {
+            Timestamps::Memory(timestamps) => {
+                crate::series::reorder_in_place(timestamps, order);
+            }
+            Timestamps::Spilled { .. } => {
+                debug_assert!(
+                    false,
+                    "Timestamps::reorder must never be called on a spilled axis"
+                );
+            }
+        }
+    }
 }
 
 /// How SPEC §2.1–2.2's statistics read this axis (issue #85): in bounded
@@ -253,6 +271,22 @@ impl ProgressiveValues {
 
     fn is_spilled(&self) -> bool {
         matches!(self, ProgressiveValues::Spilled(_))
+    }
+
+    /// [`Timestamps::reorder`]'s counterpart for a [`TimeAxis::Progressive`]
+    /// axis. Only defined for [`ProgressiveValues::Memory`].
+    fn reorder(&mut self, order: &[usize]) {
+        match self {
+            ProgressiveValues::Memory(values) => {
+                crate::series::reorder_in_place(values, order);
+            }
+            ProgressiveValues::Spilled(_) => {
+                debug_assert!(
+                    false,
+                    "ProgressiveValues::reorder must never be called on a spilled axis"
+                );
+            }
+        }
     }
 
     /// Hands `range`'s values to `visit` in bounded chunks, in row order —
@@ -363,6 +397,16 @@ impl TimeAxis {
                     .map(progressive_value_to_tick)
                     .collect(),
             ),
+        }
+    }
+
+    /// [`Timestamps::reorder`] / [`ProgressiveValues::reorder`], dispatched
+    /// on whichever variant this axis holds (SPEC §2.1's "[Sort]"
+    /// affordance — see [`sort_dataset_by_time`]).
+    fn reorder(&mut self, order: &[usize]) {
+        match self {
+            TimeAxis::Absolute { timestamps, .. } => timestamps.reorder(order),
+            TimeAxis::Progressive { values } => values.reorder(order),
         }
     }
 }
@@ -610,6 +654,14 @@ fn choose_storage(
         "spilling to the on-disk cache: materializing this file in memory would exceed the RAM \
          budget (SPEC §5.1)"
     );
+    if overrides.sort_by_time {
+        warn!(
+            file_bytes,
+            "sort-by-time was requested, but this file must spill to the on-disk cache (SPEC \
+             §5.1) — a spilled column cannot be permuted in place, so it opens unsorted \
+             (SPEC §2.1's [Sort] affordance is not available for a spilled file)"
+        );
+    }
     Ok(Storage::Spill(Box::new(sniff)))
 }
 
@@ -729,14 +781,46 @@ fn build_dataset(
         })
         .collect();
 
-    Ok((
-        Dataset {
-            time,
-            time_column_name,
-            columns,
-        },
-        inference,
-    ))
+    let mut dataset = Dataset {
+        time,
+        time_column_name,
+        columns,
+    };
+    if overrides.sort_by_time {
+        sort_dataset_by_time(&mut dataset);
+    }
+
+    Ok((dataset, inference))
+}
+
+/// SPEC §2.1's "[Sort]" affordance: reorders `dataset`'s time axis and every
+/// column so timestamps become non-decreasing, applying one permutation to
+/// all of them in lockstep so each sample stays paired with its own row. A
+/// tie-preserving ordering, so rows that already share a tick value (SPEC §2.1's
+/// "duplicate timestamps ... preserved") keep their original relative order
+/// among themselves rather than being shuffled.
+///
+/// Only called from [`build_dataset`], the in-memory conversion path — a
+/// spilled column's on-disk file is append-only and cannot be permuted in
+/// place, so [`choose_storage`] logs a warning and opens unsorted instead of
+/// reaching this at all when [`IngestOverrides::sort_by_time`] is set on a
+/// file that must spill.
+fn sort_dataset_by_time(dataset: &mut Dataset) {
+    let tick_count = dataset.time.len();
+    if tick_count < 2 {
+        return;
+    }
+
+    let ticks = dataset.time.to_pyramid_ticks();
+    let mut order: Vec<usize> = (0..tick_count).collect();
+    // Include the source index in the comparison: equal timestamps retain
+    // their original order while the sort itself needs no merge buffer.
+    order.sort_unstable_by(|&a, &b| ticks[a].cmp(&ticks[b]).then(a.cmp(&b)));
+
+    dataset.time.reorder(&order);
+    for series in &mut dataset.columns {
+        series.reorder(&order);
+    }
 }
 
 /// What ingestion settled about the time index beyond the axis itself — the

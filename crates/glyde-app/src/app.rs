@@ -183,6 +183,7 @@ impl GlydeApp {
                 self.overrides.decimal_separator = Some(separator)
             }
             Correction::TimestampFormat(format) => self.overrides.timestamp_format = Some(format),
+            Correction::SortByTime => self.overrides.sort_by_time = true,
         }
         tracing::info!(
             path = %path.display(),
@@ -367,7 +368,9 @@ impl eframe::App for GlydeApp {
                 // widget: persistent and discreet; opens expanded when any
                 // inference is low-confidence; each field correctable in one
                 // click, correcting triggers a re-index".
-                if let Some(correction) = inference_bar::show(ui, report, path) {
+                if let Some(correction) =
+                    inference_bar::show(ui, report, path, !dataset.is_spilled())
+                {
                     pending_correction = Some((path.clone(), correction));
                 }
                 // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1"; SPEC
@@ -475,6 +478,9 @@ mod tests {
             sampling_class: SamplingClass::Uniform,
             skipped_row_count: 0,
             skipped_row_details: Vec::new(),
+            non_monotonic_count: 0,
+            duplicate_timestamp_count: 0,
+            timezone: Some(glyde_core::ingest::TimezoneLabel::NaiveLocal),
         })
     }
 

@@ -366,6 +366,39 @@ impl SeriesValues {
         }
     }
 
+    /// Reorders this column's samples in place: `order[i]` is the original
+    /// index of the sample that should end up at position `i` — the same
+    /// permutation `dataset::sort_dataset_by_time` computes from the time
+    /// axis and applies to every column in lockstep (SPEC §2.1's "[Sort]"
+    /// affordance). Only defined for a heap-backed variant: a
+    /// [`SeriesValues::Spilled`] column's on-disk file is append-only and
+    /// cannot be permuted in place, so this is a no-op (`debug_assert`ed
+    /// against in tests) for it — the caller is responsible for never
+    /// reaching this on a spilled dataset (`Dataset::is_spilled` is checked
+    /// before a sort is attempted).
+    pub(crate) fn reorder(&mut self, order: &[usize]) {
+        match self {
+            SeriesValues::Bool(v) => super::reorder_in_place(v, order),
+            SeriesValues::I8(v) => super::reorder_in_place(v, order),
+            SeriesValues::I16(v) => super::reorder_in_place(v, order),
+            SeriesValues::I32(v) => super::reorder_in_place(v, order),
+            SeriesValues::I64(v) => super::reorder_in_place(v, order),
+            SeriesValues::U8(v) => super::reorder_in_place(v, order),
+            SeriesValues::U16(v) => super::reorder_in_place(v, order),
+            SeriesValues::U32(v) => super::reorder_in_place(v, order),
+            SeriesValues::U64(v) => super::reorder_in_place(v, order),
+            SeriesValues::F32(v) => super::reorder_in_place(v, order),
+            SeriesValues::F64(v) => super::reorder_in_place(v, order),
+            SeriesValues::String(v) => super::reorder_in_place(v, order),
+            SeriesValues::Spilled(_) => {
+                debug_assert!(
+                    false,
+                    "SeriesValues::reorder must never be called on a spilled column"
+                );
+            }
+        }
+    }
+
     /// The `index`-th sample as `f64`, for the plotting/cursor-readout path
     /// that walks a series sample by sample rather than scanning it whole
     /// (SPEC §4.1). `None` for `bool`/`string` (they route to the state
@@ -475,6 +508,51 @@ mod tests {
         assert_eq!(values.dtype(), Dtype::F64);
         assert_eq!(values.len(), 3);
         assert!(!values.is_empty());
+    }
+
+    // SPEC §2.1's "[Sort]" affordance: `reorder` must apply the given
+    // permutation to a heap-backed column of any dtype, gathering
+    // `values[order[i]]` into position `i`.
+    #[test]
+    fn reorder_permutes_every_heap_backed_dtype() {
+        let mut bool_values = SeriesValues::Bool(vec![true, false, true, false]);
+        bool_values.reorder(&[2, 0, 3, 1]);
+        assert_eq!(
+            bool_values,
+            SeriesValues::Bool(vec![true, true, false, false])
+        );
+
+        let mut i64_values = SeriesValues::I64(vec![10, 20, 30, 40]);
+        i64_values.reorder(&[2, 0, 3, 1]);
+        assert_eq!(i64_values, SeriesValues::I64(vec![30, 10, 40, 20]));
+
+        let mut f64_values = SeriesValues::F64(vec![1.0, 2.0, 3.0, 4.0]);
+        f64_values.reorder(&[2, 0, 3, 1]);
+        assert_eq!(f64_values, SeriesValues::F64(vec![3.0, 1.0, 4.0, 2.0]));
+
+        let mut string_values = SeriesValues::String(vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ]);
+        string_values.reorder(&[2, 0, 3, 1]);
+        assert_eq!(
+            string_values,
+            SeriesValues::String(vec![
+                "c".to_string(),
+                "a".to_string(),
+                "d".to_string(),
+                "b".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn reorder_with_the_identity_permutation_leaves_values_unchanged() {
+        let mut values = SeriesValues::F64(vec![1.0, 2.0, 3.0]);
+        values.reorder(&[0, 1, 2]);
+        assert_eq!(values, SeriesValues::F64(vec![1.0, 2.0, 3.0]));
     }
 
     #[test]

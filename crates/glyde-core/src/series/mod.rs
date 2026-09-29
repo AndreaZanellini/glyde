@@ -32,6 +32,48 @@ pub use state::{
     MAX_EXACT_BOOL_BANDS,
 };
 
+/// Apply `order[new_index] = old_index` without cloning a whole column.
+/// Cycles need only one bit per row, even for string columns whose contents
+/// may be much larger than the column's pointer array.
+pub(crate) fn reorder_in_place<T>(values: &mut [T], order: &[usize]) {
+    debug_assert_eq!(values.len(), order.len());
+    let mut visited = vec![false; values.len()];
+    for start in 0..values.len() {
+        if visited[start] {
+            continue;
+        }
+        let mut current = start;
+        loop {
+            visited[current] = true;
+            let source = order[current];
+            if source == start {
+                break;
+            }
+            values.swap(current, source);
+            current = source;
+        }
+    }
+}
+
+#[cfg(test)]
+mod reorder_tests {
+    use super::reorder_in_place;
+
+    #[test]
+    fn permutes_multiple_cycles_without_requiring_clone() {
+        struct NonClone(u8);
+        let mut values = [
+            NonClone(0),
+            NonClone(1),
+            NonClone(2),
+            NonClone(3),
+            NonClone(4),
+        ];
+        reorder_in_place(&mut values, &[2, 0, 1, 4, 3]);
+        assert_eq!(values.map(|value| value.0), [2, 0, 1, 4, 3]);
+    }
+}
+
 /// One ingested column: its name, its values in their native dtype, and any
 /// anomalies flagged against it. SPEC §1.4: constant and single-sample
 /// series are valid `Series` values and must be able to render like any
@@ -104,6 +146,23 @@ impl Series {
     pub fn anomalies(&self) -> &Anomalies {
         &self.anomalies
     }
+
+    /// [`SeriesValues::reorder`], plus keeping the anomaly record consistent
+    /// with the new sample order (SPEC §2.1's "[Sort]" affordance). NaN runs
+    /// are *positional* (SPEC §1.3: `[start, end)` sample-index ranges), so
+    /// they are recomputed against the reordered samples rather than
+    /// permuted themselves — permuting index ranges is equivalent to
+    /// recomputing them and would be more code for no benefit. Every other
+    /// anomaly kind is unaffected by reordering the *retained* rows:
+    /// `skipped_rows` names *source* row numbers that were never
+    /// materialized into this series at all, and `outliers` is not populated
+    /// by anything yet (docs/ROADMAP.md M8).
+    pub(crate) fn reorder(&mut self, order: &[usize]) {
+        self.values.reorder(order);
+        if let Some(samples) = self.values.as_f64_slice() {
+            self.anomalies.nan_runs = detect_nan_runs(samples);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +220,55 @@ mod tests {
 
         assert!(series.is_constant());
         assert_eq!(series.len(), 1);
+    }
+
+    // SPEC §2.1's "[Sort]" affordance: `reorder` must permute samples like
+    // `SeriesValues::reorder`, and — for a float column — recompute NaN runs
+    // against the new order rather than leaving them pointing at the old
+    // positions.
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn reorder_permutes_samples_and_recomputes_nan_runs_for_a_float_series() {
+        // Original order: [1.0, NaN, NaN, 4.0]; nan_runs = [1..3]. With
+        // order = [3, 0, 1, 2], new[i] = old[order[i]] reads as
+        // [4.0, 1.0, NaN, NaN] — the NaN run moves from [1..3) to [2..4),
+        // which only a real recomputation (not a carried-over stale range)
+        // produces.
+        let mut series = Series::with_anomalies(
+            "value",
+            SeriesValues::F64(vec![1.0, f64::NAN, f64::NAN, 4.0]),
+            Anomalies {
+                nan_runs: vec![1..3],
+                ..Anomalies::default()
+            },
+        );
+
+        series.reorder(&[3, 0, 1, 2]);
+
+        let SeriesValues::F64(values) = series.values() else {
+            panic!("expected an F64 series");
+        };
+        assert_eq!(values[0], 4.0);
+        assert_eq!(values[1], 1.0);
+        assert!(values[2].is_nan());
+        assert!(values[3].is_nan());
+        assert_eq!(series.anomalies().nan_runs, vec![2..4]);
+    }
+
+    #[test]
+    fn reorder_leaves_skipped_rows_untouched() {
+        let mut series = Series::with_anomalies(
+            "value",
+            SeriesValues::F64(vec![1.0, 2.0, 3.0]),
+            Anomalies {
+                skipped_rows: vec![7, 12],
+                ..Anomalies::default()
+            },
+        );
+
+        series.reorder(&[2, 0, 1]);
+
+        assert_eq!(series.anomalies().skipped_rows, vec![7, 12]);
     }
 
     #[test]
