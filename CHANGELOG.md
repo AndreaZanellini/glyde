@@ -449,6 +449,26 @@ Versioning: [Semantic Versioning](https://semver.org/).
     is identical to before, including how invalid bytes are replaced.
 
 ### Documentation
+- **Milestone 3 engineering work is finished; hands-on checks remain.** The
+  status report below was written when M3's engine existed but was not
+  connected to the app; that wiring has since been built, and
+  `docs/M3-CLOSEOUT.md` records the changes. Automated checks cover the
+  first-plot, memory, spike, sample-convergence and cache-reuse paths. The
+  maintainer's five hands-on checks on real files, including end-to-end reopen
+  timing, are still pending.
+
+  **Four things M3 deliberately does not do**, all written down rather than
+  quietly left out. (1) Reopening a file reuses the plot caches, but Glyde
+  still reads and re-interprets the file's text every time, so the inference bar
+  is worked out afresh on each open — making that instant too needs a much
+  bigger change and is now its own item. (2) A file too large to fit in memory
+  still gets no index built for it; it plots correctly by reading only what is
+  on screen, just without the index to accelerate it. (3) Nothing automatically
+  measures scrolling smoothness for those very large files — it is checked by
+  hand. (4) One internal list used by a future gaps view could in principle grow
+  with file size; no real file has ever triggered it, and the view that would
+  use it does not exist yet. Each of these is tracked as its own issue.
+
 - **New: `docs/M3-CLOSEOUT.md` — an honest status report on Milestone 3, plus a
   plan to finish it.** No app behavior changes in this entry; it is analysis.
 
