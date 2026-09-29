@@ -12,6 +12,55 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **A `true`/`false` column now shows up as a strip of colored on/off bands
+  under the plot, instead of being silently left out.** Boolean columns
+  (however they're spelled in the source file — `true`/`false`, `0`/`1`,
+  `TRUE`/`FALSE`) have always been read and classified correctly, but until
+  now nothing actually drew them: they simply didn't appear anywhere. Open a
+  file with a boolean column and you'll now see a labeled lane with a blue
+  band wherever the value is `true` and a gray band wherever it's `false`.
+  When state changes are too dense to draw individually, an amber band marks
+  intervals containing both states; the number of drawing objects stays
+  bounded even for a very large file. This is
+  the first piece of `docs/ROADMAP.md`'s state-timeline milestone (M6);
+  string/categorical columns, single-sample event markers, and sharing this
+  lane's pan/zoom with the plot above it are still to come.
+
+  **Assumptions made:**
+  - Each boolean lane is its own small, fixed view of the *whole* file — it
+    shows exact bands for ordinary files and a mixed-state overview for very
+    dense files. It does not (yet) pan or zoom together with the
+    time-domain plot above it. Expanding the overview and wiring the two
+    views together are separate, already-planned roadmap items.
+  - A run of the same value that reaches the very end of the file is drawn
+    extending to the right edge of the lane. Glyde only actually knows the
+    value as of the last sample in that run — whether it keeps holding
+    afterward is genuinely unknown — so this is a drawing choice for
+    visibility, not a claim about data past what was read.
+
+- **When Glyde drops a row while opening a file, you can now see exactly
+  which rows and why, right in the inference bar.** Until now, only a bare
+  "N rows skipped" count appeared next to the plot, with no way to look
+  closer. That count has moved into the inference bar and gained a
+  "— view details" section: expand it to see each skipped row's line number
+  and the reason (the wrong number of fields, or a line that could not be
+  read at all — for example a truncated last line). Nothing changes for a
+  clean file — the section only appears once at least one row was actually
+  skipped — and it stays visible even while the rest of the inference bar is
+  collapsed, exactly like the count it replaces, so it is never hidden behind
+  an extra click. (docs/ROADMAP.md M4, docs/SPEC.md §1.3)
+
+  **Assumptions made:**
+  - **The detail list is capped at 50 rows**, even though the count itself
+    stays exact no matter how many rows were skipped. A file with, say, 5,000
+    ragged rows would otherwise ask "view details" to hold an unbounded list
+    in memory — the same RAM-budget caution that already applies to the rest
+    of ingestion. Past the cap, the list ends with "…and N more" rather than
+    silently stopping without saying so.
+  - **Line numbers are 1-based physical lines from the top of the file,
+    including the header row** — matching a text editor even when a quoted
+    CSV field spans multiple lines, not Glyde's 0-based record index.
+
 - **The inference bar now tells you when a file's timestamps run out of
   order, offers to fix it with one click, and always states whether your
   timezone was honored or assumed.** Until now, a file with rows out of time
@@ -48,33 +97,6 @@ Versioning: [Semantic Versioning](https://semver.org/).
   "not reordering" is already what happens without it; it exists so the
   choice SPEC §2.1 names is visibly offered, not only implied by the absence
   of a Sort click.
-
-- **A `true`/`false` column now shows up as a strip of colored on/off bands
-  under the plot, instead of being silently left out.** Boolean columns
-  (however they're spelled in the source file — `true`/`false`, `0`/`1`,
-  `TRUE`/`FALSE`) have always been read and classified correctly, but until
-  now nothing actually drew them: they simply didn't appear anywhere. Open a
-  file with a boolean column and you'll now see a labeled lane with a blue
-  band wherever the value is `true` and a gray band wherever it's `false`.
-  When state changes are too dense to draw individually, an amber band marks
-  intervals containing both states; the number of drawing objects stays
-  bounded even for a very large file. This is
-  the first piece of `docs/ROADMAP.md`'s state-timeline milestone (M6);
-  string/categorical columns, single-sample event markers, and sharing this
-  lane's pan/zoom with the plot above it are still to come.
-
-  **Assumptions made:**
-  - Each boolean lane is its own small, fixed view of the *whole* file — it
-    shows exact bands for ordinary files and a mixed-state overview for very
-    dense files. It does not (yet) pan or zoom together with the
-    time-domain plot above it. Expanding the overview and wiring the two
-    views together are separate,
-    already-planned roadmap items.
-  - A run of the same value that reaches the very end of the file is drawn
-    extending to the right edge of the lane. Glyde only actually knows the
-    value as of the last sample in that run — whether it keeps holding
-    afterward is genuinely unknown — so this is a drawing choice for
-    visibility, not a claim about data past what was read.
 
 - **A file too large to fit in memory now tells you that is what is
   happening, while it happens.** When you open a file whose data would not

@@ -30,7 +30,10 @@ mod infer;
 mod report;
 
 pub use crate::index::level0::Level0Cache;
-pub use csv::{open_path, parse, CsvParseOutcome, CsvReader};
+pub use csv::{
+    open_path, parse, CsvParseOutcome, CsvReader, SkipReason, SkippedRowDetail,
+    MAX_SKIPPED_ROW_DETAILS,
+};
 pub use dataset::{
     derived_caches_for_dataset_cached, derived_caches_for_dataset_cached_with_cache_dir, load,
     load_progressive, load_progressive_with_budget, load_with_budget, load_with_overrides,

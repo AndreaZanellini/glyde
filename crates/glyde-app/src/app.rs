@@ -20,8 +20,8 @@
 //! thread.
 //!
 //! This is the M2 "single egui window" + "Time-domain view v1" slice
-//! (docs/ROADMAP.md): a file opens off-thread, its [`OpenSummary`] renders as
-//! a small text header, and its samples render as a plot via
+//! (docs/ROADMAP.md): a file opens off-thread, its inference report renders
+//! in the inference bar, and its samples render as a plot via
 //! [`crate::views::time`].
 
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glyde_core::dsp::decimation::Bucket;
-use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary};
+use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache};
 use glyde_core::series::BoolLane;
 
 use crate::inference_bar::Correction;
@@ -94,7 +94,6 @@ enum Status {
     },
     Loaded {
         path: PathBuf,
-        summary: Box<OpenSummary>,
         report: Box<InferenceReport>,
         dataset: Box<Dataset>,
         pyramids: Pyramids,
@@ -248,7 +247,6 @@ impl GlydeApp {
                 }
                 IndexingMessage::Completed {
                     path,
-                    summary,
                     report,
                     dataset,
                     pyramids,
@@ -260,7 +258,6 @@ impl GlydeApp {
                     let sample_cache = views::time::cache_column_samples(&dataset);
                     Status::Loaded {
                         path,
-                        summary,
                         report,
                         dataset,
                         pyramids,
@@ -358,7 +355,6 @@ impl eframe::App for GlydeApp {
             }
             Status::Loaded {
                 path,
-                summary,
                 report,
                 dataset,
                 pyramids,
@@ -376,9 +372,6 @@ impl eframe::App for GlydeApp {
                     inference_bar::show(ui, report, path, !dataset.is_spilled())
                 {
                     pending_correction = Some((path.clone(), correction));
-                }
-                if summary.skipped_row_count > 0 {
-                    ui.label(format!("{} rows skipped", summary.skipped_row_count));
                 }
                 // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1"; SPEC
                 // §3.1 decimation via `pyramids` (docs/ROADMAP.md M3, issue #80).
@@ -437,7 +430,8 @@ fn loading_label(path: &Path, rows_read: u64, spilled: bool) -> String {
 mod tests {
     use super::*;
     use glyde_core::ingest::{
-        Confidence, DecimalSeparator, Delimiter, InferredField, SamplingClass, TimeAxis,
+        Confidence, DecimalSeparator, Delimiter, InferredField, OpenSummary, SamplingClass,
+        TimeAxis,
     };
     use glyde_core::series::{Series, SeriesValues};
     use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
@@ -482,6 +476,8 @@ mod tests {
             },
             sample_count: 1,
             sampling_class: SamplingClass::Uniform,
+            skipped_row_count: 0,
+            skipped_row_details: Vec::new(),
             non_monotonic_count: 0,
             duplicate_timestamp_count: 0,
             timezone: Some(glyde_core::ingest::TimezoneLabel::NaiveLocal),

@@ -91,6 +91,47 @@ impl ColumnText {
     }
 }
 
+/// Why one row was skipped during ingestion (SPEC §1.3), captured for the
+/// inference bar's "N rows skipped — view details" affordance
+/// (docs/ROADMAP.md M4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Ragged-row salvage: the row's field count did not match the header's.
+    FieldCountMismatch { expected: usize, found: usize },
+    /// The underlying CSV reader could not tokenize the row at all
+    /// (truncated tail, malformed record).
+    Unparseable { message: String },
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkipReason::FieldCountMismatch { expected, found } => write!(
+                f,
+                "{found} field{} found, {expected} expected",
+                if *found == 1 { "" } else { "s" }
+            ),
+            SkipReason::Unparseable { message } => write!(f, "could not be parsed: {message}"),
+        }
+    }
+}
+
+/// How many [`SkippedRowDetail`] entries [`CsvParseOutcome::skipped_row_details`]
+/// retains. `skipped_row_count` itself stays exact and unbounded; only the
+/// per-row detail list a "view details" click renders is capped, honoring
+/// the RAM-budget caution in [`CsvParseOutcome`]'s own doc comment (a file
+/// with millions of ragged rows must not turn "view details" into an
+/// unbounded allocation).
+pub const MAX_SKIPPED_ROW_DETAILS: usize = 50;
+
+/// One skipped row's 1-based line number in the source file and why it was
+/// dropped (SPEC §1.3 "view details").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedRowDetail {
+    pub line_number: usize,
+    pub reason: SkipReason,
+}
+
 /// The result of a full single-pass parse: the header's column names, how
 /// many rows were salvaged after ragged-row / truncated-tail tolerance
 /// (SPEC §1.3), and how many were skipped along the way. This intentionally
@@ -103,11 +144,18 @@ impl ColumnText {
 /// first public consumer of this reader, which is exactly the risk M3
 /// exists to close off. Row values themselves belong to whatever
 /// milestone item actually reads them under that future budget.
+///
+/// `skipped_row_details` is the one deliberate exception, and only a
+/// bounded one (`MAX_SKIPPED_ROW_DETAILS`): SPEC §1.3's "view details"
+/// affordance needs *some* per-row detail to show, so a capped sample is
+/// kept rather than none at all, while `skipped_row_count` stays the exact
+/// total no matter how many rows were dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CsvParseOutcome {
     pub column_names: Vec<String>,
     pub row_count: u64,
     pub skipped_row_count: u64,
+    pub skipped_row_details: Vec<SkippedRowDetail>,
     /// The lowercase WHATWG encoding label (SPEC §1.2.1), e.g. `"utf-8"`.
     pub encoding_label: String,
     pub delimiter: Delimiter,
@@ -513,6 +561,7 @@ fn parse_rows<R: BufRead>(
         },
         row_count: 0,
         skipped_row_count: 0,
+        skipped_row_details: Vec::new(),
         error: None,
     };
 
@@ -520,7 +569,7 @@ fn parse_rows<R: BufRead>(
     // fields of `CsvParseOutcome` known before the row loop starts, cloned
     // fresh into each checkpoint snapshot with that snapshot's own
     // `row_count`/`skipped_row_count` (see `maybe_checkpoint`).
-    let outcome_template = on_chunk.is_some().then(|| sniff.outcome(0, 0));
+    let outcome_template = on_chunk.is_some().then(|| sniff.outcome(0, 0, Vec::new()));
     let mut next_checkpoint_rows = FIRST_PROGRESS_CHECKPOINT_ROWS;
 
     match sniff.delimiter.as_csv_byte() {
@@ -532,12 +581,25 @@ fn parse_rows<R: BufRead>(
                 .from_reader(reader);
             let mut record = csv::StringRecord::new();
             let mut row_index = 0usize;
+            let mut next_line_number = 1usize;
             while acc.error.is_none() {
                 match reader.read_record(&mut record) {
                     Ok(true) => {
+                        // csv-core may report the line of the preceding CR
+                        // while a CRLF terminator is still being consumed.
+                        // The running physical count corrects that on
+                        // Windows; the parser position advances it over
+                        // blank lines skipped between records.
+                        let line_number = next_line_number.max(
+                            record
+                                .position()
+                                .map(|position| position.line() as usize)
+                                .unwrap_or(1),
+                        );
                         if row_index >= sniff.data_start_row {
                             record_kept_or_ragged(
                                 row_index,
+                                line_number,
                                 RowFields::Record(&record),
                                 expected_field_count,
                                 &mut capture,
@@ -550,18 +612,36 @@ fn parse_rows<R: BufRead>(
                                 &acc,
                             );
                         }
+                        let embedded_newlines: usize = record
+                            .iter()
+                            .map(|field| field.bytes().filter(|&byte| byte == b'\n').count())
+                            .sum();
+                        next_line_number = line_number.saturating_add(embedded_newlines + 1);
                         row_index += 1;
                     }
                     Ok(false) => break,
                     Err(reason) => {
+                        let line_number = next_line_number.max(
+                            reason
+                                .position()
+                                .map(|position| position.line() as usize)
+                                .unwrap_or(1),
+                        );
                         if row_index >= sniff.data_start_row {
                             warn!(
                                 row_index,
                                 %reason,
                                 "row skipped: could not be parsed (SPEC §1.3 truncated-tail tolerance)"
                             );
-                            acc.skipped_row_count += 1;
+                            record_skip(
+                                &mut acc,
+                                line_number,
+                                SkipReason::Unparseable {
+                                    message: reason.to_string(),
+                                },
+                            );
                         }
+                        next_line_number = line_number.saturating_add(1);
                         row_index += 1;
                     }
                 }
@@ -571,6 +651,7 @@ fn parse_rows<R: BufRead>(
             let mut reader = reader;
             let mut line = String::new();
             let mut row_index = 0usize;
+            let mut line_number = 0usize;
             while acc.error.is_none() {
                 line.clear();
                 let read = reader
@@ -582,6 +663,7 @@ fn parse_rows<R: BufRead>(
                 if read == 0 {
                     break;
                 }
+                line_number += 1;
                 let fields: Vec<&str> = line.split_whitespace().collect();
                 if fields.is_empty() {
                     continue;
@@ -589,6 +671,7 @@ fn parse_rows<R: BufRead>(
                 if row_index >= sniff.data_start_row {
                     record_kept_or_ragged(
                         row_index,
+                        line_number,
                         RowFields::Split(&fields),
                         expected_field_count,
                         &mut capture,
@@ -618,7 +701,11 @@ fn parse_rows<R: BufRead>(
     );
 
     Ok((
-        sniff.outcome(acc.row_count, acc.skipped_row_count),
+        sniff.outcome(
+            acc.row_count,
+            acc.skipped_row_count,
+            acc.skipped_row_details,
+        ),
         acc.captured,
     ))
 }
@@ -626,11 +713,17 @@ fn parse_rows<R: BufRead>(
 impl Sniff {
     /// A [`CsvParseOutcome`] pairing this sniff's inference with a pass's own
     /// row tallies.
-    fn outcome(&self, row_count: u64, skipped_row_count: u64) -> CsvParseOutcome {
+    fn outcome(
+        &self,
+        row_count: u64,
+        skipped_row_count: u64,
+        skipped_row_details: Vec<SkippedRowDetail>,
+    ) -> CsvParseOutcome {
         CsvParseOutcome {
             column_names: self.header.column_names.clone(),
             row_count,
             skipped_row_count,
+            skipped_row_details,
             encoding_label: self.encoding_label.clone(),
             delimiter: self.delimiter,
             decimal_separator: self.decimal_separator,
@@ -650,7 +743,22 @@ struct ParseAccumulator {
     captured: Vec<ColumnText>,
     row_count: u64,
     skipped_row_count: u64,
+    skipped_row_details: Vec<SkippedRowDetail>,
     error: Option<GlydeError>,
+}
+
+/// Records `reason` against the source's physical 1-based line number in
+/// `acc`'s bounded detail sample
+/// (SPEC §1.3 "view details"), always incrementing the exact
+/// `skipped_row_count` regardless of whether the cap has been reached.
+fn record_skip(acc: &mut ParseAccumulator, line_number: usize, reason: SkipReason) {
+    acc.skipped_row_count += 1;
+    if acc.skipped_row_details.len() < MAX_SKIPPED_ROW_DETAILS {
+        acc.skipped_row_details.push(SkippedRowDetail {
+            line_number,
+            reason,
+        });
+    }
 }
 
 /// Applies SPEC §1.3's ragged-row salvage to one already-tokenized row and,
@@ -660,6 +768,7 @@ struct ParseAccumulator {
 /// (issue #75).
 fn record_kept_or_ragged(
     row_index: usize,
+    line_number: usize,
     fields: RowFields<'_>,
     expected_field_count: usize,
     capture: &mut Capture,
@@ -672,7 +781,14 @@ fn record_kept_or_ragged(
             expected_field_count,
             "row skipped: field count does not match the header (SPEC §1.3 ragged-row salvage)"
         );
-        acc.skipped_row_count += 1;
+        record_skip(
+            acc,
+            line_number,
+            SkipReason::FieldCountMismatch {
+                expected: expected_field_count,
+                found: fields.len(),
+            },
+        );
         return;
     }
 
@@ -720,6 +836,7 @@ fn maybe_checkpoint(
     let snapshot = CsvParseOutcome {
         row_count: acc.row_count,
         skipped_row_count: acc.skipped_row_count,
+        skipped_row_details: acc.skipped_row_details.clone(),
         ..template.clone()
     };
     on_chunk(&snapshot, &acc.captured);
@@ -1031,6 +1148,52 @@ mod tests {
         assert_eq!(outcome.skipped_row_count, 2);
     }
 
+    // docs/ROADMAP.md M4 "Skipped-rows detail surface ('N rows skipped —
+    // view details')", SPEC §1.3. Same fixture as above: line 3 is one field
+    // short, line 4 has one field too many (1-based, including the header).
+    #[test]
+    fn corpus_case_21_ragged_rows_capture_skip_detail() {
+        let bytes = corpus_bytes("case-21-ragged-rows.csv");
+
+        let outcome = parse(&bytes).expect("case 21 must parse");
+
+        assert_eq!(
+            outcome.skipped_row_details,
+            vec![
+                SkippedRowDetail {
+                    line_number: 3,
+                    reason: SkipReason::FieldCountMismatch {
+                        expected: 3,
+                        found: 2,
+                    },
+                },
+                SkippedRowDetail {
+                    line_number: 4,
+                    reason: SkipReason::FieldCountMismatch {
+                        expected: 3,
+                        found: 4,
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn skipped_row_detail_uses_physical_line_after_a_quoted_newline() {
+        let input = b"timestamp,value\n2026-01-01T00:00:00Z,\"first\nsecond\"\n2026-01-01T00:00:01Z,1\n2026-01-01T00:00:02Z\n";
+        let outcome = parse(input).expect("quoted newline is a valid CSV record");
+        assert_eq!(outcome.skipped_row_count, 1);
+        assert_eq!(outcome.skipped_row_details[0].line_number, 5);
+    }
+
+    #[test]
+    fn skipped_row_detail_counts_crlf_and_quoted_newlines() {
+        let input = b"timestamp,value\r\n2026-01-01T00:00:00Z,\"first\r\nsecond\"\r\n2026-01-01T00:00:01Z,1\r\n2026-01-01T00:00:02Z\r\n";
+        let outcome = parse(input).expect("CRLF CSV must parse");
+        assert_eq!(outcome.skipped_row_count, 1);
+        assert_eq!(outcome.skipped_row_details[0].line_number, 5);
+    }
+
     // Same fixture, capturing every column: proves the multi-column capture
     // path (docs/ROADMAP.md M2 "Time-domain view v1") skips exactly the same
     // two ragged rows as the tally-only path, and that every captured
@@ -1069,6 +1232,45 @@ mod tests {
         assert_eq!(outcome.column_names, vec!["timestamp", "value"]);
         assert_eq!(outcome.row_count, 4);
         assert_eq!(outcome.skipped_row_count, 1);
+    }
+
+    // docs/ROADMAP.md M4 skip-detail surface, SPEC §1.3: the truncated tail
+    // is one field short (only the timestamp survives), on line 6.
+    #[test]
+    fn corpus_case_22_truncated_final_line_capture_skip_detail() {
+        let bytes = corpus_bytes("case-22-truncated-final-line.csv");
+
+        let outcome = parse(&bytes).expect("case 22 must parse");
+
+        assert_eq!(
+            outcome.skipped_row_details,
+            vec![SkippedRowDetail {
+                line_number: 6,
+                reason: SkipReason::FieldCountMismatch {
+                    expected: 2,
+                    found: 1,
+                },
+            }]
+        );
+    }
+
+    // SPEC §1.3's "view details" must never turn into an unbounded
+    // allocation on a file with millions of ragged rows: the detail sample
+    // caps at `MAX_SKIPPED_ROW_DETAILS`, while `skipped_row_count` itself
+    // stays exact.
+    #[test]
+    fn skipped_row_details_are_capped_but_the_count_stays_exact() {
+        let ragged_rows = MAX_SKIPPED_ROW_DETAILS + 10;
+        let mut csv = String::from("timestamp,value\n2026-01-01T00:00:00Z,1.0\n");
+        for _ in 0..ragged_rows {
+            csv.push_str("2026-01-01T00:00:01Z\n"); // missing `value`: ragged
+        }
+
+        let outcome = parse(csv.as_bytes()).expect("synthetic ragged file must parse");
+
+        assert_eq!(outcome.row_count, 1);
+        assert_eq!(outcome.skipped_row_count, ragged_rows as u64);
+        assert_eq!(outcome.skipped_row_details.len(), MAX_SKIPPED_ROW_DETAILS);
     }
 
     // Corpus case 23 (QUALITY.md §1.23): an empty file must fail cleanly

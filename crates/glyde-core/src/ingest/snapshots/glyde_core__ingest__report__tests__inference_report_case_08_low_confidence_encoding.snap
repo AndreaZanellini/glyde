@@ -1,6 +1,5 @@
 ---
 source: crates/glyde-core/src/ingest/report.rs
-assertion_line: 391
 expression: report
 ---
 InferenceReport {
@@ -34,6 +33,8 @@ InferenceReport {
     },
     sample_count: 6,
     sampling_class: Uniform,
+    skipped_row_count: 0,
+    skipped_row_details: [],
     non_monotonic_count: 0,
     duplicate_timestamp_count: 0,
     timezone: Some(
