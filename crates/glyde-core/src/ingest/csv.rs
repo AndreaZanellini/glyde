@@ -72,13 +72,20 @@ pub(crate) struct ColumnText {
 }
 
 impl ColumnText {
-    fn push(&mut self, field: &str) {
+    pub(crate) fn push(&mut self, field: &str) {
         self.arena.push_str(field);
         self.ends.push(self.arena.len());
     }
 
     pub(crate) fn len(&self) -> usize {
         self.ends.len()
+    }
+
+    /// Forgets every field but keeps the allocations, for reuse as a
+    /// bounded batch buffer.
+    pub(crate) fn clear(&mut self) {
+        self.arena.clear();
+        self.ends.clear();
     }
 
     /// The field captured for row `index`. Callers only ever ask for rows
