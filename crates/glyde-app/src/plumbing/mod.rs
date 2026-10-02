@@ -92,6 +92,10 @@ pub enum IndexingMessage {
         pyramids: Pyramids,
         rows_read: u64,
         spilled: bool,
+        /// Per-checkpoint render inputs, prepared here on the indexer thread
+        /// (issue #114) — each is O(rows), and the UI thread used to derive
+        /// them itself on receipt, stalling a frame per checkpoint.
+        prepared: Box<PreparedView>,
     },
     /// `path` opened successfully; `summary` is what was inferred, `report`
     /// is the same inference surfaced as SPEC §1.2's mandatory UX fields
@@ -124,10 +128,10 @@ pub enum IndexingMessage {
         dataset: Box<Dataset>,
         pyramids: Pyramids,
         level0_caches: Level0Caches,
-        /// Prepared on the indexer thread so a large boolean column is never
-        /// scanned when the UI receives the completion message.
-        ticks: Vec<i128>,
-        bool_bands: Vec<Option<BoolLane>>,
+        /// Prepared on the indexer thread so no O(rows) pass (ticks, sample
+        /// conversion, boolean bands, cursor lookup) ever runs on the UI
+        /// thread when the completion message arrives.
+        prepared: Box<PreparedView>,
     },
     /// `path` failed to open; `message` is the human-readable reason.
     Failed {
@@ -153,6 +157,49 @@ impl IndexingMessage {
 /// Spawns a background thread that opens `path` and reports the outcome on
 /// `tx`, tagged with `generation`. Returns immediately — the caller (the UI
 /// thread) never blocks on the file read.
+/// Everything `views` needs per dataset beyond the dataset itself, each an
+/// O(rows) derivation computed once, on the indexer thread, so the UI thread
+/// never pays for one (docs/ARCHITECTURE.md Hard rule 3; issue #114).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedView {
+    /// `dataset.time`'s pyramid ticks.
+    pub ticks: Vec<i128>,
+    /// See `views::time::cache_column_samples`. `None` for a column whose
+    /// Level-0 cache already serves the same converted samples.
+    pub sample_cache: Vec<Option<Vec<f64>>>,
+    /// See `views::state_timeline::cache_bool_bands`.
+    pub bool_bands: Vec<Option<BoolLane>>,
+    /// See `views::time::CursorLookup`.
+    pub cursor: views::time::CursorLookup,
+}
+
+impl PreparedView {
+    /// `bool_tick_limit` caps how many rows the boolean bands cover (a
+    /// still-growing checkpoint previews only the head of the file, matching
+    /// what the UI used to compute for it).
+    pub fn new(dataset: &Dataset, level0_caches: &Level0Caches, bool_tick_limit: usize) -> Self {
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        let mut sample_cache = views::time::cache_column_samples_except(dataset, |index| {
+            level0_caches.get(index).is_some_and(Option::is_some)
+        });
+        sample_cache.resize_with(dataset.columns.len(), || None);
+        let bool_bands = views::state_timeline::cache_bool_bands(
+            dataset,
+            &ticks[..ticks.len().min(bool_tick_limit)],
+        );
+        let cursor = views::time::CursorLookup::for_time(&dataset.time);
+        Self {
+            ticks,
+            sample_cache,
+            bool_bands,
+            cursor,
+        }
+    }
+}
+
+/// How many rows a progress checkpoint's boolean bands preview.
+pub const PROGRESS_BOOL_BAND_ROWS: usize = 65_536;
+
 pub fn spawn_index_job(generation: u64, path: PathBuf, tx: Sender<IndexingMessage>) {
     spawn_index_job_with_overrides(generation, path, IngestOverrides::default(), tx)
 }
@@ -239,6 +286,8 @@ fn run_index_job(
         &path,
         overrides,
         |checkpoint| {
+            let prepared =
+                PreparedView::new(&checkpoint.dataset, &Vec::new(), PROGRESS_BOOL_BAND_ROWS);
             let _ = tx.send(IndexingMessage::Progress {
                 generation,
                 path: path.clone(),
@@ -246,6 +295,7 @@ fn run_index_job(
                 pyramids: checkpoint.pyramids,
                 rows_read: checkpoint.rows_read,
                 spilled: checkpoint.spilled,
+                prepared: Box::new(prepared),
             });
         },
     ) {
@@ -285,8 +335,7 @@ fn run_index_job(
                         .collect(),
                 )
             };
-            let ticks = dataset.time.to_pyramid_ticks().into_owned();
-            let bool_bands = views::state_timeline::cache_bool_bands(&dataset, &ticks);
+            let prepared = PreparedView::new(&dataset, &level0_caches, usize::MAX);
             let _ = tx.send(IndexingMessage::Completed {
                 generation,
                 path,
@@ -295,8 +344,7 @@ fn run_index_job(
                 dataset: Box::new(dataset),
                 pyramids,
                 level0_caches,
-                ticks,
-                bool_bands,
+                prepared: Box::new(prepared),
             });
         }
         Err(err) => {
@@ -418,10 +466,13 @@ mod tests {
                     pyramids,
                     rows_read,
                     spilled,
+                    prepared,
                 } => {
                     assert_eq!(generation, 3);
                     assert_eq!(progress_path, path);
                     assert_eq!(dataset.time.len(), rows_read as usize);
+                    assert_eq!(prepared.ticks.len(), rows_read as usize);
+                    assert!(prepared.cursor.is_sorted());
                     assert_eq!(pyramids.len(), dataset.columns.len());
                     assert!(
                         !spilled,
@@ -528,6 +579,12 @@ mod tests {
                 pyramids: Vec::new(),
                 rows_read: 6,
                 spilled: false,
+                prepared: Box::new(PreparedView {
+                    ticks: Vec::new(),
+                    sample_cache: Vec::new(),
+                    bool_bands: Vec::new(),
+                    cursor: views::time::CursorLookup::default(),
+                }),
             }
             .generation(),
             5

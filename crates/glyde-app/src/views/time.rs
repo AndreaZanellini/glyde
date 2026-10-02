@@ -87,6 +87,7 @@ pub fn show(
     ticks: &[i128],
     sample_cache: &[Option<Vec<f64>>],
     level0_caches: &[Option<Arc<Level0Cache>>],
+    cursor: CursorLookup,
 ) {
     let fit_clicked = ui.button("Fit to data").clicked();
 
@@ -138,21 +139,19 @@ pub fn show(
         // vs. separate per-column vertical bars ("and nothing else").
         let converged = is_converged(ticks, range, pixel_columns);
 
-        let mut next_color_index = 0usize;
-        for (column_index, series) in dataset.columns.iter().enumerate() {
-            if series.view_kind() != ViewKind::TimeDomain {
-                continue;
-            }
-            // Issue #55: one color per series, assigned here rather than
-            // left to `egui_plot`'s own per-draw-call auto-assignment —
-            // `egui_plot` would otherwise hand out a new color to every
-            // `line()`/`points()` call, so a series with more than one
-            // vertical-extent bar (drawn as separate `Line`s below) rendered
-            // as several differently-colored segments instead of one
-            // consistent color.
-            let color = series_color(next_color_index);
-            next_color_index += 1;
-
+        // Decimate every plotted column first, in parallel on the `rayon`
+        // compute pool (docs/ARCHITECTURE.md §Threading model: "Compute pool
+        // (rayon): decimation queries"; issue #114): columns are independent
+        // queries, so a multi-channel file costs about one column's query
+        // per frame instead of the sum of all of them. Drawing below stays
+        // sequential and in column order.
+        let plotted: Vec<(usize, &Series)> = dataset
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, series)| series.view_kind() == ViewKind::TimeDomain)
+            .collect();
+        let decimate = |&(column_index, series): &(usize, &Series)| {
             let pyramid = pyramids
                 .get(column_index)
                 .and_then(Option::as_ref)
@@ -164,7 +163,26 @@ pub fn show(
                 .and_then(Option::as_ref)
                 .map(Arc::as_ref);
             let samples = column_f64_samples(series.values(), cached, level0);
-            let buckets = decimate_viewport(pyramid, samples, ticks, range, pixel_columns);
+            decimate_viewport(pyramid, samples, ticks, range, pixel_columns)
+        };
+        // A lone column has nothing to run alongside, and the pool hand-off
+        // would only add its own latency to the frame.
+        let decimated: Vec<Vec<Bucket>> = if plotted.len() > 1 {
+            use rayon::prelude::*;
+            plotted.par_iter().map(decimate).collect()
+        } else {
+            plotted.iter().map(decimate).collect()
+        };
+
+        for (color_index, (&(_, series), buckets)) in plotted.iter().zip(decimated).enumerate() {
+            // Issue #55: one color per series, assigned here rather than
+            // left to `egui_plot`'s own per-draw-call auto-assignment —
+            // `egui_plot` would otherwise hand out a new color to every
+            // `line()`/`points()` call, so a series with more than one
+            // vertical-extent bar (drawn as separate `Line`s below) rendered
+            // as several differently-colored segments instead of one
+            // consistent color.
+            let color = series_color(color_index);
 
             if converged {
                 // SPEC §3.1's raw-samples regime (docs/ROADMAP.md M2): a
@@ -228,17 +246,15 @@ pub fn show(
             }
         }
 
-        // Computed lazily, only while the pointer actually hovers the plot
-        // (same rationale as the `fit_clicked` branch above): SPEC §4.1's
-        // "exact raw value" cursor readout needs the exact (not
-        // decimation-approximated) nearest sample, which `nearest_index`
-        // finds via a real linear scan (correct even on a non-monotonic
-        // axis — see its own doc comment) rather than the O(log n) but
-        // offset-only-accurate lookup `format_x_axis_tick` uses.
-        plot_ui.pointer_coordinate().and_then(|pointer| {
-            let x = x_axis_seconds(&dataset.time);
-            nearest_index(&x, pointer.x)
-        })
+        // Only while the pointer actually hovers the plot: SPEC §4.1's "exact
+        // raw value" cursor readout needs the exact (not
+        // decimation-approximated) nearest sample. `cursor` finds it in
+        // O(log n) on a time-ordered axis and falls back to an exact linear
+        // scan on a non-monotonic one (issue #114) — never by materializing
+        // the whole axis as `f64` every hovered frame, as this used to.
+        plot_ui
+            .pointer_coordinate()
+            .and_then(|pointer| cursor.nearest(&dataset.time, pointer.x))
     });
 
     if let Some(index) = response.inner {
@@ -438,11 +454,23 @@ fn column_f64_samples<'a>(
 /// — see `crate::app::PartialLoad::ticks`'s doc comment for why per-frame
 /// would be wrong.
 pub fn cache_column_samples(dataset: &Dataset) -> Vec<Option<Vec<f64>>> {
+    cache_column_samples_except(dataset, |_| false)
+}
+
+/// [`cache_column_samples`], leaving `None` for every column index `skip`
+/// selects — a column whose Level-0 cache already serves the same converted
+/// samples ([`column_f64_samples`] prefers it), where a second converted
+/// copy would cost memory and an O(n) pass for nothing (issue #114).
+pub fn cache_column_samples_except(
+    dataset: &Dataset,
+    skip: impl Fn(usize) -> bool,
+) -> Vec<Option<Vec<f64>>> {
     dataset
         .columns
         .iter()
-        .map(|series| {
-            if series.view_kind() != ViewKind::TimeDomain {
+        .enumerate()
+        .map(|(index, series)| {
+            if series.view_kind() != ViewKind::TimeDomain || skip(index) {
                 return None;
             }
             match series.values().as_f64_slice() {
@@ -657,6 +685,9 @@ fn pad_if_degenerate(min: f64, max: f64) -> (f64, f64) {
 /// "small file" scope), correct regardless of whether `x` happens to be
 /// sorted — SPEC §2.1 non-monotonic timestamps are preserved, not reordered,
 /// so a binary search would silently give the wrong answer on such a file.
+///
+/// Kept as the reference [`CursorLookup`] is tested against (issue #114).
+#[cfg(test)]
 fn nearest_index(x: &[f64], target: f64) -> Option<usize> {
     x.iter()
         .enumerate()
@@ -667,6 +698,123 @@ fn nearest_index(x: &[f64], target: f64) -> Option<usize> {
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(index, _)| index)
+}
+
+/// `time`'s `index`-th sample as the `f64` plot x-coordinate — exactly the
+/// value [`x_axis_seconds`] produces for it, one sample at a time.
+fn x_at(time: &TimeAxis, index: usize) -> f64 {
+    match time {
+        TimeAxis::Absolute { timestamps, .. } => {
+            timestamps.get(index).map_or(f64::NAN, |timestamp| {
+                timestamp.ticks as f64 / timestamp.unit.ticks_per_second() as f64
+            })
+        }
+        TimeAxis::Progressive { values } => values.as_slice()[index],
+    }
+}
+
+/// How [`show`]'s cursor readout finds the sample nearest the pointer
+/// (issue #114). Built once per dataset, off the UI thread
+/// ([`CursorLookup::for_time`] is an O(n) scan), and handed to every frame.
+///
+/// The readout used to materialize the whole axis as `f64` and scan it on
+/// every hovered frame — tens of milliseconds at ten million rows, on the
+/// UI thread, for as long as the mouse rests on the plot. A time-ordered
+/// axis (the overwhelmingly common case) is now answered by binary search;
+/// a non-monotonic one (SPEC §2.1 preserves source order) keeps the exact
+/// linear scan, just without the allocation. Both return exactly what
+/// [`nearest_index`] would over [`x_axis_seconds`], ties included —
+/// `tests::cursor_lookup_matches_the_linear_scan` locks that.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CursorLookup {
+    /// Every x-coordinate is `<=` the next (so, in particular, none is NaN).
+    sorted: bool,
+}
+
+impl CursorLookup {
+    /// Whether the axis is time-ordered, i.e. the O(log n) lookup applies.
+    pub fn is_sorted(&self) -> bool {
+        self.sorted
+    }
+
+    /// Inspects `time` once. O(n): call it where the dataset is prepared,
+    /// never per frame.
+    pub fn for_time(time: &TimeAxis) -> Self {
+        let len = time.len();
+        let sorted = (1..len).all(|index| x_at(time, index - 1) <= x_at(time, index));
+        Self { sorted }
+    }
+
+    fn nearest(&self, time: &TimeAxis, target: f64) -> Option<usize> {
+        let len = time.len();
+        if len == 0 {
+            return None;
+        }
+        if !self.sorted || !target.is_finite() {
+            return linear_nearest(len, |index| x_at(time, index), target);
+        }
+        Some(sorted_nearest(len, |index| x_at(time, index), target))
+    }
+}
+
+/// [`nearest_index`] over `x(0..len)` without materializing it.
+fn linear_nearest(len: usize, x: impl Fn(usize) -> f64, target: f64) -> Option<usize> {
+    (0..len)
+        .map(|index| (index, x(index)))
+        .min_by(|(_, a), (_, b)| {
+            (*a - target)
+                .abs()
+                .partial_cmp(&(*b - target).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index)
+}
+
+/// The first index in `lo..hi` for which `predicate` is false, given that it
+/// is true on a prefix of the range and false on the rest.
+fn partition_point(mut lo: usize, mut hi: usize, predicate: impl Fn(usize) -> bool) -> usize {
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if predicate(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// [`nearest_index`]'s answer for a non-decreasing, NaN-free `x(0..len)`
+/// (`len > 0`) and a finite `target`, in O(log n).
+///
+/// Distances are computed exactly as the linear scan computes them, and
+/// floating-point subtraction is monotonic, so `target - x(i)` never
+/// increases left of the insertion point and `x(i) - target` never
+/// decreases right of it: each side's minimum distance is found next to the
+/// insertion point, and the *first* index attaining it (the scan's tie rule)
+/// by one more binary search — which also covers distinct values whose
+/// distances round to the same `f64`. A tie between the two sides goes left,
+/// the earlier index, as the scan's `min_by` does.
+fn sorted_nearest(len: usize, x: impl Fn(usize) -> f64, target: f64) -> usize {
+    let insertion = partition_point(0, len, |index| x(index) < target);
+    let left = (insertion > 0).then(|| {
+        let distance = target - x(insertion - 1);
+        let first = partition_point(0, insertion, |index| target - x(index) > distance);
+        (first, distance)
+    });
+    let right = (insertion < len).then(|| (insertion, x(insertion) - target));
+    match (left, right) {
+        (Some((left, left_distance)), Some((right, right_distance))) => {
+            if left_distance <= right_distance {
+                left
+            } else {
+                right
+            }
+        }
+        (Some((left, _)), None) => left,
+        (None, Some((right, _))) => right,
+        (None, None) => unreachable!("len > 0"),
+    }
 }
 
 /// `values[index]` as `f64` for plotting (SPEC §1.4: integer dtypes promote
@@ -756,7 +904,15 @@ mod render_tests {
 
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &pyramids, &ticks, &sample_cache, &[]);
+                show(
+                    ui,
+                    &dataset,
+                    &pyramids,
+                    &ticks,
+                    &sample_cache,
+                    &[],
+                    CursorLookup::for_time(&dataset.time),
+                );
             });
         });
 
@@ -765,6 +921,49 @@ mod render_tests {
             "must draw something for a non-empty dataset"
         );
         insta::assert_debug_snapshot!("time_domain_view_shape_count", output.shapes.len());
+    }
+
+    /// Issue #114: a pointer resting over the plot turns on the cursor
+    /// readout — the path `benches/time_view_render.rs`'s "hovered" variant
+    /// times — and it finds the sample under the pointer.
+    #[test]
+    fn hovering_the_plot_shows_the_cursor_readout() {
+        let dataset = sample_dataset();
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
+        let ticks = dataset.time.to_pyramid_ticks();
+        let sample_cache = cache_column_samples(&dataset);
+        let cursor = CursorLookup::for_time(&dataset.time);
+        let frame = |ctx: &egui::Context, hover: bool| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events: if hover {
+                    vec![egui::Event::PointerMoved(egui::pos2(400.0, 300.0))]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(ui, &dataset, &pyramids, &ticks, &sample_cache, &[], cursor);
+                });
+            })
+            .shapes
+            .len()
+        };
+        let idle_ctx = egui::Context::default();
+        frame(&idle_ctx, false);
+        let idle = frame(&idle_ctx, false);
+        let hover_ctx = egui::Context::default();
+        frame(&hover_ctx, true);
+        let hovered = frame(&hover_ctx, true);
+        assert!(
+            hovered > idle,
+            "the cursor readout row must render while hovering ({hovered} vs {idle} shapes)"
+        );
     }
 
     // An empty dataset (e.g. every row skipped) must render the surrounding
@@ -785,7 +984,7 @@ mod render_tests {
 
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &[], &[], &[], &[]);
+                show(ui, &dataset, &[], &[], &[], &[], CursorLookup::default());
             });
         });
 
@@ -847,7 +1046,15 @@ mod render_tests {
         let sample_cache = cache_column_samples(&dataset);
         let output = egui::Context::default().run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &pyramids, &ticks, &sample_cache, &[]);
+                show(
+                    ui,
+                    &dataset,
+                    &pyramids,
+                    &ticks,
+                    &sample_cache,
+                    &[],
+                    CursorLookup::for_time(&dataset.time),
+                );
             });
         });
         assert!(!output.shapes.is_empty());
@@ -905,7 +1112,15 @@ mod render_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &pyramids, &ticks, &sample_cache, &[]);
+                show(
+                    ui,
+                    &dataset,
+                    &pyramids,
+                    &ticks,
+                    &sample_cache,
+                    &[],
+                    CursorLookup::for_time(&dataset.time),
+                );
             });
         });
 
@@ -955,7 +1170,15 @@ mod render_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &pyramids, &ticks, &sample_cache, &[]);
+                show(
+                    ui,
+                    &dataset,
+                    &pyramids,
+                    &ticks,
+                    &sample_cache,
+                    &[],
+                    CursorLookup::for_time(&dataset.time),
+                );
             });
         });
 
@@ -1026,6 +1249,77 @@ mod tests {
         assert_eq!(nearest_index(&x, 1.6), Some(2));
         assert_eq!(nearest_index(&x, -5.0), Some(0));
         assert_eq!(nearest_index(&x, 50.0), Some(3));
+    }
+
+    /// Issue #114: the O(log n) cursor lookup returns exactly what the old
+    /// per-frame linear scan over `x_axis_seconds` returned — duplicates,
+    /// exact hits, out-of-range targets, and distinct samples whose
+    /// distances round to the same `f64` (large epoch magnitudes) included —
+    /// and a non-monotonic axis keeps using the scan.
+    #[test]
+    fn cursor_lookup_matches_the_linear_scan() {
+        use proptest::prelude::*;
+        let config = ProptestConfig::with_cases(2048);
+        proptest!(config, |(
+            steps in proptest::collection::vec(0u8..4, 1..60),
+            base in prop::sample::select(vec![0i128, 1_700_000_000_000_000_000]),
+            unit in prop::sample::select(vec![TimeUnit::Nanoseconds, TimeUnit::Seconds]),
+            shuffle in any::<bool>(),
+            probe in -10i64..300,
+            probe_frac in 0.0f64..1.0,
+        )| {
+            let mut tick = base;
+            let mut ticks: Vec<i128> = steps
+                .iter()
+                .map(|&step| {
+                    tick += i128::from(step);
+                    tick
+                })
+                .collect();
+            if shuffle && ticks.len() > 2 {
+                let middle = ticks.len() / 2;
+                ticks.swap(0, middle);
+            }
+            let time = TimeAxis::Absolute {
+                timestamps: ticks
+                    .iter()
+                    .map(|&t| Timestamp::new(t, unit))
+                    .collect::<Vec<_>>()
+                    .into(),
+                format: glyde_core::time::TimestampFormat::Iso8601Naive,
+            };
+            let x = x_axis_seconds(&time);
+            let per_second = unit.ticks_per_second() as f64;
+            let target = (base as f64 + probe as f64 + probe_frac) / per_second;
+            let lookup = CursorLookup::for_time(&time);
+            prop_assert_eq!(lookup.sorted, x.windows(2).all(|w| w[0] <= w[1]));
+            prop_assert_eq!(lookup.nearest(&time, target), nearest_index(&x, target));
+            for &exact in x.iter().take(5) {
+                prop_assert_eq!(lookup.nearest(&time, exact), nearest_index(&x, exact));
+            }
+        });
+    }
+
+    #[test]
+    fn cursor_lookup_of_a_progressive_axis_matches_the_linear_scan() {
+        let time = TimeAxis::Progressive {
+            values: vec![0.0, 1.0, 1.0, 1.0, 2.5, 4.0].into(),
+        };
+        let x = x_axis_seconds(&time);
+        let lookup = CursorLookup::for_time(&time);
+        assert!(lookup.sorted);
+        for target in [-1.0, 0.4, 0.5, 1.0, 1.6, 1.75, 2.0, 3.25, 9.0, f64::NAN] {
+            assert_eq!(
+                lookup.nearest(&time, target),
+                nearest_index(&x, target),
+                "{target}"
+            );
+        }
+        let with_nan = TimeAxis::Progressive {
+            values: vec![0.0, f64::NAN, 2.0].into(),
+        };
+        assert!(!CursorLookup::for_time(&with_nan).sorted);
+        assert_eq!(CursorLookup::default().nearest(&with_nan, 1.9), Some(2));
     }
 
     #[test]

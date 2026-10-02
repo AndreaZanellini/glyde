@@ -66,6 +66,7 @@ struct Fixture {
     pyramids: Vec<Option<Vec<Vec<Bucket>>>>,
     ticks: Vec<i128>,
     sample_cache: Vec<Option<Vec<f64>>>,
+    cursor: views::time::CursorLookup,
 }
 
 fn dataset_with_column(sample_count: usize, values: SeriesValues) -> Dataset {
@@ -87,12 +88,14 @@ fn synthetic_fixture(label: &'static str, sample_count: usize, values: SeriesVal
     let pyramids = pyramids_for_dataset(&dataset);
     let ticks = dataset.time.to_pyramid_ticks().into_owned();
     let sample_cache = views::time::cache_column_samples(&dataset);
+    let cursor = views::time::CursorLookup::for_time(&dataset.time);
     Fixture {
         label,
         dataset,
         pyramids,
         ticks,
         sample_cache,
+        cursor,
     }
 }
 
@@ -113,10 +116,22 @@ fn i64_fixture(sample_count: usize) -> Fixture {
 }
 
 /// One frame, on a persistent `Context` reused across calls exactly like
-/// `eframe` drives the real app across repaints.
-fn render_frame(ctx: &egui::Context, fixture: &Fixture) {
+/// `eframe` drives the real app across repaints. `hover` rests the pointer
+/// over the middle of the plot, which is what turns on the cursor readout
+/// (SPEC §4.1) — the state the view is in for as long as the user's mouse is
+/// over the plot while panning or zooming (issue #114).
+fn render_frame(ctx: &egui::Context, fixture: &Fixture, hover: bool) {
+    let events = if hover {
+        vec![egui::Event::PointerMoved(Pos2::new(
+            VIEWPORT_SIZE.x / 2.0,
+            VIEWPORT_SIZE.y / 2.0,
+        ))]
+    } else {
+        Vec::new()
+    };
     let input = egui::RawInput {
         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, VIEWPORT_SIZE)),
+        events,
         ..Default::default()
     };
     let _ = ctx.run(input, |ctx| {
@@ -128,32 +143,48 @@ fn render_frame(ctx: &egui::Context, fixture: &Fixture) {
                 &fixture.ticks,
                 &fixture.sample_cache,
                 &[],
+                fixture.cursor,
             );
         });
     });
 }
 
 fn bench_one_fixture(c: &mut Criterion, fixture: &Fixture) {
-    let ctx = egui::Context::default();
+    for hover in [false, true] {
+        let ctx = egui::Context::default();
+        let mode = if hover { "hovered" } else { "idle pointer" };
 
-    // Warm up egui's own font/layout caches so the ceiling check below
-    // measures steady-state per-frame cost, not one-time first-frame setup.
-    render_frame(&ctx, fixture);
+        // Warm up egui's own font/layout caches so the ceiling check below
+        // measures steady-state per-frame cost, not one-time first-frame
+        // setup.
+        render_frame(&ctx, fixture, hover);
 
-    let start = Instant::now();
-    render_frame(&ctx, fixture);
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed <= FRAME_TIME_CEILING,
-        "time-domain view render took {elapsed:?} for {SAMPLE_COUNT} {} samples at a \
-         {VIEWPORT_SIZE:?} viewport, exceeding the {FRAME_TIME_CEILING:?} build-blocking \
-         ceiling (SPEC §5: pan/zoom p99 ≤100ms)",
-        fixture.label
-    );
+        let start = Instant::now();
+        render_frame(&ctx, fixture, hover);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed <= FRAME_TIME_CEILING,
+            "time-domain view render ({mode}) took {elapsed:?} for {SAMPLE_COUNT} {} samples \
+             at a {VIEWPORT_SIZE:?} viewport, exceeding the {FRAME_TIME_CEILING:?} \
+             build-blocking ceiling (SPEC §5: pan/zoom p99 ≤100ms)",
+            fixture.label
+        );
 
-    c.bench_function(&format!("time_view_render/{}", fixture.label), |b| {
-        b.iter(|| render_frame(std::hint::black_box(&ctx), std::hint::black_box(fixture)))
-    });
+        let name = if hover {
+            format!("time_view_render/{}/hovered", fixture.label)
+        } else {
+            format!("time_view_render/{}", fixture.label)
+        };
+        c.bench_function(&name, |b| {
+            b.iter(|| {
+                render_frame(
+                    std::hint::black_box(&ctx),
+                    std::hint::black_box(fixture),
+                    hover,
+                )
+            })
+        });
+    }
 }
 
 fn bench_time_view_render(c: &mut Criterion) {
