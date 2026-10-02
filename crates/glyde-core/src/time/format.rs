@@ -178,6 +178,164 @@ pub fn format_timestamp(timestamp: &Timestamp, format: TimestampFormat) -> Strin
 const CHRONO_MAX_FRACTIONAL_DIGITS: usize = 9;
 
 fn parse_iso8601_with_offset(input: &str) -> crate::Result<Timestamp> {
+    match parse_canonical_iso8601(input, b'T', true) {
+        Some(timestamp) => Ok(timestamp),
+        None => parse_iso8601_with_offset_chrono(input),
+    }
+}
+
+fn parse_iso8601_naive(input: &str) -> crate::Result<Timestamp> {
+    match parse_canonical_iso8601(input, b'T', false) {
+        Some(timestamp) => Ok(timestamp),
+        None => parse_iso8601_naive_chrono(input),
+    }
+}
+
+fn parse_datetime_space(input: &str) -> crate::Result<Timestamp> {
+    match parse_canonical_iso8601(input, b' ', false) {
+        Some(timestamp) => Ok(timestamp),
+        None => parse_datetime_space_chrono(input),
+    }
+}
+
+/// Fast path for the one textual shape real sensor logs overwhelmingly use
+/// (issue #114): `YYYY-MM-DD<sep>HH:MM:SS[.f{1,9}]`, followed — when
+/// `with_offset` — by `Z` or `±HH:MM`, and nothing else. Parsing it with
+/// `chrono` was the single most expensive per-row step of an in-memory
+/// open, run once by the format scan and again by the conversion.
+///
+/// This is an *accelerator, not a second grammar* (docs/ARCHITECTURE.md
+/// Hard rule 4): it only ever answers for inputs whose meaning is beyond
+/// doubt and that `chrono` itself accepts with the identical result, and
+/// returns `None` — handing the input to the `chrono` path unchanged — for
+/// everything else: any other separator or offset spelling (`t`, `z`,
+/// `+HHMM`), a leap second (`:60`), more than nine fractional digits (the
+/// picosecond path), an out-of-range field, or an instant too far from the
+/// epoch for the `i64` nanosecond check to be trivially satisfied.
+/// `tests::canonical_iso8601_fast_path_agrees_with_chrono` locks that
+/// subset relation differentially.
+fn parse_canonical_iso8601(input: &str, separator: u8, with_offset: bool) -> Option<Timestamp> {
+    let bytes = input.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let digits = |range: std::ops::Range<usize>| -> Option<i64> {
+        bytes[range].iter().try_fold(0i64, |acc, &byte| {
+            byte.is_ascii_digit()
+                .then(|| acc * 10 + i64::from(byte - b'0'))
+        })
+    };
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != separator
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let year = digits(0..4)?;
+    let month = digits(5..7)?;
+    let day = digits(8..10)?;
+    let hour = digits(11..13)?;
+    let minute = digits(14..16)?;
+    let second = digits(17..19)?;
+    if !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+
+    let mut position = 19;
+    let mut nanos_of_second = 0i64;
+    if bytes.get(position) == Some(&b'.') {
+        let fraction_start = position + 1;
+        let fraction_len = bytes[fraction_start..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if fraction_len == 0 || fraction_len > CHRONO_MAX_FRACTIONAL_DIGITS {
+            return None;
+        }
+        position = fraction_start + fraction_len;
+        nanos_of_second = digits(fraction_start..position)?
+            * 10i64.pow((CHRONO_MAX_FRACTIONAL_DIGITS - fraction_len) as u32);
+    }
+
+    let offset_seconds = if with_offset {
+        match bytes.get(position) {
+            Some(b'Z') => {
+                position += 1;
+                0
+            }
+            Some(&sign @ (b'+' | b'-')) => {
+                if bytes.len() < position + 6 || bytes[position + 3] != b':' {
+                    return None;
+                }
+                let offset_hours = digits(position + 1..position + 3)?;
+                let offset_minutes = digits(position + 4..position + 6)?;
+                if offset_hours > 23 || offset_minutes > 59 {
+                    return None;
+                }
+                position += 6;
+                let magnitude = offset_hours * 3600 + offset_minutes * 60;
+                if sign == b'-' {
+                    -magnitude
+                } else {
+                    magnitude
+                }
+            }
+            _ => return None,
+        }
+    } else {
+        0
+    };
+    if position != bytes.len() {
+        return None;
+    }
+
+    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second
+        - offset_seconds;
+    // Comfortably inside the `i64` nanosecond range (±9.22e9 s), so the
+    // overflow check `nanos_since_epoch` makes on the `chrono` path can never
+    // fire here; anything nearer the edge takes that path instead.
+    if seconds.abs() >= 9_000_000_000 {
+        return None;
+    }
+    let ticks = i128::from(seconds) * 1_000_000_000 + i128::from(nanos_of_second);
+    Some(if with_offset {
+        Timestamp::with_offset(ticks, TimeUnit::Nanoseconds, offset_seconds as i32)
+    } else {
+        Timestamp::new(ticks, TimeUnit::Nanoseconds)
+    })
+}
+
+/// Days in `month` (1-12) of the proleptic Gregorian `year`.
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// Days from 1970-01-01 to the proleptic Gregorian date `year-month-day`
+/// (Howard Hinnant's `days_from_civil`).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_index = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn parse_iso8601_with_offset_chrono(input: &str) -> crate::Result<Timestamp> {
     if let Some((before, frac, suffix)) = split_iso8601_fraction(input) {
         if frac.len() > CHRONO_MAX_FRACTIONAL_DIGITS {
             return parse_subnanosecond_iso8601(
@@ -217,7 +375,7 @@ fn format_iso8601_with_offset(timestamp: &Timestamp) -> String {
         .to_string()
 }
 
-fn parse_iso8601_naive(input: &str) -> crate::Result<Timestamp> {
+fn parse_iso8601_naive_chrono(input: &str) -> crate::Result<Timestamp> {
     if let Some((before, frac, suffix)) = split_iso8601_fraction(input) {
         if frac.len() > CHRONO_MAX_FRACTIONAL_DIGITS {
             return parse_subnanosecond_iso8601(
@@ -253,7 +411,7 @@ fn format_iso8601_naive(timestamp: &Timestamp) -> String {
 /// `YYYY-MM-DD HH:MM:SS[.fff…]` (SPEC §2.1 minimum-support format, issue
 /// #82) — the same grammar as [`parse_iso8601_naive`] with a space instead
 /// of a `T` between the date and time, and likewise naive (no timezone).
-fn parse_datetime_space(input: &str) -> crate::Result<Timestamp> {
+fn parse_datetime_space_chrono(input: &str) -> crate::Result<Timestamp> {
     if let Some((before, frac, suffix)) = split_iso8601_fraction(input) {
         if frac.len() > CHRONO_MAX_FRACTIONAL_DIGITS {
             return parse_subnanosecond_iso8601(
@@ -1659,5 +1817,114 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ---- Issue #114: the canonical ISO 8601 fast path is a strict subset
+    // of the chrono grammar, with identical results. ----------------------
+
+    /// One of the three formats the fast path accelerates, as (separator,
+    /// with_offset, the chrono-only parser it must agree with).
+    type ChronoParser = fn(&str) -> crate::Result<Timestamp>;
+    const FAST_PATH_FORMATS: [(u8, bool, ChronoParser); 3] = [
+        (b'T', true, parse_iso8601_with_offset_chrono),
+        (b'T', false, parse_iso8601_naive_chrono),
+        (b' ', false, parse_datetime_space_chrono),
+    ];
+
+    fn assert_fast_path_agrees(input: &str) {
+        for (separator, with_offset, chrono_parse) in FAST_PATH_FORMATS {
+            if let Some(fast) = parse_canonical_iso8601(input, separator, with_offset) {
+                let slow = chrono_parse(input).unwrap_or_else(|err| {
+                    panic!("fast path accepted {input:?} but chrono rejects it: {err}")
+                });
+                assert_eq!(fast, slow, "fast path disagrees with chrono on {input:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_iso8601_fast_path_handles_the_common_shapes() {
+        let ok = parse_canonical_iso8601("2023-11-14T22:13:20.123Z", b'T', true)
+            .expect("canonical UTC timestamp takes the fast path");
+        assert_eq!(ok.ticks, 1_700_000_000_123_000_000);
+        assert_eq!(ok.offset_seconds, Some(0));
+        for input in [
+            "2023-11-14T22:13:20.123Z",
+            "2024-02-29T00:00:00+01:00",
+            "2026-03-29T01:59:59.999999999-07:30",
+            "1970-01-01T00:00:00Z",
+            "1969-12-31T23:59:59.5Z",
+            "2024-02-29T12:00:00",
+            "2024-02-29 12:00:00.000001",
+        ] {
+            assert_fast_path_agrees(input);
+        }
+        // Everything outside the strict shape is left to chrono.
+        for input in [
+            "2023-02-29T00:00:00Z",            // not a leap year
+            "2023-12-31T23:59:60Z",            // leap second
+            "2023-11-14t22:13:20Z",            // lowercase separator
+            "2023-11-14T22:13:20z",            // lowercase zulu
+            "2023-11-14T22:13:20+0100",        // offset without a colon
+            "2023-11-14T22:13:20.Z",           // empty fraction
+            "2023-11-14T22:13:20.1234567890Z", // picosecond path
+            "1600-01-01T00:00:00Z",            // outside the trivially-safe range
+            "2023-1-14T22:13:20Z",
+            " 2023-11-14T22:13:20Z",
+        ] {
+            assert!(
+                parse_canonical_iso8601(input, b'T', true).is_none(),
+                "{input:?} must fall back to chrono"
+            );
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4096))]
+        #[test]
+        fn canonical_iso8601_fast_path_agrees_with_chrono(
+            year in 0u32..10_000,
+            month in 0u32..14,
+            day in 0u32..33,
+            hour in 0u32..26,
+            minute in 0u32..62,
+            second in 0u32..62,
+            fraction_len in 0usize..11,
+            fraction in proptest::prelude::any::<u64>(),
+            offset in 0u8..5,
+            offset_hours in 0u32..26,
+            offset_minutes in 0u32..62,
+            separator in proptest::sample::select(vec!['T', ' ', 't']),
+        ) {
+            let fraction_text = if fraction_len == 0 {
+                String::new()
+            } else {
+                let digits = format!("{fraction:020}");
+                format!(".{}", &digits[..fraction_len])
+            };
+            let offset_text = match offset {
+                0 => String::new(),
+                1 => "Z".to_string(),
+                2 => format!("+{offset_hours:02}:{offset_minutes:02}"),
+                3 => format!("-{offset_hours:02}:{offset_minutes:02}"),
+                _ => "z".to_string(),
+            };
+            let input = format!(
+                "{year:04}-{month:02}-{day:02}{separator}{hour:02}:{minute:02}:{second:02}\
+                 {fraction_text}{offset_text}"
+            );
+            assert_fast_path_agrees(&input);
+            // And the public entry points, which combine both paths, never
+            // disagree with chrono on anything chrono accepts.
+            for (format, chrono_parse) in [
+                (TimestampFormat::Iso8601WithOffset, parse_iso8601_with_offset_chrono as ChronoParser),
+                (TimestampFormat::Iso8601Naive, parse_iso8601_naive_chrono),
+                (TimestampFormat::DateTimeSpace, parse_datetime_space_chrono),
+            ] {
+                let combined = parse_timestamp(&input, format).ok();
+                let slow = chrono_parse(&input).ok();
+                proptest::prop_assert_eq!(combined, slow, "{} as {:?}", input, format);
+            }
+        }
     }
 }
