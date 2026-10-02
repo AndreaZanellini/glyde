@@ -169,15 +169,17 @@ fn main() -> Result<()> {
         (open_elapsed + cold).as_secs_f64() * 1e3
     );
 
-    // Phase 3: scripted navigation. Zoom from the full range down by 2x per
-    // step to a few hundred samples, panning as it goes, then back out.
+    // Phase 3: scripted navigation. Zoom from the full range down to a few
+    // hundred samples, panning as it goes, then back out.
     let ticks = dataset.time.to_pyramid_ticks();
     let (Some(&first), Some(&last)) = (ticks.first(), ticks.last()) else {
         anyhow::bail!("fixture has no rows");
     };
-    let mut frame_times = Vec::with_capacity(args.frames);
+    // Each frame decimates every column, once one after another (the
+    // per-query cost) and once in parallel on the rayon pool, the way
+    // `glyde-app`'s time-domain view does since issue #114.
     let full = (last - first).max(1);
-    for frame in 0..args.frames {
+    let range_for = |frame: usize| {
         let phase = frame as f64 / args.frames as f64;
         // Triangle wave: zoom in for the first half, out for the second.
         let depth = if phase < 0.5 {
@@ -187,38 +189,46 @@ fn main() -> Result<()> {
         };
         let span = ((full as f64) * (1e-6f64).powf(depth)).max(64.0) as i128;
         let center = first + ((full - span) as f64 * (0.5 + 0.45 * (phase * 37.0).sin())) as i128;
-        let range = (center, center + span);
-
-        let start = Instant::now();
-        for (index, pyramid) in pyramids.iter().enumerate() {
-            let Some(pyramid) = pyramid else { continue };
+        (center, center + span)
+    };
+    let columns: Vec<(&[Vec<_>], &[f64])> = pyramids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pyramid)| {
+            let pyramid = pyramid.as_ref()?;
             let samples = match level0[index].as_ref() {
                 Some(cache) => cache.samples(),
-                None => dataset.columns[index]
-                    .values()
-                    .as_f64_slice()
-                    .context("fixture columns are f64")?,
+                None => dataset.columns[index].values().as_f64_slice()?,
             };
-            std::hint::black_box(decimate_viewport(
-                pyramid,
-                samples,
-                &ticks,
-                range,
-                args.pixel_columns,
-            ));
+            Some((pyramid.as_slice(), samples))
+        })
+        .collect();
+    for parallel in [false, true] {
+        let mut frame_times = Vec::with_capacity(args.frames);
+        for frame in 0..args.frames {
+            let range = range_for(frame);
+            let query = |&(pyramid, samples): &(&[Vec<_>], &[f64])| {
+                decimate_viewport(pyramid, samples, &ticks, range, args.pixel_columns)
+            };
+            let start = Instant::now();
+            if parallel {
+                use rayon::prelude::*;
+                std::hint::black_box(columns.par_iter().map(query).collect::<Vec<_>>());
+            } else {
+                std::hint::black_box(columns.iter().map(query).collect::<Vec<_>>());
+            }
+            frame_times.push(start.elapsed());
         }
-        frame_times.push(start.elapsed());
+        frame_times.sort();
+        let pct = |p: f64| frame_times[((frame_times.len() - 1) as f64 * p) as usize];
+        let label = if parallel {
+            "nav_parallel"
+        } else {
+            "nav_frame"
+        };
+        println!("RESULT {label}_p50_us={:.1}", pct(0.50).as_secs_f64() * 1e6);
+        println!("RESULT {label}_p99_us={:.1}", pct(0.99).as_secs_f64() * 1e6);
     }
-    frame_times.sort();
-    let pct = |p: f64| frame_times[((frame_times.len() - 1) as f64 * p) as usize];
-    println!(
-        "RESULT nav_frame_p50_us={:.1}",
-        pct(0.50).as_secs_f64() * 1e6
-    );
-    println!(
-        "RESULT nav_frame_p99_us={:.1}",
-        pct(0.99).as_secs_f64() * 1e6
-    );
 
     println!("RESULT peak_rss_mb={:.1}", rss.stop() as f64 / 1e6);
     let _ = std::fs::remove_dir_all(&cache_dir);
