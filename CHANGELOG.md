@@ -280,7 +280,7 @@ Versioning: [Semantic Versioning](https://semver.org/).
     is still not kept (#102, #107). The cached raw samples still store the
     time column once per channel; sharing it would make the first open
     faster still, but changes the cache's on-disk layout, so it is left for
-    its own issue.
+    its own issue (#115).
 
 - **The memory guard-rail test in CI now also checks the drawing index, not
   just the file open — and the last two places that could have quietly
