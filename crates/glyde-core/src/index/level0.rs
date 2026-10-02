@@ -278,6 +278,34 @@ impl Level0CacheWriter {
         Ok(())
     }
 
+    /// Appends many `(timestamp, value)` pairs at once — byte for byte what
+    /// one [`Self::push`] per pair writes (both are the elements' native
+    /// in-memory bytes), but as two bulk writes instead of two per sample
+    /// (issue #114: per-sample writes dominated building the cache for an
+    /// already-materialized column).
+    pub fn push_slices(&mut self, timestamps: &[i128], samples: &[f64]) -> Result<()> {
+        debug_assert_eq!(
+            samples.len(),
+            timestamps.len(),
+            "samples and timestamps must be the same length"
+        );
+        let count = timestamps.len().min(samples.len());
+        self.timestamps_writer
+            .write_all(bytemuck::cast_slice(&timestamps[..count]))
+            .map_err(|source| GlydeError::Io {
+                path: self.timestamps_tmp_path.clone(),
+                source,
+            })?;
+        self.values_writer
+            .write_all(bytemuck::cast_slice(&samples[..count]))
+            .map_err(|source| GlydeError::Io {
+                path: self.values_tmp_path.clone(),
+                source,
+            })?;
+        self.sample_count += count as u64;
+        Ok(())
+    }
+
     /// Flushes and syncs both files, then atomically renames them into
     /// place and memory-maps the result.
     pub fn finish(mut self) -> Result<Level0Cache> {
@@ -357,9 +385,7 @@ pub fn build(
     );
 
     let mut writer = Level0CacheWriter::create(cache_dir, key)?;
-    for (&timestamp, &value) in timestamps.iter().zip(samples) {
-        writer.push(timestamp, value)?;
-    }
+    writer.push_slices(timestamps, samples)?;
     writer.finish()
 }
 
