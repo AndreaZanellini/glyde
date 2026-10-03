@@ -169,12 +169,25 @@ impl GlydeApp {
     /// read would be stale under the new reading).
     fn apply_correction(&mut self, path: PathBuf, correction: Correction) {
         match correction {
-            Correction::Delimiter(delimiter) => self.overrides.delimiter = Some(delimiter),
+            Correction::Delimiter(delimiter) => {
+                self.overrides.delimiter = Some(delimiter);
+                // A new delimiter re-splits every row: a picked column
+                // position would now name a different column, if any.
+                self.overrides.time_column = None;
+            }
             Correction::DecimalSeparator(separator) => {
                 self.overrides.decimal_separator = Some(separator)
             }
             Correction::TimestampFormat(format) => self.overrides.timestamp_format = Some(format),
             Correction::SortByTime => self.overrides.sort_by_time = true,
+            Correction::TimeColumn(choice) => {
+                self.overrides.time_column = Some(choice);
+                // Both belonged to the previous time column: its timestamp
+                // format would misparse (or fail on) the new one, and sorting
+                // by it would scramble the new axis.
+                self.overrides.timestamp_format = None;
+                self.overrides.sort_by_time = false;
+            }
         }
         tracing::info!(
             path = %path.display(),
@@ -416,7 +429,7 @@ mod tests {
     use super::*;
     use glyde_core::ingest::{
         Confidence, DecimalSeparator, Delimiter, InferredField, OpenSummary, SamplingClass,
-        TimeAxis,
+        TimeAxis, TimeColumnChoice,
     };
     use glyde_core::series::{Series, SeriesValues};
     use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
@@ -466,6 +479,11 @@ mod tests {
             non_monotonic_count: 0,
             duplicate_timestamp_count: 0,
             timezone: Some(glyde_core::ingest::TimezoneLabel::NaiveLocal),
+            time_index: glyde_core::ingest::TimeIndexSource::Column {
+                index: 0,
+                name: "timestamp".to_string(),
+            },
+            column_names: vec!["timestamp".to_string(), "value".to_string()],
         })
     }
 
@@ -799,6 +817,74 @@ mod tests {
                     &SeriesValues::F64(vec![1.5, 2.5]),
                     "the comma-decimal override must actually change the parsed values, \
                      not just the reported confidence"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    // Picking a time column invalidates the two overrides that belonged to
+    // the previous one; a new delimiter invalidates a picked column position.
+    #[test]
+    fn a_time_column_choice_resets_what_belonged_to_the_previous_time_column() {
+        let mut app = GlydeApp::new();
+        let path = PathBuf::from("does-not-exist-glyde-app-test.csv");
+        app.overrides.timestamp_format = Some(TimestampFormat::MonthFirst);
+        app.overrides.sort_by_time = true;
+
+        app.apply_correction(
+            path.clone(),
+            Correction::TimeColumn(TimeColumnChoice::Column(2)),
+        );
+        assert_eq!(app.overrides.time_column, Some(TimeColumnChoice::Column(2)));
+        assert_eq!(app.overrides.timestamp_format, None);
+        assert!(!app.overrides.sort_by_time);
+
+        app.apply_correction(path, Correction::Delimiter(Delimiter::Semicolon));
+        assert_eq!(app.overrides.time_column, None);
+    }
+
+    /// End-to-end: asking for the row index on a file with a real time column
+    /// re-indexes it with the former time column kept as a series.
+    #[test]
+    fn picking_the_row_index_re_indexes_the_file_against_it() {
+        let mut app = GlydeApp::new();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("counter.csv");
+        std::fs::write(
+            &path,
+            "counter,value
+0,1.5
+1,2.5
+2,0.5
+",
+        )
+        .expect("write fixture");
+
+        app.apply_correction(
+            path.clone(),
+            Correction::TimeColumn(TimeColumnChoice::RowIndex),
+        );
+
+        let _started = app
+            .rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected a Started message");
+        match app
+            .rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected a Completed message")
+        {
+            IndexingMessage::Completed {
+                report, dataset, ..
+            } => {
+                let names: Vec<&str> = dataset.columns.iter().map(Series::name).collect();
+                assert_eq!(names, ["counter", "value"]);
+                assert_eq!(
+                    report.time_index,
+                    glyde_core::ingest::TimeIndexSource::Generated(
+                        glyde_core::ingest::GeneratedIndexReason::Requested
+                    )
                 );
             }
             other => panic!("expected Completed, got {other:?}"),

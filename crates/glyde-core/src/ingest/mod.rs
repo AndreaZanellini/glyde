@@ -39,8 +39,8 @@ pub use dataset::{
     load_progressive, load_progressive_with_budget, load_with_budget, load_with_overrides,
     load_with_overrides_and_budget, progressive_tick_to_value, progressive_value_to_tick,
     pyramids_for_dataset, pyramids_for_dataset_cached, pyramids_for_dataset_cached_with_cache_dir,
-    Checkpoint, ColumnLevel0Caches, ColumnPyramids, Dataset, DerivedCaches, ProgressiveValues,
-    TimeAxis, Timestamps, PROGRESSIVE_TICK_SCALE,
+    Checkpoint, ColumnLevel0Caches, ColumnPyramids, Dataset, DerivedCaches, GeneratedIndexReason,
+    ProgressiveValues, TimeAxis, Timestamps, GENERATED_TIME_COLUMN_NAME, PROGRESSIVE_TICK_SCALE,
 };
 pub use infer::{
     decode, detect_encoding, infer_column, infer_decimal_separator, infer_delimiter, infer_header,
@@ -50,7 +50,7 @@ pub use infer::{
 pub use report::{
     inspect, open_dataset, open_dataset_progressive, open_dataset_progressive_with_overrides,
     open_dataset_with_budget, open_dataset_with_overrides, InferenceReport, InferredField,
-    OpenSummary, SamplingClass, TimezoneLabel,
+    OpenSummary, SamplingClass, TimeIndexSource, TimezoneLabel,
 };
 
 use crate::time::TimestampFormat;
@@ -81,6 +81,29 @@ pub struct IngestOverrides {
     /// opens unsorted instead, since a spill file cannot be permuted in
     /// place (see `dataset::choose_storage`).
     pub sort_by_time: bool,
+    /// SPEC §1.2's time-column correction: which column is the time index,
+    /// or none at all. `None` keeps SPEC §2.1's automatic detection (column
+    /// 0, unless it is a numeric column that runs backwards or never
+    /// advances — see `dataset::TimeCandidateScan`). A choice is taken as
+    /// given: a picked numeric column is never second-guessed for running
+    /// backwards (SPEC §2.1's non-monotonic report and its "Sort" apply
+    /// instead), but one that cannot be read as an index at all still falls
+    /// back to the generated row index rather than failing the open.
+    pub time_column: Option<TimeColumnChoice>,
+}
+
+/// Which column the user settled on as the time index (see
+/// [`IngestOverrides::time_column`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimeColumnChoice {
+    /// The column at this 0-based position in the header. A position past
+    /// the file's last column (e.g. left over from before a delimiter
+    /// correction changed the column count) is ignored, with a `warn`, in
+    /// favor of automatic detection.
+    Column(usize),
+    /// No column of the file: index the rows `0, 1, 2, …` instead, and plot
+    /// every column as a series.
+    RowIndex,
 }
 
 /// A plain hash of `overrides`, for scoping a cache key to it

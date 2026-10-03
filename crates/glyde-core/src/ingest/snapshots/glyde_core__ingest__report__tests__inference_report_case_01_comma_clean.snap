@@ -42,4 +42,13 @@ InferenceReport {
             "+00:00",
         ),
     ),
+    time_index: Column {
+        index: 0,
+        name: "timestamp",
+    },
+    column_names: [
+        "timestamp",
+        "value",
+        "pressure",
+    ],
 }
