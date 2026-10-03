@@ -200,8 +200,17 @@ Resolved as follows:
   view, so a hit materializes an owned pyramid from the cache file rather
   than mapping it in place. The win is skipping the aggregation pass (and
   not needing Level 0 open at all to redo it), not a zero-copy reopen.
-- **Deferred, tracked separately:** cache eviction (the cache directory only
-  ever grows, for Level 0, the pyramid, and the ingestion spill files alike);
+- **Ingestion spill files are deleted with their dataset** (issue #118).
+  They are a backing store, never read back by a later open, so each open
+  spills into its own locked directory under `<cache>/spill/`, deleted when
+  the last column mapping it is dropped (closed, replaced by a reopen, or a
+  failed/abandoned open). A sweep at startup and before every spill removes
+  what a crashed session left (its lock is gone) and the loose `*.glysp`
+  files of earlier versions. Before spilling, the estimated spill size plus
+  1 GB of headroom must fit in the cache disk's free space, or the open is
+  refused with an explanation (`GlydeError::DiskSpaceExceeded`).
+- **Deferred, tracked separately:** cache eviction for the *reused* caches
+  (the cache directory still only grows for Level 0 and the pyramid);
   and the size of an owned pyramid itself — ~9 bytes per sample per column
   across all levels, which is proportional to file size and is what a
   pyramid-accelerated view of a *spilled* file would hit first (issue #102).

@@ -144,7 +144,7 @@ pub fn welch(samples: &[f64], sample_rate_hz: f64, config: &WelchConfig) -> Psd 
     }
 
     let scale_denominator = sample_rate_hz * window_sum_sq;
-    let nyquist_bin = if effective_len % 2 == 0 {
+    let nyquist_bin = if effective_len.is_multiple_of(2) {
         Some(effective_len / 2)
     } else {
         None

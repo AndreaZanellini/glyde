@@ -267,6 +267,53 @@ Versioning: [Semantic Versioning](https://semver.org/).
      is the conventional default for this use.
 
 ### Fixed
+- **Opening a large file no longer fills your disk.** A file too big to hold in
+  memory is first copied to a cache on disk, and every earlier version left
+  that copy behind for good, about the file's own size each time. Two opens
+  of a 3.2 GB CSV left 6 GB behind, and an interrupted open left a few more.
+  Now:
+  - the cached copy is deleted as soon as you close the file, open another
+    one, or reopen it (for example after a correction in the inference bar),
+    so a large file only ever takes up one copy on disk;
+  - an open that fails or is cut short cleans up what it had written so far;
+  - if Glyde crashes or is force-quit, its leftovers are deleted the next time
+    it starts (or the next time it opens a large file), and so are the leftovers
+    of every earlier version;
+  - before caching a file, Glyde checks that the disk has room for it plus
+    1 GB to spare. If not, the file is not opened and you see why: *"This file
+    is too large to hold in memory, so Glyde has to cache it on disk first.
+    That needs about 4.1 GB free on the disk holding … (3.1 GB for the cache
+    plus 1.0 GB left free for your system), but only 1.2 GB is free. Free up
+    some disk space, then open the file again."* (issue #118)
+
+  What to try: open a file large enough to be cached (the loading line says
+  so), and check the size of `~/Library/Caches/com.glyde.Glyde/index/` on
+  macOS (`%LOCALAPPDATA%\glyde\Glyde\cache\index` on Windows,
+  `~/.cache/glyde/index` on Linux). While the file is open there is one
+  `spill/<…>` folder about its size, and a few seconds after you open another
+  file it is gone. The first start of this version also deletes the loose
+  `.glysp` files earlier versions left there; the log says how much space
+  came back.
+
+  **Assumptions made (please veto by testing the app):**
+  - **Cached copies are deleted on close, not kept for a faster reopen.** The
+    issue left this to you: "delete on close" or "keep for reuse once #106
+    lands". Nothing reads the copy back today (#106 is not done), so keeping
+    it would cost disk space and save no time. If #106 makes reuse worth it,
+    that PR needs to settle how much to keep.
+  - **Spare space is 1 GB, and the size estimate assumes numeric columns.**
+    Text columns take more space than the estimate allows for; the 1 GB is
+    what absorbs that. If a file with a lot of text still fills the disk while
+    it is being cached, the open fails with "No space left on device" and the
+    partial copy is deleted at once, so the space comes back.
+  - **When the free space cannot be measured** (an unusual disk setup), Glyde
+    caches the file anyway rather than refusing a file that may well fit, and
+    says so in the log.
+  - **The minimum Rust version for building Glyde is now 1.89** (it was 1.82),
+    for the file locks that tell a crashed session's leftovers apart from
+    files another running Glyde is using. The app is unchanged for users: CI
+    and releases already build with the latest stable Rust.
+
 - **A file whose time column Glyde cannot read now opens anyway, plotted
   against row numbers, and says so.** Until now, a first column that was
   neither a timestamp Glyde recognizes nor a plain number took the entire file

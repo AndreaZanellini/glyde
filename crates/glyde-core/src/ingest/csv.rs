@@ -230,6 +230,10 @@ pub(crate) struct Footprint {
     pub(crate) column_count: usize,
     pub(crate) estimated_row_count: u64,
     pub(crate) estimated_bytes: u64,
+    /// What the spill path would write to the cache directory instead
+    /// (issue #118): see [`SPILLED_TIME_BYTES_PER_ROW`] and
+    /// [`SPILLED_SAMPLE_BYTES`].
+    pub(crate) estimated_spill_bytes: u64,
 }
 
 /// Bytes one captured field is budgeted in a [`ColumnText`] offset table, on
@@ -249,6 +253,19 @@ const TYPED_TIMESTAMP_BYTES: u64 = std::mem::size_of::<crate::time::Timestamp>()
 /// `bool` column is cheaper and a `string` one dearer, but neither is the
 /// case worth sizing the budget check against).
 const TYPED_SAMPLE_BYTES: u64 = 8;
+
+/// Bytes one row of a spilled absolute time axis costs on disk: an `i128`
+/// tick, a one-byte unit and an `i64` UTC offset, each in its own file
+/// (`ingest::dataset`'s `AbsoluteAxisSpillWriter`). A progressive or
+/// generated axis costs 8; sizing for the dearer case keeps the disk check
+/// on the safe side.
+const SPILLED_TIME_BYTES_PER_ROW: u64 = 16 + 1 + 8;
+
+/// Bytes one spilled sample of one data column costs on disk: 8 for
+/// `i64`/`f64`, 1 for `bool`. A `string` column costs its text plus an
+/// 8-byte offset, which no head sample can size reliably; the disk check's
+/// headroom (`budget::DISK_HEADROOM_BYTES`) is what absorbs it.
+const SPILLED_SAMPLE_BYTES: u64 = 8;
 
 impl Sniff {
     /// Estimates what [`parse_capturing_all_columns`] plus
@@ -286,6 +303,10 @@ impl Sniff {
             estimated_row_count,
             estimated_bytes: file_bytes
                 .saturating_add(estimated_row_count.saturating_mul(per_row_bytes)),
+            estimated_spill_bytes: estimated_row_count.saturating_mul(
+                SPILLED_TIME_BYTES_PER_ROW
+                    + SPILLED_SAMPLE_BYTES * column_count.saturating_sub(1) as u64,
+            ),
         }
     }
 

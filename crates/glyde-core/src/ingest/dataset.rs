@@ -53,7 +53,7 @@ use crate::budget::RamBudget;
 use crate::dsp::decimation::{build_pyramid, build_pyramid_streaming, extend_pyramid, Bucket};
 use crate::index::level0::{self, CacheKey, Level0Cache};
 use crate::index::pyramid;
-use crate::index::spill::{SpillStringsWriter, SpillVec, SpillVecWriter};
+use crate::index::spill::{SpillSet, SpillStringsWriter, SpillVec, SpillVecWriter};
 use crate::series::{Anomalies, Dtype, NanRunScan, Series, SeriesValues, SpilledValues};
 use crate::time::{
     parse_timestamp, TickSource, TimeUnit, Timestamp, TimestampFormat, TimestampFormatInference,
@@ -619,6 +619,24 @@ fn choose_storage(
     cache_dir: Option<&Path>,
     overrides: IngestOverrides,
 ) -> Result<Storage> {
+    choose_storage_with_disk(
+        path,
+        budget,
+        cache_dir,
+        overrides,
+        crate::budget::available_disk_bytes,
+    )
+}
+
+/// [`choose_storage`] with the free-disk-space query injected, so a test can
+/// stand in for a full disk.
+fn choose_storage_with_disk(
+    path: &Path,
+    budget: RamBudget,
+    cache_dir: Option<&Path>,
+    overrides: IngestOverrides,
+    available_disk_bytes: impl FnOnce(&Path) -> Option<u64>,
+) -> Result<Storage> {
     let file_bytes = std::fs::metadata(path)
         .map_err(|source| GlydeError::Io {
             path: path.to_path_buf(),
@@ -641,11 +659,32 @@ fn choose_storage(
         return Ok(Storage::InMemory);
     }
 
-    if cache_dir.is_none() {
+    let Some(cache_dir) = cache_dir else {
         return Err(GlydeError::BudgetExceeded {
             requested_bytes: footprint.estimated_bytes,
             cap_bytes: budget.cap_bytes(),
         });
+    };
+
+    // Issue #118: the disk is a budget too. Spill files a closed dataset or
+    // a crashed session left behind are given back first, so they never
+    // count against this open; then the spill must fit with headroom to
+    // spare, or the open is refused before a byte is written.
+    // A dataset this open replaces may still be giving its space back.
+    crate::index::spill::wait_for_pending_deletions();
+    crate::index::spill::sweep_orphaned_spill_files(cache_dir);
+    match available_disk_bytes(cache_dir) {
+        Some(available_bytes) => crate::budget::check_disk_affordable(
+            footprint.estimated_spill_bytes,
+            available_bytes,
+            cache_dir,
+        )?,
+        None => warn!(
+            cache_dir = %cache_dir.display(),
+            estimated_spill_bytes = footprint.estimated_spill_bytes,
+            "could not determine the free space on the cache disk; spilling without checking it \
+             (a full disk fails the open and its partial spill files are deleted)"
+        ),
     }
 
     info!(
@@ -1446,29 +1485,21 @@ fn load_spilled(
     };
 
     // --- Pass 2: type every row straight into its spill file ----------------
-    // `.with_overrides_signature`: these spill files are always freshly
-    // written on this call (never read-and-reused within it), so nothing
-    // reachable today collides across two different overrides for the same
-    // path — but scoping the stem consistently with the pyramid cache keeps
-    // that true if a later reopen ever starts reading them back (issue #92's
-    // Level 0 read-through wiring, not yet wired into the open path) rather
-    // than leaving the same class of staleness bug latent for that PR to
-    // rediscover.
-    let stem = CacheKey::for_path(path)?
-        .with_overrides_signature(super::overrides_signature(overrides))
-        .cache_stem();
+    // Issue #118: this open's files go in a set of their own, deleted once
+    // the dataset (or, on a failure below, the writers) is dropped. Spill
+    // files are never read back by a later open, so a fresh set per open
+    // needs no cache key — and cannot be overwritten by a reopen of the same
+    // file while the previous dataset still maps it.
+    let set = SpillSet::create(cache_dir)?;
     let mut time_writer = TimeAxisSpillWriter::create(
-        cache_dir,
-        &stem,
+        &set,
         timestamp_format.map(|inference| inference.format),
         inference.generated.is_some(),
     )?;
     let mut column_writers: Vec<ColumnSpillWriter> = choices
         .iter()
         .enumerate()
-        .map(|(index, choice)| {
-            ColumnSpillWriter::create(cache_dir, &format!("{stem}.c{index}"), choice.dtype)
-        })
+        .map(|(index, choice)| ColumnSpillWriter::create(&set, &format!("c{index}"), choice.dtype))
         .collect::<Result<_>>()?;
     let data_column_names: Vec<String> = data_columns
         .iter()
@@ -1515,7 +1546,7 @@ fn load_spilled(
     info!(
         row_count = outcome.row_count,
         column_count,
-        cache_dir = %cache_dir.display(),
+        spill_dir = %set.dir().display(),
         "file materialized through the on-disk spill cache (SPEC §5.1)"
     );
 
@@ -1722,27 +1753,26 @@ struct AbsoluteAxisSpillWriter {
 
 impl TimeAxisSpillWriter {
     fn create(
-        cache_dir: &Path,
-        stem: &str,
+        set: &SpillSet,
         format: Option<TimestampFormat>,
         generated_index: bool,
     ) -> Result<Self> {
         match format {
             Some(format) => Ok(TimeAxisSpillWriter::Absolute(Box::new(
                 AbsoluteAxisSpillWriter {
-                    ticks: SpillVecWriter::create(cache_dir, &format!("{stem}.ts"))?,
-                    units: SpillVecWriter::create(cache_dir, &format!("{stem}.tsunit"))?,
-                    offsets: SpillVecWriter::create(cache_dir, &format!("{stem}.tsoffset"))?,
+                    ticks: SpillVecWriter::create(set, "ts")?,
+                    units: SpillVecWriter::create(set, "tsunit")?,
+                    offsets: SpillVecWriter::create(set, "tsoffset")?,
                     format,
                 },
             ))),
             None if generated_index => Ok(TimeAxisSpillWriter::RowOrdinal {
-                values: SpillVecWriter::create(cache_dir, &format!("{stem}.tsprogressive"))?,
+                values: SpillVecWriter::create(set, "tsprogressive")?,
                 next_row: 0,
             }),
             None => Ok(TimeAxisSpillWriter::Progressive(SpillVecWriter::create(
-                cache_dir,
-                &format!("{stem}.tsprogressive"),
+                set,
+                "tsprogressive",
             )?)),
         }
     }
@@ -1828,19 +1858,18 @@ enum ColumnSpillWriter {
 }
 
 impl ColumnSpillWriter {
-    fn create(cache_dir: &Path, stem: &str, dtype: Dtype) -> Result<Self> {
+    fn create(set: &SpillSet, stem: &str, dtype: Dtype) -> Result<Self> {
         Ok(match dtype {
-            Dtype::Bool => ColumnSpillWriter::Bool(SpillVecWriter::create(cache_dir, stem)?),
-            Dtype::I64 => ColumnSpillWriter::I64(SpillVecWriter::create(cache_dir, stem)?),
-            Dtype::F64 => ColumnSpillWriter::F64(
-                SpillVecWriter::create(cache_dir, stem)?,
-                NanRunScan::default(),
-            ),
+            Dtype::Bool => ColumnSpillWriter::Bool(SpillVecWriter::create(set, stem)?),
+            Dtype::I64 => ColumnSpillWriter::I64(SpillVecWriter::create(set, stem)?),
+            Dtype::F64 => {
+                ColumnSpillWriter::F64(SpillVecWriter::create(set, stem)?, NanRunScan::default())
+            }
             // Every other dtype is unreachable from `ColumnDtypeScan`, which
             // only ever settles on bool/i64/f64/string (SPEC §1.4 via
             // `infer_column`); a Parquet reader's narrower widths land with
             // docs/ROADMAP.md M7 and will extend both together.
-            _ => ColumnSpillWriter::String(SpillStringsWriter::create(cache_dir, stem)?),
+            _ => ColumnSpillWriter::String(SpillStringsWriter::create(set, stem)?),
         })
     }
 
@@ -2869,6 +2898,108 @@ mod tests {
             .join("testdata")
             .join("corpus")
             .join(file_name)
+    }
+
+    // --- Issue #118: the disk is a budget too ------------------------------
+
+    /// A small file and an empty cache, opened under a zero RAM budget so it
+    /// must spill.
+    fn spill_candidate() -> (tempfile::TempDir, PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("signals.csv");
+        let mut text = String::from("timestamp,a,b\n");
+        for i in 0..1_000 {
+            text.push_str(&format!("2026-01-01T00:00:{:02}Z,{i},{}\n", i % 60, i * 2));
+        }
+        std::fs::write(&path, text).expect("write fixture");
+        (dir, path, tempfile::tempdir().expect("temp cache dir"))
+    }
+
+    fn choose_with_free_space(path: &Path, cache_dir: &Path, free: Option<u64>) -> Result<Storage> {
+        choose_storage_with_disk(
+            path,
+            RamBudget::from_total_ram_bytes(0),
+            Some(cache_dir),
+            IngestOverrides::default(),
+            |_| free,
+        )
+    }
+
+    #[test]
+    fn a_spill_that_would_not_fit_on_disk_is_refused_before_writing_anything() {
+        let (_dir, path, cache) = spill_candidate();
+
+        let refusal = choose_with_free_space(&path, cache.path(), Some(500_000_000));
+
+        let Err(GlydeError::DiskSpaceExceeded {
+            required_bytes,
+            available_bytes,
+            cache_dir,
+            ..
+        }) = refusal
+        else {
+            panic!("expected a DiskSpaceExceeded refusal");
+        };
+        assert!(required_bytes > crate::budget::DISK_HEADROOM_BYTES);
+        assert_eq!(available_bytes, 500_000_000);
+        assert_eq!(cache_dir, cache.path());
+        assert!(
+            !cache.path().join("spill").exists(),
+            "a refused open must not have written a byte to the cache"
+        );
+    }
+
+    #[test]
+    fn a_spill_that_fits_on_disk_goes_ahead() {
+        let (_dir, path, cache) = spill_candidate();
+        let storage = choose_with_free_space(&path, cache.path(), Some(u64::MAX))
+            .expect("plenty of free space");
+        assert!(matches!(storage, Storage::Spill(_)));
+    }
+
+    // Unknown free space is no reason to refuse a file that may well fit;
+    // a disk that does fill up fails the open, and the partial spill is
+    // deleted with its writers.
+    #[test]
+    fn a_spill_goes_ahead_when_the_free_space_cannot_be_determined() {
+        let (_dir, path, cache) = spill_candidate();
+        let storage =
+            choose_with_free_space(&path, cache.path(), None).expect("unknown free space");
+        assert!(matches!(storage, Storage::Spill(_)));
+    }
+
+    // The spill estimate is what the spill path writes for a numeric file,
+    // so the check neither waves through a file that cannot fit nor refuses
+    // one that can by a wide margin.
+    #[test]
+    fn the_spill_estimate_matches_what_a_numeric_spill_writes() {
+        let (_dir, path, cache) = spill_candidate();
+        let file_bytes = std::fs::metadata(&path).expect("metadata").len();
+        let estimate = super::super::csv::sniff_path(&path, IngestOverrides::default())
+            .expect("sniff")
+            .footprint(file_bytes)
+            .estimated_spill_bytes;
+
+        let dataset = load_with_budget(&path, RamBudget::from_total_ram_bytes(0), cache.path())
+            .expect("spilled open");
+        assert!(dataset.is_spilled());
+        let set_dir = std::fs::read_dir(cache.path().join("spill"))
+            .expect("spill dir")
+            .next()
+            .expect("one set")
+            .expect("entry")
+            .path();
+        let written: u64 = std::fs::read_dir(&set_dir)
+            .expect("set dir")
+            .map(|entry| entry.expect("entry").metadata().expect("metadata").len())
+            .sum();
+
+        // Each spill file also carries a 16-byte header.
+        let ratio = estimate as f64 / written as f64;
+        assert!(
+            (0.9..=1.1).contains(&ratio),
+            "estimate {estimate} vs {written} bytes written"
+        );
     }
 
     fn verdict_of(fields: &[&str], check_monotonic: bool) -> Option<GeneratedIndexReason> {

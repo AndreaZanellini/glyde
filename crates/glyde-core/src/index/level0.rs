@@ -513,7 +513,7 @@ fn validated_sample_count(mmap: &Mmap, element_size: usize) -> Option<usize> {
         return None;
     }
     let data_len = mmap.len() - HEADER_LEN;
-    if data_len % element_size != 0 {
+    if !data_len.is_multiple_of(element_size) {
         return None;
     }
     Some(data_len / element_size)
