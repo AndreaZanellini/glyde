@@ -1159,6 +1159,11 @@ pub enum GeneratedIndexReason {
     /// The candidate column is numeric but holds one value throughout — it
     /// never advances, so it cannot place samples in time.
     Constant { column: String },
+    /// The candidate column is numeric and never decreases, but it stays on
+    /// the same value for most rows, changing on only `changes` of them — a
+    /// staircase such as an operating-point or test-step number. Plotted
+    /// against it, every sample of one step would land on the same x.
+    MostlyRepeated { column: String, changes: u64 },
     /// The candidate column is neither timestamps in a supported format nor
     /// numbers (issue #94).
     Unreadable { column: String },
@@ -1185,6 +1190,15 @@ fn log_time_index_decision(time_column_name: &str, inference: &TimeIndexInferenc
             "no time column detected: the first column is numeric but runs backwards, so it is \
              plotted as a signal against a generated row index (SPEC §2.1), reported \
              low-confidence in the inference bar"
+        ),
+        Some(GeneratedIndexReason::MostlyRepeated { column, changes }) => warn!(
+            candidate = %column,
+            changes,
+            rows,
+            "no time column detected: the first column never decreases but stays on the same \
+             value for most rows (a staircase, not a time axis), so it is plotted as a signal \
+             against a generated row index (SPEC §2.1), reported low-confidence in the \
+             inference bar"
         ),
         Some(GeneratedIndexReason::Constant { column }) => warn!(
             candidate = %column,
@@ -1226,7 +1240,8 @@ fn parse_progressive_value(field: &str) -> Result<f64> {
 /// *numeric* column is not: an epoch counter and an accelerometer channel
 /// look alike field by field. What tells them apart is order — a time index
 /// never runs backwards and does advance — so a numeric candidate that drops
-/// (or is constant) is a signal and the row index stands in for it. The test
+/// (or is constant, or a staircase that stays on one value for most rows) is
+/// a signal and the row index stands in for it. The test
 /// is on the parsed `f64`, the same value for every numeric format (epoch,
 /// LabVIEW, Excel serial, progressive), so it never depends on which format
 /// the column also happens to match.
@@ -1237,7 +1252,8 @@ pub(crate) struct TimeCandidateScan {
     non_numeric: usize,
     previous: Option<f64>,
     first_drop: Option<usize>,
-    advanced: bool,
+    /// How many steps (row to the next) increased the value.
+    advances: u64,
 }
 
 impl TimeCandidateScan {
@@ -1251,7 +1267,7 @@ impl TimeCandidateScan {
         if let Some(previous) = self.previous {
             // Incomparable (a NaN on either side) counts as a drop too.
             match value.partial_cmp(&previous) {
-                Some(std::cmp::Ordering::Greater) => self.advanced = true,
+                Some(std::cmp::Ordering::Greater) => self.advances += 1,
                 Some(std::cmp::Ordering::Equal) => {}
                 Some(std::cmp::Ordering::Less) | None => {
                     self.first_drop.get_or_insert(row);
@@ -1285,8 +1301,23 @@ impl TimeCandidateScan {
                 row: row as u64,
             });
         }
-        (self.rows >= 2 && !self.advanced).then(|| GeneratedIndexReason::Constant {
+        if self.rows < 2 {
+            return None;
+        }
+        if self.advances == 0 {
+            return Some(GeneratedIndexReason::Constant {
+                column: column.to_string(),
+            });
+        }
+        // A time index advances on most rows; duplicates are occasional
+        // anomalies (SPEC §2.1 "preserved, flagged"). One that advances on
+        // fewer than half of its steps is a staircase — every row of one step
+        // would share one x. The threshold is an assumption flagged in
+        // `CHANGELOG.md`, not a SPEC number.
+        let steps = (self.rows - 1) as u64;
+        (self.advances * 2 < steps).then(|| GeneratedIndexReason::MostlyRepeated {
             column: column.to_string(),
+            changes: self.advances,
         })
     }
 }
@@ -2887,6 +2918,19 @@ mod tests {
             })
         );
         assert_eq!(verdict_of(&["4"], true), None);
+    }
+
+    #[test]
+    fn a_column_that_changes_on_few_rows_is_a_signal() {
+        assert_eq!(
+            verdict_of(&["1", "1", "1", "2", "2", "2"], true),
+            Some(GeneratedIndexReason::MostlyRepeated {
+                column: "c".to_string(),
+                changes: 1,
+            })
+        );
+        // Exactly half of the steps advancing is enough.
+        assert_eq!(verdict_of(&["0", "1", "1", "2", "2"], true), None);
     }
 
     #[test]

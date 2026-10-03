@@ -235,6 +235,11 @@ fn generated_index_notice(report: &InferenceReport) -> Option<String> {
             "No time column detected: \"{column}\" holds the same value on every row, so it is \
              plotted as a signal."
         ),
+        GeneratedIndexReason::MostlyRepeated { column, changes } => format!(
+            "No time column detected: \"{column}\" changes value on only {changes} of {} rows, \
+             so it is plotted as a signal.",
+            report.sample_count
+        ),
         GeneratedIndexReason::Unreadable { column } => format!(
             "\"{column}\" is neither timestamps in a supported format nor numbers, so it is \
              plotted as a series, not used as time."
@@ -954,6 +959,16 @@ mod tests {
         assert!(
             constant.contains("\"mode\" holds the same value"),
             "{constant}"
+        );
+
+        report.time_index = TimeIndexSource::Generated(GeneratedIndexReason::MostlyRepeated {
+            column: "OP".to_string(),
+            changes: 2,
+        });
+        let staircase = generated_index_notice(&report).expect("announced");
+        assert!(
+            staircase.contains("\"OP\" changes value on only 2 of 8 rows"),
+            "{staircase}"
         );
 
         report.time_index = TimeIndexSource::Generated(GeneratedIndexReason::Unreadable {

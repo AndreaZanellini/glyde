@@ -49,6 +49,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
   - **Repeated values do not disqualify a time column** (a duplicate
     timestamp is not a step backwards — it is flagged as before). A column
     with the same value on every row does.
+  - **A "staircase" first column is a signal, not a time axis**: a column
+    that never goes back but changes value on fewer than half of its rows —
+    typically an operating-point or test-step number (`OP` = 1, 1, 1, …, 2,
+    2, 2, …) — would stack every sample of one step on the same x. Glyde now
+    plots it as a signal against the row index and says *"OP" changes value
+    on only 73 of N rows*. The 50% threshold is an assumption, not a SPEC
+    number. Consequence: a whole-second timestamp on data logged faster than
+    1 Hz (e.g. 10 rows per second) is now treated as "no time column" — one
+    click in the dropdown makes it the time axis again.
   - **A first column that is a steadily increasing *signal*** (a counter, a
     cumulative energy reading) cannot be told apart from a time axis and is
     still taken as one. That is exactly why the dropdown is always offered,

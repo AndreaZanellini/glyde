@@ -469,3 +469,95 @@ fn a_column_that_runs_backwards_only_after_the_first_checkpoint_is_demoted_clean
     assert_eq!(names(&one_shot), ["counter", "value"]);
     assert_eq!(one_shot.time.len(), 60_101);
 }
+
+#[test]
+fn a_spilled_file_whose_first_column_is_all_ones_plots_it_against_the_row_index() {
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut text = String::from("flag,value\n");
+    for row in 0..50_000u32 {
+        text.push_str(&format!("1,{}\n", f64::from(row % 13) * 0.5));
+    }
+    let path = write(dir.path(), "ones.csv", &text);
+
+    let (_summary, report, spilled) =
+        ingest::open_dataset_with_budget(&path, zero_budget(), cache.path()).expect("spilled open");
+    let in_memory =
+        ingest::load_with_budget(&path, unlimited_budget(), cache.path()).expect("in-memory open");
+
+    assert!(spilled.is_spilled());
+    assert_eq!(
+        report.time_index,
+        TimeIndexSource::Generated(GeneratedIndexReason::Constant {
+            column: "flag".to_string(),
+        })
+    );
+    assert_eq!(report.time_column.confidence, Confidence::Low);
+    assert_eq!(spilled.time.len(), 50_000);
+    assert_eq!(spilled.time, in_memory.time);
+    assert_eq!(names(&spilled), ["flag", "value"]);
+    println!("flag dtype = {:?}", spilled.columns[0].dtype());
+    for (spilled, in_memory) in spilled.columns.iter().zip(&in_memory.columns) {
+        assert_eq!(spilled.values(), in_memory.values());
+    }
+}
+
+#[test]
+fn a_staircase_first_column_is_a_signal_not_a_time_index() {
+    // The shape of a real test-bench export: `OP` (operating point) holds
+    // 1, then 2, then 3 for thousands of rows each, and `time in s` restarts
+    // at 0 for every operating point. `OP` never decreases and does advance,
+    // but it changes on a handful of rows out of thousands — every sample of
+    // one operating point would land on the same x. Neither column is a
+    // whole-file time axis; the row index is, with both kept as series.
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut text = String::from("OP,time in s,i_a in A\n");
+    for op in 1..=3u32 {
+        for row in 0..10_000u32 {
+            text.push_str(&format!(
+                "{op},{},{}\n",
+                f64::from(row) * 1e-6,
+                f64::from(row % 17) * 0.25
+            ));
+        }
+    }
+    let path = write(dir.path(), "staircase.csv", &text);
+
+    for budget in [unlimited_budget(), zero_budget()] {
+        let (summary, report, dataset) =
+            ingest::open_dataset_with_budget(&path, budget, cache.path()).expect("opens");
+
+        assert_eq!(progressive(&dataset.time).len(), 30_000);
+        assert_eq!(names(&dataset), ["OP", "time in s", "i_a in A"]);
+        assert_eq!(summary.sampling_class, SamplingClass::ProgressiveIndex);
+        assert_eq!(
+            report.time_index,
+            TimeIndexSource::Generated(GeneratedIndexReason::MostlyRepeated {
+                column: "OP".to_string(),
+                changes: 2,
+            })
+        );
+        assert_eq!(report.time_column.confidence, Confidence::Low);
+    }
+}
+
+#[test]
+fn an_index_that_advances_on_most_rows_is_still_a_time_index() {
+    // Duplicates alone are not disqualifying (SPEC §2.1 "preserved,
+    // flagged"): an index that repeats now and then still advances on most
+    // rows.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = write(
+        dir.path(),
+        "some-dups.csv",
+        "t,v\n0,1\n1,2\n1,3\n2,4\n3,5\n3,6\n4,7\n",
+    );
+
+    let (_summary, report, _dataset) = ingest::open_dataset(&path).expect("opens");
+
+    assert!(matches!(
+        report.time_index,
+        TimeIndexSource::Column { index: 0, .. }
+    ));
+}
