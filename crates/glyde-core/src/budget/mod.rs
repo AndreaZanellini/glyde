@@ -23,6 +23,8 @@
 //! responsible for actually refusing/offering an alternative when a check
 //! fails (SPEC §5.1's "clear explanation and affordable alternative").
 
+use std::path::Path;
+
 use tracing::{info, warn};
 
 use crate::{GlydeError, Result};
@@ -101,6 +103,64 @@ impl RamBudget {
     }
 }
 
+/// Free space a spill must leave on the cache disk (issue #118), on top of
+/// the spill itself: a nearly full disk breaks the OS and every other app,
+/// and this also absorbs what the spill estimate cannot size up front
+/// (text columns, `ingest::csv`'s `SPILLED_SAMPLE_BYTES`).
+pub const DISK_HEADROOM_BYTES: u64 = 1_000_000_000;
+
+/// Free space, in bytes, on the disk that holds `path` (which need not exist
+/// yet), as `sysinfo` reports it: the mounted disk with the longest mount
+/// point `path` lies under — or `None` when none matches.
+pub fn available_disk_bytes(path: &Path) -> Option<u64> {
+    // Not `canonicalize`: on Windows it yields a `\\?\C:\` path that no
+    // mount point (`C:\`) is a prefix of.
+    let resolved = std::path::absolute(path).ok()?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|disk| resolved.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(|disk| disk.available_space())
+}
+
+/// Checks that spilling `spill_bytes` into `cache_dir` leaves at least
+/// [`DISK_HEADROOM_BYTES`] free on a disk with `available_bytes` free —
+/// SPEC §5.1's "checks affordability before acting" applied to the disk the
+/// spill path writes to, refusing with [`GlydeError::DiskSpaceExceeded`]
+/// (whose message is the "clear explanation") rather than filling it.
+pub fn check_disk_affordable(
+    spill_bytes: u64,
+    available_bytes: u64,
+    cache_dir: &Path,
+) -> Result<()> {
+    let required_bytes = spill_bytes.saturating_add(DISK_HEADROOM_BYTES);
+    if required_bytes <= available_bytes {
+        info!(
+            spill_bytes,
+            available_bytes,
+            headroom_bytes = DISK_HEADROOM_BYTES,
+            cache_dir = %cache_dir.display(),
+            "the spill cache fits on disk (issue #118)"
+        );
+        return Ok(());
+    }
+    warn!(
+        spill_bytes,
+        available_bytes,
+        headroom_bytes = DISK_HEADROOM_BYTES,
+        cache_dir = %cache_dir.display(),
+        "refusing to open: the spill cache would not fit on disk (issue #118)"
+    );
+    Err(GlydeError::DiskSpaceExceeded {
+        required_bytes,
+        headroom_bytes: DISK_HEADROOM_BYTES,
+        available_bytes,
+        cache_dir: cache_dir.to_path_buf(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +223,54 @@ mod tests {
         let expected = RamBudget::from_total_ram_bytes(system.total_memory());
 
         assert_eq!(RamBudget::from_system(), expected);
+    }
+
+    #[test]
+    fn a_spill_that_leaves_the_headroom_free_is_affordable() {
+        let dir = Path::new("/cache");
+        assert!(check_disk_affordable(2 * GB, 2 * GB + DISK_HEADROOM_BYTES, dir).is_ok());
+        assert!(check_disk_affordable(0, DISK_HEADROOM_BYTES, dir).is_ok());
+    }
+
+    #[test]
+    fn a_spill_that_would_eat_into_the_headroom_is_refused_with_a_clear_explanation() {
+        let err = check_disk_affordable(
+            3_100_000_000,
+            175_000_000 + DISK_HEADROOM_BYTES,
+            Path::new("/cache/index"),
+        )
+        .expect_err("a spill eating into the headroom must be refused");
+
+        let GlydeError::DiskSpaceExceeded {
+            required_bytes,
+            headroom_bytes,
+            available_bytes,
+            ref cache_dir,
+        } = err
+        else {
+            panic!("expected GlydeError::DiskSpaceExceeded, got {err:?}");
+        };
+        assert_eq!(required_bytes, 3_100_000_000 + DISK_HEADROOM_BYTES);
+        assert_eq!(headroom_bytes, DISK_HEADROOM_BYTES);
+        assert_eq!(available_bytes, 175_000_000 + DISK_HEADROOM_BYTES);
+        assert_eq!(cache_dir, Path::new("/cache/index"));
+        // What the open failure tells the user, verbatim.
+        assert_eq!(
+            err.to_string(),
+            "This file is too large to hold in memory, so Glyde has to cache it on disk first. \
+             That needs about 4.1 GB free on the disk holding /cache/index (3.1 GB for the cache \
+             plus 1.0 GB left free for your system), but only 1.2 GB is free. Free up some disk \
+             space, then open the file again."
+        );
+    }
+
+    #[test]
+    fn available_disk_bytes_finds_the_disk_holding_a_path_that_does_not_exist_yet() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let available = available_disk_bytes(&dir.path().join("not/created/yet"));
+        assert!(
+            available.is_some_and(|bytes| bytes > 0),
+            "the temp dir lives on a mounted disk with some free space: {available:?}"
+        );
     }
 }

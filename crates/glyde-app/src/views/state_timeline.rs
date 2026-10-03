@@ -514,12 +514,14 @@ mod tests {
     // in-memory equivalent.
     #[test]
     fn cache_bool_bands_reads_a_spilled_bool_column_through_bounded_chunks() {
-        use glyde_core::index::spill::SpillVecWriter;
+        use glyde_core::index::spill::{SpillSet, SpillVecWriter};
         use glyde_core::series::SpilledValues;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let values = [true, true, false, false, false, true, false];
-        let mut writer = SpillVecWriter::<u8>::create(dir.path(), "flag").expect("create");
+        let mut writer =
+            SpillVecWriter::<u8>::create(&SpillSet::create(dir.path()).expect("set"), "flag")
+                .expect("create");
         for &value in &values {
             writer.push(value as u8).expect("push");
         }

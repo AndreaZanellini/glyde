@@ -189,6 +189,9 @@ fn main() -> Result<()> {
         "in-memory"
     };
     drop(dataset);
+    // Issue #118: the spill files go with the dataset; let their deletion
+    // finish before exiting so the gate leaves no fixture-sized copy behind.
+    glyde_core::index::spill::wait_for_pending_deletions();
 
     let (pyramided_columns, pyramid_byte_count) = pyramid_summary
         .expect("the open succeeded, so the pyramid build was attempted")

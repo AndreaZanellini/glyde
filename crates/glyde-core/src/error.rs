@@ -94,6 +94,42 @@ pub enum GlydeError {
         requested_bytes: u64,
         cap_bytes: u64,
     },
+
+    /// A file too large for the RAM budget must spill to the on-disk cache,
+    /// but the disk holding it has too little free space (issue #118). Like
+    /// [`Self::BudgetExceeded`], checked and refused before anything is
+    /// written — never discovered by filling the disk.
+    #[error(
+        "This file is too large to hold in memory, so Glyde has to cache it on disk first. That \
+         needs about {} free on the disk holding {} ({} for the cache plus {} left free for your \
+         system), but only {} is free. Free up some disk space, then open the file again.",
+        human_bytes(*required_bytes),
+        cache_dir.display(),
+        human_bytes(required_bytes.saturating_sub(*headroom_bytes)),
+        human_bytes(*headroom_bytes),
+        human_bytes(*available_bytes)
+    )]
+    DiskSpaceExceeded {
+        /// The spill estimate plus `headroom_bytes`.
+        required_bytes: u64,
+        /// Free space Glyde refuses to eat into.
+        headroom_bytes: u64,
+        available_bytes: u64,
+        cache_dir: PathBuf,
+    },
+}
+
+/// `bytes` in the unit a person reads a disk size in: GB with one decimal
+/// from 1 GB up, whole MB below it (decimal units, as file managers show).
+fn human_bytes(bytes: u64) -> String {
+    const MB: f64 = 1_000_000.0;
+    const GB: f64 = 1_000_000_000.0;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes / GB)
+    } else {
+        format!("{:.0} MB", bytes / MB)
+    }
 }
 
 /// The `Result` alias every fallible `glyde-core` function returns.

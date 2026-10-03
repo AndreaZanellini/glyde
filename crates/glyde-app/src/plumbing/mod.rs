@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::thread;
 
 use glyde_core::dsp::decimation::Bucket;
+use glyde_core::index::spill::SweepReport;
 use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary};
 use glyde_core::series::BoolLane;
 
@@ -236,6 +237,20 @@ pub fn spawn_open_dialog(generation: u64, tx: Sender<IndexingMessage>) {
             }
         })
         .expect("failed to spawn the file dialog thread");
+}
+
+/// Spawns a thread that deletes the spill files under `cache_dir` no running
+/// Glyde is using (issue #118): what a previous run that crashed or was
+/// force-quit left behind, and the loose files versions before #118 never
+/// deleted. Called once at startup, off the UI thread because it can be
+/// gigabytes of deletion. A failure to start it is logged and otherwise
+/// harmless — the next spilled open sweeps too.
+pub fn spawn_spill_sweep(cache_dir: PathBuf) -> Option<thread::JoinHandle<SweepReport>> {
+    thread::Builder::new()
+        .name("glyde-spill-sweep".to_string())
+        .spawn(move || glyde_core::index::spill::sweep_orphaned_spill_files(&cache_dir))
+        .map_err(|err| tracing::warn!(error = %err, "could not start the spill sweep thread"))
+        .ok()
 }
 
 /// The indexer thread's body, split out from [`spawn_index_job`] so tests can
@@ -535,6 +550,24 @@ mod tests {
 
     /// A recognized extension whose file does not exist must still report
     /// `Failed` (the underlying `Io` error), never panic.
+    // Issue #118: what earlier versions left in the cache is given back at
+    // startup, without waiting for the next large file to be opened.
+    #[test]
+    fn the_startup_sweep_deletes_spill_files_left_by_earlier_versions() {
+        let cache = tempfile::tempdir().expect("temp cache dir");
+        let legacy = cache.path().join("0123456789abcdef.c0.glysp");
+        std::fs::write(&legacy, [0u8; 128]).expect("write");
+
+        let report = spawn_spill_sweep(cache.path().to_path_buf())
+            .expect("sweep thread")
+            .join()
+            .expect("sweep must not panic");
+
+        assert_eq!(report.legacy_files, 1);
+        assert_eq!(report.bytes_freed, 128);
+        assert!(!legacy.exists());
+    }
+
     #[test]
     fn spawn_index_job_reports_failed_for_a_missing_file() {
         let path = PathBuf::from("does-not-exist-glyde-plumbing-test.csv");
