@@ -70,8 +70,13 @@ fn an_unreadable_time_column_opens_against_a_row_ordinal_index() {
     }
 
     // The data columns are untouched — this is an index substitution, never a
-    // change to the samples themselves (Golden Rule 1).
-    assert_eq!(dataset.columns.len(), 2);
+    // change to the samples themselves (Golden Rule 1). Since SPEC §2.1's
+    // "Files without a time column", the unreadable column is no longer
+    // dropped either: it is not the index, so it is a series like any other
+    // (text, so it routes to the state timeline), and nothing in the file is
+    // hidden from the user.
+    let names: Vec<&str> = dataset.columns.iter().map(|series| series.name()).collect();
+    assert_eq!(names, ["timestamp", "temperature", "pressure"]);
     assert_eq!(summary.row_count, 6);
     assert_eq!(summary.skipped_row_count, 0);
     assert_eq!(summary.sampling_class, SamplingClass::ProgressiveIndex);

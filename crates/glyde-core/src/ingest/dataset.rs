@@ -48,7 +48,7 @@ use super::csv::{
 use super::infer::{
     log_dtype_choice, normalize_decimal_field, ColumnDtypeChoice, ColumnDtypeScan, ColumnInference,
 };
-use super::IngestOverrides;
+use super::{IngestOverrides, TimeColumnChoice};
 use crate::budget::RamBudget;
 use crate::dsp::decimation::{build_pyramid, build_pyramid_streaming, extend_pyramid, Bucket};
 use crate::index::level0::{self, CacheKey, Level0Cache};
@@ -498,11 +498,12 @@ impl Dataset {
 
 /// Loads every row and column of the delimited-text file at `path`, choosing
 /// between the in-memory and spilled backing stores by the machine's RAM
-/// budget (see the module docs). Column 0 is always the time index, the same
-/// convention `ingest::report::inspect` uses (docs/QUALITY.md's torture
-/// corpus never puts the time column anywhere else). A single-column file
-/// has no data series to plot and is rejected as
-/// [`GlydeError::SingleColumnFile`], exactly like `inspect`.
+/// budget (see the module docs). Column 0 is the time-index candidate, the
+/// same convention `ingest::report::inspect` uses — unless it is a numeric
+/// column that runs backwards or never advances, or no index at all, in which
+/// case it is a series and a row index is generated ([`TimeCandidateScan`],
+/// SPEC §2.1 "Files without a time column"). A file left with nothing to plot
+/// is rejected as [`GlydeError::SingleColumnFile`], exactly like `inspect`.
 pub fn load(path: &Path) -> Result<Dataset> {
     load_with_outcome(path).map(|(_outcome, dataset, _timestamp_format_ambiguous)| dataset)
 }
@@ -701,6 +702,71 @@ fn build_dataset(
     DatasetBuilder::default().finish(outcome, columns_text, overrides)
 }
 
+/// The column SPEC §2.1's time-index detection examines: column 0 unless the
+/// user picked another one (or none at all — `None`). A picked position past
+/// the last column is a stale choice, never a reason to fail the open, so it
+/// falls back to automatic detection with a `warn`.
+fn time_column_candidate(overrides: IngestOverrides, column_count: usize) -> Option<usize> {
+    match overrides.time_column {
+        None => (column_count > 0).then_some(0),
+        Some(TimeColumnChoice::RowIndex) => None,
+        Some(TimeColumnChoice::Column(index)) if index < column_count => Some(index),
+        Some(TimeColumnChoice::Column(index)) => {
+            warn!(
+                picked_column = index,
+                column_count,
+                "the picked time column does not exist in this file; detecting the time column \
+                 automatically instead"
+            );
+            (column_count > 0).then_some(0)
+        }
+    }
+}
+
+/// Whether SPEC §2.1's monotonicity test applies to the candidate: only when
+/// Glyde is choosing on the user's behalf. A deliberately picked column is
+/// taken as given (its out-of-order rows are reported, never overruled).
+fn checks_monotonicity(overrides: IngestOverrides, column_count: usize) -> bool {
+    !matches!(
+        overrides.time_column,
+        Some(TimeColumnChoice::Column(index)) if index < column_count
+    )
+}
+
+/// The data columns of a file with `column_count` columns whose time index
+/// is `time_column` (`None`: a generated row index, so every column is
+/// data), in source header order.
+fn data_column_indices(column_count: usize, time_column: Option<usize>) -> Vec<usize> {
+    (0..column_count)
+        .filter(|&index| Some(index) != time_column)
+        .collect()
+}
+
+/// Whether a file of `column_count` columns, with this time-index decision,
+/// leaves nothing to plot ([`GlydeError::SingleColumnFile`]): no data column
+/// at all (corpus case 18: a lone timestamp column), or a lone column that is
+/// neither timestamps nor numbers. The latter is far more often a wrong
+/// delimiter collapsing every row into one field than a dataset, and failing
+/// cleanly is what lets a bad delimiter correction be noticed rather than
+/// opened as one giant text series.
+pub(crate) fn has_nothing_to_plot(
+    column_count: usize,
+    time_column: Option<usize>,
+    generated: Option<&GeneratedIndexReason>,
+) -> bool {
+    data_column_indices(column_count, time_column).is_empty()
+        || (column_count == 1 && matches!(generated, Some(GeneratedIndexReason::Unreadable { .. })))
+}
+
+/// [`Dataset::time_column_name`] for a time index read from `time_column`,
+/// or [`GENERATED_TIME_COLUMN_NAME`] when there is none.
+fn time_column_name(column_names: &[String], time_column: Option<usize>) -> String {
+    time_column.map_or_else(
+        || GENERATED_TIME_COLUMN_NAME.to_string(),
+        |index| column_names[index].clone(),
+    )
+}
+
 /// Types captured column text into a [`Dataset`] incrementally (issue #114).
 ///
 /// Before #114, every progressive checkpoint re-derived its dataset from
@@ -720,7 +786,19 @@ fn build_dataset(
 #[derive(Default)]
 struct DatasetBuilder {
     time: TimeAxisBuilder,
+    /// One per source column, in header order. The time-index candidate's
+    /// entry is only extended once the candidate turns out *not* to be a
+    /// time index (SPEC §2.1 "Files without a time column") — until then its
+    /// text is typed by `time` alone, so the common case types it once.
     columns: Vec<ColumnInference>,
+    /// The time column the previous [`Self::advance`] settled on (`Some(None)`:
+    /// the generated row index), or `None` before the first call.
+    time_column: Option<Option<usize>>,
+    /// Set when an `advance` settles on a different time column than the one
+    /// before it — a candidate can be demoted when a later row runs
+    /// backwards. Everything derived from earlier checkpoints (a pyramid
+    /// cursor, above all) then describes a different axis and column set.
+    layout_changed: bool,
 }
 
 impl DatasetBuilder {
@@ -735,21 +813,23 @@ impl DatasetBuilder {
         let (time, inference) = self.advance(outcome, columns_text, overrides)?;
         let time = time.unwrap_or_else(|| self.time.absolute_snapshot());
         let decimal_separator = outcome.decimal_separator;
-        let columns = self
-            .columns
-            .iter()
-            .zip(&outcome.column_names[1..])
-            .zip(&columns_text[1..])
-            .map(|((column, name), text)| {
-                column.snapshot(name.clone(), |row| {
+        let columns = data_column_indices(outcome.column_names.len(), inference.time_column)
+            .into_iter()
+            .map(|index| {
+                let text = &columns_text[index];
+                self.columns[index].snapshot(outcome.column_names[index].clone(), |row| {
                     normalize_decimal_field(text.field(row), decimal_separator)
                 })
             })
             .collect();
-        Ok((
-            assemble_dataset(outcome, time, columns, overrides),
-            inference,
-        ))
+        let name = time_column_name(&outcome.column_names, inference.time_column);
+        Ok((assemble_dataset(time, name, columns, overrides), inference))
+    }
+
+    /// Whether the time column changed since this was last asked (see
+    /// [`Self::layout_changed`]), clearing the flag.
+    fn take_layout_changed(&mut self) -> bool {
+        std::mem::take(&mut self.layout_changed)
     }
 
     /// The final dataset, handing over the typed vectors rather than copying
@@ -763,27 +843,31 @@ impl DatasetBuilder {
         let (time, inference) = self.advance(outcome, columns_text, overrides)?;
         let time = time.unwrap_or_else(|| self.time.take_absolute());
         let decimal_separator = outcome.decimal_separator;
+        let name = time_column_name(&outcome.column_names, inference.time_column);
+        log_time_index_decision(
+            &name,
+            &inference,
+            columns_text.first().map_or(0, ColumnText::len),
+        );
         let columns = std::mem::take(&mut self.columns)
             .into_iter()
-            .zip(&outcome.column_names[1..])
-            .zip(&columns_text[1..])
-            .map(|((column, name), text)| {
+            .enumerate()
+            .filter(|&(index, _)| Some(index) != inference.time_column)
+            .map(|(index, column)| {
+                let text = &columns_text[index];
                 column
-                    .finish(name.clone(), |row| {
+                    .finish(outcome.column_names[index].clone(), |row| {
                         normalize_decimal_field(text.field(row), decimal_separator)
                     })
                     .series
             })
             .collect();
-        Ok((
-            assemble_dataset(outcome, time, columns, overrides),
-            inference,
-        ))
+        Ok((assemble_dataset(time, name, columns, overrides), inference))
     }
 
     /// Types every row not yet typed, in every column. Returns the time axis
     /// only when it is *not* the incrementally-built absolute axis (a
-    /// progressive index or the row-ordinal fallback, both cheap and rare);
+    /// progressive index or the generated row index, both cheap and rare);
     /// otherwise the caller reads it from [`Self::time`].
     fn advance(
         &mut self,
@@ -791,43 +875,99 @@ impl DatasetBuilder {
         columns_text: &[ColumnText],
         overrides: IngestOverrides,
     ) -> Result<(Option<TimeAxis>, TimeIndexInference)> {
-        if outcome.column_names.len() < 2 {
-            return Err(GlydeError::SingleColumnFile);
-        }
-        let data_columns = &columns_text[1..];
+        let column_count = outcome.column_names.len();
+        let row_count = columns_text.first().map_or(0, ColumnText::len);
+        let candidate = time_column_candidate(overrides, column_count);
+        let check_monotonic = checks_monotonicity(overrides, column_count);
         self.columns
-            .resize_with(data_columns.len(), ColumnInference::default);
+            .resize_with(column_count, ColumnInference::default);
         let decimal_separator = outcome.decimal_separator;
         let (time, ()) = rayon::join(
-            || {
-                self.time
-                    .advance(&columns_text[0], &outcome.column_names[0], overrides)
+            || match candidate {
+                Some(index) => self.time.advance(
+                    &columns_text[index],
+                    &outcome.column_names[index],
+                    overrides,
+                    check_monotonic,
+                ),
+                None => Ok(TimeAdvance {
+                    axis: Some(row_ordinal_axis(row_count)),
+                    generated: Some(GeneratedIndexReason::Requested),
+                    timestamp_format_ambiguous: false,
+                }),
             },
             || {
                 use rayon::prelude::*;
                 self.columns
                     .par_iter_mut()
-                    .zip(data_columns)
-                    .for_each(|(column, text)| {
+                    .zip(columns_text)
+                    .enumerate()
+                    .filter(|&(index, _)| Some(index) != candidate)
+                    .for_each(|(_, (column, text))| {
                         column.extend(text.len(), |row| {
                             normalize_decimal_field(text.field(row), decimal_separator)
                         })
                     });
             },
         );
-        time
+        let time = time?;
+
+        let time_column = if time.generated.is_some() {
+            None
+        } else {
+            candidate
+        };
+        if let (None, Some(index)) = (time_column, candidate) {
+            // Demoted: the candidate is a series after all, typed like any
+            // other (from row 0 if this is the first call that knows it).
+            let text = &columns_text[index];
+            self.columns[index].extend(text.len(), |row| {
+                normalize_decimal_field(text.field(row), decimal_separator)
+            });
+        }
+        if self
+            .time_column
+            .is_some_and(|previous| previous != time_column)
+        {
+            self.layout_changed = true;
+        }
+        self.time_column = Some(time_column);
+
+        if has_nothing_to_plot(column_count, time_column, time.generated.as_ref()) {
+            return Err(GlydeError::SingleColumnFile);
+        }
+        Ok((
+            time.axis,
+            TimeIndexInference {
+                timestamp_format_ambiguous: time.timestamp_format_ambiguous,
+                time_column,
+                generated: time.generated,
+            },
+        ))
     }
 }
 
-/// [`DatasetBuilder`]'s time-axis half: SPEC §2.1's timestamp-format scan,
-/// fed incrementally, and the timestamps parsed so far under the format it
-/// currently settles on. Should a later row change that decision, the
-/// timestamps are re-parsed from the first row under the new format, so the
-/// result is always exactly what a from-scratch pass over the same rows
-/// produces.
+/// What one [`TimeAxisBuilder::advance`] settled.
+struct TimeAdvance {
+    /// `None` when the axis is the incrementally-built absolute one, read
+    /// from the builder instead.
+    axis: Option<TimeAxis>,
+    /// `Some` when the candidate is not a time index and `axis` is the
+    /// generated row index.
+    generated: Option<GeneratedIndexReason>,
+    timestamp_format_ambiguous: bool,
+}
+
+/// [`DatasetBuilder`]'s time-axis half: SPEC §2.1's timestamp-format scan and
+/// the time-candidate verdict, fed incrementally, and the timestamps parsed
+/// so far under the format the scan currently settles on. Should a later row
+/// change that decision, the timestamps are re-parsed from the first row
+/// under the new format, so the result is always exactly what a from-scratch
+/// pass over the same rows produces.
 #[derive(Default)]
 struct TimeAxisBuilder {
     scan: TimestampFormatScan,
+    candidate: TimeCandidateScan,
     observed: usize,
     parsed: Vec<Timestamp>,
     parsed_format: Option<TimestampFormat>,
@@ -839,8 +979,17 @@ impl TimeAxisBuilder {
         text: &ColumnText,
         column_name: &str,
         overrides: IngestOverrides,
-    ) -> Result<(Option<TimeAxis>, TimeIndexInference)> {
+        check_monotonic: bool,
+    ) -> Result<TimeAdvance> {
         let total = text.len();
+        for row in self.observed..total {
+            let field = text.field(row);
+            if overrides.timestamp_format.is_none() {
+                self.scan.observe(field);
+            }
+            self.candidate.observe(field);
+        }
+        self.observed = total;
         let inference = match overrides.timestamp_format {
             // A user override settles the format outright, never scanned —
             // the same as `resolve_timestamp_format`.
@@ -848,14 +997,25 @@ impl TimeAxisBuilder {
                 format,
                 ambiguous: false,
             }),
-            None => {
-                for row in self.observed..total {
-                    self.scan.observe(text.field(row));
-                }
-                self.observed = total;
-                self.scan.clone().finish()
-            }
+            None => self.scan.clone().finish(),
         };
+
+        // SPEC §2.1 "Files without a time column": a numeric column that
+        // runs backwards or never advances is a signal, and one that is
+        // neither timestamps nor numbers is no index at all (issue #94) —
+        // either way the row index stands in for it.
+        if let Some(reason) =
+            self.candidate
+                .verdict(inference.is_some(), check_monotonic, column_name)
+        {
+            self.parsed = Vec::new();
+            self.parsed_format = None;
+            return Ok(TimeAdvance {
+                axis: Some(row_ordinal_axis(total)),
+                generated: Some(reason),
+                timestamp_format_ambiguous: false,
+            });
+        }
 
         match inference {
             Some(format_inference) => {
@@ -870,39 +1030,27 @@ impl TimeAxisBuilder {
                     self.parsed
                         .push(parse_timestamp(text.field(row), format_inference.format)?);
                 }
-                Ok((
-                    None,
-                    TimeIndexInference {
-                        timestamp_format_ambiguous: format_inference.ambiguous,
-                        row_ordinal_fallback: false,
-                    },
-                ))
+                Ok(TimeAdvance {
+                    axis: None,
+                    generated: None,
+                    timestamp_format_ambiguous: format_inference.ambiguous,
+                })
             }
             // SPEC §2.1: no recognized absolute-timestamp format matched every
-            // field, so this is a progressive numeric index (corpus case 35) —
-            // unless it isn't even that, in which case the column is not a time
-            // index at all and the row ordinal stands in for it (issue #94).
+            // field, but every field is a number (the verdict above saw to
+            // that), so this is a progressive numeric index (corpus case 35).
             None => {
                 self.parsed = Vec::new();
                 self.parsed_format = None;
-                let fields: Vec<&str> = (0..total).map(|row| text.field(row)).collect();
-                Ok(match parse_progressive_values(&fields) {
-                    Ok(values) => (
-                        Some(TimeAxis::Progressive {
-                            values: ProgressiveValues::Memory(values),
-                        }),
-                        TimeIndexInference::default(),
-                    ),
-                    Err(rejection) => {
-                        rejection.log(column_name);
-                        (
-                            Some(row_ordinal_axis(total)),
-                            TimeIndexInference {
-                                timestamp_format_ambiguous: false,
-                                row_ordinal_fallback: true,
-                            },
-                        )
-                    }
+                let values = (0..total)
+                    .map(|row| parse_progressive_value(text.field(row)))
+                    .collect::<Result<Vec<f64>>>()?;
+                Ok(TimeAdvance {
+                    axis: Some(TimeAxis::Progressive {
+                        values: ProgressiveValues::Memory(values),
+                    }),
+                    generated: None,
+                    timestamp_format_ambiguous: false,
                 })
             }
         }
@@ -928,14 +1076,14 @@ impl TimeAxisBuilder {
 }
 
 fn assemble_dataset(
-    outcome: &CsvParseOutcome,
     time: TimeAxis,
+    time_column_name: String,
     columns: Vec<Series>,
     overrides: IngestOverrides,
 ) -> Dataset {
     let mut dataset = Dataset {
         time,
-        time_column_name: outcome.column_names[0].clone(),
+        time_column_name,
         columns,
     };
     if overrides.sort_by_time {
@@ -975,25 +1123,104 @@ fn sort_dataset_by_time(dataset: &mut Dataset) {
 }
 
 /// What ingestion settled about the time index beyond the axis itself — the
-/// two things `super::report` needs to describe an open in SPEC §1.2's
+/// things `super::report` needs to describe an open in SPEC §1.2's
 /// inference bar but cannot re-derive from a finished [`Dataset`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TimeIndexInference {
     /// SPEC §2.1's day-vs-month ambiguity rule fired: the format is the
     /// documented default, not a discriminated match, so the inference bar
     /// reports it low-confidence with a one-click swap.
     pub(crate) timestamp_format_ambiguous: bool,
-    /// Issue #94: the declared time column matched no timestamp format *and*
-    /// is not numeric either, so it cannot be a time index at all and the row
-    /// ordinal stands in for it. The load still succeeds — SPEC §1.3 "never
-    /// abort the load" — and the inference bar reports both time fields at
-    /// low confidence so the substitution is never silent (Golden Rule 2).
-    pub(crate) row_ordinal_fallback: bool,
+    /// The 0-based header position of the column the time index was read
+    /// from, or `None` for the generated row index.
+    pub(crate) time_column: Option<usize>,
+    /// Why the row index was generated, when it was. The load still succeeds
+    /// either way — SPEC §1.3 "never abort the load" — and every reason but
+    /// [`GeneratedIndexReason::Requested`] is reported low-confidence so the
+    /// substitution is never silent (Golden Rule 2).
+    pub(crate) generated: Option<GeneratedIndexReason>,
+}
+
+/// [`Dataset::time_column_name`] when the time index is generated rather
+/// than read from a column.
+pub const GENERATED_TIME_COLUMN_NAME: &str = "row index";
+
+/// Why a file is plotted against a generated row index `0, 1, 2, …` instead
+/// of one of its own columns (SPEC §2.1 "Files without a time column").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GeneratedIndexReason {
+    /// The user asked for the row index (SPEC §1.2's time-column correction).
+    Requested,
+    /// The candidate column is numeric, but its value drops at row index
+    /// `row` (0-based, the same position the generated axis gives that row),
+    /// so it is a signal, not a time index. NaN counts as a drop: a time
+    /// index has no missing values.
+    NotMonotonic { column: String, row: u64 },
+    /// The candidate column is numeric but holds one value throughout — it
+    /// never advances, so it cannot place samples in time.
+    Constant { column: String },
+    /// The candidate column is numeric and never decreases, but it stays on
+    /// the same value for most rows, changing on only `changes` of them — a
+    /// staircase such as an operating-point or test-step number. Plotted
+    /// against it, every sample of one step would land on the same x.
+    MostlyRepeated { column: String, changes: u64 },
+    /// The candidate column is neither timestamps in a supported format nor
+    /// numbers (issue #94).
+    Unreadable { column: String },
+}
+
+/// CLAUDE.md "every ingestion decision is logged": the time index is the
+/// first one the plot depends on, and generating one the file does not
+/// contain is the loudest decision ingestion can take on the user's behalf.
+fn log_time_index_decision(time_column_name: &str, inference: &TimeIndexInference, rows: usize) {
+    match &inference.generated {
+        None => info!(
+            time_column = %time_column_name,
+            position = inference.time_column,
+            "time index read from a column of the file (SPEC §2.1)"
+        ),
+        Some(GeneratedIndexReason::Requested) => info!(
+            rows,
+            "no time column, as requested: plotting every column against the row index"
+        ),
+        Some(GeneratedIndexReason::NotMonotonic { column, row }) => warn!(
+            candidate = %column,
+            first_drop_at_row = row,
+            rows,
+            "no time column detected: the first column is numeric but runs backwards, so it is \
+             plotted as a signal against a generated row index (SPEC §2.1), reported \
+             low-confidence in the inference bar"
+        ),
+        Some(GeneratedIndexReason::MostlyRepeated { column, changes }) => warn!(
+            candidate = %column,
+            changes,
+            rows,
+            "no time column detected: the first column never decreases but stays on the same \
+             value for most rows (a staircase, not a time axis), so it is plotted as a signal \
+             against a generated row index (SPEC §2.1), reported low-confidence in the \
+             inference bar"
+        ),
+        Some(GeneratedIndexReason::Constant { column }) => warn!(
+            candidate = %column,
+            rows,
+            "no time column detected: the first column holds a single value throughout, so it is \
+             plotted as a signal against a generated row index (SPEC §2.1), reported \
+             low-confidence in the inference bar"
+        ),
+        Some(GeneratedIndexReason::Unreadable { column }) => warn!(
+            candidate = %column,
+            rows,
+            "the time column matches no timestamp format (SPEC §2.1) and is not numeric either; \
+             it is kept as a series and the file is plotted against a generated row index \
+             instead of being refused (SPEC §1.3 \"never abort the load\"), reported \
+             low-confidence in the inference bar"
+        ),
+    }
 }
 
 /// SPEC §2.1's progressive numeric index: a plain number with no
 /// absolute-time meaning. A field that is not even that is not a time index
-/// value at all — see [`TimeIndexRejection`].
+/// value at all — see [`TimeCandidateScan`].
 fn parse_progressive_value(field: &str) -> Result<f64> {
     field
         .trim()
@@ -1003,78 +1230,102 @@ fn parse_progressive_value(field: &str) -> Result<f64> {
         })
 }
 
-/// Reads a whole time column as SPEC §2.1's progressive numeric index, or
-/// reports why it is not one (issue #94).
-fn parse_progressive_values(fields: &[&str]) -> std::result::Result<Vec<f64>, TimeIndexRejection> {
-    let mut values = Vec::with_capacity(fields.len());
-    let mut rejection = TimeIndexRejection::default();
-    for field in fields {
-        match parse_progressive_value(field) {
-            Ok(value) => {
-                if rejection.is_empty() {
-                    values.push(value);
+/// Whether a candidate column can be the time index, decided from its text
+/// one field at a time, so the in-memory, spilled and progressive paths all
+/// reach the same verdict without holding the column (SPEC §2.1 "Files
+/// without a time column").
+///
+/// A column of dates and times is unmistakably a time column, even with rows
+/// out of order (SPEC §2.1 reports those with [Sort]/[Keep as-is]). A
+/// *numeric* column is not: an epoch counter and an accelerometer channel
+/// look alike field by field. What tells them apart is order — a time index
+/// never runs backwards and does advance — so a numeric candidate that drops
+/// (or is constant, or a staircase that stays on one value for most rows) is
+/// a signal and the row index stands in for it. The test
+/// is on the parsed `f64`, the same value for every numeric format (epoch,
+/// LabVIEW, Excel serial, progressive), so it never depends on which format
+/// the column also happens to match.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TimeCandidateScan {
+    rows: usize,
+    /// Fields that are not numbers (issue #94).
+    non_numeric: usize,
+    previous: Option<f64>,
+    first_drop: Option<usize>,
+    /// How many steps (row to the next) increased the value.
+    advances: u64,
+}
+
+impl TimeCandidateScan {
+    pub(crate) fn observe(&mut self, field: &str) {
+        let row = self.rows;
+        self.rows += 1;
+        let Ok(value) = parse_progressive_value(field) else {
+            self.non_numeric += 1;
+            return;
+        };
+        if let Some(previous) = self.previous {
+            // Incomparable (a NaN on either side) counts as a drop too.
+            match value.partial_cmp(&previous) {
+                Some(std::cmp::Ordering::Greater) => self.advances += 1,
+                Some(std::cmp::Ordering::Equal) => {}
+                Some(std::cmp::Ordering::Less) | None => {
+                    self.first_drop.get_or_insert(row);
                 }
             }
-            Err(_) => rejection.observe(field),
         }
+        self.previous = Some(value);
     }
 
-    if rejection.is_empty() {
-        Ok(values)
-    } else {
-        // The partially-filled `values` is dropped: a rejected column produces
-        // row ordinals for *every* row, never a mix of the two.
-        Err(rejection.with_total(fields.len()))
-    }
-}
-
-/// Why a time column is not a time index (issue #94): how many of its fields
-/// parse as neither a timestamp nor a number, and the first one that did not
-/// — so the `warn` log names the value the user has to look at, and says
-/// whether the whole column is unreadable or just one stray row.
-#[derive(Debug, Default, Clone)]
-struct TimeIndexRejection {
-    first_offender: Option<String>,
-    unparseable_count: usize,
-    total_count: usize,
-}
-
-impl TimeIndexRejection {
-    fn is_empty(&self) -> bool {
-        self.unparseable_count == 0
-    }
-
-    fn observe(&mut self, field: &str) {
-        self.unparseable_count += 1;
-        if self.first_offender.is_none() {
-            self.first_offender = Some(field.to_string());
+    /// `None` when the candidate is a time index; otherwise why it is not.
+    /// `matches_timestamp_format`: whether every field also parses under the
+    /// (inferred or user-chosen) timestamp format. `check_monotonic` is off
+    /// for a column the user picked deliberately.
+    pub(crate) fn verdict(
+        &self,
+        matches_timestamp_format: bool,
+        check_monotonic: bool,
+        column: &str,
+    ) -> Option<GeneratedIndexReason> {
+        if self.non_numeric > 0 {
+            return (!matches_timestamp_format).then(|| GeneratedIndexReason::Unreadable {
+                column: column.to_string(),
+            });
         }
-    }
-
-    fn with_total(mut self, total_count: usize) -> Self {
-        self.total_count = total_count;
-        self
-    }
-
-    /// CLAUDE.md "every ingestion decision is logged": this one substitutes an
-    /// index the file does not contain, which is the loudest decision
-    /// ingestion can take on the user's behalf.
-    fn log(&self, column: &str) {
-        warn!(
-            time_column = %column,
-            first_unreadable_value = %self.first_offender.as_deref().unwrap_or(""),
-            unreadable_fields = self.unparseable_count,
-            total_fields = self.total_count,
-            "the time column matches no timestamp format (SPEC §2.1) and is not numeric either; \
-             opening with a row-ordinal index instead of refusing the file (SPEC §1.3 \"never \
-             abort the load\"), reported low-confidence in the inference bar"
-        );
+        if !check_monotonic {
+            return None;
+        }
+        if let Some(row) = self.first_drop {
+            return Some(GeneratedIndexReason::NotMonotonic {
+                column: column.to_string(),
+                row: row as u64,
+            });
+        }
+        if self.rows < 2 {
+            return None;
+        }
+        if self.advances == 0 {
+            return Some(GeneratedIndexReason::Constant {
+                column: column.to_string(),
+            });
+        }
+        // A time index advances on most rows; duplicates are occasional
+        // anomalies (SPEC §2.1 "preserved, flagged"). One that advances on
+        // fewer than half of its steps is a staircase — every row of one step
+        // would share one x. The threshold is an assumption flagged in
+        // `CHANGELOG.md`, not a SPEC number.
+        let steps = (self.rows - 1) as u64;
+        (self.advances * 2 < steps).then(|| GeneratedIndexReason::MostlyRepeated {
+            column: column.to_string(),
+            changes: self.advances,
+        })
     }
 }
 
-/// Issue #94's index of last resort: row 0, 1, 2, … as an SPEC §2.1
-/// progressive numeric axis, so a file whose time column Glyde cannot read
-/// still opens, still plots, and still keeps its rows in source order.
+/// The generated row index (SPEC §2.1 "Files without a time column", issue
+/// #94): row 0, 1, 2, … of the rows kept after SPEC §1.3's skipping, as a
+/// progressive numeric axis, so a file without a usable time column still
+/// opens, still plots, and still keeps its rows in source order.
 fn row_ordinal_axis(row_count: usize) -> TimeAxis {
     TimeAxis::Progressive {
         values: ProgressiveValues::Memory((0..row_count).map(|row| row as f64).collect()),
@@ -1111,23 +1362,21 @@ fn load_spilled(
     overrides: IngestOverrides,
 ) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     let column_names = sniff.column_names().to_vec();
-    if column_names.len() < 2 {
-        return Err(GlydeError::SingleColumnFile);
-    }
+    let column_count = column_names.len();
     let decimal_separator = sniff.decimal_separator;
-    let data_column_count = column_names.len() - 1;
+    let candidate = time_column_candidate(overrides, column_count);
+    let check_monotonic = checks_monotonicity(overrides, column_count);
 
     // --- Pass 1: infer, retaining nothing -----------------------------------
     let mut time_scan = TimestampFormatScan::default();
-    // Issue #94: the same "is this column a progressive numeric index at all?"
-    // question the in-memory path answers with `parse_progressive_values`,
-    // asked incrementally so a spilled open reaches the same verdict without
-    // holding the column. Counting every offender (rather than stopping at the
-    // first) costs nothing but makes the `warn` log say whether the column is
-    // unreadable or merely has one stray row.
-    let mut time_rejection = TimeIndexRejection::default();
-    let mut time_field_count = 0usize;
-    let mut dtype_scans: Vec<ColumnDtypeScan> = (0..data_column_count)
+    // SPEC §2.1 "Files without a time column" / issue #94: the same verdict
+    // the in-memory path reaches, asked incrementally so a spilled open
+    // reaches it without holding the column.
+    let mut candidate_scan = TimeCandidateScan::default();
+    // One dtype scan per column, the time candidate's included: whether the
+    // candidate is a time index is only known once pass 1 ends, and if it is
+    // not, it is written as a series in pass 2.
+    let mut dtype_scans: Vec<ColumnDtypeScan> = (0..column_count)
         .map(|_| ColumnDtypeScan::default())
         .collect();
     //
@@ -1136,15 +1385,13 @@ fn load_spilled(
     // (issue #114): every column's scan is independent and sees its own
     // fields in row order, so the result is the row-at-a-time scan's
     // exactly — and this pass is what a spilled open's first plot waits on.
-    stream_in_batches(path, sniff, column_names.len(), |batch| {
-        let (time_text, data_text) = batch.split_at(1);
+    stream_in_batches(path, sniff, column_count, |batch| {
         rayon::join(
             || {
-                for time_field in time_text[0].iter() {
-                    time_scan.observe(time_field);
-                    time_field_count += 1;
-                    if parse_progressive_value(time_field).is_err() {
-                        time_rejection.observe(time_field);
+                if let Some(index) = candidate {
+                    for time_field in batch[index].iter() {
+                        time_scan.observe(time_field);
+                        candidate_scan.observe(time_field);
                     }
                 }
             },
@@ -1152,7 +1399,7 @@ fn load_spilled(
                 use rayon::prelude::*;
                 dtype_scans
                     .par_iter_mut()
-                    .zip(data_text)
+                    .zip(batch)
                     .for_each(|(scan, text)| {
                         for field in text.iter() {
                             scan.observe(&normalize_decimal_field(field, decimal_separator));
@@ -1173,17 +1420,30 @@ fn load_spilled(
         }),
         None => time_scan.finish(),
     };
-    let choices: Vec<ColumnDtypeChoice> = dtype_scans.iter().map(ColumnDtypeScan::finish).collect();
-
-    // Issue #94: neither a timestamp format nor a number — the column is not a
-    // time index, so row ordinals stand in for it rather than the open failing.
-    let row_ordinal_fallback = timestamp_format.is_none() && !time_rejection.is_empty();
-    if row_ordinal_fallback {
-        time_rejection
-            .clone()
-            .with_total(time_field_count)
-            .log(&column_names[0]);
+    let generated = match candidate {
+        Some(index) => candidate_scan.verdict(
+            timestamp_format.is_some(),
+            check_monotonic,
+            &column_names[index],
+        ),
+        None => Some(GeneratedIndexReason::Requested),
+    };
+    let time_column = if generated.is_some() { None } else { candidate };
+    let timestamp_format = timestamp_format.filter(|_| time_column.is_some());
+    if has_nothing_to_plot(column_count, time_column, generated.as_ref()) {
+        return Err(GlydeError::SingleColumnFile);
     }
+    let data_columns = data_column_indices(column_count, time_column);
+    let choices: Vec<ColumnDtypeChoice> = data_columns
+        .iter()
+        .map(|&index| dtype_scans[index].finish())
+        .collect();
+    let time_column_name = time_column_name(&column_names, time_column);
+    let inference = TimeIndexInference {
+        timestamp_format_ambiguous: timestamp_format.is_some_and(|inference| inference.ambiguous),
+        time_column,
+        generated,
+    };
 
     // --- Pass 2: type every row straight into its spill file ----------------
     // `.with_overrides_signature`: these spill files are always freshly
@@ -1201,7 +1461,7 @@ fn load_spilled(
         cache_dir,
         &stem,
         timestamp_format.map(|inference| inference.format),
-        row_ordinal_fallback,
+        inference.generated.is_some(),
     )?;
     let mut column_writers: Vec<ColumnSpillWriter> = choices
         .iter()
@@ -1210,10 +1470,15 @@ fn load_spilled(
             ColumnSpillWriter::create(cache_dir, &format!("{stem}.c{index}"), choice.dtype)
         })
         .collect::<Result<_>>()?;
+    let data_column_names: Vec<String> = data_columns
+        .iter()
+        .map(|&index| column_names[index].clone())
+        .collect();
 
     let mut preview = SpillPreview::new(
         on_checkpoint,
-        &column_names,
+        time_column_name.clone(),
+        data_column_names.clone(),
         &choices,
         timestamp_format.map(|inference| inference.format),
     );
@@ -1222,9 +1487,11 @@ fn load_spilled(
     // preview vector — sees its own fields in row order, on the `rayon`
     // pool, and the preview's checkpoints are emitted afterwards over
     // exactly the row prefixes the row-at-a-time loop emitted them at.
-    let outcome = stream_in_batches(path, sniff, column_names.len(), |batch| {
+    let outcome = stream_in_batches(path, sniff, column_count, |batch| {
         write_spill_batch(
             batch,
+            time_column,
+            &data_columns,
             &mut time_writer,
             &mut column_writers,
             decimal_separator,
@@ -1233,20 +1500,21 @@ fn load_spilled(
     })?;
     drop(preview);
 
+    log_time_index_decision(&time_column_name, &inference, outcome.row_count as usize);
     let time = time_writer.finish()?;
     let columns = column_writers
         .into_iter()
-        .zip(&column_names[1..])
+        .zip(data_column_names)
         .zip(&choices)
         .map(|((writer, name), choice)| {
             log_dtype_choice(*choice, outcome.row_count as usize);
-            writer.finish(name.clone())
+            writer.finish(name)
         })
         .collect::<Result<Vec<Series>>>()?;
 
     info!(
         row_count = outcome.row_count,
-        column_count = column_names.len(),
+        column_count,
         cache_dir = %cache_dir.display(),
         "file materialized through the on-disk spill cache (SPEC §5.1)"
     );
@@ -1255,14 +1523,10 @@ fn load_spilled(
         outcome,
         Dataset {
             time,
-            time_column_name: column_names[0].clone(),
+            time_column_name,
             columns,
         },
-        TimeIndexInference {
-            timestamp_format_ambiguous: timestamp_format
-                .is_some_and(|inference| inference.ambiguous),
-            row_ordinal_fallback,
-        },
+        inference,
     ))
 }
 
@@ -1352,14 +1616,18 @@ const SPILL_BATCHES_IN_FLIGHT: usize = 2;
 /// the preview has counted (and checkpointed) every row before it.
 fn write_spill_batch(
     batch: &[ColumnText],
+    time_column: Option<usize>,
+    data_columns: &[usize],
     time_writer: &mut TimeAxisSpillWriter,
     column_writers: &mut [ColumnSpillWriter],
     decimal_separator: super::infer::DecimalSeparator,
     preview: &mut SpillPreview<'_>,
 ) -> Result<()> {
-    let rows = batch[0].len();
+    let rows = batch.first().map_or(0, ColumnText::len);
     let collect = preview.is_active();
-    let (time_text, data_text) = batch.split_at(1);
+    // A generated row index reads no field at all (`TimeAxisSpillWriter::RowOrdinal`).
+    let time_text = time_column.map(|index| &batch[index]);
+    let data_text: Vec<&ColumnText> = data_columns.iter().map(|&index| &batch[index]).collect();
     let SpillPreview {
         timestamps,
         progressive,
@@ -1372,7 +1640,7 @@ fn write_spill_batch(
     let (time_failure, column_failures) = rayon::join(
         || -> Option<(usize, usize, GlydeError)> {
             for row in 0..rows {
-                match time_writer.push(time_text[0].field(row)) {
+                match time_writer.push(time_text.map_or("", |text| text.field(row))) {
                     Ok(value) if collect => match value {
                         TimeValue::Absolute(timestamp) => timestamps.push(timestamp),
                         TimeValue::Progressive(value) => progressive.push(value),
@@ -1432,10 +1700,11 @@ const SCAN_BATCH_ROWS: usize = 16_384;
 enum TimeAxisSpillWriter {
     Absolute(Box<AbsoluteAxisSpillWriter>),
     Progressive(SpillVecWriter<f64>),
-    /// Issue #94: the time column is neither timestamps nor numbers, so the
-    /// row ordinal is written in its place. Structurally a `Progressive` axis
-    /// — the difference is that the values come from the row counter rather
-    /// than from the file, which is what the inference bar flags.
+    /// The generated row index (SPEC §2.1 "Files without a time column",
+    /// issue #94): the row ordinal is written in place of a time column.
+    /// Structurally a `Progressive` axis — the difference is that the values
+    /// come from the row counter rather than from the file, which is what the
+    /// inference bar flags.
     RowOrdinal {
         values: SpillVecWriter<f64>,
         next_row: u64,
@@ -1456,7 +1725,7 @@ impl TimeAxisSpillWriter {
         cache_dir: &Path,
         stem: &str,
         format: Option<TimestampFormat>,
-        row_ordinal_fallback: bool,
+        generated_index: bool,
     ) -> Result<Self> {
         match format {
             Some(format) => Ok(TimeAxisSpillWriter::Absolute(Box::new(
@@ -1467,7 +1736,7 @@ impl TimeAxisSpillWriter {
                     format,
                 },
             ))),
-            None if row_ordinal_fallback => Ok(TimeAxisSpillWriter::RowOrdinal {
+            None if generated_index => Ok(TimeAxisSpillWriter::RowOrdinal {
                 values: SpillVecWriter::create(cache_dir, &format!("{stem}.tsprogressive"))?,
                 next_row: 0,
             }),
@@ -1498,9 +1767,9 @@ impl TimeAxisSpillWriter {
                 values.push(value)?;
                 Ok(TimeValue::Progressive(value))
             }
-            // Issue #94: the field is deliberately not read — pass 1 already
-            // established it is not an index value, and substituting the row
-            // ordinal is exactly the decision the inference bar reports.
+            // The field is deliberately not read — pass 1 already established
+            // there is no time column to read it from, and substituting the
+            // row ordinal is exactly the decision the inference bar reports.
             TimeAxisSpillWriter::RowOrdinal { values, next_row } => {
                 let value = *next_row as f64;
                 values.push(value)?;
@@ -1756,14 +2025,15 @@ impl PreviewColumn {
 impl<'a> SpillPreview<'a> {
     fn new(
         on_checkpoint: Option<&'a mut dyn FnMut(Checkpoint)>,
-        column_names: &[String],
+        time_column_name: String,
+        column_names: Vec<String>,
         choices: &[ColumnDtypeChoice],
         format: Option<TimestampFormat>,
     ) -> Self {
         Self {
             on_checkpoint,
-            time_column_name: column_names[0].clone(),
-            column_names: column_names[1..].to_vec(),
+            time_column_name,
+            column_names,
             format,
             timestamps: Vec::new(),
             progressive: Vec::new(),
@@ -1957,6 +2227,11 @@ fn load_with_outcome_progressive_using(
                     overrides,
                 ) {
                     Ok((dataset, _ambiguous)) => {
+                        if builder.take_layout_changed() {
+                            // The time column was demoted: the axis and the
+                            // column set the cursor extends are gone.
+                            pyramid_cursor = PyramidCursor::default();
+                        }
                         let pyramids = pyramid_cursor.update(&dataset);
                         on_checkpoint(Checkpoint {
                             rows_read: partial_outcome.row_count,
@@ -2012,6 +2287,9 @@ pub fn load_progressive_with_budget(
                 |partial, columns| {
                     if let Ok((dataset, _ambiguous)) = builder.snapshot(partial, columns, overrides)
                     {
+                        if builder.take_layout_changed() {
+                            pyramid_cursor = PyramidCursor::default();
+                        }
                         let pyramids = pyramid_cursor.update(&dataset);
                         on_checkpoint(Checkpoint {
                             rows_read: partial.row_count,
@@ -2593,28 +2871,92 @@ mod tests {
             .join(file_name)
     }
 
-    // Issue #94: the column-level verdict itself, isolated from any file. A
-    // column of real numbers is a progressive index; one bad field makes the
-    // whole column not an index, and the rejection carries what the `warn` log
-    // needs to name the culprit.
+    fn verdict_of(fields: &[&str], check_monotonic: bool) -> Option<GeneratedIndexReason> {
+        let mut scan = TimeCandidateScan::default();
+        for field in fields {
+            scan.observe(field);
+        }
+        let matches_format = crate::time::infer_timestamp_format(fields).is_some();
+        scan.verdict(matches_format, check_monotonic, "c")
+    }
+
+    // SPEC §2.1 "Files without a time column": the column-level verdict
+    // itself, isolated from any file.
     #[test]
-    fn a_numeric_time_column_reads_as_a_progressive_index() {
-        let fields = ["0", "10", " 20 ", "30.5"];
-        let values = parse_progressive_values(&fields).expect("every field is a number");
-        assert_eq!(values, vec![0.0, 10.0, 20.0, 30.5]);
+    fn a_non_decreasing_numeric_column_is_a_time_index() {
+        assert_eq!(verdict_of(&["0", "10", " 20 ", "20", "30.5"], true), None);
     }
 
     #[test]
-    fn an_unreadable_time_column_is_rejected_with_the_first_offender_named() {
-        let fields = ["0", "10", "01-Jan-2026 00:00:00", "30", "not a number"];
-        let rejection = parse_progressive_values(&fields).expect_err("two fields are not numbers");
-
-        assert_eq!(rejection.unparseable_count, 2);
-        assert_eq!(rejection.total_count, 5);
+    fn a_numeric_column_that_drops_is_a_signal_and_names_the_first_drop() {
         assert_eq!(
-            rejection.first_offender.as_deref(),
-            Some("01-Jan-2026 00:00:00")
+            verdict_of(&["0", "1", "2", "1.5", "0"], true),
+            Some(GeneratedIndexReason::NotMonotonic {
+                column: "c".to_string(),
+                row: 3,
+            })
         );
+    }
+
+    #[test]
+    fn a_nan_in_a_numeric_candidate_counts_as_a_drop() {
+        assert_eq!(
+            verdict_of(&["0", "NaN", "2"], true),
+            Some(GeneratedIndexReason::NotMonotonic {
+                column: "c".to_string(),
+                row: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_constant_numeric_column_is_a_signal_but_a_single_row_is_not_judged() {
+        assert_eq!(
+            verdict_of(&["4", "4", "4"], true),
+            Some(GeneratedIndexReason::Constant {
+                column: "c".to_string(),
+            })
+        );
+        assert_eq!(verdict_of(&["4"], true), None);
+    }
+
+    #[test]
+    fn a_column_that_changes_on_few_rows_is_a_signal() {
+        assert_eq!(
+            verdict_of(&["1", "1", "1", "2", "2", "2"], true),
+            Some(GeneratedIndexReason::MostlyRepeated {
+                column: "c".to_string(),
+                changes: 1,
+            })
+        );
+        // Exactly half of the steps advancing is enough.
+        assert_eq!(verdict_of(&["0", "1", "1", "2", "2"], true), None);
+    }
+
+    #[test]
+    fn a_picked_numeric_column_is_never_overruled_for_running_backwards() {
+        assert_eq!(verdict_of(&["3", "1", "2"], false), None);
+        assert_eq!(verdict_of(&["3", "3"], false), None);
+    }
+
+    #[test]
+    fn out_of_order_text_timestamps_are_still_a_time_index() {
+        let fields = [
+            "2026-01-01T00:00:02Z",
+            "2026-01-01T00:00:01Z",
+            "2026-01-01T00:00:03Z",
+        ];
+        assert_eq!(verdict_of(&fields, true), None);
+    }
+
+    #[test]
+    fn a_column_of_neither_timestamps_nor_numbers_is_unreadable() {
+        let expected = Some(GeneratedIndexReason::Unreadable {
+            column: "c".to_string(),
+        });
+        assert_eq!(verdict_of(&["0", "10", "N/A", "30"], true), expected);
+        // …even when the user picked it: there is nothing to index by.
+        assert_eq!(verdict_of(&["idle", "run"], false), expected);
     }
 
     #[test]

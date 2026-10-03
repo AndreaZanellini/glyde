@@ -70,6 +70,8 @@ Accepted index kinds:
 - Duplicate timestamps: preserved, flagged.
 - Timezone: if the source carries one, honor it and display it. If not, treat as naive local time and label it as such in the axis. Never invent a timezone.
 
+**Files without a time column.** The time-index candidate is the first column. A *numeric* candidate (plain numbers, epoch, Excel serial, LabVIEW) is only a time index if it never decreases (NaN counts as a decrease) and advances on at least half of its row-to-row steps (a constant column, or a staircase such as an operating-point number, is a series); a column of dates/times is always a time index (its out-of-order rows get the [Sort]/[Keep as-is] affordance above). A candidate that fails this, or is neither numbers nor a supported timestamp format, is a **series**: Glyde generates a row index `0 … N−1` over the kept rows, plots every column against it, reports the time column at low confidence, and states the reason in a notice that stays visible while the inference bar is collapsed. The time column is correctable to any column or to the generated row index, and — unlike the other fields — that picker is always offered, because a monotonic *signal* in the first column cannot be detected. A user-picked column is never overruled for running backwards (the non-monotonic report applies); one that cannot be read as an index falls back to the row index, reported. A file with nothing left to plot (a lone timestamp column, or a lone text column) is still refused.
+
 ### 2.2 Sampling classification
 
 At index time, per series, compute the distribution of Δt and classify:

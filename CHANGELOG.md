@@ -12,6 +12,79 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Files with no time column now open and plot every column, against a row
+  index Glyde generates — and you can pick the time column yourself.** A file
+  of plain signals (say `ax,ay,az`, no timestamps) used to be read as if its
+  first column were the time: the other channels were drawn against the
+  *values* of `ax`, and `ax` itself disappeared from the plot. Now Glyde looks
+  at the first column: if it is numbers that go backwards at some point (or
+  are the same number on every row), it is a signal, not a time axis. Glyde
+  then numbers the rows 0, 1, 2, … , plots **every** column — the first one
+  included — against that index, opens the inference bar and says so in
+  plain words: *"No time column detected: "ax" goes backwards at row 1, so it
+  is plotted as a signal. Glyde generated a row index (0 … 7) and plots every
+  column against it. If one of the columns is the time, pick it under "time
+  column"."* The "time column" field of the inference bar is now a dropdown,
+  always available: choose any column of the file as the time axis, or
+  "Row index (generated)". (docs/SPEC.md §2.1 "Files without a time column",
+  §1.2; new torture-corpus case 59.)
+
+  What to try: open a CSV of plain signals (every channel should appear, the
+  x axis should run 0 … rows−1, and the yellow notice should explain why);
+  then open a normal file and use the dropdown to switch to another column
+  or to the row index — the plot re-indexes immediately.
+
+  **Assumptions made (please veto by testing the app):**
+  - **Only numeric first columns are judged by their order.** A column of
+    dates and times (`2026-01-01T00:00:00Z`, `01/02/2026 10:00:00`, …) is
+    always the time axis even if a row is out of order — as before, you get
+    "timestamps not monotonic — [Sort] / [Keep as-is]". A *numeric* column
+    (plain numbers, epoch seconds/ms/µs/ns, Excel serial dates, LabVIEW time)
+    looks exactly like a signal, so its order is what decides: one step
+    backwards is enough to call it a signal. Consequence: an epoch-time
+    column with a clock that jumps back once (e.g. a logger resyncing its
+    clock) is now treated as "no time column". You'll see the notice, and
+    one click in the dropdown makes it the time axis again — then [Sort]
+    is offered as usual.
+  - **Repeated values do not disqualify a time column** (a duplicate
+    timestamp is not a step backwards — it is flagged as before). A column
+    with the same value on every row does.
+  - **A "staircase" first column is a signal, not a time axis**: a column
+    that never goes back but changes value on fewer than half of its rows —
+    typically an operating-point or test-step number (`OP` = 1, 1, 1, …, 2,
+    2, 2, …) — would stack every sample of one step on the same x. Glyde now
+    plots it as a signal against the row index and says *"OP" changes value
+    on only 73 of N rows*. The 50% threshold is an assumption, not a SPEC
+    number. Consequence: a whole-second timestamp on data logged faster than
+    1 Hz (e.g. 10 rows per second) is now treated as "no time column" — one
+    click in the dropdown makes it the time axis again.
+  - **A first column that is a steadily increasing *signal*** (a counter, a
+    cumulative energy reading) cannot be told apart from a time axis and is
+    still taken as one. That is exactly why the dropdown is always offered,
+    unlike the other corrections, which only appear when Glyde is unsure.
+  - **The generated index counts the rows that were kept**: if Glyde skipped
+    a malformed row, the rows after it are not shifted by one. Its numbers
+    have no unit — they are not seconds — so nothing on screen should be
+    read as a duration.
+  - **A column you pick yourself is never overruled** for running backwards;
+    you get the usual "not monotonic — [Sort]" instead (this now also works
+    for a plain-number time column). A column you pick that is neither
+    numbers nor dates cannot be a time axis: Glyde falls back to the row
+    index and tells you why.
+  - **Picking a time column forgets** a timestamp-format swap or a [Sort]
+    you applied to the previous time column (they belonged to it), and
+    changing the delimiter forgets a picked time column (the columns are
+    different afterwards).
+  - **A file whose time column Glyde cannot read at all** (corpus case 58)
+    still opens against the row index, but that column is now shown as a
+    text series instead of being dropped from view.
+  - **A single-column file of numbers** now opens (one signal against the
+    row index) instead of being refused; a single column of timestamps, or
+    of text, is still refused, since there is nothing to plot — the text
+    case is almost always a wrong delimiter.
+  - The time column is still searched for in the first column only; a time
+    column elsewhere in the file needs one click in the dropdown.
+
 - **A `true`/`false` column now shows up as a strip of colored on/off bands
   under the plot, instead of being silently left out.** Boolean columns
   (however they're spelled in the source file — `true`/`false`, `0`/`1`,

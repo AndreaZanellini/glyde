@@ -47,7 +47,7 @@ pub use format::{
     TimestampFormat, TimestampFormatInference, TimestampFormatScan,
 };
 pub use gap::{classify_sampling, detect_gaps, summarize_ticks, Gap, SamplingClass, TimeAxisStats};
-pub use monotonic::{detect_monotonicity, MonotonicityReport};
+pub use monotonic::{detect_monotonicity, detect_monotonicity_from, MonotonicityReport};
 pub use ticks::{TickSource, TICK_CHUNK_LEN};
 
 /// Reads a `testdata/corpus/` fixture's raw column text, shared by this

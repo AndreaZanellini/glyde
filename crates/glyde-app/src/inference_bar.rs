@@ -37,7 +37,17 @@
 //! [`glyde_core::ingest::IngestOverrides`] field set — this module only ever
 //! renders and reports the click, it never re-indexes anything itself
 //! (docs/ARCHITECTURE.md Hard rule 2: no product logic in the UI layer).
-//! Encoding and time-column correction are not covered yet (issue #97).
+//! Encoding correction is not covered yet (issue #97).
+//!
+//! **The time column is the one exception to the gating rule below**: its
+//! picker is always offered. Every other field's inference knows when it is
+//! unsure; the time column's cannot always — a first column that is a
+//! monotonic *signal* (a counter, a cumulative quantity) is confidently,
+//! wrongly taken as the time index, and only the user can tell. Picking the
+//! generated row index, or any other column, is therefore always one click
+//! away (SPEC §2.1 "Files without a time column"). When Glyde generated the
+//! row index on the user's behalf, a notice outside the collapsible body says
+//! so in plain words, whatever the bar's collapsed state.
 //!
 //! **Every correction control is gated to its own field's confidence**: a
 //! high-confidence field renders as a plain label, nothing more. A clean,
@@ -65,7 +75,8 @@
 //! Not worth offering as a one-click option.
 
 use glyde_core::ingest::{
-    Confidence, DecimalSeparator, Delimiter, InferenceReport, InferredField, TimezoneLabel,
+    Confidence, DecimalSeparator, Delimiter, GeneratedIndexReason, InferenceReport, InferredField,
+    TimeColumnChoice, TimeIndexSource, TimezoneLabel,
 };
 use glyde_core::time::TimestampFormat;
 use std::path::Path;
@@ -80,6 +91,9 @@ pub enum Correction {
     /// SPEC §2.1's "[Sort]" half of the "timestamps not monotonic —
     /// [Sort]/[Keep as-is]" affordance.
     SortByTime,
+    /// SPEC §1.2's time-column correction: index by this column, or by the
+    /// generated row index.
+    TimeColumn(TimeColumnChoice),
 }
 
 /// Renders `report` as a collapsible header into `ui`, one row of field
@@ -113,12 +127,9 @@ pub fn show(
                 if let Some(picked) = decimal_separator_control(ui, &report.decimal_separator) {
                     correction = Some(Correction::DecimalSeparator(picked));
                 }
-                field_label(
-                    ui,
-                    "time column",
-                    display_option(&report.time_column.value),
-                    report.time_column.confidence,
-                );
+                if let Some(picked) = time_column_control(ui, report) {
+                    correction = Some(Correction::TimeColumn(picked));
+                }
                 if let Some(picked) = timestamp_format_control(ui, &report.timestamp_format) {
                     correction = Some(Correction::TimestampFormat(picked));
                 }
@@ -141,7 +152,104 @@ pub fn show(
     // make — a regression from the plain label this replaces, which was
     // always visible regardless of the bar's collapsed state.
     skipped_rows_detail(ui, report);
+    // A sibling of the header for the same reason as the skipped-rows line:
+    // plotting against an index the file does not contain must be stated
+    // where it cannot be collapsed away (Golden Rule 2).
+    if let Some(notice) = generated_index_notice(report) {
+        ui.colored_label(ui.visuals().warn_fg_color, notice);
+    }
     response.body_returned.flatten()
+}
+
+/// The time-column picker's label for the generated row index.
+const ROW_INDEX_OPTION: &str = "Row index (generated)";
+
+/// The choice the time index currently reflects.
+fn current_time_column(report: &InferenceReport) -> TimeColumnChoice {
+    match &report.time_index {
+        TimeIndexSource::Column { index, .. } => TimeColumnChoice::Column(*index),
+        TimeIndexSource::Generated(_) => TimeColumnChoice::RowIndex,
+    }
+}
+
+/// Every choice the time-column picker offers, in display order: the
+/// generated row index, then each column of the file in header order.
+fn time_column_options(report: &InferenceReport) -> Vec<(TimeColumnChoice, String)> {
+    std::iter::once((TimeColumnChoice::RowIndex, ROW_INDEX_OPTION.to_string()))
+        .chain(
+            report
+                .column_names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| (TimeColumnChoice::Column(index), name.clone())),
+        )
+        .collect()
+}
+
+/// The time column field: its current value, flagged when low-confidence,
+/// as an always-available picker (see the module docs for why this field
+/// alone is not gated on confidence). Returns the newly picked choice if the
+/// user chose one different from the current one this frame.
+fn time_column_control(ui: &mut egui::Ui, report: &InferenceReport) -> Option<TimeColumnChoice> {
+    let current = current_time_column(report);
+    let options = time_column_options(report);
+    let current_label = options
+        .iter()
+        .find(|(choice, _)| *choice == current)
+        .map_or(ROW_INDEX_OPTION, |(_, label)| label.as_str());
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        ui.label("time column:");
+        egui::ComboBox::from_id_salt("inference-bar-time-column")
+            .selected_text(current_label)
+            .show_ui(ui, |ui| {
+                for (choice, label) in &options {
+                    let is_current = *choice == current;
+                    if ui.selectable_label(is_current, label).clicked() && !is_current {
+                        picked = Some(*choice);
+                    }
+                }
+            });
+        if report.time_column.confidence == Confidence::Low {
+            ui.label("(low confidence)");
+        }
+    });
+    picked
+}
+
+/// The plain-language notice for a row index Glyde generated on the user's
+/// behalf (SPEC §2.1 "Files without a time column"): what was found, what was
+/// done instead, and where to change it. `None` when the time index was read
+/// from a column, or when the user asked for the row index themselves.
+fn generated_index_notice(report: &InferenceReport) -> Option<String> {
+    let TimeIndexSource::Generated(reason) = &report.time_index else {
+        return None;
+    };
+    let why = match reason {
+        GeneratedIndexReason::Requested => return None,
+        GeneratedIndexReason::NotMonotonic { column, row } => format!(
+            "No time column detected: \"{column}\" goes backwards at row {row}, so it is plotted \
+             as a signal."
+        ),
+        GeneratedIndexReason::Constant { column } => format!(
+            "No time column detected: \"{column}\" holds the same value on every row, so it is \
+             plotted as a signal."
+        ),
+        GeneratedIndexReason::MostlyRepeated { column, changes } => format!(
+            "No time column detected: \"{column}\" changes value on only {changes} of {} rows, \
+             so it is plotted as a signal.",
+            report.sample_count
+        ),
+        GeneratedIndexReason::Unreadable { column } => format!(
+            "\"{column}\" is neither timestamps in a supported format nor numbers, so it is \
+             plotted as a series, not used as time."
+        ),
+    };
+    let last_row = report.sample_count.saturating_sub(1);
+    Some(format!(
+        "{why} Glyde generated a row index (0 … {last_row}) and plots every column against it. \
+         If one of the columns is the time, pick it under \"time column\"."
+    ))
 }
 
 /// SPEC §1.3 "rows ... skipped, counted, logged at `warn`, surfaced in the
@@ -468,7 +576,32 @@ mod tests {
             non_monotonic_count: 0,
             duplicate_timestamp_count: 0,
             timezone: Some(TimezoneLabel::NaiveLocal),
+            time_index: TimeIndexSource::Column {
+                index: 0,
+                name: "timestamp".to_string(),
+            },
+            column_names: vec!["timestamp".to_string(), "value".to_string()],
         }
+    }
+
+    /// A file with no time column: the row index was generated because the
+    /// first column runs backwards (corpus case 59's shape).
+    fn generated_index_report() -> InferenceReport {
+        let mut report = sample_report(Confidence::High);
+        report.time_column = InferredField {
+            value: None,
+            confidence: Confidence::Low,
+        };
+        report.timestamp_format.value = None;
+        report.sampling_class = SamplingClass::ProgressiveIndex;
+        report.timezone = None;
+        report.time_index = TimeIndexSource::Generated(GeneratedIndexReason::NotMonotonic {
+            column: "ax".to_string(),
+            row: 1,
+        });
+        report.column_names = vec!["ax".to_string(), "ay".to_string()];
+        report.sample_count = 8;
+        report
     }
 
     /// [`sample_report`] with a nonzero skip count and one bounded detail —
@@ -776,5 +909,97 @@ mod tests {
         });
 
         assert!(!output.shapes.is_empty());
+    }
+
+    // SPEC §2.1 "Files without a time column": the picker offers the
+    // generated row index first, then every column in header order, and
+    // marks whichever one the time index currently reflects.
+    #[test]
+    fn time_column_options_list_the_row_index_then_every_column() {
+        let report = sample_report(Confidence::High);
+
+        assert_eq!(
+            time_column_options(&report),
+            vec![
+                (TimeColumnChoice::RowIndex, ROW_INDEX_OPTION.to_string()),
+                (TimeColumnChoice::Column(0), "timestamp".to_string()),
+                (TimeColumnChoice::Column(1), "value".to_string()),
+            ]
+        );
+        assert_eq!(current_time_column(&report), TimeColumnChoice::Column(0));
+        assert_eq!(
+            current_time_column(&generated_index_report()),
+            TimeColumnChoice::RowIndex
+        );
+    }
+
+    // Golden Rule 2: a generated index is announced in words that say what
+    // was found, what was done, and where to change it.
+    #[test]
+    fn generated_index_notice_explains_the_substitution() {
+        let notice = generated_index_notice(&generated_index_report())
+            .expect("a row index generated on the user's behalf must be announced");
+
+        assert!(notice.contains("No time column detected"), "{notice}");
+        assert!(
+            notice.contains("\"ax\" goes backwards at row 1"),
+            "{notice}"
+        );
+        assert!(notice.contains("row index (0 … 7)"), "{notice}");
+        assert!(notice.contains("time column"), "{notice}");
+    }
+
+    #[test]
+    fn generated_index_notice_names_every_reason() {
+        let mut report = generated_index_report();
+        report.time_index = TimeIndexSource::Generated(GeneratedIndexReason::Constant {
+            column: "mode".to_string(),
+        });
+        let constant = generated_index_notice(&report).expect("announced");
+        assert!(
+            constant.contains("\"mode\" holds the same value"),
+            "{constant}"
+        );
+
+        report.time_index = TimeIndexSource::Generated(GeneratedIndexReason::MostlyRepeated {
+            column: "OP".to_string(),
+            changes: 2,
+        });
+        let staircase = generated_index_notice(&report).expect("announced");
+        assert!(
+            staircase.contains("\"OP\" changes value on only 2 of 8 rows"),
+            "{staircase}"
+        );
+
+        report.time_index = TimeIndexSource::Generated(GeneratedIndexReason::Unreadable {
+            column: "stamp".to_string(),
+        });
+        let unreadable = generated_index_notice(&report).expect("announced");
+        assert!(unreadable.contains("\"stamp\" is neither"), "{unreadable}");
+    }
+
+    // Nothing to announce when the index is a real column, or when the user
+    // asked for the row index themselves.
+    #[test]
+    fn generated_index_notice_is_silent_unless_glyde_chose_the_row_index() {
+        assert_eq!(
+            generated_index_notice(&sample_report(Confidence::High)),
+            None
+        );
+        let mut requested = generated_index_report();
+        requested.time_index = TimeIndexSource::Generated(GeneratedIndexReason::Requested);
+        assert_eq!(generated_index_notice(&requested), None);
+    }
+
+    // The notice sits outside the collapsible body, so it renders even when
+    // every other field is confident and the bar is collapsed.
+    #[test]
+    fn generated_index_notice_renders_with_the_bar_collapsed() {
+        let mut generated = generated_index_report();
+        generated.time_column.confidence = Confidence::High;
+        let mut requested = generated.clone();
+        requested.time_index = TimeIndexSource::Generated(GeneratedIndexReason::Requested);
+
+        assert!(render_shape_count(&generated) > render_shape_count(&requested));
     }
 }

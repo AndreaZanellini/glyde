@@ -82,7 +82,7 @@ pub fn detect_monotonicity(timestamps: &[i128]) -> MonotonicityReport {
 
 /// [`detect_monotonicity`] over any [`TickSource`] — the bounded-memory form,
 /// for a time axis too large to hold as one slice (issue #85).
-fn detect_monotonicity_from<S: TickSource + ?Sized>(source: &S) -> Result<MonotonicityReport> {
+pub fn detect_monotonicity_from<S: TickSource + ?Sized>(source: &S) -> Result<MonotonicityReport> {
     let mut report = MonotonicityReport::default();
     for_each_delta(source, 0..source.tick_count(), &mut |delta| {
         report.observe_delta(delta);
