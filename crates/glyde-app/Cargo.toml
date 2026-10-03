@@ -18,6 +18,10 @@ eframe.workspace = true
 egui.workspace = true
 egui_plot.workspace = true
 rfd.workspace = true
+# Per-frame decimation of every plotted column in parallel (issue #114) —
+# the compute pool docs/ARCHITECTURE.md §Threading model already assigns
+# decimation queries to, and already in the tree through glyde-core.
+rayon.workspace = true
 
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -27,6 +31,7 @@ directories.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+proptest.workspace = true
 insta.workspace = true
 criterion.workspace = true
 

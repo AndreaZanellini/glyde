@@ -45,7 +45,9 @@ use super::csv::{
     open_path_capturing_all_columns, open_path_capturing_all_columns_with_progress, ColumnText,
     CsvParseOutcome, RowFields, Sniff, FIRST_PROGRESS_CHECKPOINT_ROWS,
 };
-use super::infer::{log_dtype_choice, normalize_decimal_field, ColumnDtypeChoice, ColumnDtypeScan};
+use super::infer::{
+    log_dtype_choice, normalize_decimal_field, ColumnDtypeChoice, ColumnDtypeScan, ColumnInference,
+};
 use super::IngestOverrides;
 use crate::budget::RamBudget;
 use crate::dsp::decimation::{build_pyramid, build_pyramid_streaming, extend_pyramid, Bucket};
@@ -54,8 +56,8 @@ use crate::index::pyramid;
 use crate::index::spill::{SpillStringsWriter, SpillVec, SpillVecWriter};
 use crate::series::{Anomalies, Dtype, NanRunScan, Series, SeriesValues, SpilledValues};
 use crate::time::{
-    infer_timestamp_format, parse_timestamp, TickSource, TimeUnit, Timestamp, TimestampFormat,
-    TimestampFormatInference, TimestampFormatScan, TICK_CHUNK_LEN,
+    parse_timestamp, TickSource, TimeUnit, Timestamp, TimestampFormat, TimestampFormatInference,
+    TimestampFormatScan, TICK_CHUNK_LEN,
 };
 use crate::{GlydeError, Result};
 use std::borrow::Cow;
@@ -684,113 +686,262 @@ fn load_with_outcome_using(
     }
 }
 
-/// SPEC §2.1's timestamp-format inference, or the user's override
-/// (docs/ROADMAP.md M4 "One-click correction ... triggers a re-index")
-/// settled outright instead. An override is never `ambiguous` — it is a
-/// deliberate choice, not a guess (Golden Rule 2) — and it applies even when
-/// the auto-inference would have found no absolute-timestamp format at all,
-/// so a column mis-read as a progressive index can be corrected to an
-/// absolute one too.
-fn resolve_timestamp_format<S: AsRef<str>>(
-    fields: &[S],
-    timestamp_format_override: Option<TimestampFormat>,
-) -> Option<TimestampFormatInference> {
-    match timestamp_format_override {
-        Some(format) => Some(TimestampFormatInference {
-            format,
-            ambiguous: false,
-        }),
-        None => infer_timestamp_format(fields),
-    }
-}
-
 /// The typed-conversion half of the in-memory path: every column's raw
 /// captured text, already fully read by [`super::csv`], into a [`Dataset`].
-/// Split out so [`load_with_outcome_progressive`] can run the exact same
-/// conversion against a growing prefix of `columns_text` at each checkpoint,
-/// rather than a second, drifting implementation of the same logic
-/// (docs/ROADMAP.md M3 "Background progressive build emitting partial
-/// levels").
+/// A thin wrapper over [`DatasetBuilder`], which
+/// [`load_with_outcome_progressive`] drives incrementally across checkpoints
+/// — one implementation for both, so a checkpoint can never drift from the
+/// final dataset (docs/ROADMAP.md M3 "Background progressive build emitting
+/// partial levels").
 fn build_dataset(
     outcome: &CsvParseOutcome,
     columns_text: &[ColumnText],
     overrides: IngestOverrides,
 ) -> Result<(Dataset, TimeIndexInference)> {
-    if outcome.column_names.len() < 2 {
-        return Err(GlydeError::SingleColumnFile);
+    DatasetBuilder::default().finish(outcome, columns_text, overrides)
+}
+
+/// Types captured column text into a [`Dataset`] incrementally (issue #114).
+///
+/// Before #114, every progressive checkpoint re-derived its dataset from
+/// the whole prefix read so far, and the final dataset was derived once more
+/// from scratch: with checkpoints at 20k, 40k, 80k, … rows that is roughly
+/// twice the typing work of the file itself, and typing (number and
+/// timestamp parsing) — not tokenizing — is where an in-memory open spends
+/// most of its time. The builder keeps each column's [`ColumnInference`] and
+/// the time axis's parsed timestamps between calls, so every row is typed
+/// once: a checkpoint only types the rows that arrived since the previous
+/// one and hands out a copy, and the final call types the tail and hands
+/// over the vectors themselves.
+///
+/// Columns are independent, so they are typed in parallel on the `rayon`
+/// compute pool (docs/ARCHITECTURE.md §Threading model), the time axis
+/// alongside them.
+#[derive(Default)]
+struct DatasetBuilder {
+    time: TimeAxisBuilder,
+    columns: Vec<ColumnInference>,
+}
+
+impl DatasetBuilder {
+    /// A checkpoint's dataset over every row captured so far; the builder
+    /// keeps its state for the next call.
+    fn snapshot(
+        &mut self,
+        outcome: &CsvParseOutcome,
+        columns_text: &[ColumnText],
+        overrides: IngestOverrides,
+    ) -> Result<(Dataset, TimeIndexInference)> {
+        let (time, inference) = self.advance(outcome, columns_text, overrides)?;
+        let time = time.unwrap_or_else(|| self.time.absolute_snapshot());
+        let decimal_separator = outcome.decimal_separator;
+        let columns = self
+            .columns
+            .iter()
+            .zip(&outcome.column_names[1..])
+            .zip(&columns_text[1..])
+            .map(|((column, name), text)| {
+                column.snapshot(name.clone(), |row| {
+                    normalize_decimal_field(text.field(row), decimal_separator)
+                })
+            })
+            .collect();
+        Ok((
+            assemble_dataset(outcome, time, columns, overrides),
+            inference,
+        ))
     }
 
-    let time_column_name = outcome.column_names[0].clone();
-    let time_fields: Vec<&str> = columns_text[0].iter().collect();
+    /// The final dataset, handing over the typed vectors rather than copying
+    /// them.
+    fn finish(
+        mut self,
+        outcome: &CsvParseOutcome,
+        columns_text: &[ColumnText],
+        overrides: IngestOverrides,
+    ) -> Result<(Dataset, TimeIndexInference)> {
+        let (time, inference) = self.advance(outcome, columns_text, overrides)?;
+        let time = time.unwrap_or_else(|| self.time.take_absolute());
+        let decimal_separator = outcome.decimal_separator;
+        let columns = std::mem::take(&mut self.columns)
+            .into_iter()
+            .zip(&outcome.column_names[1..])
+            .zip(&columns_text[1..])
+            .map(|((column, name), text)| {
+                column
+                    .finish(name.clone(), |row| {
+                        normalize_decimal_field(text.field(row), decimal_separator)
+                    })
+                    .series
+            })
+            .collect();
+        Ok((
+            assemble_dataset(outcome, time, columns, overrides),
+            inference,
+        ))
+    }
 
-    let (time, inference) = match resolve_timestamp_format(&time_fields, overrides.timestamp_format)
-    {
-        Some(format_inference) => {
-            let mut timestamps = Vec::with_capacity(time_fields.len());
-            for field in &time_fields {
-                timestamps.push(parse_timestamp(field, format_inference.format)?);
-            }
-            (
-                TimeAxis::Absolute {
-                    timestamps: Timestamps::Memory(timestamps),
-                    format: format_inference.format,
-                },
-                TimeIndexInference {
-                    timestamp_format_ambiguous: format_inference.ambiguous,
-                    row_ordinal_fallback: false,
-                },
-            )
+    /// Types every row not yet typed, in every column. Returns the time axis
+    /// only when it is *not* the incrementally-built absolute axis (a
+    /// progressive index or the row-ordinal fallback, both cheap and rare);
+    /// otherwise the caller reads it from [`Self::time`].
+    fn advance(
+        &mut self,
+        outcome: &CsvParseOutcome,
+        columns_text: &[ColumnText],
+        overrides: IngestOverrides,
+    ) -> Result<(Option<TimeAxis>, TimeIndexInference)> {
+        if outcome.column_names.len() < 2 {
+            return Err(GlydeError::SingleColumnFile);
         }
-        // SPEC §2.1: no recognized absolute-timestamp format matched every
-        // field, so this is a progressive numeric index (corpus case 35) —
-        // unless it isn't even that, in which case the column is not a time
-        // index at all and the row ordinal stands in for it (issue #94).
-        None => match parse_progressive_values(&time_fields) {
-            Ok(values) => (
-                TimeAxis::Progressive {
-                    values: ProgressiveValues::Memory(values),
-                },
-                TimeIndexInference::default(),
-            ),
-            Err(rejection) => {
-                rejection.log(&time_column_name);
-                (
-                    row_ordinal_axis(time_fields.len()),
-                    TimeIndexInference {
-                        timestamp_format_ambiguous: false,
-                        row_ordinal_fallback: true,
-                    },
-                )
+        let data_columns = &columns_text[1..];
+        self.columns
+            .resize_with(data_columns.len(), ColumnInference::default);
+        let decimal_separator = outcome.decimal_separator;
+        let (time, ()) = rayon::join(
+            || {
+                self.time
+                    .advance(&columns_text[0], &outcome.column_names[0], overrides)
+            },
+            || {
+                use rayon::prelude::*;
+                self.columns
+                    .par_iter_mut()
+                    .zip(data_columns)
+                    .for_each(|(column, text)| {
+                        column.extend(text.len(), |row| {
+                            normalize_decimal_field(text.field(row), decimal_separator)
+                        })
+                    });
+            },
+        );
+        time
+    }
+}
+
+/// [`DatasetBuilder`]'s time-axis half: SPEC §2.1's timestamp-format scan,
+/// fed incrementally, and the timestamps parsed so far under the format it
+/// currently settles on. Should a later row change that decision, the
+/// timestamps are re-parsed from the first row under the new format, so the
+/// result is always exactly what a from-scratch pass over the same rows
+/// produces.
+#[derive(Default)]
+struct TimeAxisBuilder {
+    scan: TimestampFormatScan,
+    observed: usize,
+    parsed: Vec<Timestamp>,
+    parsed_format: Option<TimestampFormat>,
+}
+
+impl TimeAxisBuilder {
+    fn advance(
+        &mut self,
+        text: &ColumnText,
+        column_name: &str,
+        overrides: IngestOverrides,
+    ) -> Result<(Option<TimeAxis>, TimeIndexInference)> {
+        let total = text.len();
+        let inference = match overrides.timestamp_format {
+            // A user override settles the format outright, never scanned —
+            // the same as `resolve_timestamp_format`.
+            Some(format) => Some(TimestampFormatInference {
+                format,
+                ambiguous: false,
+            }),
+            None => {
+                for row in self.observed..total {
+                    self.scan.observe(text.field(row));
+                }
+                self.observed = total;
+                self.scan.clone().finish()
             }
-        },
-    };
+        };
 
-    let columns = outcome.column_names[1..]
-        .iter()
-        .zip(&columns_text[1..])
-        .map(|(name, column_text)| {
-            // `normalize_decimal_field` keeps `Cow::Borrowed` when the field
-            // needs no rewrite (the common dot-decimal case): `infer_column`
-            // is generic over `AsRef<str>`, so this never forces an owned
-            // copy just to satisfy its signature (issue #62).
-            let normalized: Vec<Cow<'_, str>> = column_text
-                .iter()
-                .map(|field| normalize_decimal_field(field, outcome.decimal_separator))
-                .collect();
-            super::infer::infer_column(name.clone(), &normalized).series
-        })
-        .collect();
+        match inference {
+            Some(format_inference) => {
+                if self.parsed_format != Some(format_inference.format) {
+                    self.parsed.clear();
+                    self.parsed_format = Some(format_inference.format);
+                }
+                // Exact, for the same reason as `ColumnInference::extend`.
+                self.parsed
+                    .reserve_exact(total.saturating_sub(self.parsed.len()));
+                for row in self.parsed.len()..total {
+                    self.parsed
+                        .push(parse_timestamp(text.field(row), format_inference.format)?);
+                }
+                Ok((
+                    None,
+                    TimeIndexInference {
+                        timestamp_format_ambiguous: format_inference.ambiguous,
+                        row_ordinal_fallback: false,
+                    },
+                ))
+            }
+            // SPEC §2.1: no recognized absolute-timestamp format matched every
+            // field, so this is a progressive numeric index (corpus case 35) —
+            // unless it isn't even that, in which case the column is not a time
+            // index at all and the row ordinal stands in for it (issue #94).
+            None => {
+                self.parsed = Vec::new();
+                self.parsed_format = None;
+                let fields: Vec<&str> = (0..total).map(|row| text.field(row)).collect();
+                Ok(match parse_progressive_values(&fields) {
+                    Ok(values) => (
+                        Some(TimeAxis::Progressive {
+                            values: ProgressiveValues::Memory(values),
+                        }),
+                        TimeIndexInference::default(),
+                    ),
+                    Err(rejection) => {
+                        rejection.log(column_name);
+                        (
+                            Some(row_ordinal_axis(total)),
+                            TimeIndexInference {
+                                timestamp_format_ambiguous: false,
+                                row_ordinal_fallback: true,
+                            },
+                        )
+                    }
+                })
+            }
+        }
+    }
 
+    fn absolute_snapshot(&self) -> TimeAxis {
+        TimeAxis::Absolute {
+            timestamps: Timestamps::Memory(self.parsed.clone()),
+            format: self
+                .parsed_format
+                .expect("advance returned no axis, so it parsed an absolute one"),
+        }
+    }
+
+    fn take_absolute(&mut self) -> TimeAxis {
+        TimeAxis::Absolute {
+            timestamps: Timestamps::Memory(std::mem::take(&mut self.parsed)),
+            format: self
+                .parsed_format
+                .expect("advance returned no axis, so it parsed an absolute one"),
+        }
+    }
+}
+
+fn assemble_dataset(
+    outcome: &CsvParseOutcome,
+    time: TimeAxis,
+    columns: Vec<Series>,
+    overrides: IngestOverrides,
+) -> Dataset {
     let mut dataset = Dataset {
         time,
-        time_column_name,
+        time_column_name: outcome.column_names[0].clone(),
         columns,
     };
     if overrides.sort_by_time {
         sort_dataset_by_time(&mut dataset);
     }
-
-    Ok((dataset, inference))
+    dataset
 }
 
 /// SPEC §2.1's "[Sort]" affordance: reorders `dataset`'s time axis and every
@@ -979,17 +1130,36 @@ fn load_spilled(
     let mut dtype_scans: Vec<ColumnDtypeScan> = (0..data_column_count)
         .map(|_| ColumnDtypeScan::default())
         .collect();
-    super::csv::stream_path(path, sniff, &mut |row: RowFields<'_>| {
-        let time_field = row.get(0).unwrap_or_default();
-        time_scan.observe(time_field);
-        time_field_count += 1;
-        if parse_progressive_value(time_field).is_err() {
-            time_rejection.observe(time_field);
-        }
-        for (index, scan) in dtype_scans.iter_mut().enumerate() {
-            let field = row.get(index + 1).unwrap_or_default();
-            scan.observe(&normalize_decimal_field(field, decimal_separator));
-        }
+    //
+    // Rows arrive in bounded column-major batches (`stream_in_batches`) and
+    // each batch's columns are scanned in parallel on the `rayon` pool
+    // (issue #114): every column's scan is independent and sees its own
+    // fields in row order, so the result is the row-at-a-time scan's
+    // exactly — and this pass is what a spilled open's first plot waits on.
+    stream_in_batches(path, sniff, column_names.len(), |batch| {
+        let (time_text, data_text) = batch.split_at(1);
+        rayon::join(
+            || {
+                for time_field in time_text[0].iter() {
+                    time_scan.observe(time_field);
+                    time_field_count += 1;
+                    if parse_progressive_value(time_field).is_err() {
+                        time_rejection.observe(time_field);
+                    }
+                }
+            },
+            || {
+                use rayon::prelude::*;
+                dtype_scans
+                    .par_iter_mut()
+                    .zip(data_text)
+                    .for_each(|(scan, text)| {
+                        for field in text.iter() {
+                            scan.observe(&normalize_decimal_field(field, decimal_separator));
+                        }
+                    });
+            },
+        );
         Ok(())
     })?;
 
@@ -1048,17 +1218,18 @@ fn load_spilled(
         timestamp_format.map(|inference| inference.format),
     );
 
-    let outcome = super::csv::stream_path(path, sniff, &mut |row: RowFields<'_>| {
-        let time_value = time_writer.push(row.get(0).unwrap_or_default())?;
-        preview.observe_time(time_value);
-        for (index, writer) in column_writers.iter_mut().enumerate() {
-            let field = row.get(index + 1).unwrap_or_default();
-            let normalized = normalize_decimal_field(field, decimal_separator);
-            let value = writer.push(&normalized)?;
-            preview.observe_column(index, value);
-        }
-        preview.end_row();
-        Ok(())
+    // Batched like pass 1 (issue #114): each column's writer — and its
+    // preview vector — sees its own fields in row order, on the `rayon`
+    // pool, and the preview's checkpoints are emitted afterwards over
+    // exactly the row prefixes the row-at-a-time loop emitted them at.
+    let outcome = stream_in_batches(path, sniff, column_names.len(), |batch| {
+        write_spill_batch(
+            batch,
+            &mut time_writer,
+            &mut column_writers,
+            decimal_separator,
+            &mut preview,
+        )
     })?;
     drop(preview);
 
@@ -1094,6 +1265,163 @@ fn load_spilled(
         },
     ))
 }
+
+/// Streams every row of `path` (see [`super::csv::stream_path`]) to
+/// `process` in column-major batches of up to [`SCAN_BATCH_ROWS`] rows —
+/// one [`ColumnText`] per column — in row order, returning the parse's
+/// outcome (issue #114).
+///
+/// Tokenizing runs on a scoped reader thread while `process` handles the
+/// previous batch on the calling thread, so a spilled pass costs roughly the
+/// slower of the two rather than their sum. At most
+/// [`SPILL_BATCHES_IN_FLIGHT`] filled batches wait between them and drained
+/// buffers are handed back for reuse, so memory stays a few MB at any file
+/// size (SPEC §5.1). `process` — and with it every writer, the preview and
+/// its checkpoint callback — never leaves the calling thread.
+///
+/// A `process` failure stops the reader and is returned in preference to
+/// anything the reader then reports: it concerns earlier rows, and is the
+/// error the row-at-a-time loop this replaces would have stopped on.
+fn stream_in_batches(
+    path: &Path,
+    sniff: &Sniff,
+    column_count: usize,
+    mut process: impl FnMut(&[ColumnText]) -> Result<()>,
+) -> Result<CsvParseOutcome> {
+    let new_batch =
+        || -> Vec<ColumnText> { (0..column_count).map(|_| ColumnText::default()).collect() };
+    let (filled_tx, filled_rx) =
+        std::sync::mpsc::sync_channel::<Vec<ColumnText>>(SPILL_BATCHES_IN_FLIGHT);
+    let (drained_tx, drained_rx) = std::sync::mpsc::channel::<Vec<ColumnText>>();
+
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(move || {
+            let consumer_stopped = || GlydeError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("the spill writer stopped reading rows"),
+            };
+            let mut batch = new_batch();
+            let outcome = super::csv::stream_path(path, sniff, &mut |row: RowFields<'_>| {
+                for (index, column) in batch.iter_mut().enumerate() {
+                    column.push(row.get(index).unwrap_or_default());
+                }
+                if batch[0].len() >= SCAN_BATCH_ROWS {
+                    let next = drained_rx.try_recv().unwrap_or_else(|_| new_batch());
+                    filled_tx
+                        .send(std::mem::replace(&mut batch, next))
+                        .map_err(|_| consumer_stopped())?;
+                }
+                Ok(())
+            })?;
+            if batch[0].len() > 0 {
+                filled_tx.send(batch).map_err(|_| consumer_stopped())?;
+            }
+            Ok(outcome)
+        });
+
+        let processed = loop {
+            let Ok(mut batch) = filled_rx.recv() else {
+                break Ok(());
+            };
+            if let Err(error) = process(&batch) {
+                break Err(error);
+            }
+            batch.iter_mut().for_each(ColumnText::clear);
+            let _ = drained_tx.send(batch);
+        };
+        // Unblocks a reader waiting on a full channel after a failure.
+        drop(filled_rx);
+        let read = reader
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        processed.and(read)
+    })
+}
+
+/// How many filled batches [`stream_in_batches`] lets the reader get ahead
+/// of the writer by.
+const SPILL_BATCHES_IN_FLIGHT: usize = 2;
+
+/// Types one batch of rows into the spill writers (pass 2 of
+/// [`load_spilled`]) — the time axis and every data column in parallel —
+/// feeding the progressive preview as it goes.
+///
+/// Fails exactly as the row-at-a-time loop did: with the error of the
+/// earliest failing row, and within that row the time column's before any
+/// data column's and a lower column index's before a higher one's — after
+/// the preview has counted (and checkpointed) every row before it.
+fn write_spill_batch(
+    batch: &[ColumnText],
+    time_writer: &mut TimeAxisSpillWriter,
+    column_writers: &mut [ColumnSpillWriter],
+    decimal_separator: super::infer::DecimalSeparator,
+    preview: &mut SpillPreview<'_>,
+) -> Result<()> {
+    let rows = batch[0].len();
+    let collect = preview.is_active();
+    let (time_text, data_text) = batch.split_at(1);
+    let SpillPreview {
+        timestamps,
+        progressive,
+        columns: preview_columns,
+        ..
+    } = &mut *preview;
+
+    // Each task reports its first failure as (row, order, error), where
+    // `order` ranks the time column before every data column.
+    let (time_failure, column_failures) = rayon::join(
+        || -> Option<(usize, usize, GlydeError)> {
+            for row in 0..rows {
+                match time_writer.push(time_text[0].field(row)) {
+                    Ok(value) if collect => match value {
+                        TimeValue::Absolute(timestamp) => timestamps.push(timestamp),
+                        TimeValue::Progressive(value) => progressive.push(value),
+                    },
+                    Ok(_) => {}
+                    Err(error) => return Some((row, 0, error)),
+                }
+            }
+            None
+        },
+        || -> Vec<Option<(usize, usize, GlydeError)>> {
+            use rayon::prelude::*;
+            column_writers
+                .par_iter_mut()
+                .zip(preview_columns.par_iter_mut())
+                .zip(data_text.par_iter())
+                .enumerate()
+                .map(|(index, ((writer, preview_column), text))| {
+                    for row in 0..rows {
+                        let normalized =
+                            normalize_decimal_field(text.field(row), decimal_separator);
+                        match writer.push(&normalized) {
+                            Ok(value) if collect => preview_column.push(value),
+                            Ok(_) => {}
+                            Err(error) => return Some((row, index + 1, error)),
+                        }
+                    }
+                    None
+                })
+                .collect()
+        },
+    );
+
+    let first_failure = std::iter::once(time_failure)
+        .chain(column_failures)
+        .flatten()
+        .min_by_key(|&(row, order, _)| (row, order));
+    let completed_rows = first_failure.as_ref().map_or(rows, |&(row, _, _)| row);
+    preview.advance_rows(completed_rows as u64);
+    match first_failure {
+        Some((_, _, error)) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Rows per batch in the spilled path's inference scan: large enough that
+/// handing a batch's columns to the `rayon` pool costs nothing next to
+/// scanning them, small enough to stay a few MB at any file size (SPEC §5.1).
+const SCAN_BATCH_ROWS: usize = 16_384;
 
 /// Writes a [`TimeAxis`] to the spill cache one row at a time.
 ///
@@ -1380,20 +1708,25 @@ impl PreviewColumn {
         }
     }
 
-    fn to_series(&self, name: &str) -> Series {
+    /// The first `rows` values as a [`Series`].
+    fn to_series(&self, name: &str, rows: usize) -> Series {
         match self {
-            PreviewColumn::Bool(values) => Series::new(name, SeriesValues::Bool(values.clone())),
-            PreviewColumn::I64(values) => Series::new(name, SeriesValues::I64(values.clone())),
+            PreviewColumn::Bool(values) => {
+                Series::new(name, SeriesValues::Bool(values[..rows].to_vec()))
+            }
+            PreviewColumn::I64(values) => {
+                Series::new(name, SeriesValues::I64(values[..rows].to_vec()))
+            }
             PreviewColumn::F64(values) => Series::with_anomalies(
                 name,
-                SeriesValues::F64(values.clone()),
+                SeriesValues::F64(values[..rows].to_vec()),
                 Anomalies {
-                    nan_runs: crate::series::detect_nan_runs(values),
+                    nan_runs: crate::series::detect_nan_runs(&values[..rows]),
                     ..Anomalies::default()
                 },
             ),
             PreviewColumn::String(values) => {
-                Series::new(name, SeriesValues::String(values.clone()))
+                Series::new(name, SeriesValues::String(values[..rows].to_vec()))
             }
         }
     }
@@ -1448,50 +1781,36 @@ impl<'a> SpillPreview<'a> {
         self.on_checkpoint.is_some()
     }
 
-    fn observe_time(&mut self, value: TimeValue) {
+    /// Counts `completed` more rows whose values every preview vector
+    /// already holds (a batch may have pushed a few rows past them — see
+    /// [`write_spill_batch`]), emitting each checkpoint the row-at-a-time
+    /// count would have crossed, over exactly its own row prefix, and
+    /// retiring the preview at [`PREVIEW_MAX_ROWS`].
+    fn advance_rows(&mut self, completed: u64) {
         if !self.is_active() {
             return;
         }
-        match value {
-            TimeValue::Absolute(timestamp) => self.timestamps.push(timestamp),
-            TimeValue::Progressive(value) => self.progressive.push(value),
-        }
-    }
-
-    fn observe_column(&mut self, index: usize, value: ColumnValue<'_>) {
-        if !self.is_active() {
-            return;
-        }
-        if let Some(column) = self.columns.get_mut(index) {
-            column.push(value);
-        }
-    }
-
-    /// Closes the row, firing a checkpoint if the doubling schedule says so
-    /// and retiring the preview once it reaches [`PREVIEW_MAX_ROWS`].
-    fn end_row(&mut self) {
-        if !self.is_active() {
-            return;
-        }
-        self.rows += 1;
-        if self.rows >= self.next_checkpoint_rows {
-            self.emit();
+        let target = self.rows + completed;
+        while self.next_checkpoint_rows <= target.min(PREVIEW_MAX_ROWS) {
+            self.emit(self.next_checkpoint_rows as usize);
             self.next_checkpoint_rows = self.next_checkpoint_rows.saturating_mul(2);
         }
+        self.rows = target;
         if self.rows >= PREVIEW_MAX_ROWS {
             self.retire();
         }
     }
 
-    fn emit(&mut self) {
+    /// A checkpoint over the first `rows` rows.
+    fn emit(&mut self, rows: usize) {
         let dataset = Dataset {
             time: match self.format {
                 Some(format) => TimeAxis::Absolute {
-                    timestamps: Timestamps::Memory(self.timestamps.clone()),
+                    timestamps: Timestamps::Memory(self.timestamps[..rows].to_vec()),
                     format,
                 },
                 None => TimeAxis::Progressive {
-                    values: ProgressiveValues::Memory(self.progressive.clone()),
+                    values: ProgressiveValues::Memory(self.progressive[..rows].to_vec()),
                 },
             },
             time_column_name: self.time_column_name.clone(),
@@ -1499,16 +1818,15 @@ impl<'a> SpillPreview<'a> {
                 .columns
                 .iter()
                 .zip(&self.column_names)
-                .map(|(column, name)| column.to_series(name))
+                .map(|(column, name)| column.to_series(name, rows))
                 .collect(),
         };
         let pyramids = self.pyramid_cursor.update(&dataset);
-        let rows_read = self.rows;
         if let Some(on_checkpoint) = self.on_checkpoint.as_deref_mut() {
             on_checkpoint(Checkpoint {
                 dataset,
                 pyramids,
-                rows_read,
+                rows_read: rows as u64,
                 // Issue #87: this preview exists *because* the file is being
                 // streamed to disk, so every checkpoint it emits says so.
                 spilled: true,
@@ -1516,9 +1834,6 @@ impl<'a> SpillPreview<'a> {
         }
     }
 
-    /// Stops previewing and hands back the memory. Everything after this point
-    /// is read straight through to the spill files, so peak memory stops
-    /// depending on how many rows are left.
     fn retire(&mut self) {
         info!(
             rows = self.rows,
@@ -1632,10 +1947,11 @@ fn load_with_outcome_progressive_using(
         }
         Storage::InMemory => {
             let mut pyramid_cursor = PyramidCursor::default();
+            let mut builder = DatasetBuilder::default();
             let (outcome, columns_text) = open_path_capturing_all_columns_with_progress(
                 path,
                 overrides,
-                |partial_outcome, partial_columns| match build_dataset(
+                |partial_outcome, partial_columns| match builder.snapshot(
                     partial_outcome,
                     partial_columns,
                     overrides,
@@ -1658,9 +1974,8 @@ fn load_with_outcome_progressive_using(
                     }
                 },
             )?;
-
             let (dataset, timestamp_format_ambiguous) =
-                build_dataset(&outcome, &columns_text, overrides)?;
+                builder.finish(&outcome, &columns_text, overrides)?;
             Ok((outcome, dataset, timestamp_format_ambiguous))
         }
     }
@@ -1690,11 +2005,13 @@ pub fn load_progressive_with_budget(
         }
         Storage::InMemory => {
             let mut pyramid_cursor = PyramidCursor::default();
+            let mut builder = DatasetBuilder::default();
             let (outcome, columns_text) = open_path_capturing_all_columns_with_progress(
                 path,
                 overrides,
                 |partial, columns| {
-                    if let Ok((dataset, _ambiguous)) = build_dataset(partial, columns, overrides) {
+                    if let Ok((dataset, _ambiguous)) = builder.snapshot(partial, columns, overrides)
+                    {
                         let pyramids = pyramid_cursor.update(&dataset);
                         on_checkpoint(Checkpoint {
                             rows_read: partial.row_count,
@@ -1705,7 +2022,9 @@ pub fn load_progressive_with_budget(
                     }
                 },
             )?;
-            build_dataset(&outcome, &columns_text, overrides).map(|(dataset, _ambiguous)| dataset)
+            builder
+                .finish(&outcome, &columns_text, overrides)
+                .map(|(dataset, _ambiguous)| dataset)
         }
     }
 }
@@ -1759,10 +2078,13 @@ impl PyramidCursor {
             self.columns.resize_with(dataset.columns.len(), || None);
         }
 
+        // One column's pyramid never reads another's, so they extend in
+        // parallel on the `rayon` compute pool (issue #114).
+        use rayon::prelude::*;
         dataset
             .columns
-            .iter()
-            .zip(self.columns.iter_mut())
+            .par_iter()
+            .zip(self.columns.par_iter_mut())
             .map(|(series, state)| Self::update_column(series.values(), &ticks, state))
             .collect()
     }
@@ -1856,9 +2178,10 @@ pub fn pyramids_for_dataset(dataset: &Dataset) -> Vec<Option<Vec<Vec<Bucket>>>> 
     }
 
     let ticks = dataset.time.to_pyramid_ticks();
+    use rayon::prelude::*;
     dataset
         .columns
-        .iter()
+        .par_iter()
         .map(|series| match series.values().as_f64_slice() {
             // Already `f64`: hand `build_pyramid` the samples themselves
             // rather than a freshly allocated copy of them.
@@ -2127,9 +2450,13 @@ pub fn derived_caches_for_dataset_cached_with_cache_dir(
     };
 
     let ticks = dataset.time.to_pyramid_ticks();
-    dataset
+    // Columns are independent — each has its own cache files — so they are
+    // built on the `rayon` compute pool (issue #114). The result keeps
+    // `dataset.columns` order.
+    use rayon::prelude::*;
+    let per_column: Vec<_> = dataset
         .columns
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(index, series)| {
             derived_caches_for_column(
@@ -2141,7 +2468,8 @@ pub fn derived_caches_for_dataset_cached_with_cache_dir(
                 &ticks,
             )
         })
-        .unzip()
+        .collect();
+    per_column.into_iter().unzip()
 }
 
 /// One column's pyramid and Level-0 cache, converting the column to `f64` at
@@ -2567,6 +2895,154 @@ mod tests {
                 };
                 assert_eq!(checkpoint_values, &final_values[..checkpoint_values.len()]);
             }
+        }
+    }
+
+    /// Issue #114: checkpoints are typed incrementally (`DatasetBuilder`),
+    /// so a decision that changes between checkpoints — a time column that
+    /// stops matching its timestamp format, a column widening from integer
+    /// to float, or from bool to integer to string — must still produce, at
+    /// every checkpoint, exactly the dataset a from-scratch load of that same
+    /// prefix produces, and a final dataset equal to a non-progressive load.
+    #[test]
+    fn incremental_checkpoints_match_a_from_scratch_load_of_the_same_prefix() {
+        let row_count = 90_000usize;
+        let header = "time,a,b\n";
+        let rows: Vec<String> = (0..row_count)
+            .map(|i| {
+                // EpochSeconds for the first 25k rows; an all-zero fraction
+                // afterwards matches no absolute format, so the column turns
+                // into a progressive index between the 20k and 40k checkpoints.
+                let time = if i < 25_000 {
+                    format!("{}", 1_700_000_000 + i)
+                } else {
+                    format!("{}.0", 1_700_000_000 + i)
+                };
+                let a = if i < 30_000 {
+                    format!("{}", i as i64 - 500)
+                } else {
+                    format!("{}.25", i)
+                };
+                let b = if i < 35_000 {
+                    format!("{}", i % 2)
+                } else if i < 60_000 {
+                    format!("{}", i * 3)
+                } else if i == 60_000 {
+                    "x".to_string()
+                } else {
+                    format!("{i}")
+                };
+                format!("{time},{a},{b}\n")
+            })
+            .collect();
+        let write = |count: usize| {
+            let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+            let mut text = String::from(header);
+            for row in &rows[..count] {
+                text.push_str(row);
+            }
+            std::io::Write::write_all(&mut file, text.as_bytes()).expect("write temp file");
+            file
+        };
+
+        let full = write(row_count);
+        let mut checkpoints: Vec<Checkpoint> = Vec::new();
+        let (_outcome, final_dataset, final_inference) =
+            load_with_outcome_progressive(full.path(), |checkpoint| checkpoints.push(checkpoint))
+                .expect("progressive load must succeed");
+        let (_outcome, expected, expected_inference) =
+            load_with_outcome(full.path()).expect("non-progressive load must succeed");
+        assert_eq!(final_dataset, expected);
+        assert_eq!(final_inference, expected_inference);
+
+        let rows_read: Vec<u64> = checkpoints.iter().map(|c| c.rows_read).collect();
+        assert_eq!(rows_read, vec![20_000, 40_000, 80_000]);
+        let dtypes = |dataset: &Dataset| -> Vec<Dtype> {
+            dataset.columns.iter().map(Series::dtype).collect()
+        };
+        assert_eq!(
+            dtypes(&checkpoints[0].dataset),
+            vec![Dtype::I64, Dtype::Bool]
+        );
+        assert_eq!(
+            dtypes(&checkpoints[1].dataset),
+            vec![Dtype::F64, Dtype::I64]
+        );
+        assert_eq!(
+            dtypes(&checkpoints[2].dataset),
+            vec![Dtype::F64, Dtype::String]
+        );
+        assert!(matches!(
+            checkpoints[0].dataset.time,
+            TimeAxis::Absolute { .. }
+        ));
+        assert!(matches!(
+            checkpoints[1].dataset.time,
+            TimeAxis::Progressive { .. }
+        ));
+
+        for checkpoint in &checkpoints {
+            let prefix = write(checkpoint.rows_read as usize);
+            let (_outcome, from_scratch, _inference) =
+                load_with_outcome(prefix.path()).expect("prefix load must succeed");
+            assert_eq!(
+                checkpoint.dataset, from_scratch,
+                "checkpoint at {} rows must equal a from-scratch load of that prefix",
+                checkpoint.rows_read
+            );
+        }
+    }
+
+    /// Issue #114: the spilled path types and writes rows in parallel
+    /// batches, but its progressive preview must still checkpoint at the
+    /// same row counts, over the same rows, as the in-memory path — across
+    /// batch boundaries (`SCAN_BATCH_ROWS`) and up to the preview cap
+    /// (`PREVIEW_MAX_ROWS`) — and the finished spilled dataset must equal
+    /// the in-memory one.
+    #[test]
+    fn batched_spilled_checkpoints_match_the_in_memory_checkpoints() {
+        let row_count = 230_000u64;
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        let mut text = String::from("time,a,b,flag\n");
+        for i in 0..row_count {
+            text.push_str(&format!(
+                "2024-01-01T00:00:00.{:06}Z,{},{}.5,{}\n",
+                i % 1_000_000,
+                i as i64 - 7,
+                i * 3,
+                i % 2
+            ));
+        }
+        std::io::Write::write_all(&mut file, text.as_bytes()).expect("write temp file");
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+
+        let collect = |budget: RamBudget| {
+            let mut checkpoints: Vec<(u64, Dataset)> = Vec::new();
+            let dataset =
+                load_progressive_with_budget(file.path(), budget, cache_dir.path(), |c| {
+                    checkpoints.push((c.rows_read, c.dataset));
+                })
+                .expect("load must succeed");
+            (dataset, checkpoints)
+        };
+        let (in_memory, memory_checkpoints) =
+            collect(RamBudget::from_total_ram_bytes(64 * 1024 * 1024 * 1024));
+        let (spilled, spilled_checkpoints) = collect(RamBudget::from_total_ram_bytes(1));
+        assert!(!in_memory.is_spilled());
+        assert!(spilled.is_spilled());
+        assert_eq!(spilled, in_memory);
+
+        let spilled_rows: Vec<u64> = spilled_checkpoints.iter().map(|(rows, _)| *rows).collect();
+        assert_eq!(spilled_rows, vec![20_000, 40_000, 80_000, 160_000]);
+        for (rows, spilled_checkpoint) in &spilled_checkpoints {
+            let (_, memory_checkpoint) = memory_checkpoints
+                .iter()
+                .find(|(memory_rows, _)| memory_rows == rows)
+                .expect("the in-memory load checkpoints at the same row counts");
+            assert_eq!(
+                spilled_checkpoint, memory_checkpoint,
+                "checkpoint at {rows} rows"
+            );
         }
     }
 

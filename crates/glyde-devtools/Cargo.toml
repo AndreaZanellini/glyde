@@ -19,6 +19,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 sysinfo.workspace = true
 rand = "0.8"
+# open_perf times the app's parallel per-column decimation (issue #114).
+rayon.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -34,3 +36,9 @@ path = "src/bin/generate_fixtures.rs"
 [[bin]]
 name = "memory_gate"
 path = "src/bin/memory_gate.rs"
+
+# Times a headless open + scripted pan/zoom session (issue #114), printing
+# `RESULT key=value` lines so two checkouts can be compared directly.
+[[bin]]
+name = "open_perf"
+path = "src/bin/open_perf.rs"

@@ -240,6 +240,48 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `blocking-decision` issue rather than decided here.
 
 ### Changed
+- **Files open about 2–3× faster, and the plot no longer stutters while the
+  mouse is over it.** (issue #114) Measured on a 1 GB, 9.2-million-row,
+  8-channel CSV, median of three runs, before → after:
+  - A file that fits in memory is fully open and ready to navigate in
+    **17 s instead of 45 s** (reading it: 37 s → 12 s; building the zoom
+    index: 8.5 s → 4.4 s). The first plot still appears in well under a
+    second.
+  - A file too large for memory (streamed to disk) shows its first plot in
+    **4.4 s instead of 8.0 s** and finishes in **8.9 s instead of 16.7 s**,
+    with memory use still flat (about 75 MB).
+  - With the pointer resting on the plot, each frame used to take **140 ms**
+    on an 8-million-sample file — above the 100 ms budget, so panning and
+    zooming visibly stuttered — because the cursor readout re-scanned the
+    whole file every frame. It now takes **under 0.1 ms**. Drawing several
+    channels is also faster: each frame decimates all channels at once
+    instead of one after another (8 channels: worst frames 24 ms → 6.5 ms).
+  - Small hitches while a big file was still loading are gone: the work the
+    window used to do each time a new partial plot arrived now happens in
+    the background.
+
+  Nothing about what you see changes: every value, timestamp, inferred
+  format and data type is exactly what it was before, and new tests check
+  that bit for bit. The speed comes from no longer doing the same work
+  twice (each number used to be parsed two or three times, and the
+  partial plots during loading were rebuilt from scratch each time) and
+  from using every CPU core while opening.
+
+  **Assumptions made:**
+  - **Opening a file now uses all CPU cores for a few seconds**, where it
+    used one before. That is the point — it is why it is faster — but on a
+    laptop you may hear the fan briefly during a large open.
+  - The numbers above were measured on a 4-core Linux machine, not on the
+    reference MacBook Air M1; the before/after ratio is the meaningful part.
+    `cargo run --release -p glyde-devtools --bin open_perf` reproduces them
+    on any machine.
+  - Not addressed here, tracked separately: reopening a file still re-reads
+    its text in full (#106), and the zoom index of a file streamed to disk
+    is still not kept (#102, #107). The cached raw samples still store the
+    time column once per channel; sharing it would make the first open
+    faster still, but changes the cache's on-disk layout, so it is left for
+    its own issue (#115).
+
 - **The memory guard-rail test in CI now also checks the drawing index, not
   just the file open — and the last two places that could have quietly
   reloaded a whole file are gone.** Opening a huge file was already proven not

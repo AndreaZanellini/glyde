@@ -683,12 +683,41 @@ impl ColumnDtypeScan {
     /// already be decimal-normalized ([`normalize_decimal_field`]), exactly
     /// as [`infer_column`]'s callers normalize before calling it.
     pub fn observe(&mut self, field: &str) {
+        self.observe_number(field);
+    }
+
+    /// [`Self::observe`], additionally handing back the number the field
+    /// parsed as under the narrowest numeric dtype still in the running, so
+    /// [`ColumnInference`] can collect typed values from the very parse that
+    /// decided the dtype instead of parsing every field a second time
+    /// (issue #114).
+    ///
+    /// Each numeric parse runs only while its dtype is still a candidate, and
+    /// the `f64` parse is skipped whenever the `i64` one succeeds: every text
+    /// `str::parse::<i64>` accepts (an optional sign followed by ASCII
+    /// digits) is also accepted by `str::parse::<f64>`, so an integer field
+    /// can never be what rules `f64` out (locked by
+    /// `tests::every_i64_text_is_also_f64_text`). The resulting flags are
+    /// therefore exactly the ones the four unconditional checks this used to
+    /// run would have produced.
+    pub(crate) fn observe_number(&mut self, field: &str) -> ObservedNumber {
         self.field_count += 1;
         let trimmed = field.trim();
-        self.bool_matches_every_field &= parse_bool_field(field).is_some();
+        self.bool_matches_every_field &= parse_bool_field(trimmed).is_some();
         self.numeric_bool_convention_only &= matches!(trimmed, "0" | "1");
-        self.i64_matches_every_field &= trimmed.parse::<i64>().is_ok();
-        self.f64_matches_every_field &= trimmed.parse::<f64>().is_ok();
+        if self.i64_matches_every_field {
+            match trimmed.parse::<i64>() {
+                Ok(value) => return ObservedNumber::I64(value),
+                Err(_) => self.i64_matches_every_field = false,
+            }
+        }
+        if self.f64_matches_every_field {
+            match trimmed.parse::<f64>() {
+                Ok(value) => return ObservedNumber::F64(value),
+                Err(_) => self.f64_matches_every_field = false,
+            }
+        }
+        ObservedNumber::None
     }
 
     /// The dtype every observed field agreed on, tried bool → integer →
@@ -761,47 +790,170 @@ pub(crate) fn log_dtype_choice(choice: ColumnDtypeChoice, field_count: usize) {
 /// integer widths (`i8`..`i32`, `u8`..`u64`) and `f32` are a later item's
 /// job, not required by any corpus case this one is proven against.
 pub fn infer_column<S: AsRef<str>>(name: impl Into<String>, fields: &[S]) -> DtypeInference {
-    let mut scan = ColumnDtypeScan::default();
-    for field in fields {
-        scan.observe(field.as_ref());
+    let mut inference = ColumnInference::default();
+    inference.extend(fields.len(), |index| fields[index].as_ref());
+    inference.finish(name, |index| fields[index].as_ref())
+}
+
+/// What [`ColumnDtypeScan::observe_number`] parsed one field as.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ObservedNumber {
+    I64(i64),
+    F64(f64),
+    None,
+}
+
+/// [`infer_column`] as a resumable computation (issue #114): fields are fed
+/// in row order, possibly across several calls to [`Self::extend`], and the
+/// column's typed values are collected from the same parse
+/// [`ColumnDtypeScan`] uses to decide its dtype — one parse per field
+/// instead of the three (`i64` attempt, `f64` check, `f64` conversion) the
+/// decide-then-convert form needed.
+///
+/// Resumable so a progressive load (docs/ROADMAP.md M3) can extend each
+/// checkpoint's column by only the rows that arrived since the previous one
+/// instead of re-typing the whole prefix every time; [`infer_column`] is a
+/// single `extend` over the whole slice, so both produce the same [`Series`]
+/// by construction (docs/ARCHITECTURE.md Hard rule 4).
+///
+/// Only the values of the narrowest numeric dtype still in the running are
+/// kept: integers while every field so far is an integer, floats once one
+/// is not. The switch re-reads the earlier fields as `f64` (the exact parse
+/// the old conversion pass ran on them), so the memory held is one typed
+/// value per row, never two.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ColumnInference {
+    scan: ColumnDtypeScan,
+    len: usize,
+    ints: Vec<i64>,
+    floats: Vec<f64>,
+}
+
+impl ColumnInference {
+    /// Observes fields `self.len()..total`, in order. `field(i)` must return
+    /// the (decimal-normalized) text of row `i` for every `i < total`,
+    /// including rows already observed — the integer-to-float switch re-reads
+    /// them.
+    pub(crate) fn extend<'f, F, S>(&mut self, total: usize, field: F)
+    where
+        F: Fn(usize) -> S,
+        S: AsRef<str> + 'f,
+    {
+        // Exact reservations: a progressive load extends in steps, and
+        // `push`'s amortized doubling would otherwise leave up to twice the
+        // column's size allocated — memory the in-memory path's RSS
+        // estimate (`csv::Sniff::footprint`) does not budget for.
+        let additional = total.saturating_sub(self.len);
+        if self.scan.i64_matches_every_field {
+            self.ints.reserve_exact(additional);
+        } else if self.scan.f64_matches_every_field {
+            self.floats.reserve_exact(additional);
+        }
+        for index in self.len..total {
+            let text = field(index);
+            let was_integer = self.scan.i64_matches_every_field;
+            match self.scan.observe_number(text.as_ref()) {
+                ObservedNumber::I64(value) => self.ints.push(value),
+                ObservedNumber::F64(value) => {
+                    if was_integer {
+                        // The first non-integer field: every earlier field
+                        // was an integer, and is re-read as `f64` here.
+                        self.ints = Vec::new();
+                        self.floats.reserve_exact(total);
+                        for earlier in 0..index {
+                            self.floats.push(
+                                field(earlier)
+                                    .as_ref()
+                                    .trim()
+                                    .parse::<f64>()
+                                    .unwrap_or_default(),
+                            );
+                        }
+                    }
+                    self.floats.push(value);
+                }
+                ObservedNumber::None => {
+                    self.ints = Vec::new();
+                    self.floats = Vec::new();
+                }
+            }
+        }
+        self.len = self.len.max(total);
     }
-    let choice = scan.finish();
-    log_dtype_choice(choice, fields.len());
 
-    let values = match choice.dtype {
-        Dtype::Bool => SeriesValues::Bool(
-            fields
-                .iter()
-                .map(|field| parse_bool_field(field.as_ref()).unwrap_or_default())
-                .collect(),
-        ),
-        Dtype::I64 => SeriesValues::I64(
-            fields
-                .iter()
-                .map(|field| field.as_ref().trim().parse::<i64>().unwrap_or_default())
-                .collect(),
-        ),
-        Dtype::F64 => SeriesValues::F64(
-            fields
-                .iter()
-                .map(|field| field.as_ref().trim().parse::<f64>().unwrap_or_default())
-                .collect(),
-        ),
-        _ => SeriesValues::String(
-            fields
-                .iter()
-                .map(|field| field.as_ref().to_string())
-                .collect(),
-        ),
-    };
+    /// The column's dtype decision over every field observed so far.
+    pub(crate) fn choice(&self) -> ColumnDtypeChoice {
+        self.scan.finish()
+    }
 
-    // SPEC §1.3: NaN runs are flagged, never filled. Only a float column can
-    // carry them; `to_f64_vec` is not used here because a `Bool`/`String`
-    // column has no NaN concept at all and an `I64` one cannot produce a NaN.
+    /// A [`Series`] over every field observed so far, leaving `self` able
+    /// to keep extending — a progressive checkpoint's snapshot. Not logged:
+    /// the decision is logged once, by [`Self::finish`], when it is final.
+    pub(crate) fn snapshot<'f, F, S>(&self, name: impl Into<String>, field: F) -> Series
+    where
+        F: Fn(usize) -> S,
+        S: AsRef<str> + 'f,
+    {
+        let choice = self.choice();
+        let values = match choice.dtype {
+            Dtype::I64 => SeriesValues::I64(self.ints.clone()),
+            Dtype::F64 => SeriesValues::F64(self.floats.clone()),
+            dtype => self.text_values(dtype, &field),
+        };
+        series_with_anomalies(name, values, false)
+    }
+
+    /// The finished column, logging its dtype decision (Golden Rule 2).
+    pub(crate) fn finish<'f, F, S>(self, name: impl Into<String>, field: F) -> DtypeInference
+    where
+        F: Fn(usize) -> S,
+        S: AsRef<str> + 'f,
+    {
+        let choice = self.choice();
+        log_dtype_choice(choice, self.len);
+        let values = match choice.dtype {
+            Dtype::I64 => SeriesValues::I64(self.ints),
+            Dtype::F64 => SeriesValues::F64(self.floats),
+            dtype => self.text_values(dtype, &field),
+        };
+        DtypeInference {
+            series: series_with_anomalies(name, values, true),
+            ambiguous: choice.ambiguous,
+        }
+    }
+
+    /// A `Bool` or `String` column's values, read straight from its text —
+    /// neither has a numeric parse to reuse.
+    fn text_values<'f, F, S>(&self, dtype: Dtype, field: &F) -> SeriesValues
+    where
+        F: Fn(usize) -> S,
+        S: AsRef<str> + 'f,
+    {
+        match dtype {
+            Dtype::Bool => SeriesValues::Bool(
+                (0..self.len)
+                    .map(|index| parse_bool_field(field(index).as_ref()).unwrap_or_default())
+                    .collect(),
+            ),
+            _ => SeriesValues::String(
+                (0..self.len)
+                    .map(|index| field(index).as_ref().to_string())
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Wraps `values` in a [`Series`] with SPEC §1.3's NaN runs flagged, never
+/// filled. Only a float column can carry them; `to_f64_vec` is not used here
+/// because a `Bool`/`String` column has no NaN concept at all and an `I64`
+/// one cannot produce a NaN. `log` is off for a progressive snapshot, whose
+/// runs are logged once the column is final.
+fn series_with_anomalies(name: impl Into<String>, values: SeriesValues, log: bool) -> Series {
     let anomalies = match values.as_f64_slice() {
         Some(samples) => {
             let nan_runs = detect_nan_runs(samples);
-            if !nan_runs.is_empty() {
+            if log && !nan_runs.is_empty() {
                 warn!(
                     run_count = nan_runs.len(),
                     "NaN run(s) flagged in a numeric column (SPEC §1.3)"
@@ -814,11 +966,7 @@ pub fn infer_column<S: AsRef<str>>(name: impl Into<String>, fields: &[S]) -> Dty
         }
         None => Anomalies::default(),
     };
-
-    DtypeInference {
-        series: Series::with_anomalies(name, values, anomalies),
-        ambiguous: choice.ambiguous,
-    }
+    Series::with_anomalies(name, values, anomalies)
 }
 
 /// SPEC §1.4 / corpus case 47: the boolean spellings the torture corpus
@@ -1564,5 +1712,134 @@ mod tests {
 
         assert_eq!(inference.series.dtype(), Dtype::String);
         assert!(!inference.ambiguous);
+    }
+
+    // ---- Issue #114: the fused, resumable inference matches the old
+    // decide-then-convert form exactly. ------------------------------------
+
+    /// The pre-#114 `infer_column`, verbatim in behavior: decide the dtype
+    /// over every field, then parse every field again under it.
+    fn reference_infer_column(fields: &[String]) -> (Dtype, bool, SeriesValues) {
+        let mut bool_ok = true;
+        let mut numeric_bool_only = true;
+        let mut i64_ok = true;
+        let mut f64_ok = true;
+        for field in fields {
+            let trimmed = field.trim();
+            bool_ok &= parse_bool_field(field).is_some();
+            numeric_bool_only &= matches!(trimmed, "0" | "1");
+            i64_ok &= trimmed.parse::<i64>().is_ok();
+            f64_ok &= trimmed.parse::<f64>().is_ok();
+        }
+        let (dtype, ambiguous) = if bool_ok {
+            (Dtype::Bool, !fields.is_empty() && numeric_bool_only)
+        } else if i64_ok {
+            (Dtype::I64, false)
+        } else if f64_ok {
+            (Dtype::F64, false)
+        } else {
+            (Dtype::String, false)
+        };
+        let values = match dtype {
+            Dtype::Bool => SeriesValues::Bool(
+                fields
+                    .iter()
+                    .map(|f| parse_bool_field(f).unwrap_or_default())
+                    .collect(),
+            ),
+            Dtype::I64 => SeriesValues::I64(
+                fields
+                    .iter()
+                    .map(|f| f.trim().parse::<i64>().unwrap_or_default())
+                    .collect(),
+            ),
+            Dtype::F64 => SeriesValues::F64(
+                fields
+                    .iter()
+                    .map(|f| f.trim().parse::<f64>().unwrap_or_default())
+                    .collect(),
+            ),
+            _ => SeriesValues::String(fields.to_vec()),
+        };
+        (dtype, ambiguous, values)
+    }
+
+    /// Bit-exact comparison (`-0.0` vs `0.0` and NaN payloads included),
+    /// which `SeriesValues`'s own `PartialEq` may be laxer about.
+    fn assert_bit_identical(actual: &SeriesValues, expected: &SeriesValues) {
+        match (actual, expected) {
+            (SeriesValues::F64(a), SeriesValues::F64(b)) => {
+                let a: Vec<u64> = a.iter().map(|v| v.to_bits()).collect();
+                let b: Vec<u64> = b.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(a, b);
+            }
+            (a, b) => assert_eq!(a, b),
+        }
+    }
+
+    fn field_strategy() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        prop_oneof![
+            4 => any::<i64>().prop_map(|v| v.to_string()),
+            4 => any::<f64>().prop_map(|v| v.to_string()),
+            2 => (-1000i32..1000).prop_map(|v| format!(" {v} ")),
+            2 => prop::sample::select(vec![
+                "0", "1", " 1", "true", "FALSE", "-0", "+0", "+7", "-0.0", "NaN", "nan",
+                "inf", "-infinity", "1e5", ".5", "5.", "", " ", "-", "+", "ERR", "1,5",
+                "0x10", "9223372036854775808", "-9223372036854775809", "007",
+            ]).prop_map(str::to_string),
+        ]
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn every_i64_text_is_also_f64_text(value in proptest::prelude::any::<i64>(),
+                                            plus in proptest::prelude::any::<bool>(),
+                                            zeros in 0usize..3) {
+            let digits = value.unsigned_abs().to_string();
+            let sign = if value < 0 { "-" } else if plus { "+" } else { "" };
+            let text = format!("{sign}{}{digits}", "0".repeat(zeros));
+            if text.parse::<i64>().is_ok() {
+                proptest::prop_assert!(text.parse::<f64>().is_ok(), "{text}");
+            }
+        }
+
+        #[test]
+        fn fused_infer_column_matches_the_decide_then_convert_reference(
+            uniform in proptest::collection::vec(field_strategy(), 0..40),
+            kind in 0u8..4,
+            split in 0usize..40,
+        ) {
+            // Bias most columns towards one dtype so every branch, including
+            // the integer-to-float switch mid-column, is exercised.
+            let fields: Vec<String> = match kind {
+                0 => uniform,
+                1 => uniform.iter().enumerate().map(|(i, _)| (i as i64 * 7 - 50).to_string()).collect(),
+                2 => uniform.iter().enumerate().map(|(i, f)| if i % 5 == 4 { f.clone() } else { i.to_string() }).collect(),
+                _ => uniform.iter().enumerate().map(|(i, _)| (i % 2).to_string()).collect(),
+            };
+            let (dtype, ambiguous, values) = reference_infer_column(&fields);
+
+            let inferred = infer_column("c", &fields);
+            proptest::prop_assert_eq!(inferred.series.dtype(), dtype);
+            proptest::prop_assert_eq!(inferred.ambiguous, ambiguous);
+            assert_bit_identical(inferred.series.values(), &values);
+
+            // Resumed across two extends (a progressive checkpoint, then the
+            // rest): the snapshot is the prefix's own inference, and the
+            // finished column is the same as one uninterrupted pass.
+            let split = split.min(fields.len());
+            let mut resumable = ColumnInference::default();
+            resumable.extend(split, |i| fields[i].as_str());
+            let snapshot = resumable.snapshot("c", |i| fields[i].as_str());
+            let prefix = infer_column("c", &fields[..split]);
+            proptest::prop_assert_eq!(snapshot.dtype(), prefix.series.dtype());
+            assert_bit_identical(snapshot.values(), prefix.series.values());
+            resumable.extend(fields.len(), |i| fields[i].as_str());
+            let finished = resumable.finish("c", |i| fields[i].as_str());
+            proptest::prop_assert_eq!(finished.series.dtype(), dtype);
+            proptest::prop_assert_eq!(finished.ambiguous, ambiguous);
+            assert_bit_identical(finished.series.values(), &values);
+        }
     }
 }

@@ -31,11 +31,11 @@ use std::time::Duration;
 
 use glyde_core::dsp::decimation::Bucket;
 use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache};
-use glyde_core::series::BoolLane;
 
 use crate::inference_bar::Correction;
 use crate::plumbing::{
     spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog, IndexingMessage,
+    PreparedView, PROGRESS_BOOL_BAND_ROWS,
 };
 use crate::{inference_bar, views};
 
@@ -66,11 +66,10 @@ type Level0Caches = Vec<Option<Arc<Level0Cache>>>;
 struct PartialLoad {
     dataset: Box<Dataset>,
     pyramids: Pyramids,
-    ticks: Vec<i128>,
-    sample_cache: Vec<Option<Vec<f64>>>,
-    /// See [`Status::Loaded::bool_bands`] — the same once-per-status-change
-    /// caching, for a still-growing checkpoint.
-    bool_bands: Vec<Option<BoolLane>>,
+    /// `ticks`, `sample_cache`, the boolean bands and the cursor lookup,
+    /// derived once per checkpoint on the indexer thread (issue #114) —
+    /// never here on the UI thread, and never per frame.
+    prepared: Box<PreparedView>,
     rows_read: u64,
     /// Issue #87: whether ingestion chose the on-disk spill path for this
     /// file (SPEC §5.1). Drives [`loading_label`]'s explanation — the two
@@ -97,17 +96,9 @@ enum Status {
         report: Box<InferenceReport>,
         dataset: Box<Dataset>,
         pyramids: Pyramids,
-        /// See [`PartialLoad::ticks`] — the same once-per-status-change
-        /// caching, for the completed dataset.
-        ticks: Vec<i128>,
-        /// See [`PartialLoad::sample_cache`].
-        sample_cache: Vec<Option<Vec<f64>>>,
-        /// `dataset.columns`-parallel, `Some` with a `bool` column's on/off
-        /// bands (docs/ROADMAP.md M6, SPEC §4.3), computed once here rather
-        /// than by [`views::state_timeline::show`] on every frame — see
-        /// [`PartialLoad::sample_cache`]'s doc comment for why per-frame
-        /// would repeat issue #80's mistake.
-        bool_bands: Vec<Option<BoolLane>>,
+        /// See [`PartialLoad::prepared`]: the same once-per-status-change
+        /// derivations, for the completed dataset.
+        prepared: Box<PreparedView>,
         /// See `crate::plumbing::IndexingMessage::Completed`'s doc comment
         /// (issue #92) — `views::time::show` prefers this over `dataset`'s
         /// own column, and over `sample_cache`, whenever an entry is `Some`.
@@ -225,48 +216,34 @@ impl GlydeApp {
                     pyramids,
                     rows_read,
                     spilled,
+                    prepared,
                     ..
-                } => {
-                    let ticks = dataset.time.to_pyramid_ticks().into_owned();
-                    let sample_cache = views::time::cache_column_samples(&dataset);
-                    let preview_ticks = &ticks[..ticks.len().min(65_536)];
-                    let bool_bands =
-                        views::state_timeline::cache_bool_bands(&dataset, preview_ticks);
-                    Status::Loading {
-                        path,
-                        partial: Some(PartialLoad {
-                            dataset,
-                            pyramids,
-                            ticks,
-                            sample_cache,
-                            bool_bands,
-                            rows_read,
-                            spilled,
-                        }),
-                    }
-                }
+                } => Status::Loading {
+                    path,
+                    partial: Some(PartialLoad {
+                        dataset,
+                        pyramids,
+                        prepared,
+                        rows_read,
+                        spilled,
+                    }),
+                },
                 IndexingMessage::Completed {
                     path,
                     report,
                     dataset,
                     pyramids,
                     level0_caches,
-                    ticks,
-                    bool_bands,
+                    prepared,
                     ..
-                } => {
-                    let sample_cache = views::time::cache_column_samples(&dataset);
-                    Status::Loaded {
-                        path,
-                        report,
-                        dataset,
-                        pyramids,
-                        ticks,
-                        sample_cache,
-                        bool_bands,
-                        level0_caches,
-                    }
-                }
+                } => Status::Loaded {
+                    path,
+                    report,
+                    dataset,
+                    pyramids,
+                    prepared,
+                    level0_caches,
+                },
                 IndexingMessage::Failed { path, message, .. } => Status::Failed { path, message },
             };
         }
@@ -326,20 +303,22 @@ impl eframe::App for GlydeApp {
                             ui,
                             &partial.dataset,
                             &partial.pyramids,
-                            &partial.ticks,
-                            &partial.sample_cache,
+                            &partial.prepared.ticks,
+                            &partial.prepared.sample_cache,
                             // A still-growing checkpoint has no level0 cache
                             // of its own (issue #92's doc comment on
                             // `IndexingMessage::Completed`) — it renders
                             // straight from the in-memory dataset like it
                             // always has, same as a `None` entry would.
                             &[],
+                            partial.prepared.cursor,
                         );
+                        let ticks = &partial.prepared.ticks;
                         views::state_timeline::show(
                             ui,
                             &partial.dataset,
-                            &partial.ticks[..partial.ticks.len().min(65_536)],
-                            &partial.bool_bands,
+                            &ticks[..ticks.len().min(PROGRESS_BOOL_BAND_ROWS)],
+                            &partial.prepared.bool_bands,
                         );
                     }
                     None => {
@@ -358,9 +337,7 @@ impl eframe::App for GlydeApp {
                 report,
                 dataset,
                 pyramids,
-                ticks,
-                sample_cache,
-                bool_bands,
+                prepared,
                 level0_caches,
             } => {
                 ui.heading(path.display().to_string());
@@ -375,12 +352,20 @@ impl eframe::App for GlydeApp {
                 }
                 // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1"; SPEC
                 // §3.1 decimation via `pyramids` (docs/ROADMAP.md M3, issue #80).
-                views::time::show(ui, dataset, pyramids, ticks, sample_cache, level0_caches);
+                views::time::show(
+                    ui,
+                    dataset,
+                    pyramids,
+                    &prepared.ticks,
+                    &prepared.sample_cache,
+                    level0_caches,
+                    prepared.cursor,
+                );
                 // SPEC §4.3 / docs/ROADMAP.md M6 "Boolean series → on/off
                 // horizontal bands" (`string`/categorical bands, markers,
                 // and sharing this view's axis with the plot above are
                 // still-open M6 items, not yet built).
-                views::state_timeline::show(ui, dataset, ticks, bool_bands);
+                views::state_timeline::show(ui, dataset, &prepared.ticks, &prepared.bool_bands);
             }
             Status::Failed { path, message } => {
                 ui.colored_label(
@@ -508,6 +493,15 @@ mod tests {
         vec![None]
     }
 
+    /// The indexer-prepared view inputs for [`sample_dataset`].
+    fn sample_prepared() -> Box<PreparedView> {
+        Box::new(PreparedView::new(
+            &sample_dataset(),
+            &sample_level0_caches(),
+            usize::MAX,
+        ))
+    }
+
     /// The bug the generation guard exists to prevent: file A is slow to
     /// index, the user opens file B before A's background thread reports
     /// back, and A's late `Completed` message must not silently overwrite
@@ -531,8 +525,7 @@ mod tests {
                 dataset: sample_dataset(),
                 pyramids: sample_pyramids(),
                 level0_caches: sample_level0_caches(),
-                ticks: vec![0],
-                bool_bands: vec![None],
+                prepared: sample_prepared(),
             })
             .expect("channel send");
 
@@ -564,6 +557,7 @@ mod tests {
                 pyramids: sample_pyramids(),
                 rows_read: 1,
                 spilled: false,
+                prepared: sample_prepared(),
             })
             .expect("channel send");
 
@@ -598,6 +592,7 @@ mod tests {
                 pyramids: sample_pyramids(),
                 rows_read: 200_000,
                 spilled: true,
+                prepared: sample_prepared(),
             })
             .expect("channel send");
 
@@ -662,6 +657,7 @@ mod tests {
                 pyramids: sample_pyramids(),
                 rows_read: 1,
                 spilled: false,
+                prepared: sample_prepared(),
             })
             .expect("channel send");
 
@@ -693,8 +689,7 @@ mod tests {
                 dataset: sample_dataset(),
                 pyramids: sample_pyramids(),
                 level0_caches: sample_level0_caches(),
-                ticks: vec![0],
-                bool_bands: vec![None],
+                prepared: sample_prepared(),
             })
             .expect("channel send");
 

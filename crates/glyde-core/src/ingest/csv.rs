@@ -62,32 +62,53 @@ impl super::Reader for CsvReader {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ColumnText {
     arena: String,
-    ranges: Vec<(usize, usize)>,
+    /// Where each field ends in `arena`; it starts where the previous one
+    /// ended. One `usize` per field rather than a `(start, len)` pair
+    /// (issue #114): with millions of rows times every column, the offset
+    /// table is the second-largest allocation of an in-memory open after the
+    /// arena itself, and every byte of it is a page the kernel has to fault
+    /// in and zero.
+    ends: Vec<usize>,
 }
 
 impl ColumnText {
-    fn push(&mut self, field: &str) {
-        let start = self.arena.len();
+    pub(crate) fn push(&mut self, field: &str) {
         self.arena.push_str(field);
-        self.ranges.push((start, field.len()));
+        self.ends.push(self.arena.len());
     }
 
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.ranges.len()
+        self.ends.len()
+    }
+
+    /// Forgets every field but keeps the allocations, for reuse as a
+    /// bounded batch buffer.
+    pub(crate) fn clear(&mut self) {
+        self.arena.clear();
+        self.ends.clear();
+    }
+
+    /// The field captured for row `index`. Callers only ever ask for rows
+    /// below [`Self::len`]; an out-of-range index reads as empty text rather
+    /// than panicking on user data.
+    pub(crate) fn field(&self, index: usize) -> &str {
+        let Some(&end) = self.ends.get(index) else {
+            return "";
+        };
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |previous| self.ends[previous]);
+        &self.arena[start..end]
     }
 
     /// Every captured field, in row order, borrowed from the arena.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &str> + '_ {
-        self.ranges
-            .iter()
-            .map(move |&(start, len)| &self.arena[start..start + len])
+        (0..self.len()).map(move |index| self.field(index))
     }
 
     #[cfg(test)]
     pub(crate) fn get(&self, index: usize) -> Option<&str> {
-        let &(start, len) = self.ranges.get(index)?;
-        Some(&self.arena[start..start + len])
+        (index < self.len()).then(|| self.field(index))
     }
 }
 
@@ -211,8 +232,13 @@ pub(crate) struct Footprint {
     pub(crate) estimated_bytes: u64,
 }
 
-/// Bytes one captured field costs in a [`ColumnText`] offset table, on top
-/// of its own text in the arena: a `(start, len)` pair of `usize`.
+/// Bytes one captured field is budgeted in a [`ColumnText`] offset table, on
+/// top of its own text in the arena. The table itself costs one `usize` per
+/// field (issue #114 halved it from a `(start, len)` pair); the estimate
+/// deliberately keeps budgeting the old pair's two, as headroom for the
+/// arena's own amortized growth, which this estimate otherwise ignores —
+/// over-estimating costs a file the slower spill path, under-estimating
+/// costs the user a freeze (see [`Sniff::footprint`]).
 const CAPTURED_FIELD_OVERHEAD_BYTES: u64 = 2 * std::mem::size_of::<usize>() as u64;
 
 /// Bytes one row of the typed time axis costs — a `Timestamp` is an `i128`
@@ -612,10 +638,14 @@ fn parse_rows<R: BufRead>(
                                 &acc,
                             );
                         }
-                        let embedded_newlines: usize = record
+                        // One pass over the record's contiguous field bytes
+                        // rather than one iterator per field (issue #114).
+                        let embedded_newlines = record
+                            .as_byte_record()
+                            .as_slice()
                             .iter()
-                            .map(|field| field.bytes().filter(|&byte| byte == b'\n').count())
-                            .sum();
+                            .filter(|&&byte| byte == b'\n')
+                            .count();
                         next_line_number = line_number.saturating_add(embedded_newlines + 1);
                         row_index += 1;
                     }
