@@ -25,7 +25,6 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 
-use glyde_core::budget::RamBudget;
 use glyde_core::dsp::psd::{
     compute_psds, plan_psd, PsdMemoryCap, PsdPlan, PsdSettings, PsdUnavailable,
 };
@@ -80,7 +79,16 @@ pub struct PsdJob {
 impl PsdJob {
     /// Starts computing the PSD of `selection` (row indices) of every numeric
     /// column of `dataset` under `settings`.
-    pub fn spawn(dataset: Arc<Dataset>, selection: Range<usize>, settings: PsdSettings) -> Self {
+    ///
+    /// Never panics (the release build aborts on panic, which would close
+    /// the app): if the thread cannot even be started, the job finishes at
+    /// once with that error.
+    pub fn spawn(
+        dataset: Arc<Dataset>,
+        selection: Range<usize>,
+        settings: PsdSettings,
+        cap: PsdMemoryCap,
+    ) -> Self {
         let shared = Arc::new(Shared::default());
         let (tx, rx) = mpsc::channel();
 
@@ -92,19 +100,24 @@ impl PsdJob {
         {
             let selection = selection.clone();
             let shared = Arc::clone(&shared);
-            thread::Builder::new()
+            let tx_job = tx.clone();
+            let started = thread::Builder::new()
                 .name("glyde-psd".to_string())
                 .spawn(move || {
-                    let outcome = run(&dataset, selection, &settings, &shared);
-                    match outcome {
+                    match run(&dataset, selection, &settings, cap, &shared) {
                         // The receiver is gone if the job was cancelled.
                         Some(outcome) => {
-                            let _ = tx.send(outcome);
+                            let _ = tx_job.send(outcome);
                         }
                         None => tracing::info!("PSD cancelled"),
                     }
-                })
-                .expect("spawning the PSD thread");
+                });
+            if let Err(error) = started {
+                tracing::error!(%error, "could not start the PSD thread");
+                let _ = tx.send(PsdOutcome::Failed(format!(
+                    "could not start the computation ({error})"
+                )));
+            }
         }
 
         Self {
@@ -158,6 +171,7 @@ fn run(
     dataset: &Dataset,
     selection: Range<usize>,
     settings: &PsdSettings,
+    cap: PsdMemoryCap,
     shared: &Shared,
 ) -> Option<PsdOutcome> {
     let (names, columns): (Vec<&str>, Vec<_>) = dataset
@@ -170,7 +184,6 @@ fn run(
         return Some(PsdOutcome::NoNumericSeries);
     }
 
-    let cap = PsdMemoryCap::for_budget(&RamBudget::from_system());
     let plan = match plan_psd(&dataset.time, selection, settings, columns.len(), cap) {
         Ok(Ok(plan)) => plan,
         Ok(Err(unavailable)) => return Some(PsdOutcome::Unavailable(unavailable)),
@@ -242,6 +255,26 @@ mod tests {
         })
     }
 
+    fn roomy() -> PsdMemoryCap {
+        PsdMemoryCap::from_bytes(glyde_core::dsp::psd::PSD_MEMORY_CAP_BYTES)
+    }
+
+    #[test]
+    fn a_psd_over_the_memory_cap_ends_with_an_explanation_not_a_crash() {
+        let job = PsdJob::spawn(
+            tone_dataset(20_000),
+            0..20_000,
+            PsdSettings::default(),
+            PsdMemoryCap::from_bytes(1024),
+        );
+        match wait(&job) {
+            PsdOutcome::Unavailable(refusal @ PsdUnavailable::OverMemoryCap { .. }) => {
+                assert!(refusal.to_string().contains("over its"));
+            }
+            other => panic!("expected a memory-cap refusal, got {other:?}"),
+        }
+    }
+
     fn wait(job: &PsdJob) -> PsdOutcome {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -255,7 +288,12 @@ mod tests {
 
     #[test]
     fn a_job_computes_one_spectrum_per_numeric_column_with_the_peak_where_physics_says() {
-        let job = PsdJob::spawn(tone_dataset(20_000), 0..20_000, PsdSettings::default());
+        let job = PsdJob::spawn(
+            tone_dataset(20_000),
+            0..20_000,
+            PsdSettings::default(),
+            roomy(),
+        );
 
         let PsdOutcome::Ready { plan, spectra } = wait(&job) else {
             panic!("a uniform tone must have a PSD");
@@ -273,7 +311,7 @@ mod tests {
 
     #[test]
     fn a_selection_that_may_not_have_a_psd_comes_back_with_its_explanation() {
-        let job = PsdJob::spawn(tone_dataset(100), 5..6, PsdSettings::default());
+        let job = PsdJob::spawn(tone_dataset(100), 5..6, PsdSettings::default(), roomy());
         assert!(matches!(
             wait(&job),
             PsdOutcome::Unavailable(PsdUnavailable::TooFewSamples { available: 1 })
@@ -286,6 +324,7 @@ mod tests {
             tone_dataset(2_000_000),
             0..2_000_000,
             PsdSettings::default(),
+            roomy(),
         );
         let shared = Arc::clone(&job.shared);
         drop(job);

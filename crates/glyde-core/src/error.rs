@@ -117,6 +117,28 @@ pub enum GlydeError {
         available_bytes: u64,
         cache_dir: PathBuf,
     },
+
+    /// A running PSD would have gone over its memory limit
+    /// (`dsp::psd::PsdMemoryCap`), so it was stopped before allocating the
+    /// memory. The plan checks this up front; this is the guard behind that
+    /// check, so a wrong estimate stops one computation instead of the app.
+    #[error(
+        "The PSD was stopped because it would have needed more than its {} memory limit \
+         (about {} in use). Nothing else was affected; try a shorter segment length in PSD \
+         settings.",
+        human_bytes(*cap_bytes),
+        human_bytes(*needed_bytes)
+    )]
+    PsdMemoryLimit { needed_bytes: u64, cap_bytes: u64 },
+
+    /// The system refused an allocation a PSD asked for: the computation is
+    /// stopped with this error instead of the process being terminated.
+    #[error(
+        "The PSD was stopped because the system could not provide {} of memory. Nothing else \
+         was affected; close other applications or try a shorter segment length.",
+        human_bytes(*requested_bytes)
+    )]
+    OutOfMemory { requested_bytes: u64 },
 }
 
 /// `bytes` in the unit a person reads a disk size in: GB with one decimal

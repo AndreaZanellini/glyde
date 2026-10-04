@@ -40,7 +40,7 @@ use std::sync::Arc;
 use super::detrend::{self, Detrend};
 use super::window::{self, Window};
 use crate::series::SampleSource;
-use crate::Result;
+use crate::{GlydeError, Result};
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
@@ -155,7 +155,7 @@ pub fn welch_source<S: SampleSource + ?Sized>(
         }));
     }
 
-    let mut accumulator = WelchAccumulator::new(effective_len, config);
+    let mut accumulator = WelchAccumulator::new(effective_len, config)?;
     let mut read = 0usize;
     let mut cancelled = false;
     source.visit_sample_chunks(start..end, &mut |chunk| {
@@ -170,7 +170,7 @@ pub fn welch_source<S: SampleSource + ?Sized>(
     if cancelled {
         return Ok(None);
     }
-    Ok(Some(accumulator.finish(sample_rate_hz)))
+    accumulator.finish(sample_rate_hz).map(Some)
 }
 
 /// The running state of one Welch estimate: the window being filled, the
@@ -198,26 +198,34 @@ struct WelchAccumulator {
 }
 
 impl WelchAccumulator {
-    fn new(len: usize, config: &WelchConfig) -> Self {
-        let window_coeffs = window::coefficients(config.window, len);
+    /// Every buffer is reserved fallibly, before the FFT is planned: if the
+    /// system cannot provide the memory, this is an error the caller can
+    /// report, never a terminated process.
+    fn new(len: usize, config: &WelchConfig) -> Result<Self> {
+        let mut window_coeffs = try_with_capacity::<f64>(len)?;
+        window_coeffs.extend((0..len).map(|n| window::coefficient(config.window, n, len)));
         let window_sum_sq = window_coeffs.iter().map(|w| w * w).sum();
+        let pending = try_with_capacity::<f64>(len)?;
+        let buffer = try_filled(len, 0.0)?;
+        let spectrum = try_filled(len, Complex::new(0.0, 0.0))?;
+        let accumulated = try_filled(len / 2 + 1, 0.0)?;
         let fft = FftPlanner::<f64>::new().plan_fft_forward(len);
-        let scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
-        Self {
+        let scratch = try_filled(fft.get_inplace_scratch_len(), Complex::new(0.0, 0.0))?;
+        Ok(Self {
             len,
             step: sub_segment_step(len, config.overlap),
             detrend: config.detrend,
             window_coeffs,
             window_sum_sq,
             fft,
-            pending: Vec::with_capacity(len),
-            buffer: vec![0.0; len],
-            spectrum: vec![Complex::new(0.0, 0.0); len],
+            pending,
+            buffer,
+            spectrum,
             scratch,
-            accumulated: vec![0.0; len / 2 + 1],
+            accumulated,
             segment_count: 0,
             non_finite_count: 0,
-        }
+        })
     }
 
     /// Feeds the next samples, in order, completing every window they fill.
@@ -263,8 +271,10 @@ impl WelchAccumulator {
         self.segment_count += 1;
     }
 
-    /// The averaged, one-sided, density-scaled estimate (SPEC §3.2).
-    fn finish(self, sample_rate_hz: f64) -> Psd {
+    /// The averaged, one-sided, density-scaled estimate (SPEC §3.2). The
+    /// power is scaled in place; only the frequency axis is a new
+    /// (fallibly reserved) allocation.
+    fn finish(self, sample_rate_hz: f64) -> Result<Psd> {
         let scale_denominator = sample_rate_hz * self.window_sum_sq;
         let nyquist_bin = if self.len.is_multiple_of(2) {
             Some(self.len / 2)
@@ -272,32 +282,47 @@ impl WelchAccumulator {
             None
         };
         let segment_count = self.segment_count;
-        let power: Vec<f64> = self
-            .accumulated
-            .into_iter()
-            .enumerate()
-            .map(|(bin, sum)| {
-                let mean_power = sum / segment_count.max(1) as f64;
-                let one_sided_factor = if bin == 0 || Some(bin) == nyquist_bin {
-                    1.0
-                } else {
-                    2.0
-                };
-                one_sided_factor * mean_power / scale_denominator
-            })
-            .collect();
+        let mut power = self.accumulated;
+        for (bin, sum) in power.iter_mut().enumerate() {
+            let mean_power = *sum / segment_count.max(1) as f64;
+            let one_sided_factor = if bin == 0 || Some(bin) == nyquist_bin {
+                1.0
+            } else {
+                2.0
+            };
+            *sum = one_sided_factor * mean_power / scale_denominator;
+        }
 
         let delta_f = sample_rate_hz / self.len as f64;
-        let freqs = (0..power.len()).map(|bin| bin as f64 * delta_f).collect();
+        let mut freqs = try_with_capacity::<f64>(power.len())?;
+        freqs.extend((0..power.len()).map(|bin| bin as f64 * delta_f));
 
-        Psd {
+        Ok(Psd {
             freqs,
             power,
             delta_f,
             segment_count,
             non_finite_count: self.non_finite_count,
-        }
+        })
     }
+}
+
+/// A `Vec` with room for `len` elements, or [`GlydeError::OutOfMemory`] when
+/// the system refuses the allocation — never an aborted process.
+fn try_with_capacity<T>(len: usize) -> Result<Vec<T>> {
+    let mut vec = Vec::new();
+    vec.try_reserve_exact(len)
+        .map_err(|_| GlydeError::OutOfMemory {
+            requested_bytes: (len as u64).saturating_mul(std::mem::size_of::<T>() as u64),
+        })?;
+    Ok(vec)
+}
+
+/// [`try_with_capacity`], filled with `len` copies of `value`.
+fn try_filled<T: Clone>(len: usize, value: T) -> Result<Vec<T>> {
+    let mut vec = try_with_capacity(len)?;
+    vec.resize(len, value);
+    Ok(vec)
 }
 
 /// The sample step between consecutive analysis windows for a given overlap
@@ -372,24 +397,35 @@ pub(crate) struct LengthWeightedAverage {
 }
 
 impl LengthWeightedAverage {
+    /// Folds one segment's estimate in. The first one's own power array
+    /// becomes the running sum, so adding never allocates.
     pub(crate) fn add(&mut self, len: usize, psd: Psd) {
         let weight = len as f64;
-        if self.reference.is_none() {
-            self.weighted_power = psd.power.iter().map(|&power| power * weight).collect();
-        } else {
-            for (acc, &p) in self.weighted_power.iter_mut().zip(psd.power.iter()) {
-                *acc += weight * p;
-            }
-        }
         self.total_weight += weight;
         self.segment_count += psd.segment_count;
         self.non_finite_count += psd.non_finite_count;
-        if self.reference.is_none() {
-            self.reference = Some(Psd {
-                power: Vec::new(),
-                ..psd
-            });
+        if self.reference.is_some() {
+            for (acc, &p) in self.weighted_power.iter_mut().zip(psd.power.iter()) {
+                *acc += weight * p;
+            }
+            return;
         }
+        let Psd {
+            freqs,
+            mut power,
+            delta_f,
+            segment_count,
+            non_finite_count,
+        } = psd;
+        power.iter_mut().for_each(|p| *p *= weight);
+        self.weighted_power = power;
+        self.reference = Some(Psd {
+            freqs,
+            power: Vec::new(),
+            delta_f,
+            segment_count,
+            non_finite_count,
+        });
     }
 
     pub(crate) fn finish(self, sample_rate_hz: f64, config: &WelchConfig) -> Psd {
@@ -403,13 +439,11 @@ impl LengthWeightedAverage {
             };
         };
         let total_weight = self.total_weight;
+        let mut power = self.weighted_power;
+        power.iter_mut().for_each(|p| *p /= total_weight);
         Psd {
             freqs: reference.freqs,
-            power: self
-                .weighted_power
-                .into_iter()
-                .map(|p| p / total_weight)
-                .collect(),
+            power,
             delta_f: reference.delta_f,
             segment_count: self.segment_count,
             non_finite_count: self.non_finite_count,

@@ -58,8 +58,10 @@
 use std::fmt;
 use std::ops::Range;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rayon::prelude::*;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::detrend::Detrend;
 use super::welch::{
@@ -71,7 +73,7 @@ use crate::budget::RamBudget;
 use crate::ingest::{TimeAxis, PROGRESSIVE_TICK_SCALE};
 use crate::series::SampleSource;
 use crate::time::{for_each_segment, is_uniform_range, scan_range, SamplingClass, TickSource};
-use crate::Result;
+use crate::{GlydeError, Result};
 
 /// Every segment length the PSD settings offer: the powers of two the
 /// software's own default can pick (SPEC §3.2's `[256, 65536]` clamp).
@@ -205,6 +207,93 @@ fn in_flight_bytes(len: usize) -> u64 {
     len as u64 * (3 * 8 + 3 * 16) + (len / 2 + 1) as u64 * (8 + 16) + READ_BUFFERS_PER_COLUMN
 }
 
+/// Whether a PSD of `columns` series with `len`-sample segments fits under
+/// `cap` at all (one series at a time) — what the PSD settings use to
+/// disable the segment lengths that would not, before anything is computed.
+pub fn segment_length_fits(len: usize, columns: usize, cap: PsdMemoryCap) -> bool {
+    PsdMemory::fit(len, columns, 1, cap).is_some()
+}
+
+/// The longest of [`SEGMENT_LENGTH_CHOICES`] that fits `columns` series
+/// under `cap`, or `None` when not even the shortest does.
+pub fn largest_affordable_segment_len(columns: usize, cap: PsdMemoryCap) -> Option<usize> {
+    SEGMENT_LENGTH_CHOICES
+        .iter()
+        .rev()
+        .copied()
+        .find(|&len| segment_length_fits(len, columns, cap))
+}
+
+/// The least memory a PSD of `columns` series with `len`-sample segments
+/// can take (one series at a time), for explaining why a length is not
+/// offered.
+pub fn minimum_peak_bytes(len: usize, columns: usize) -> u64 {
+    PsdMemory::estimate(len, columns, 1, PsdMemoryCap::from_bytes(u64::MAX)).peak_bytes
+}
+
+/// Running count of the memory a PSD computation has claimed, checked
+/// against the cap *before* each claim: the guard behind the plan's
+/// estimate. A claim over the cap is refused with
+/// [`GlydeError::PsdMemoryLimit`], which stops the computation — it never
+/// takes the application down.
+struct MemoryLedger {
+    cap_bytes: u64,
+    used: AtomicU64,
+}
+
+/// A claim on a [`MemoryLedger`], given back when dropped.
+struct Claim<'a> {
+    ledger: &'a MemoryLedger,
+    bytes: u64,
+}
+
+impl MemoryLedger {
+    fn new(cap_bytes: u64) -> Self {
+        Self {
+            cap_bytes,
+            used: AtomicU64::new(0),
+        }
+    }
+
+    fn claim(&self, bytes: u64) -> Result<Claim<'_>> {
+        let mut used = self.used.load(Ordering::Relaxed);
+        loop {
+            let needed = used.saturating_add(bytes);
+            if needed > self.cap_bytes {
+                warn!(
+                    needed_bytes = needed,
+                    cap_bytes = self.cap_bytes,
+                    "PSD stopped: it would have gone over the PSD memory cap"
+                );
+                return Err(GlydeError::PsdMemoryLimit {
+                    needed_bytes: needed,
+                    cap_bytes: self.cap_bytes,
+                });
+            }
+            match self.used.compare_exchange_weak(
+                used,
+                needed,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Ok(Claim {
+                        ledger: self,
+                        bytes,
+                    })
+                }
+                Err(actual) => used = actual,
+            }
+        }
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.ledger.used.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 /// The unit a PSD's frequency axis is in, which follows from the time axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrequencyUnit {
@@ -279,6 +368,9 @@ pub struct PsdPlan {
     /// are read anyway — and the user is told so (SPEC §5.1's example: "PSD
     /// over the full 8-hour range needs streaming — computing progressively").
     pub larger_than_memory_cap: bool,
+    /// `Some(default)` when [`SegmentLength::Auto`]'s default length did not
+    /// fit the memory cap and a shorter one was used instead.
+    pub segment_len_reduced_from: Option<usize>,
 }
 
 impl PsdPlan {
@@ -472,9 +564,28 @@ pub fn plan_psd_on<T: TickSource + ?Sized>(
     let gap_threshold = scan.gap_threshold().expect("a median Δt exists");
 
     let segmented = sampling_class == SamplingClass::SegmentedUniform;
+    let parallelism = rayon::current_num_threads();
+    let mut segment_len_reduced_from = None;
     let segment_len = match settings.segment_length {
         SegmentLength::Auto => {
-            default_segment_length(if segmented { longest } else { selection.len() })
+            let default = default_segment_length(if segmented { longest } else { selection.len() });
+            // The software's own default never asks for more memory than the
+            // cap allows: it steps down to the longest length that fits, and
+            // says so (the readout shows the length actually used).
+            match largest_affordable_segment_len(columns, cap) {
+                Some(affordable) if affordable < default => {
+                    info!(
+                        default,
+                        affordable,
+                        columns,
+                        cap_bytes = cap.bytes(),
+                        "PSD default segment length reduced to fit the PSD memory cap"
+                    );
+                    segment_len_reduced_from = Some(default);
+                    affordable
+                }
+                _ => default,
+            }
         }
         SegmentLength::Fixed(len) => len.clamp(MIN_SEGMENT_LEN, MAX_SEGMENT_LEN),
     };
@@ -510,7 +621,6 @@ pub fn plan_psd_on<T: TickSource + ?Sized>(
         (1, selection.len(), ExcludedSegments::default())
     };
 
-    let parallelism = rayon::current_num_threads();
     let Some(memory) = PsdMemory::fit(segment_len, columns, parallelism, cap) else {
         let affordable_segment_len = SEGMENT_LENGTH_CHOICES
             .iter()
@@ -555,6 +665,7 @@ pub fn plan_psd_on<T: TickSource + ?Sized>(
         columns,
         memory,
         larger_than_memory_cap: raw_bytes > cap.bytes(),
+        segment_len_reduced_from,
     };
     info!(
         selection = ?plan.selection,
@@ -616,11 +727,24 @@ where
     T: TickSource + Sync + ?Sized,
     S: SampleSource + Sync,
 {
-    let mut spectra = Vec::with_capacity(columns.len());
+    let len = plan.config.segment_len;
+    let ledger = MemoryLedger::new(plan.memory.cap_bytes);
+    // Planning's overhead and every column's result are held for the whole
+    // job; each column in flight claims its own working set on top.
+    let _held = ledger.claim(PLANNING_BYTES + columns.len() as u64 * result_bytes(len))?;
+    let mut spectra = Vec::new();
+    spectra
+        .try_reserve_exact(columns.len())
+        .map_err(|_| GlydeError::OutOfMemory {
+            requested_bytes: (columns.len() * std::mem::size_of::<Psd>()) as u64,
+        })?;
     for batch in columns.chunks(plan.memory.concurrent_columns.max(1)) {
         let results: Vec<Result<Option<Psd>>> = batch
             .par_iter()
-            .map(|samples| compute_column(ticks, samples, plan, on_progress))
+            .map(|samples| {
+                let _working_set = ledger.claim(in_flight_bytes(len))?;
+                compute_column(ticks, samples, plan, on_progress)
+            })
             .collect();
         for result in results {
             match result? {
@@ -1035,6 +1159,83 @@ mod tests {
 
         let cancelled = compute_psds(&ticks[..], &[&samples[..]], &plan, &|_| false).unwrap();
         assert!(cancelled.is_none());
+    }
+
+    #[test]
+    fn a_computation_that_would_exceed_the_cap_stops_with_an_error_instead_of_crashing() {
+        let ticks = run(0, 1_000_000, 100_000);
+        let columns: Vec<Vec<f64>> = (0..4).map(|_| vec![1.0; 100_000]).collect();
+        let slices: Vec<&[f64]> = columns.iter().map(Vec::as_slice).collect();
+        let mut plan = plan_psd_on(
+            &ticks[..],
+            SECONDS,
+            0..100_000,
+            &PsdSettings::default(),
+            4,
+            roomy(),
+        )
+        .unwrap()
+        .unwrap();
+        // An estimate that turned out wrong: the guard must still hold.
+        plan.memory.cap_bytes = plan.memory.peak_bytes / 2;
+
+        let stopped = compute_psds(&ticks[..], &slices, &plan, &|_| true);
+
+        match stopped {
+            Err(GlydeError::PsdMemoryLimit {
+                needed_bytes,
+                cap_bytes,
+            }) => assert!(needed_bytes > cap_bytes),
+            other => panic!("expected the memory-limit error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_guard_refuses_any_claim_that_would_go_over_the_cap_and_gives_memory_back() {
+        let ledger = MemoryLedger::new(1000);
+        let first = ledger.claim(600).expect("within the cap");
+        let refused = ledger.claim(500).err().expect("600 + 500 is over 1000");
+        assert!(matches!(
+            refused,
+            GlydeError::PsdMemoryLimit {
+                needed_bytes: 1100,
+                cap_bytes: 1000
+            }
+        ));
+        drop(first);
+        let _again = ledger.claim(1000).expect("released claims are given back");
+    }
+
+    #[test]
+    fn the_settings_know_in_advance_which_segment_lengths_fit() {
+        let cap = PsdMemoryCap::from_bytes(minimum_peak_bytes(4096, 10));
+        assert!(segment_length_fits(4096, 10, cap));
+        assert!(segment_length_fits(256, 10, cap));
+        assert!(!segment_length_fits(8192, 10, cap));
+        assert_eq!(largest_affordable_segment_len(10, cap), Some(4096));
+        let tiny = PsdMemoryCap::from_bytes(1024);
+        assert_eq!(largest_affordable_segment_len(10, tiny), None);
+    }
+
+    #[test]
+    fn auto_steps_its_default_down_to_the_longest_length_that_fits_and_says_so() {
+        let ticks = run(0, 1_000_000, 4_000_000); // default would be 65536
+        let cap = PsdMemoryCap::from_bytes(minimum_peak_bytes(8192, 20));
+
+        let plan = plan_psd_on(
+            &ticks[..],
+            SECONDS,
+            0..ticks.len(),
+            &PsdSettings::default(),
+            20,
+            cap,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(plan.config.segment_len, 8192);
+        assert_eq!(plan.segment_len_reduced_from, Some(65536));
+        assert!(plan.memory.peak_bytes <= cap.bytes());
     }
 
     #[test]

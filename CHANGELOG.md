@@ -60,10 +60,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
     length of the selection, the number of gaps in it, or the number of
     series. The samples are read in small chunks, one analysis window at a
     time; Glyde works out the peak memory *before* starting and computes as
-    many series at once as fit under the limit. If not even one series at a
-    time fits (very long windows on a file with very many series), the PSD is
-    refused before anything runs, with a button for the largest segment
-    length that fits. A line under the plot shows the memory used against
+    many series at once as fit under the limit. It also checks in advance
+    what *can* fit: in PSD settings, segment lengths that would go over the
+    limit for this file's number of series are greyed out (hover to see how
+    much they would need); if "Auto"'s usual length would not fit, a shorter
+    one is used and the panel says so; if not even the shortest fits (a file
+    with a huge number of series), "Compute PSD" is disabled with the reason.
+    **Reaching the limit never closes the app**: should a running computation
+    still be about to go over it, or should the system refuse memory, that
+    one computation stops with a message (*"The PSD was stopped because…"*)
+    and everything else keeps working. A line under the plot shows the memory used against
     the limit, e.g. *"Memory: at most 23.0 MB of the 256.0 MB PSD limit (4
     series at a time)"*. A test measures every byte actually allocated and
     checks it never exceeds that estimate. A 10-million-sample PSD takes

@@ -36,13 +36,16 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use egui_plot::{Legend, Line, Plot, PlotPoints};
+use glyde_core::budget::RamBudget;
 use glyde_core::dsp::psd::{
-    FrequencyUnit, PsdPlan, PsdSettings, PsdUnavailable, SegmentLength, OVERLAP_CHOICES,
+    largest_affordable_segment_len, minimum_peak_bytes, segment_length_fits, FrequencyUnit,
+    PsdMemoryCap, PsdPlan, PsdSettings, PsdUnavailable, SegmentLength, OVERLAP_CHOICES,
     SEGMENT_LENGTH_CHOICES,
 };
 use glyde_core::dsp::welch::Psd;
 use glyde_core::dsp::window::Window;
 use glyde_core::ingest::Dataset;
+use glyde_core::series::ViewKind;
 
 use crate::plumbing::psd::{PsdJob, PsdOutcome, Spectrum};
 use crate::views::time::series_color;
@@ -88,6 +91,8 @@ pub struct PsdPanel {
     log_power: bool,
     job: Option<PsdJob>,
     shown: Option<Shown>,
+    /// The PSD memory cap on this machine, read once per file.
+    cap: PsdMemoryCap,
 }
 
 impl Default for PsdPanel {
@@ -101,6 +106,7 @@ impl Default for PsdPanel {
             log_power: true,
             job: None,
             shown: None,
+            cap: PsdMemoryCap::for_budget(&RamBudget::from_system()),
         }
     }
 }
@@ -126,7 +132,12 @@ impl PsdPanel {
     /// Starts computing the PSD of `selection` under the current settings,
     /// replacing (and so cancelling) any computation still running.
     pub fn compute(&mut self, dataset: &Arc<Dataset>, selection: Range<usize>) {
-        self.job = Some(PsdJob::spawn(Arc::clone(dataset), selection, self.settings));
+        self.job = Some(PsdJob::spawn(
+            Arc::clone(dataset),
+            selection,
+            self.settings,
+            self.cap,
+        ));
     }
 
     /// Stops the running computation, if any; what was shown stays shown.
@@ -145,6 +156,10 @@ impl PsdPanel {
         selection: Option<Range<usize>>,
     ) -> Option<PsdRequest> {
         let mut request = None;
+        let columns = numeric_columns(dataset);
+        // Checked before anything runs (SPEC §5.1): with this many series,
+        // does even the shortest segment length fit the memory cap?
+        let affordable = largest_affordable_segment_len(columns, self.cap);
 
         ui.horizontal(|ui| {
             ui.strong("Power spectral density");
@@ -155,7 +170,10 @@ impl PsdPanel {
                 }
             } else {
                 let compute = ui
-                    .add_enabled(selection.is_some(), egui::Button::new("Compute PSD"))
+                    .add_enabled(
+                        selection.is_some() && affordable.is_some(),
+                        egui::Button::new("Compute PSD"),
+                    )
                     .on_hover_text("Compute the spectrum of the interval the time view shows now");
                 if let (true, Some(selection)) = (compute.clicked(), selection.clone()) {
                     self.compute(dataset, selection);
@@ -168,7 +186,18 @@ impl PsdPanel {
             ui.checkbox(&mut self.log_frequency, "Log frequency");
             ui.checkbox(&mut self.log_power, "Log power");
         });
-        self.show_settings(ui);
+        self.show_settings(ui, columns);
+        if affordable.is_none() && columns > 0 {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!(
+                    "A PSD of this file's {columns} series would need at least {} even with the \
+                     shortest segments, over the {} PSD memory limit, so it cannot be computed.",
+                    megabytes(minimum_peak_bytes(SEGMENT_LENGTH_CHOICES[0], columns)),
+                    megabytes(self.cap.bytes())
+                ),
+            );
+        }
 
         if let Some(job) = &self.job {
             ui.horizontal(|ui| {
@@ -210,6 +239,9 @@ impl PsdPanel {
             PsdOutcome::Ready { plan, spectra } => {
                 ui.label(computed_on(plan, spectra));
                 ui.label(memory_note(plan));
+                if let Some(note) = reduced_segment_note(plan) {
+                    ui.label(note);
+                }
                 for line in missing_sample_notes(spectra) {
                     ui.label(line);
                 }
@@ -258,7 +290,7 @@ impl PsdPanel {
             PsdOutcome::Failed(message) => {
                 ui.colored_label(
                     ui.visuals().error_fg_color,
-                    format!("PSD failed: {message}"),
+                    format!("PSD stopped: {message}"),
                 );
             }
         }
@@ -274,7 +306,10 @@ impl PsdPanel {
     }
 
     /// SPEC §3.2: the three controls, behind one affordance, never required.
-    fn show_settings(&mut self, ui: &mut egui::Ui) {
+    /// The settings; segment lengths that would not fit the memory cap for
+    /// `columns` series are shown but cannot be chosen.
+    fn show_settings(&mut self, ui: &mut egui::Ui, columns: usize) {
+        let cap = self.cap;
         let before = self.settings;
         egui::CollapsingHeader::new("PSD settings")
             .default_open(false)
@@ -303,11 +338,25 @@ impl PsdPanel {
                             );
                             for len in SEGMENT_LENGTH_CHOICES {
                                 let choice = SegmentLength::Fixed(len);
-                                ui.selectable_value(
-                                    &mut self.settings.segment_length,
-                                    choice,
-                                    segment_length_name(choice),
+                                let fits = segment_length_fits(len, columns, cap);
+                                let option = ui.add_enabled(
+                                    fits,
+                                    egui::SelectableLabel::new(
+                                        self.settings.segment_length == choice,
+                                        segment_length_name(choice),
+                                    ),
                                 );
+                                if option.clicked() {
+                                    self.settings.segment_length = choice;
+                                }
+                                if !fits {
+                                    option.on_disabled_hover_text(format!(
+                                        "Would need at least {} for {columns} series, over the \
+                                         {} PSD memory limit",
+                                        megabytes(minimum_peak_bytes(len, columns)),
+                                        megabytes(cap.bytes())
+                                    ));
+                                }
                             }
                         });
                     ui.label("Overlap");
@@ -503,6 +552,31 @@ fn megabytes(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
+/// When "Auto" had to shorten its default segment length to stay within the
+/// memory cap, says so (never silently, Golden Rule 2).
+pub fn reduced_segment_note(plan: &PsdPlan) -> Option<String> {
+    plan.segment_len_reduced_from.map(|default| {
+        format!(
+            "Segment length reduced from the default {} to {} samples to stay within the PSD \
+             memory limit for {} series.",
+            group_thousands(default),
+            group_thousands(plan.config.segment_len),
+            plan.columns
+        )
+    })
+}
+
+/// How many series of `dataset` get a spectrum.
+fn numeric_columns(dataset: &Dataset) -> usize {
+    dataset
+        .columns
+        .iter()
+        .filter(|series| {
+            series.view_kind() == ViewKind::TimeDomain && series.values().sample_source().is_some()
+        })
+        .count()
+}
+
 /// One note per series that had missing (non-finite) samples in the
 /// selection: the windows touching them were skipped, never filled in.
 pub fn missing_sample_notes(spectra: &[Spectrum]) -> Vec<String> {
@@ -616,6 +690,7 @@ mod tests {
                 cap_bytes: 256 * 1024 * 1024,
             },
             larger_than_memory_cap: false,
+            segment_len_reduced_from: None,
         }
     }
 
@@ -663,6 +738,20 @@ mod tests {
         assert_eq!(
             memory_note(&plan(1, 20_000, SamplingClass::Uniform)),
             "Memory: at most 12.5 MB of the 256.0 MB PSD limit (1 series at a time)"
+        );
+    }
+
+    #[test]
+    fn a_reduced_auto_segment_length_is_never_silent() {
+        let mut plan = plan(1, 20_000, SamplingClass::Uniform);
+        assert_eq!(reduced_segment_note(&plan), None);
+        plan.segment_len_reduced_from = Some(65536);
+        assert_eq!(
+            reduced_segment_note(&plan).as_deref(),
+            Some(
+                "Segment length reduced from the default 65,536 to 1,024 samples to stay \
+                 within the PSD memory limit for 1 series."
+            )
         );
     }
 
@@ -938,6 +1027,21 @@ mod request_tests {
         let text = render(&mut panel, &dataset, 0..4096);
         assert!(panel.job.is_none());
         assert!(text.contains("changed since this PSD was computed"));
+    }
+
+    #[test]
+    fn when_nothing_fits_the_memory_cap_the_panel_says_so_and_never_computes() {
+        let dataset = dataset();
+        let mut panel = PsdPanel {
+            cap: PsdMemoryCap::from_bytes(1024),
+            ..PsdPanel::default()
+        };
+        let text = render(&mut panel, &dataset, 0..4096);
+        assert!(
+            text.contains("cannot be computed"),
+            "the reason must be shown"
+        );
+        assert!(panel.job.is_none());
     }
 
     #[test]
