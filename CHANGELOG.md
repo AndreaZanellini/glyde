@@ -12,6 +12,86 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Power spectral density (PSD) view — milestone M5.** Under the time plot
+  there is now a resizable panel with the spectrum of every numeric series,
+  computed with Welch's method on the **raw samples** (never on the
+  decimated plot data). It follows the time view: whatever interval the time
+  plot shows *is* the selection. Zoom or box-select a stretch and, a quarter
+  of a second after you stop moving, the PSD is recomputed for that stretch
+  only; "Fit to data" goes back to the whole signal. A newer selection
+  cancels a computation still running for an older one, and the work happens
+  in the background, so the window never freezes. (docs/SPEC.md §3.2, §3.3,
+  §4.2.)
+  - **Overlay / Stacked**: all spectra on one plot, or one plot per series;
+    every plot shares the same frequency axis (pan or zoom one, they all
+    follow). Each spectrum uses its series' color from the time plot.
+  - **Log frequency / Log power**: independent log/linear toggles for both
+    axes. Bins that have no logarithm (0 Hz, zero power) are simply not drawn
+    on a log axis — never replaced by an invented value.
+  - **"Computed on" line** under the toolbar, always: number of samples,
+    number of averaged windows, window type and length, overlap, Δf and the
+    sampling rate, e.g. *"Computed on 20,000 samples · 38 windows · Hann,
+    1,024 samples, 50% overlap · Δf = 0.9766 Hz · sampling rate 1000 Hz"*.
+  - **PSD settings** (collapsed by default, never needed for a correct first
+    result): window (Hann / Hamming / Rectangular), segment length (Auto or
+    256 … 65,536) and overlap (0 / 25 / 50 / 75 %), plus a "Defaults" button.
+    Changing one recomputes immediately.
+  - **Data with gaps** (bursts separated by long pauses): the PSD is computed
+    per burst — no analysis window ever crosses a gap — and averaged,
+    weighted by burst length. The line says *"averaged over N segments (no
+    window crosses a gap)"*, and bursts too short for one window are listed
+    as excluded with their sample count. If no burst is long enough, the
+    panel says so and why instead of drawing anything.
+  - **Irregular timestamps** (event logs): no PSD, and an explanation —
+    *"PSD requires uniform sampling; this series has irregular timestamps.
+    Glyde does not resample it to fake a uniform rate."* If the file has a
+    uniformly sampled stretch of at least 256 samples, a button **"Analyze
+    the largest uniform stretch"** moves the time view onto it, which makes
+    it the new selection.
+  - **Timestamps out of order**: no PSD, with a pointer to the inference
+    bar's [Sort].
+  - **Missing values (NaN / empty cells)**: windows that would contain one
+    are skipped, never filled in, and the panel says how many missing samples
+    each series had in the selection.
+  - **Large selections**: the PSD reads the samples in small chunks and only
+    ever holds one analysis window in memory, so any selection size works
+    without running out of memory. When the selection alone would not fit
+    Glyde's memory budget, the progress line says it is being read
+    progressively. A 10-million-sample PSD takes about 0.45 s on an Apple
+    Silicon laptop (budget: 1 s, now enforced by the `welch` benchmark).
+
+  What to try (the M5 maintainer test): open a signal with known frequency
+  content and check the peak lands where physics says; box-select a
+  sub-interval and watch the PSD recompute for it; open a file with bursts
+  separated by gaps and look for "averaged over N segments"; open an
+  irregular event log (e.g. corpus case 39) and read the explanation; toggle
+  both log axes.
+
+  **Assumptions made (please veto by testing the app):**
+  - **The selection is the time view's visible interval**, not a separate
+    selection tool. SPEC §4.2 says "selection in the time view drives the PSD
+    view" without saying how a selection is made; reusing zoom/box-select
+    avoids adding a new interaction.
+  - **Log power is on by default, log frequency off.** Power usually spans
+    many orders of magnitude, so a linear power axis shows only the biggest
+    peak.
+  - **Auto segment length for data with gaps** uses the longest burst in the
+    selection (largest power of two ≤ its length / 8, clamped to 256 …
+    65,536), so the longest burst always holds several windows. For uniform
+    data it is the whole selection, exactly as SPEC §3.2 says.
+  - **Gaps and uniformity are judged on the selection itself**, with the
+    same rules as the inference bar (gap = Δt > 10 × median Δt; uniform =
+    jitter ≤ 1 %). So selecting a clean stretch of an otherwise irregular
+    file gives you its PSD.
+  - **"Largest uniform stretch"** means the longest gap-free run of the whole
+    file that is itself uniform and has at least 256 samples (one minimum
+    window). A file that is jittery throughout, with no gaps, has none.
+  - **Missing values split windows** as described above (each remaining
+    window counts equally), rather than making the whole PSD unavailable.
+  - **A file whose time axis is a plain number (not a timestamp)** shows
+    frequency in "cycles per index unit", never relabeled as Hz.
+  - **At least 2 samples** are needed for a PSD; a uniform selection
+    shorter than one window is analyzed as one shorter window (as before).
 - **Files with no time column now open and plot every column, against a row
   index Glyde generates — and you can pick the time column yourself.** A file
   of plain signals (say `ax,ay,az`, no timestamps) used to be read as if its
