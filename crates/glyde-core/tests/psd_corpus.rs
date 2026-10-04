@@ -16,8 +16,9 @@
 //! corpus through the real loader (docs/QUALITY.md §1 cases 39 and 40,
 //! docs/ROADMAP.md M5 "`SegmentedUniform` ... `Irregular`").
 
-use glyde_core::budget::RamBudget;
-use glyde_core::dsp::psd::{plan_psd, PsdSettings, PsdUnavailable};
+use glyde_core::dsp::psd::{
+    plan_psd, PsdMemoryCap, PsdSettings, PsdUnavailable, PSD_MEMORY_CAP_BYTES,
+};
 use glyde_core::dsp::welch::MIN_SEGMENT_LEN;
 use glyde_core::ingest::load;
 use std::path::{Path, PathBuf};
@@ -30,12 +31,12 @@ fn corpus_path(file_name: &str) -> PathBuf {
 
 fn plan_whole_file(file_name: &str) -> Result<glyde_core::dsp::psd::PsdPlan, PsdUnavailable> {
     let dataset = load(&corpus_path(file_name)).expect("corpus file opens");
-    let budget = RamBudget::from_total_ram_bytes(16 * 1024 * 1024 * 1024);
     plan_psd(
         &dataset.time,
         0..dataset.time.len(),
         &PsdSettings::default(),
-        &budget,
+        dataset.columns.len(),
+        PsdMemoryCap::from_bytes(PSD_MEMORY_CAP_BYTES),
     )
     .expect("an in-memory axis cannot fail to scan")
 }

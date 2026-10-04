@@ -14,7 +14,8 @@
 
 //! The PSD product logic (docs/SPEC.md §3.2–3.3, §5.1, docs/ROADMAP.md M5):
 //! given a selected interval of a time axis, decide *whether* it may have a
-//! PSD and *what exactly* it is computed on — before a single sample is read.
+//! PSD, *what exactly* it is computed on, and *how much memory* computing it
+//! will take — before a single sample is read.
 //!
 //! [`plan_psd`] classifies the selection itself (SPEC §2.2's rules, applied to
 //! just the selected rows) and answers with either a [`PsdPlan`] or a
@@ -31,29 +32,45 @@
 //! - Out-of-order timestamps → no PSD: a Δt is only a sampling interval when
 //!   time moves forward.
 //!
-//! [`compute_psd`] then runs the plan through `dsp::welch`'s streaming entry
-//! points, once per numeric column. It reads raw samples only — a
-//! [`SampleSource`], never the pyramid (SPEC §3.2) — in bounded chunks, so
-//! the memory it needs is a fixed multiple of the window length whatever the
-//! selection's size. That working set is the one thing that is checked
-//! against the RAM budget up front (SPEC §5.1: "checks affordability before
-//! acting, never after").
+//! # The memory cap
+//!
+//! A PSD never holds more than [`PsdMemoryCap`] bytes, whatever the
+//! selection's length, the number of gaps in it, or the number of series
+//! (SPEC §5.1: "checks affordability before acting, never after"). Nothing
+//! here grows with the selection: planning only counts segments (they are
+//! enumerated again on the fly while computing, never stored), and each
+//! column's samples are streamed through one analysis window. What remains
+//! is bounded and accounted for in [`PsdMemory`]:
+//!
+//! - a fixed planning overhead (the bounded-memory median's counters and the
+//!   tick read buffers);
+//! - each column's result (its spectrum and running average), held until
+//!   the job ends;
+//! - each column *being computed*: one window's buffers, FFT plan and
+//!   scratch, and its read buffers.
+//!
+//! The plan fixes how many columns are computed at once so that the total
+//! stays under the cap, and refuses — naming the largest segment length that
+//! would fit — when not even one column at a time does. A counting-allocator
+//! test (`tests/psd_memory_cap.rs`) proves the real peak never exceeds the
+//! estimate.
 
 use std::fmt;
 use std::ops::Range;
 
+use rayon::prelude::*;
 use tracing::info;
 
 use super::detrend::Detrend;
 use super::welch::{
-    default_segment_length, welch_segmented_source, welch_source, Psd, WelchConfig,
-    DEFAULT_OVERLAP, MAX_SEGMENT_LEN, MIN_SEGMENT_LEN,
+    default_segment_length, welch_source, LengthWeightedAverage, Psd, WelchConfig, DEFAULT_OVERLAP,
+    MAX_SEGMENT_LEN, MIN_SEGMENT_LEN,
 };
 use super::window::Window;
 use crate::budget::RamBudget;
 use crate::ingest::{TimeAxis, PROGRESSIVE_TICK_SCALE};
 use crate::series::SampleSource;
-use crate::time::{is_uniform_range, scan_range, SamplingClass, TickSource};
+use crate::time::{for_each_segment, is_uniform_range, scan_range, SamplingClass, TickSource};
 use crate::Result;
 
 /// Every segment length the PSD settings offer: the powers of two the
@@ -67,6 +84,22 @@ pub const OVERLAP_CHOICES: [f64; 4] = [0.0, 0.25, 0.5, 0.75];
 /// Fewer selected samples than this has no spectrum to speak of (a single
 /// sample has no Δt, so no sampling rate either).
 pub const MIN_PSD_SAMPLES: usize = 2;
+
+/// The most memory a PSD computation may ever hold: 256 MiB, or the
+/// application's whole RAM budget on a machine where that is smaller.
+pub const PSD_MEMORY_CAP_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Planning's fixed overhead: the bounded-memory median's 2¹⁶ counters
+/// (512 KiB), the tick read buffer of a spilled axis and the conversion
+/// buffer of a progressive one (1 MiB each), rounded up for the bookkeeping
+/// around them.
+const PLANNING_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read buffers one column in flight may hold at once: the spill reader's
+/// buffer and the dtype-conversion buffer (1 MiB each, see
+/// `series::SAMPLE_CHUNK_LEN`), plus a tick read buffer for enumerating a
+/// segmented selection's runs.
+const READ_BUFFERS_PER_COLUMN: u64 = 3 * 1024 * 1024;
 
 /// How the analysis segment length is chosen (SPEC §3.2's second control).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +129,80 @@ impl Default for PsdSettings {
             overlap: DEFAULT_OVERLAP,
         }
     }
+}
+
+/// The ceiling on what a PSD computation may hold (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PsdMemoryCap {
+    bytes: u64,
+}
+
+impl PsdMemoryCap {
+    /// [`PSD_MEMORY_CAP_BYTES`], lowered to `budget`'s cap if that is smaller.
+    pub fn for_budget(budget: &RamBudget) -> Self {
+        Self::from_bytes(PSD_MEMORY_CAP_BYTES.min(budget.cap_bytes()))
+    }
+
+    /// An explicit cap, e.g. for a test.
+    pub fn from_bytes(bytes: u64) -> Self {
+        Self { bytes }
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+/// What a planned PSD will hold at its peak, by part (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PsdMemory {
+    /// How many columns are computed at the same time.
+    pub concurrent_columns: usize,
+    /// The estimated peak: planning + every result + the columns in flight.
+    pub peak_bytes: u64,
+    pub cap_bytes: u64,
+}
+
+impl PsdMemory {
+    /// The peak for `columns` series at window length `len`, computing
+    /// `concurrent` of them at a time.
+    pub fn estimate(len: usize, columns: usize, concurrent: usize, cap: PsdMemoryCap) -> Self {
+        Self {
+            concurrent_columns: concurrent,
+            peak_bytes: PLANNING_BYTES
+                + columns as u64 * result_bytes(len)
+                + concurrent as u64 * in_flight_bytes(len),
+            cap_bytes: cap.bytes(),
+        }
+    }
+
+    /// The most columns at a time that keep `columns` series at window
+    /// length `len` under `cap` — at most `parallelism` — or `None` when not
+    /// even one does.
+    fn fit(len: usize, columns: usize, parallelism: usize, cap: PsdMemoryCap) -> Option<Self> {
+        let fixed = PLANNING_BYTES + columns as u64 * result_bytes(len);
+        let room = cap.bytes().checked_sub(fixed)?;
+        let concurrent = (room / in_flight_bytes(len)).min(parallelism.min(columns).max(1) as u64);
+        (concurrent >= 1).then(|| Self::estimate(len, columns, concurrent as usize, cap))
+    }
+}
+
+/// Bytes one column holds for the whole job at window length `len`: its
+/// running length-weighted average and its finished spectrum (frequencies and
+/// power, `len / 2 + 1` bins of 8 bytes each), with room for the average's
+/// power array and the spectrum's to coexist while one becomes the other.
+fn result_bytes(len: usize) -> u64 {
+    (len / 2 + 1) as u64 * 8 * 3
+}
+
+/// Bytes one column holds only while it is being computed, at window length
+/// `len`: the window being filled, its detrend buffer and the window
+/// coefficients (8 bytes per sample each); the complex spectrum, the FFT's
+/// scratch and its twiddle factors (16 bytes per sample each); the running sum
+/// of periodograms and one finished per-segment estimate (8 + 16 bytes per
+/// bin); and its read buffers.
+fn in_flight_bytes(len: usize) -> u64 {
+    len as u64 * (3 * 8 + 3 * 16) + (len / 2 + 1) as u64 * (8 + 16) + READ_BUFFERS_PER_COLUMN
 }
 
 /// The unit a PSD's frequency axis is in, which follows from the time axis.
@@ -143,7 +250,9 @@ pub struct ExcludedSegments {
     pub samples: usize,
 }
 
-/// Exactly what a PSD will be computed on, decided before any sample is read.
+/// Exactly what a PSD will be computed on, and how much memory it will take,
+/// decided before any sample is read. Holds no per-segment list: its size is
+/// the same for any selection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PsdPlan {
     /// The selected rows, as asked for.
@@ -153,15 +262,23 @@ pub struct PsdPlan {
     /// Samples per [`FrequencyUnit`] unit: `1 / median Δt` of the selection.
     pub sample_rate: f64,
     pub frequency_unit: FrequencyUnit,
-    /// The contiguous, gap-free runs Welch runs on, in row order.
-    pub segments: Vec<Range<usize>>,
+    /// The selection's gap threshold in ticks (SPEC §2.2–2.3), with which
+    /// [`compute_psds`] enumerates the same runs planning counted.
+    pub gap_threshold: f64,
+    /// Gap-free runs that enter the estimate (1 for a uniform selection).
+    pub segment_count: usize,
+    /// Samples that enter the estimate (excluded runs not counted).
+    pub samples_used: usize,
     pub excluded: ExcludedSegments,
     pub config: WelchConfig,
-    /// The selection's raw samples alone would not fit the RAM budget, so it
-    /// is only ever computable streaming — which is how it is computed — and
-    /// the user is told so (SPEC §5.1's example: "PSD over the full 8-hour
-    /// range needs streaming — computing progressively").
-    pub exceeds_memory_budget: bool,
+    /// How many series the plan was made for.
+    pub columns: usize,
+    pub memory: PsdMemory,
+    /// The selection's raw samples, all series together, are larger than the
+    /// memory cap: they are only ever read progressively — which is how they
+    /// are read anyway — and the user is told so (SPEC §5.1's example: "PSD
+    /// over the full 8-hour range needs streaming — computing progressively").
+    pub larger_than_memory_cap: bool,
 }
 
 impl PsdPlan {
@@ -171,18 +288,13 @@ impl PsdPlan {
         self.sampling_class == SamplingClass::SegmentedUniform
     }
 
-    /// Samples that actually enter the estimate (excluded runs not counted).
-    pub fn samples_used(&self) -> usize {
-        self.segments.iter().map(|r| r.len()).sum()
-    }
-
     /// The analysis window length actually used: the configured segment
     /// length, or the whole selection when a uniform selection is shorter.
     pub fn window_len(&self) -> usize {
         if self.is_segmented() {
             self.config.segment_len
         } else {
-            self.config.segment_len.min(self.samples_used())
+            self.config.segment_len.min(self.samples_used)
         }
     }
 }
@@ -210,8 +322,8 @@ pub enum PsdUnavailable {
         longest: usize,
         window: usize,
     },
-    /// Even one analysis window's working set would not fit the RAM budget.
-    OverBudget {
+    /// Even one series at a time would go over the PSD memory cap.
+    OverMemoryCap {
         requested_bytes: u64,
         cap_bytes: u64,
         affordable_segment_len: Option<usize>,
@@ -262,37 +374,31 @@ impl fmt::Display for PsdUnavailable {
                  analysis window may cross a gap — but even the longest segment ({longest} \
                  samples) is shorter than one {window}-sample window."
             ),
-            PsdUnavailable::OverBudget {
+            PsdUnavailable::OverMemoryCap {
                 requested_bytes,
                 cap_bytes,
                 affordable_segment_len,
             } => {
                 write!(
                     f,
-                    "This PSD's working memory ({requested_bytes} bytes) is over Glyde's \
-                     {cap_bytes}-byte memory budget."
+                    "This PSD would need {} of memory, over its {} limit.",
+                    mebibytes(*requested_bytes),
+                    mebibytes(*cap_bytes)
                 )?;
                 match affordable_segment_len {
                     Some(len) => write!(
                         f,
                         " A {len}-sample segment length fits — choose it in PSD settings."
                     ),
-                    None => write!(f, " No segment length fits on this machine."),
+                    None => write!(f, " No segment length fits for this many series."),
                 }
             }
         }
     }
 }
 
-/// Bytes one Welch estimate holds while it runs, for a window of `len`
-/// samples: the window being filled, its detrend buffer, the window
-/// coefficients (8 bytes each), the complex spectrum and FFT scratch (16
-/// each), plus the per-bin running sums the estimate and a segmented average
-/// keep (three `len / 2 + 1` arrays of 8 bytes).
-pub fn working_set_bytes(len: usize, segment_count: usize) -> u64 {
-    let window = 3 * 8 + 2 * 16;
-    let bins = (len / 2 + 1) as u64 * 8 * 3;
-    len as u64 * window + bins + segment_count as u64 * 16
+fn mebibytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// [`plan_psd_on`] for a [`TimeAxis`], with its own [`AxisScale`].
@@ -300,19 +406,22 @@ pub fn plan_psd(
     time: &TimeAxis,
     selection: Range<usize>,
     settings: &PsdSettings,
-    budget: &RamBudget,
+    columns: usize,
+    cap: PsdMemoryCap,
 ) -> Result<std::result::Result<PsdPlan, PsdUnavailable>> {
-    plan_psd_on(time, AxisScale::of(time), selection, settings, budget)
+    plan_psd_on(time, AxisScale::of(time), selection, settings, columns, cap)
 }
 
-/// Decides what a PSD of `selection` (row indices into `ticks`) is computed
-/// on, in bounded memory over the ticks alone — see the module docs.
+/// Decides what a PSD of `selection` (row indices into `ticks`) of `columns`
+/// series is computed on, in bounded memory over the ticks alone — see the
+/// module docs.
 pub fn plan_psd_on<T: TickSource + ?Sized>(
     ticks: &T,
     scale: AxisScale,
     selection: Range<usize>,
     settings: &PsdSettings,
-    budget: &RamBudget,
+    columns: usize,
+    cap: PsdMemoryCap,
 ) -> Result<std::result::Result<PsdPlan, PsdUnavailable>> {
     let end = selection.end.min(ticks.tick_count());
     let selection = selection.start.min(end)..end;
@@ -322,22 +431,12 @@ pub fn plan_psd_on<T: TickSource + ?Sized>(
         }));
     }
 
-    // Every run long enough to hold a minimum-length window is kept (at most
-    // `len / MIN_SEGMENT_LEN` of them, a bounded list); shorter ones are only
-    // counted.
-    let mut runs: Vec<Range<usize>> = Vec::new();
-    let mut short = ExcludedSegments::default();
+    // Runs are only counted here, never collected.
     let mut run_count = 0usize;
     let mut longest = 0usize;
     let scan = scan_range(ticks, selection.clone(), &mut |run| {
         run_count += 1;
         longest = longest.max(run.len());
-        if run.len() >= MIN_SEGMENT_LEN {
-            runs.push(run);
-        } else {
-            short.count += 1;
-            short.samples += run.len();
-        }
         Ok(())
     })?;
 
@@ -370,33 +469,32 @@ pub fn plan_psd_on<T: TickSource + ?Sized>(
         }));
     }
     let sample_rate = scale.ticks_per_unit as f64 / median_delta;
+    let gap_threshold = scan.gap_threshold().expect("a median Δt exists");
 
-    let (segments, excluded, basis) = if sampling_class == SamplingClass::Uniform {
-        (
-            vec![selection.clone()],
-            ExcludedSegments::default(),
-            selection.len(),
-        )
-    } else {
-        (runs, short, longest)
-    };
+    let segmented = sampling_class == SamplingClass::SegmentedUniform;
     let segment_len = match settings.segment_length {
-        SegmentLength::Auto => default_segment_length(basis),
+        SegmentLength::Auto => {
+            default_segment_length(if segmented { longest } else { selection.len() })
+        }
         SegmentLength::Fixed(len) => len.clamp(MIN_SEGMENT_LEN, MAX_SEGMENT_LEN),
     };
 
-    let (segments, excluded) = if sampling_class == SamplingClass::SegmentedUniform {
-        let mut excluded = excluded;
-        let mut kept = Vec::with_capacity(segments.len());
-        for run in segments {
+    let (segment_count, samples_used, excluded) = if segmented {
+        // A second, median-free pass now that the window length is known.
+        let mut kept = 0usize;
+        let mut samples = 0usize;
+        let mut excluded = ExcludedSegments::default();
+        for_each_segment(ticks, selection.clone(), gap_threshold, &mut |run| {
             if run.len() >= segment_len {
-                kept.push(run);
+                kept += 1;
+                samples += run.len();
             } else {
                 excluded.count += 1;
                 excluded.samples += run.len();
             }
-        }
-        if kept.is_empty() {
+            Ok(())
+        })?;
+        if kept == 0 {
             info!(
                 run_count,
                 longest, segment_len, "PSD unavailable: no gap-free segment holds one window"
@@ -407,38 +505,46 @@ pub fn plan_psd_on<T: TickSource + ?Sized>(
                 window: segment_len,
             }));
         }
-        (kept, excluded)
+        (kept, samples, excluded)
     } else {
-        (segments, excluded)
+        (1, selection.len(), ExcludedSegments::default())
     };
 
-    let requested_bytes = working_set_bytes(segment_len, segments.len());
-    if !budget.affords(requested_bytes) {
+    let parallelism = rayon::current_num_threads();
+    let Some(memory) = PsdMemory::fit(segment_len, columns, parallelism, cap) else {
         let affordable_segment_len = SEGMENT_LENGTH_CHOICES
             .iter()
             .rev()
             .copied()
-            .find(|&len| budget.affords(working_set_bytes(len, segments.len())));
+            .filter(|&len| len < segment_len)
+            .find(|&len| PsdMemory::fit(len, columns, parallelism, cap).is_some());
+        let requested_bytes = PsdMemory::estimate(segment_len, columns, 1, cap).peak_bytes;
         info!(
             requested_bytes,
-            cap_bytes = budget.cap_bytes(),
+            cap_bytes = cap.bytes(),
+            columns,
+            segment_len,
             ?affordable_segment_len,
-            "PSD refused before computing: working set over the RAM budget (SPEC §5.1)"
+            "PSD refused before computing: over the PSD memory cap (SPEC §5.1)"
         );
-        return Ok(Err(PsdUnavailable::OverBudget {
+        return Ok(Err(PsdUnavailable::OverMemoryCap {
             requested_bytes,
-            cap_bytes: budget.cap_bytes(),
+            cap_bytes: cap.bytes(),
             affordable_segment_len,
         }));
-    }
+    };
 
-    let selection_bytes = selection.len() as u64 * std::mem::size_of::<f64>() as u64;
+    let raw_bytes = (selection.len() as u64)
+        .saturating_mul(columns as u64)
+        .saturating_mul(std::mem::size_of::<f64>() as u64);
     let plan = PsdPlan {
         selection,
         sampling_class,
         sample_rate,
         frequency_unit: scale.frequency_unit,
-        segments,
+        gap_threshold,
+        segment_count,
+        samples_used,
         excluded,
         config: WelchConfig {
             window: settings.window,
@@ -446,71 +552,148 @@ pub fn plan_psd_on<T: TickSource + ?Sized>(
             overlap: settings.overlap,
             detrend: Detrend::Constant,
         },
-        exceeds_memory_budget: !budget.affords(selection_bytes),
+        columns,
+        memory,
+        larger_than_memory_cap: raw_bytes > cap.bytes(),
     };
     info!(
         selection = ?plan.selection,
         sampling_class = ?plan.sampling_class,
         sample_rate = plan.sample_rate,
-        segments = plan.segments.len(),
+        segments = plan.segment_count,
         excluded_segments = plan.excluded.count,
         excluded_samples = plan.excluded.samples,
         window = ?plan.config.window,
         segment_len = plan.config.segment_len,
         overlap = plan.config.overlap,
-        streaming_required = plan.exceeds_memory_budget,
-        "PSD planned (SPEC §3.2–3.3)"
+        columns,
+        concurrent_columns = plan.memory.concurrent_columns,
+        peak_bytes = plan.memory.peak_bytes,
+        cap_bytes = plan.memory.cap_bytes,
+        larger_than_memory_cap = plan.larger_than_memory_cap,
+        "PSD planned (SPEC §3.2–3.3, §5.1)"
     );
     Ok(Ok(plan))
 }
 
 /// The longest gap-delimited run of the whole series that is itself uniform
 /// (SPEC §2.2) and holds at least one minimum-length window — what an
-/// `Irregular` series offers instead of a PSD (SPEC §3.3).
+/// `Irregular` series offers instead of a PSD (SPEC §3.3). Constant memory:
+/// runs are visited, and each is tested for uniformity only if it would beat
+/// the best found so far, so each run is tested at most once. The earliest of
+/// equally long runs wins.
 fn largest_uniform_run<T: TickSource + ?Sized>(ticks: &T) -> Result<Option<Range<usize>>> {
-    let mut runs: Vec<Range<usize>> = Vec::new();
-    scan_range(ticks, 0..ticks.tick_count(), &mut |run| {
-        if run.len() >= MIN_SEGMENT_LEN {
-            runs.push(run);
+    let whole = 0..ticks.tick_count();
+    let Some(threshold) = scan_range(ticks, whole.clone(), &mut |_| Ok(()))?.gap_threshold() else {
+        return Ok(None);
+    };
+    let mut best: Option<Range<usize>> = None;
+    for_each_segment(ticks, whole, threshold, &mut |run| {
+        let longer = run.len() > best.as_ref().map_or(MIN_SEGMENT_LEN - 1, |b| b.len());
+        if longer && is_uniform_range(ticks, run.clone())? {
+            best = Some(run);
         }
         Ok(())
     })?;
-    // Longest first; the earliest of equally long runs wins, deterministically.
-    runs.sort_by(|a, b| b.len().cmp(&a.len()).then(a.start.cmp(&b.start)));
-    for run in runs {
-        if is_uniform_range(ticks, run.clone())? {
-            return Ok(Some(run));
-        }
-    }
-    Ok(None)
+    Ok(best)
 }
 
-/// Runs `plan` over one column's raw samples, streaming (see the module
-/// docs). `keep_going` is called with the number of samples read so far and
-/// cancels the estimate by returning `false`, in which case this returns
-/// `Ok(None)`.
-pub fn compute_psd<S: SampleSource + ?Sized>(
+/// Runs `plan` over `columns` — the raw samples of each series, in order,
+/// sharing the time axis `ticks` — streaming, at most
+/// [`PsdMemory::concurrent_columns`] at a time so the plan's memory estimate
+/// holds (see the module docs).
+///
+/// `on_progress` is called with each newly read batch of samples (counted
+/// across all columns) and cancels the whole computation by returning
+/// `false`, in which case this returns `Ok(None)` — never a partial result.
+pub fn compute_psds<T, S>(
+    ticks: &T,
+    columns: &[S],
+    plan: &PsdPlan,
+    on_progress: &(dyn Fn(usize) -> bool + Sync),
+) -> Result<Option<Vec<Psd>>>
+where
+    T: TickSource + Sync + ?Sized,
+    S: SampleSource + Sync,
+{
+    let mut spectra = Vec::with_capacity(columns.len());
+    for batch in columns.chunks(plan.memory.concurrent_columns.max(1)) {
+        let results: Vec<Result<Option<Psd>>> = batch
+            .par_iter()
+            .map(|samples| compute_column(ticks, samples, plan, on_progress))
+            .collect();
+        for result in results {
+            match result? {
+                Some(psd) => spectra.push(psd),
+                None => return Ok(None),
+            }
+        }
+    }
+    Ok(Some(spectra))
+}
+
+/// One column of [`compute_psds`].
+fn compute_column<T, S>(
+    ticks: &T,
     samples: &S,
     plan: &PsdPlan,
-    keep_going: &mut dyn FnMut(usize) -> bool,
-) -> Result<Option<Psd>> {
-    if plan.is_segmented() {
-        welch_segmented_source(
-            samples,
-            &plan.segments,
-            plan.sample_rate,
-            &plan.config,
-            keep_going,
-        )
-    } else {
-        welch_source(
+    on_progress: &(dyn Fn(usize) -> bool + Sync),
+) -> Result<Option<Psd>>
+where
+    T: TickSource + ?Sized,
+    S: SampleSource + ?Sized,
+{
+    // `welch_source` reports a running total per call; `on_progress` wants
+    // what is new since the last report.
+    let reporter = || {
+        let mut reported = 0usize;
+        move |read: usize| {
+            let fresh = read - reported;
+            reported = read;
+            on_progress(fresh)
+        }
+    };
+
+    if !plan.is_segmented() {
+        return welch_source(
             samples,
             plan.selection.clone(),
             plan.sample_rate,
             &plan.config,
-            keep_going,
-        )
+            &mut reporter(),
+        );
     }
+
+    // SPEC §3.3: each gap-free run on its own (no window ever crosses a
+    // gap), folded into the length-weighted average as soon as it is done.
+    let mut average = LengthWeightedAverage::default();
+    let mut cancelled = false;
+    for_each_segment(
+        ticks,
+        plan.selection.clone(),
+        plan.gap_threshold,
+        &mut |run| {
+            if cancelled || run.len() < plan.config.segment_len {
+                return Ok(());
+            }
+            let len = run.len();
+            match welch_source(
+                samples,
+                run,
+                plan.sample_rate,
+                &plan.config,
+                &mut reporter(),
+            )? {
+                Some(psd) => average.add(len, psd),
+                None => cancelled = true,
+            }
+            Ok(())
+        },
+    )?;
+    if cancelled {
+        return Ok(None);
+    }
+    Ok(Some(average.finish(plan.sample_rate, &plan.config)))
 }
 
 #[cfg(test)]
@@ -523,8 +706,8 @@ mod tests {
         frequency_unit: FrequencyUnit::Hertz,
     };
 
-    fn roomy() -> RamBudget {
-        RamBudget::from_total_ram_bytes(16 * 1024 * 1024 * 1024)
+    fn roomy() -> PsdMemoryCap {
+        PsdMemoryCap::from_bytes(PSD_MEMORY_CAP_BYTES)
     }
 
     /// `len` ticks at `period_ns`, starting at `start_ns`.
@@ -536,7 +719,22 @@ mod tests {
         ticks: &[i128],
         selection: Range<usize>,
     ) -> std::result::Result<PsdPlan, PsdUnavailable> {
-        plan_psd_on(ticks, SECONDS, selection, &PsdSettings::default(), &roomy()).unwrap()
+        plan_psd_on(
+            ticks,
+            SECONDS,
+            selection,
+            &PsdSettings::default(),
+            1,
+            roomy(),
+        )
+        .unwrap()
+    }
+
+    fn compute_one(ticks: &[i128], samples: &[f64], plan: &PsdPlan) -> Psd {
+        compute_psds(ticks, &[samples], plan, &|_| true)
+            .unwrap()
+            .unwrap()
+            .remove(0)
     }
 
     #[test]
@@ -545,22 +743,23 @@ mod tests {
         let plan = plan(&ticks, 0..10_000).unwrap();
 
         assert_eq!(plan.sampling_class, SamplingClass::Uniform);
-        assert_eq!(plan.segments, vec![0..10_000]);
+        assert_eq!(plan.segment_count, 1);
+        assert_eq!(plan.samples_used, 10_000);
         assert_eq!(plan.sample_rate, 1000.0);
         assert_eq!(plan.config.segment_len, 1024); // largest 2^k ≤ 10000/8
         assert_eq!(plan.config.window, Window::Hann);
         assert_eq!(plan.config.overlap, 0.5);
         assert_eq!(plan.config.detrend, Detrend::Constant);
         assert_eq!(plan.excluded, ExcludedSegments::default());
-        assert!(!plan.exceeds_memory_budget);
+        assert!(!plan.larger_than_memory_cap);
     }
 
     #[test]
     fn only_the_selected_rows_are_planned() {
         let ticks = run(0, 1_000_000, 10_000);
         let plan = plan(&ticks, 2_000..6_000).unwrap();
-        assert_eq!(plan.segments, vec![2_000..6_000]);
-        assert_eq!(plan.samples_used(), 4_000);
+        assert_eq!(plan.selection, 2_000..6_000);
+        assert_eq!(plan.samples_used, 4_000);
     }
 
     #[test]
@@ -576,7 +775,8 @@ mod tests {
         let plan = plan(&ticks, 0..ticks.len()).unwrap();
 
         assert!(plan.is_segmented());
-        assert_eq!(plan.segments, vec![0..4096, 4096..8192, 8292..12388]);
+        assert_eq!(plan.segment_count, 3);
+        assert_eq!(plan.samples_used, 3 * 4096);
         assert_eq!(
             plan.excluded,
             ExcludedSegments {
@@ -660,26 +860,59 @@ mod tests {
     }
 
     #[test]
-    fn a_working_set_over_budget_is_refused_before_computing_with_an_affordable_length() {
+    fn the_plans_memory_estimate_is_under_the_cap_by_construction() {
+        let ticks = run(0, 1_000_000, 1_000_000);
+        let cap = PsdMemoryCap::from_bytes(64 * 1024 * 1024);
+        let plan = plan_psd_on(
+            &ticks[..],
+            SECONDS,
+            0..ticks.len(),
+            &PsdSettings::default(),
+            50,
+            cap,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(plan.memory.peak_bytes <= cap.bytes());
+        assert!(plan.memory.concurrent_columns >= 1);
+        assert_eq!(plan.memory.cap_bytes, cap.bytes());
+    }
+
+    #[test]
+    fn a_tight_cap_lowers_how_many_columns_are_computed_at_once() {
         let ticks = run(0, 1_000_000, 1_000_000);
         let settings = PsdSettings {
             segment_length: SegmentLength::Fixed(65536),
             ..PsdSettings::default()
         };
-        // A budget that holds a 1024-sample window but not a 65536 one.
-        let cap = working_set_bytes(1024, 1);
-        let budget = RamBudget::from_total_ram_bytes(cap * 4);
-        assert_eq!(budget.cap_bytes(), cap);
+        let one_at_a_time = PsdMemory::estimate(65536, 8, 1, roomy()).peak_bytes;
+        let cap = PsdMemoryCap::from_bytes(one_at_a_time);
+        let plan = plan_psd_on(&ticks[..], SECONDS, 0..ticks.len(), &settings, 8, cap)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.memory.concurrent_columns, 1);
+        assert_eq!(plan.memory.peak_bytes, one_at_a_time);
+    }
 
-        let refused = plan_psd_on(&ticks[..], SECONDS, 0..ticks.len(), &settings, &budget)
+    #[test]
+    fn a_psd_over_the_cap_is_refused_before_computing_with_an_affordable_length() {
+        let ticks = run(0, 1_000_000, 1_000_000);
+        let settings = PsdSettings {
+            segment_length: SegmentLength::Fixed(65536),
+            ..PsdSettings::default()
+        };
+        // Exactly enough for one column at a 1024-sample window.
+        let cap = PsdMemoryCap::from_bytes(PsdMemory::estimate(1024, 1, 1, roomy()).peak_bytes);
+
+        let refused = plan_psd_on(&ticks[..], SECONDS, 0..ticks.len(), &settings, 1, cap)
             .unwrap()
             .unwrap_err();
 
         assert_eq!(
             refused,
-            PsdUnavailable::OverBudget {
-                requested_bytes: working_set_bytes(65536, 1),
-                cap_bytes: cap,
+            PsdUnavailable::OverMemoryCap {
+                requested_bytes: PsdMemory::estimate(65536, 1, 1, cap).peak_bytes,
+                cap_bytes: cap.bytes(),
                 affordable_segment_len: Some(1024),
             }
         );
@@ -689,20 +922,31 @@ mod tests {
     }
 
     #[test]
-    fn a_selection_too_large_to_hold_is_planned_as_streaming_not_refused() {
-        let ticks = run(0, 1_000_000, 1_000_000);
-        // Enough for the working set, far too little for a million samples.
-        let budget = RamBudget::from_total_ram_bytes(working_set_bytes(65536, 1) * 4);
+    fn the_cap_never_exceeds_the_applications_ram_budget() {
+        let small = RamBudget::from_total_ram_bytes(400 * 1024 * 1024); // cap 100 MiB
+        assert_eq!(PsdMemoryCap::for_budget(&small).bytes(), small.cap_bytes());
+        let large = RamBudget::from_total_ram_bytes(64 * 1024 * 1024 * 1024);
+        assert_eq!(
+            PsdMemoryCap::for_budget(&large).bytes(),
+            PSD_MEMORY_CAP_BYTES
+        );
+    }
+
+    #[test]
+    fn a_selection_larger_than_the_cap_is_planned_as_streaming_not_refused() {
+        let ticks = run(0, 1_000_000, 4_000_000);
+        let cap = PsdMemoryCap::from_bytes(PsdMemory::estimate(65536, 1, 1, roomy()).peak_bytes);
         let plan = plan_psd_on(
             &ticks[..],
             SECONDS,
             0..ticks.len(),
             &PsdSettings::default(),
-            &budget,
+            1,
+            cap,
         )
         .unwrap()
         .unwrap();
-        assert!(plan.exceeds_memory_budget);
+        assert!(plan.larger_than_memory_cap);
     }
 
     #[test]
@@ -711,9 +955,7 @@ mod tests {
         let samples: Vec<f64> = (0..20_000).map(|n| (n as f64 * 0.3).sin()).collect();
         let plan = plan(&ticks, 1_000..19_000).unwrap();
 
-        let psd = compute_psd(&samples[..], &plan, &mut |_| true)
-            .unwrap()
-            .unwrap();
+        let psd = compute_one(&ticks, &samples, &plan);
 
         let expected = welch(&samples[1_000..19_000], 1000.0, &plan.config);
         assert_eq!(psd.power, expected.power);
@@ -728,9 +970,7 @@ mod tests {
         let samples: Vec<f64> = (0..ticks.len()).map(|n| (n as f64 * 0.7).cos()).collect();
         let plan = plan(&ticks, 0..ticks.len()).unwrap();
 
-        let psd = compute_psd(&samples[..], &plan, &mut |_| true)
-            .unwrap()
-            .unwrap();
+        let psd = compute_one(&ticks, &samples, &plan);
 
         let expected = welch_segmented(
             &[&samples[0..4096], &samples[4196..10196]],
@@ -742,11 +982,67 @@ mod tests {
     }
 
     #[test]
+    fn every_column_gets_its_own_spectrum_in_order_whatever_the_concurrency() {
+        let ticks = run(0, 1_000_000, 8192);
+        let columns: Vec<Vec<f64>> = (1..=5)
+            .map(|k| {
+                (0..8192)
+                    .map(|n| (n as f64 * 0.01 * k as f64).sin())
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[f64]> = columns.iter().map(Vec::as_slice).collect();
+        let mut plan = plan_psd_on(
+            &ticks[..],
+            SECONDS,
+            0..8192,
+            &PsdSettings::default(),
+            5,
+            roomy(),
+        )
+        .unwrap()
+        .unwrap();
+
+        let parallel = compute_psds(&ticks[..], &slices, &plan, &|_| true)
+            .unwrap()
+            .unwrap();
+        plan.memory.concurrent_columns = 1;
+        let serial = compute_psds(&ticks[..], &slices, &plan, &|_| true)
+            .unwrap()
+            .unwrap();
+
+        for (k, (p, s)) in parallel.iter().zip(&serial).enumerate() {
+            assert_eq!(p.power, s.power);
+            assert_eq!(p.power, welch(slices[k], 1000.0, &plan.config).power);
+        }
+    }
+
+    #[test]
+    fn progress_counts_every_sample_read_and_can_cancel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let ticks = run(0, 1_000_000, 300_000);
+        let samples: Vec<f64> = (0..300_000).map(|n| (n as f64).sin()).collect();
+        let plan = plan(&ticks, 0..300_000).unwrap();
+
+        let read = AtomicUsize::new(0);
+        compute_psds(&ticks[..], &[&samples[..]], &plan, &|n| {
+            read.fetch_add(n, Ordering::Relaxed);
+            true
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(read.load(Ordering::Relaxed), 300_000);
+
+        let cancelled = compute_psds(&ticks[..], &[&samples[..]], &plan, &|_| false).unwrap();
+        assert!(cancelled.is_none());
+    }
+
+    #[test]
     fn a_progressive_index_reports_frequency_per_index_unit_never_hertz() {
         let time = TimeAxis::Progressive {
             values: (0..1000).map(|n| n as f64 * 0.5).collect::<Vec<_>>().into(),
         };
-        let plan = plan_psd(&time, 0..1000, &PsdSettings::default(), &roomy())
+        let plan = plan_psd(&time, 0..1000, &PsdSettings::default(), 1, roomy())
             .unwrap()
             .unwrap();
         assert_eq!(plan.frequency_unit, FrequencyUnit::PerIndexUnit);

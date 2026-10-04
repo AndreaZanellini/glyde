@@ -363,7 +363,7 @@ pub fn welch_segmented_source<S: SampleSource + ?Sized>(
 /// length in samples, folded in one at a time. The one place this average is
 /// computed, for both the in-memory and the streaming segmented entry points.
 #[derive(Default)]
-struct LengthWeightedAverage {
+pub(crate) struct LengthWeightedAverage {
     reference: Option<Psd>,
     weighted_power: Vec<f64>,
     total_weight: f64,
@@ -372,7 +372,7 @@ struct LengthWeightedAverage {
 }
 
 impl LengthWeightedAverage {
-    fn add(&mut self, len: usize, psd: Psd) {
+    pub(crate) fn add(&mut self, len: usize, psd: Psd) {
         let weight = len as f64;
         if self.reference.is_none() {
             self.weighted_power = psd.power.iter().map(|&power| power * weight).collect();
@@ -392,7 +392,7 @@ impl LengthWeightedAverage {
         }
     }
 
-    fn finish(self, sample_rate_hz: f64, config: &WelchConfig) -> Psd {
+    pub(crate) fn finish(self, sample_rate_hz: f64, config: &WelchConfig) -> Psd {
         let Some(reference) = self.reference else {
             return Psd {
                 freqs: Vec::new(),

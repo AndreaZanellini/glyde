@@ -28,7 +28,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use glyde_core::budget::RamBudget;
 use glyde_core::dsp::psd::{
-    compute_psd, plan_psd_on, AxisScale, FrequencyUnit, PsdPlan, PsdSettings,
+    compute_psds, plan_psd_on, AxisScale, FrequencyUnit, PsdMemoryCap, PsdPlan, PsdSettings,
 };
 use std::time::{Duration, Instant};
 
@@ -64,7 +64,8 @@ fn plan(ticks: &[i128]) -> PsdPlan {
         NANOS,
         0..ticks.len(),
         &PsdSettings::default(),
-        &RamBudget::from_system(),
+        1,
+        PsdMemoryCap::for_budget(&RamBudget::from_system()),
     )
     .expect("an in-memory axis cannot fail to scan")
     .expect("a uniform fixture always has a PSD")
@@ -72,9 +73,9 @@ fn plan(ticks: &[i128]) -> PsdPlan {
 
 fn plan_and_compute(samples: &[f64], ticks: &[i128]) -> usize {
     let plan = plan(ticks);
-    compute_psd(samples, &plan, &mut |_| true)
+    compute_psds(ticks, &[samples], &plan, &|_| true)
         .expect("an in-memory source cannot fail")
-        .expect("never cancelled")
+        .expect("never cancelled")[0]
         .segment_count
 }
 

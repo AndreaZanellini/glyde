@@ -452,6 +452,40 @@ pub fn scan_range<S: TickSource + ?Sized>(
     })
 }
 
+impl RangeScan {
+    /// SPEC §2.2–2.3's gap threshold for this range, in ticks (`10 × median
+    /// Δt`), or `None` when the range has no Δt.
+    pub fn gap_threshold(&self) -> Option<f64> {
+        self.median_delta
+            .map(|median| GAP_MULTIPLE_OF_MEDIAN * median)
+    }
+}
+
+/// Hands every gap-delimited run of `range` to `visit`, in row order, as an
+/// absolute index range — exactly the runs [`scan_range`] reports for the same
+/// range, given its [`RangeScan::gap_threshold`]. One pass over Δt and no
+/// median, so a caller that already scanned the range can enumerate its runs
+/// again cheaply, without ever collecting them.
+pub fn for_each_segment<S: TickSource + ?Sized>(
+    source: &S,
+    range: Range<usize>,
+    gap_threshold: f64,
+    visit: &mut dyn FnMut(Range<usize>) -> Result<()>,
+) -> Result<()> {
+    let end = range.end.min(source.tick_count());
+    let start = range.start.min(end);
+    if start == end {
+        return Ok(());
+    }
+    let mut segment_start = start;
+    for_each_gap(source, start..end, gap_threshold, &mut |gap| {
+        visit(segment_start..gap.after_index)?;
+        segment_start = gap.after_index;
+        Ok(())
+    })?;
+    visit(segment_start..end)
+}
+
 /// SPEC §2.2's uniformity test (robust CV of Δt ≤ 1% of the median Δt) for
 /// one range on its own — e.g. one gap-delimited segment that a PSD of an
 /// `Irregular` series might still be computed on (SPEC §3.3).
