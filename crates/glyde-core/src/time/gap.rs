@@ -337,21 +337,66 @@ fn for_each_gap<S: TickSource + ?Sized>(
 /// Does not log the monotonicity anomalies it counted; that is the caller's
 /// choice (see [`summarize_ticks`]).
 fn scan_distribution<S: TickSource + ?Sized>(source: &S) -> Result<TimeAxisStats> {
-    let tick_count = source.tick_count();
+    let scan = scan_range(source, 0..source.tick_count(), &mut |_| Ok(()))?;
+    if scan.stats.gap_count > 0 {
+        info!(
+            gap_count = scan.stats.gap_count,
+            threshold_ticks = scan.median_delta.unwrap_or(0.0) * GAP_MULTIPLE_OF_MEDIAN,
+            "gaps detected (Δt > 10× median Δt, SPEC §2.2–2.3)"
+        );
+    }
+    info!(
+        sampling_class = ?scan.stats.sampling_class,
+        gap_count = scan.stats.gap_count,
+        "sampling classified (SPEC §2.2)"
+    );
+    Ok(scan.stats)
+}
+
+/// SPEC §2.2's classification of one sub-range of a time axis — e.g. the
+/// interval a PSD was asked for (SPEC §3.3) — together with the median Δt it
+/// was measured against.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RangeScan {
+    /// Gap count, sampling class and monotonicity of the range alone.
+    pub stats: TimeAxisStats,
+    /// The range's median Δt in ticks, or `None` when it holds fewer than two
+    /// ticks.
+    pub median_delta: Option<f64>,
+}
+
+/// [`summarize_ticks`] restricted to `range`, additionally handing every
+/// gap-delimited segment of it to `on_segment`, in row order, as an absolute
+/// index range (a range with no gap is one segment). Gaps are judged against
+/// the range's own median Δt. Bounded memory, like everything here: the
+/// segments are visited, never collected.
+pub fn scan_range<S: TickSource + ?Sized>(
+    source: &S,
+    range: Range<usize>,
+    on_segment: &mut dyn FnMut(Range<usize>) -> Result<()>,
+) -> Result<RangeScan> {
+    let end = range.end.min(source.tick_count());
+    let start = range.start.min(end);
     let mut monotonicity = MonotonicityReport::default();
 
     // Fewer than two samples has no Δt to classify and is vacuously
     // `Uniform`, with nothing to compare for monotonicity either.
-    if tick_count < 2 {
-        return Ok(TimeAxisStats {
-            gap_count: 0,
-            sampling_class: SamplingClass::Uniform,
-            monotonicity,
+    if end - start < 2 {
+        if end > start {
+            on_segment(start..end)?;
+        }
+        return Ok(RangeScan {
+            stats: TimeAxisStats {
+                gap_count: 0,
+                sampling_class: SamplingClass::Uniform,
+                monotonicity,
+            },
+            median_delta: None,
         });
     }
 
-    let median_delta = median_delta(source, 0..tick_count)?
-        .expect("two or more ticks always have at least one Δt");
+    let median_delta =
+        median_delta(source, start..end)?.expect("two or more ticks always have at least one Δt");
     let threshold = GAP_MULTIPLE_OF_MEDIAN * median_delta;
 
     // One pass over Δt answers all three questions: how many gaps, whether
@@ -359,10 +404,10 @@ fn scan_distribution<S: TickSource + ?Sized>(source: &S) -> Result<TimeAxisStats
     // closes, so no boundary list is ever built), and SPEC §2.1's monotonicity
     // counts, which are the signs of these very same Δt.
     let mut gap_count = 0usize;
-    let mut segment_start = 0usize;
+    let mut segment_start = start;
     let mut every_segment_uniform = true;
-    let mut after_index = 1usize;
-    for_each_delta(source, 0..tick_count, &mut |delta| {
+    let mut after_index = start + 1;
+    for_each_delta(source, start..end, &mut |delta| {
         monotonicity.observe_delta(delta);
         let segment_end = after_index;
         after_index += 1;
@@ -373,20 +418,22 @@ fn scan_distribution<S: TickSource + ?Sized>(source: &S) -> Result<TimeAxisStats
             if every_segment_uniform {
                 every_segment_uniform = is_uniform(source, segment_start..segment_end)?;
             }
+            on_segment(segment_start..segment_end)?;
             segment_start = segment_end;
         }
         Ok(())
     })?;
+    on_segment(segment_start..end)?;
 
     let sampling_class = if gap_count == 0 {
-        if is_uniform(source, 0..tick_count)? {
+        if is_uniform(source, start..end)? {
             SamplingClass::Uniform
         } else {
             SamplingClass::Irregular
         }
     } else {
         if every_segment_uniform {
-            every_segment_uniform = is_uniform(source, segment_start..tick_count)?;
+            every_segment_uniform = is_uniform(source, segment_start..end)?;
         }
         if every_segment_uniform {
             SamplingClass::SegmentedUniform
@@ -395,24 +442,21 @@ fn scan_distribution<S: TickSource + ?Sized>(source: &S) -> Result<TimeAxisStats
         }
     };
 
-    if gap_count > 0 {
-        info!(
+    Ok(RangeScan {
+        stats: TimeAxisStats {
             gap_count,
-            threshold_ticks = threshold,
-            "gaps detected (Δt > 10× median Δt, SPEC §2.2–2.3)"
-        );
-    }
-    info!(
-        sampling_class = ?sampling_class,
-        gap_count,
-        "sampling classified (SPEC §2.2)"
-    );
-
-    Ok(TimeAxisStats {
-        gap_count,
-        sampling_class,
-        monotonicity,
+            sampling_class,
+            monotonicity,
+        },
+        median_delta: Some(median_delta),
     })
+}
+
+/// SPEC §2.2's uniformity test (robust CV of Δt ≤ 1% of the median Δt) for
+/// one range on its own — e.g. one gap-delimited segment that a PSD of an
+/// `Irregular` series might still be computed on (SPEC §3.3).
+pub fn is_uniform_range<S: TickSource + ?Sized>(source: &S, range: Range<usize>) -> Result<bool> {
+    is_uniform(source, range)
 }
 
 /// Everything SPEC §2.1–2.2 says about `source`, in bounded memory — the

@@ -21,3 +21,5 @@ mod decimation;
 mod time;
 #[path = "golden/welch.rs"]
 mod welch;
+#[path = "golden/welch_streaming.rs"]
+mod welch_streaming;
