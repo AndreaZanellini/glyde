@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use glyde_core::dsp::decimation::Bucket;
 use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache};
@@ -37,7 +37,7 @@ use crate::plumbing::{
     spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog, IndexingMessage,
     PreparedView, PROGRESS_BOOL_BAND_ROWS,
 };
-use crate::views::psd::{selection_rows, PsdPanel};
+use crate::views::psd::{selection_rows, PsdPanel, PsdRequest};
 use crate::{inference_bar, views};
 
 /// One numeric column's min/max pyramid, or `None` for a non-numeric column
@@ -315,27 +315,29 @@ impl eframe::App for GlydeApp {
 
         let mut pending_correction: Option<(PathBuf, Correction)> = None;
 
-        // SPEC §4.2: the PSD of whatever the time view shows, in a resizable
-        // panel under it. Driven by last frame's time-view selection.
+        // SPEC §4.2: the PSD view, in a resizable panel under the time view.
+        // It computes only when the user presses "Compute PSD", on the
+        // interval the time view showed last frame.
         if let Status::Loaded {
             dataset, prepared, ..
         } = &self.status
         {
-            if let Some(selection) = self.time_selection.clone() {
-                if self.psd.update(dataset, selection, Instant::now()) {
-                    ctx.request_repaint_after(Duration::from_millis(50));
-                }
+            if self.psd.poll() {
+                ctx.request_repaint_after(Duration::from_millis(50));
             }
-            let offered = egui::TopBottomPanel::bottom("psd_view")
+            let request = egui::TopBottomPanel::bottom("psd_view")
                 .resizable(true)
                 .default_height(320.0)
-                .show(ctx, |ui| self.psd.show(ui))
+                .show(ctx, |ui| {
+                    self.psd.show(ui, dataset, self.time_selection.clone())
+                })
                 .inner;
-            if let Some(range) = offered.filter(|range| !range.is_empty()) {
+            if let Some(PsdRequest::ShowRows(range)) = request {
                 let ticks = &prepared.ticks;
-                if let (Some(&first), Some(&last)) =
-                    (ticks.get(range.start), ticks.get(range.end - 1))
-                {
+                if let (Some(&first), Some(&last)) = (
+                    ticks.get(range.start),
+                    range.end.checked_sub(1).and_then(|last| ticks.get(last)),
+                ) {
                     self.time_focus = Some((
                         views::time::tick_to_seconds(&dataset.time, first),
                         views::time::tick_to_seconds(&dataset.time, last),
@@ -490,6 +492,7 @@ mod tests {
     };
     use glyde_core::series::{Series, SeriesValues};
     use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
+    use std::time::Instant;
 
     fn sample_summary() -> Box<OpenSummary> {
         Box::new(OpenSummary {
@@ -983,17 +986,17 @@ mod tests {
         // The time view's "Fit to data" interval: every row.
         let selection = selection_rows(&ticks, true, (ticks[0], *ticks.last().unwrap()));
         assert_eq!(selection, 0..20_000);
-        let mut now = Instant::now();
-        while app.psd.update(&dataset, selection.clone(), now) {
+        // The user presses "Compute PSD".
+        app.psd.compute(&dataset, selection.clone());
+        while app.psd.poll() {
             assert!(Instant::now() < deadline, "PSD never finished");
-            now += crate::views::psd::SELECTION_SETTLE;
             std::thread::sleep(Duration::from_millis(5));
         }
 
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                app.psd.show(ui);
+                app.psd.show(ui, &dataset, Some(selection.clone()));
             });
         });
         assert!(!output.shapes.is_empty());

@@ -2,4 +2,4 @@
 source: crates/glyde-app/src/views/psd.rs
 expression: output.shapes.len()
 ---
-17
+20

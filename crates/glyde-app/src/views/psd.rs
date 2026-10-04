@@ -14,25 +14,26 @@
 
 //! The PSD view (docs/SPEC.md §4.2, docs/ROADMAP.md M5 "PSD view").
 //!
-//! - The time view's visible interval *is* the selection: zooming or
-//!   box-selecting in the time view recomputes the PSD for that interval
-//!   only, and "Fit to data" goes back to the whole signal. The recompute
-//!   waits for the view to settle ([`SELECTION_SETTLE`]) so a pan does not
-//!   start a computation per frame, and a newer selection cancels an older
-//!   one still running.
+//! - **Computed only on request.** The "Compute PSD" button takes the
+//!   interval the time view shows at that moment (zoom or box-select to
+//!   choose it; "Fit to data" for the whole signal). Panning or zooming
+//!   afterwards never starts a computation: on a large or spilled file each
+//!   one reads every selected sample, so it is the user's call. A PSD that no
+//!   longer matches the view or the settings stays on screen, marked as such.
 //! - One spectrum per numeric series, overlaid on one plot or stacked on
 //!   several, always sharing one synchronized frequency axis.
 //! - Log/linear toggles on both axes.
-//! - A "computed on" readout under the plot: samples, windows, window,
-//!   overlap, Δf, sample rate, segments averaged, and anything excluded.
+//! - A "computed on" readout: samples, windows, window, overlap, Δf, sample
+//!   rate, segments averaged, anything excluded, and the memory used against
+//!   the PSD memory cap.
 //!
-//! Every decision about *what* is computed lives in `glyde_core::dsp::psd`;
-//! this module only renders its answers and forwards the user's selection
-//! and settings (docs/ARCHITECTURE.md Hard rule 2).
+//! Every decision about *what* is computed — and whether it fits the memory
+//! cap — lives in `glyde_core::dsp::psd`; this module only renders its
+//! answers and forwards the user's requests (docs/ARCHITECTURE.md Hard
+//! rule 2).
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 use glyde_core::dsp::psd::{
@@ -45,10 +46,6 @@ use glyde_core::ingest::Dataset;
 
 use crate::plumbing::psd::{PsdJob, PsdOutcome, Spectrum};
 use crate::views::time::series_color;
-
-/// How long the time view's interval must stay unchanged before its PSD is
-/// recomputed.
-pub const SELECTION_SETTLE: Duration = Duration::from_millis(250);
 
 /// Height of one plot when spectra are stacked.
 const STACKED_PLOT_HEIGHT: f32 = 140.0;
@@ -67,6 +64,21 @@ struct Shown {
     outcome: PsdOutcome,
 }
 
+/// What the user asked the panel to do this frame, for the caller to carry
+/// out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PsdRequest {
+    /// Move the time view onto these rows (the uniform stretch an
+    /// `Irregular` series offers).
+    ShowRows(Range<usize>),
+}
+
+/// A one-click way out of a refused PSD.
+enum Alternative {
+    ShowRows(Range<usize>),
+    SegmentLength(usize),
+}
+
 /// The PSD view's state for the file currently open. A new file starts a
 /// new panel (see `crate::app`).
 pub struct PsdPanel {
@@ -74,8 +86,6 @@ pub struct PsdPanel {
     layout: Layout,
     log_frequency: bool,
     log_power: bool,
-    /// The latest selection seen and when it last changed.
-    pending: Option<(Range<usize>, Instant)>,
     job: Option<PsdJob>,
     shown: Option<Shown>,
 }
@@ -89,7 +99,6 @@ impl Default for PsdPanel {
             // Power spans orders of magnitude; a linear power axis flattens
             // everything but the strongest peak.
             log_power: true,
-            pending: None,
             job: None,
             shown: None,
         }
@@ -97,15 +106,9 @@ impl Default for PsdPanel {
 }
 
 impl PsdPanel {
-    /// Feeds this frame's time-view selection; starts (or restarts) the
-    /// computation once it has settled. Returns `true` while there is
-    /// something to wait for, so the caller keeps repainting.
-    pub fn update(
-        &mut self,
-        dataset: &Arc<Dataset>,
-        selection: Range<usize>,
-        now: Instant,
-    ) -> bool {
+    /// Collects a finished computation, if any. Returns `true` while one is
+    /// still running, so the caller keeps repainting.
+    pub fn poll(&mut self) -> bool {
         if let Some(job) = &self.job {
             if let Some(outcome) = job.try_outcome() {
                 let (selection, settings) = job.request();
@@ -117,58 +120,47 @@ impl PsdPanel {
                 self.job = None;
             }
         }
-
-        let up_to_date = |requested: &Range<usize>, settings: &PsdSettings| {
-            *requested == selection && *settings == self.settings
-        };
-        let computing_it = self.job.as_ref().is_some_and(|job| {
-            let (requested, settings) = job.request();
-            up_to_date(requested, settings)
-        });
-        let showing_it = self.job.is_none()
-            && self
-                .shown
-                .as_ref()
-                .is_some_and(|shown| up_to_date(&shown.selection, &shown.settings));
-        if computing_it || showing_it {
-            self.pending = None;
-            return self.job.is_some();
-        }
-
-        // Same interval, new settings: a deliberate change, so recompute
-        // without waiting for anything to settle.
-        let last_selection = self
-            .job
-            .as_ref()
-            .map(|job| job.request().0)
-            .or(self.shown.as_ref().map(|shown| &shown.selection));
-        if last_selection == Some(&selection) {
-            self.job = Some(PsdJob::spawn(Arc::clone(dataset), selection, self.settings));
-            self.pending = None;
-            return true;
-        }
-
-        match &self.pending {
-            Some((pending, since)) if *pending == selection => {
-                if now.duration_since(*since) >= SELECTION_SETTLE {
-                    // Replacing the job drops (and so cancels) the old one.
-                    self.job = Some(PsdJob::spawn(Arc::clone(dataset), selection, self.settings));
-                    self.pending = None;
-                }
-            }
-            _ => self.pending = Some((selection, now)),
-        }
-        true
+        self.job.is_some()
     }
 
-    /// Renders the view. Returns a row range when the user asked to analyze
-    /// the uniform stretch an `Irregular` series offers, for the caller to
-    /// move the time view to (which makes it the new selection).
-    pub fn show(&mut self, ui: &mut egui::Ui) -> Option<Range<usize>> {
-        let mut focus = None;
+    /// Starts computing the PSD of `selection` under the current settings,
+    /// replacing (and so cancelling) any computation still running.
+    pub fn compute(&mut self, dataset: &Arc<Dataset>, selection: Range<usize>) {
+        self.job = Some(PsdJob::spawn(Arc::clone(dataset), selection, self.settings));
+    }
+
+    /// Stops the running computation, if any; what was shown stays shown.
+    pub fn cancel(&mut self) {
+        if self.job.take().is_some() {
+            tracing::info!("user cancelled the PSD computation");
+        }
+    }
+
+    /// Renders the view. `selection` is the rows the time view shows right
+    /// now — what "Compute PSD" would analyze.
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        dataset: &Arc<Dataset>,
+        selection: Option<Range<usize>>,
+    ) -> Option<PsdRequest> {
+        let mut request = None;
 
         ui.horizontal(|ui| {
             ui.strong("Power spectral density");
+            ui.separator();
+            if self.job.is_some() {
+                if ui.button("Cancel").clicked() {
+                    self.cancel();
+                }
+            } else {
+                let compute = ui
+                    .add_enabled(selection.is_some(), egui::Button::new("Compute PSD"))
+                    .on_hover_text("Compute the spectrum of the interval the time view shows now");
+                if let (true, Some(selection)) = (compute.clicked(), selection.clone()) {
+                    self.compute(dataset, selection);
+                }
+            }
             ui.separator();
             ui.selectable_value(&mut self.layout, Layout::Overlay, "Overlay");
             ui.selectable_value(&mut self.layout, Layout::Stacked, "Stacked");
@@ -188,48 +180,89 @@ impl PsdPanel {
             });
             if job.is_streaming() {
                 ui.label(
-                    "The selection is larger than Glyde's memory budget, so its samples are \
+                    "The selection is larger than the PSD memory limit, so its samples are \
                      read progressively (streaming) rather than loaded at once.",
                 );
             }
         }
 
-        match self.shown.as_ref().map(|shown| &shown.outcome) {
-            None => {
-                if self.job.is_none() {
-                    ui.label("Waiting for the time view's selection…");
-                }
+        let Some(shown) = &self.shown else {
+            if self.job.is_none() {
+                ui.label(
+                    "Zoom the time view to the interval you want (or use \"Fit to data\" for \
+                     the whole signal), then press \"Compute PSD\".",
+                );
             }
-            Some(PsdOutcome::Ready { plan, spectra }) => {
+            return request;
+        };
+
+        if self.job.is_none()
+            && (selection.as_ref() != Some(&shown.selection) || shown.settings != self.settings)
+        {
+            ui.colored_label(
+                ui.visuals().weak_text_color(),
+                "The time view or the settings changed since this PSD was computed — press \
+                 \"Compute PSD\" to update it.",
+            );
+        }
+
+        match &shown.outcome {
+            PsdOutcome::Ready { plan, spectra } => {
                 ui.label(computed_on(plan, spectra));
+                ui.label(memory_note(plan));
                 for line in missing_sample_notes(spectra) {
                     ui.label(line);
                 }
                 self.show_spectra(ui, plan, spectra);
             }
-            Some(PsdOutcome::Unavailable(unavailable)) => {
+            PsdOutcome::Unavailable(unavailable) => {
                 ui.colored_label(ui.visuals().warn_fg_color, unavailable.to_string());
-                if let PsdUnavailable::Irregular {
-                    largest_uniform: Some(range),
-                } = unavailable
-                {
-                    if ui.button("Analyze the largest uniform stretch").clicked() {
-                        tracing::info!(?range, "user chose to analyze the offered uniform stretch");
-                        focus = Some(range.clone());
+                // The affordable alternative, one click away (SPEC §3.3, §5.1).
+                let alternative = match unavailable {
+                    PsdUnavailable::Irregular {
+                        largest_uniform: Some(range),
+                    } => Some((
+                        "Show the largest uniform stretch".to_string(),
+                        Alternative::ShowRows(range.clone()),
+                    )),
+                    PsdUnavailable::OverMemoryCap {
+                        affordable_segment_len: Some(len),
+                        ..
+                    } => Some((
+                        format!("Use {}-sample segments", group_thousands(*len)),
+                        Alternative::SegmentLength(*len),
+                    )),
+                    _ => None,
+                };
+                if let Some((label, alternative)) = alternative {
+                    if ui.button(label).clicked() {
+                        match alternative {
+                            Alternative::ShowRows(range) => {
+                                tracing::info!(
+                                    ?range,
+                                    "user chose to view the offered uniform stretch"
+                                );
+                                request = Some(PsdRequest::ShowRows(range));
+                            }
+                            Alternative::SegmentLength(len) => {
+                                tracing::info!(len, "user chose the affordable segment length");
+                                self.settings.segment_length = SegmentLength::Fixed(len);
+                            }
+                        }
                     }
                 }
             }
-            Some(PsdOutcome::NoNumericSeries) => {
+            PsdOutcome::NoNumericSeries => {
                 ui.label("This file has no numeric series to take a spectrum of.");
             }
-            Some(PsdOutcome::Failed(message)) => {
+            PsdOutcome::Failed(message) => {
                 ui.colored_label(
                     ui.visuals().error_fg_color,
                     format!("PSD failed: {message}"),
                 );
             }
         }
-        focus
+        request
     }
 
     /// The spectra currently shown, if the last computation produced any.
@@ -428,7 +461,7 @@ pub fn computed_on(plan: &PsdPlan, spectra: &[Spectrum]) -> String {
     let mut text = format!(
         "Computed on {} samples · {} window{} · {}, {} samples, {} overlap · Δf = {}{unit} · \
          sampling rate {}{unit}",
-        group_thousands(plan.samples_used()),
+        group_thousands(plan.samples_used),
         group_thousands(windows),
         if windows == 1 { "" } else { "s" },
         window_name(plan.config.window),
@@ -440,8 +473,8 @@ pub fn computed_on(plan: &PsdPlan, spectra: &[Spectrum]) -> String {
     if plan.is_segmented() {
         text.push_str(&format!(
             " · averaged over {} segment{} (no window crosses a gap)",
-            plan.segments.len(),
-            if plan.segments.len() == 1 { "" } else { "s" }
+            plan.segment_count,
+            if plan.segment_count == 1 { "" } else { "s" }
         ));
     }
     if plan.excluded.count > 0 {
@@ -453,6 +486,21 @@ pub fn computed_on(plan: &PsdPlan, spectra: &[Spectrum]) -> String {
         ));
     }
     text
+}
+
+/// The memory the computation was allowed and how it used it (SPEC §5.1):
+/// the plan's estimated peak against the PSD memory cap.
+pub fn memory_note(plan: &PsdPlan) -> String {
+    format!(
+        "Memory: at most {} of the {} PSD limit ({} series at a time)",
+        megabytes(plan.memory.peak_bytes),
+        megabytes(plan.memory.cap_bytes),
+        plan.memory.concurrent_columns
+    )
+}
+
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// One note per series that had missing (non-finite) samples in the
@@ -541,17 +589,19 @@ fn format_number(v: f64) -> String {
 mod tests {
     use super::*;
     use glyde_core::dsp::detrend::Detrend;
-    use glyde_core::dsp::psd::ExcludedSegments;
+    use glyde_core::dsp::psd::{ExcludedSegments, PsdMemory};
     use glyde_core::dsp::welch::WelchConfig;
     use glyde_core::time::SamplingClass;
 
-    fn plan(segments: Vec<Range<usize>>, class: SamplingClass) -> PsdPlan {
+    fn plan(segment_count: usize, samples_used: usize, class: SamplingClass) -> PsdPlan {
         PsdPlan {
             selection: 0..20_000,
             sampling_class: class,
             sample_rate: 1000.0,
             frequency_unit: FrequencyUnit::Hertz,
-            segments,
+            gap_threshold: 1e7,
+            segment_count,
+            samples_used,
             excluded: ExcludedSegments::default(),
             config: WelchConfig {
                 window: Window::Hann,
@@ -559,7 +609,13 @@ mod tests {
                 overlap: 0.5,
                 detrend: Detrend::Constant,
             },
-            exceeds_memory_budget: false,
+            columns: 1,
+            memory: PsdMemory {
+                concurrent_columns: 1,
+                peak_bytes: 12 * 1024 * 1024 + 512 * 1024,
+                cap_bytes: 256 * 1024 * 1024,
+            },
+            larger_than_memory_cap: false,
         }
     }
 
@@ -578,10 +634,7 @@ mod tests {
 
     #[test]
     fn the_readout_states_samples_windows_window_and_delta_f() {
-        let text = computed_on(
-            &plan(std::iter::once(0..20_000).collect(), SamplingClass::Uniform),
-            &[spectrum(38, 0)],
-        );
+        let text = computed_on(&plan(1, 20_000, SamplingClass::Uniform), &[spectrum(38, 0)]);
         assert_eq!(
             text,
             "Computed on 20,000 samples · 38 windows · Hann, 1,024 samples, 50% overlap · \
@@ -591,10 +644,7 @@ mod tests {
 
     #[test]
     fn a_segmented_readout_says_how_many_segments_it_averaged_and_what_it_excluded() {
-        let mut plan = plan(
-            vec![0..4096, 5000..9096, 10_000..14_096],
-            SamplingClass::SegmentedUniform,
-        );
+        let mut plan = plan(3, 12_288, SamplingClass::SegmentedUniform);
         plan.excluded = ExcludedSegments {
             count: 2,
             samples: 300,
@@ -606,6 +656,14 @@ mod tests {
             "{text}"
         );
         assert!(text.starts_with("Computed on 12,288 samples"), "{text}");
+    }
+
+    #[test]
+    fn the_memory_note_states_the_estimated_peak_against_the_cap() {
+        assert_eq!(
+            memory_note(&plan(1, 20_000, SamplingClass::Uniform)),
+            "Memory: at most 12.5 MB of the 256.0 MB PSD limit (1 series at a time)"
+        );
     }
 
     #[test]
@@ -664,8 +722,9 @@ mod tests {
 #[cfg(test)]
 mod render_tests {
     use super::*;
-    use glyde_core::budget::RamBudget;
-    use glyde_core::dsp::psd::{compute_psd, plan_psd_on, AxisScale};
+    use glyde_core::dsp::psd::{
+        compute_psds, plan_psd_on, AxisScale, PsdMemoryCap, PSD_MEMORY_CAP_BYTES,
+    };
 
     /// A real plan and spectrum: a 1 kHz axis with a 125 Hz tone.
     fn ready() -> PsdOutcome {
@@ -677,13 +736,14 @@ mod render_tests {
             ticks_per_unit: 1_000_000_000,
             frequency_unit: FrequencyUnit::Hertz,
         };
-        let budget = RamBudget::from_total_ram_bytes(16 * 1024 * 1024 * 1024);
-        let plan = plan_psd_on(&ticks[..], scale, 0..8192, &PsdSettings::default(), &budget)
+        let cap = PsdMemoryCap::from_bytes(PSD_MEMORY_CAP_BYTES);
+        let plan = plan_psd_on(&ticks[..], scale, 0..8192, &PsdSettings::default(), 2, cap)
             .unwrap()
             .unwrap();
-        let psd = compute_psd(&samples[..], &plan, &mut |_| true)
+        let psd = compute_psds(&ticks[..], &[&samples[..]], &plan, &|_| true)
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .remove(0);
         let spectra = vec![
             Spectrum {
                 name: "a".to_string(),
@@ -709,15 +769,38 @@ mod render_tests {
         }
     }
 
-    fn render(panel: &mut PsdPanel) -> (egui::FullOutput, Option<Range<usize>>) {
+    fn tiny_dataset() -> Arc<Dataset> {
+        use glyde_core::ingest::TimeAxis;
+        use glyde_core::series::{Series, SeriesValues};
+        Arc::new(Dataset {
+            time: TimeAxis::Progressive {
+                values: vec![0.0, 1.0].into(),
+            },
+            time_column_name: "row".to_string(),
+            columns: vec![Series::new("v", SeriesValues::F64(vec![0.0, 1.0]))],
+        })
+    }
+
+    /// Renders `panel` as if the time view showed rows `0..8192` — the same
+    /// interval the shown PSD was computed on, unless `selection` says
+    /// otherwise.
+    fn render_with(
+        panel: &mut PsdPanel,
+        selection: Option<Range<usize>>,
+    ) -> (egui::FullOutput, Option<PsdRequest>) {
         let ctx = egui::Context::default();
-        let mut offered = None;
+        let dataset = tiny_dataset();
+        let mut request = None;
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                offered = panel.show(ui);
+                request = panel.show(ui, &dataset, selection.clone());
             });
         });
-        (output, offered)
+        (output, request)
+    }
+
+    fn render(panel: &mut PsdPanel) -> (egui::FullOutput, Option<PsdRequest>) {
+        render_with(panel, Some(0..8192))
     }
 
     #[test]
@@ -761,10 +844,11 @@ mod render_tests {
 }
 
 #[cfg(test)]
-mod update_tests {
+mod request_tests {
     use super::*;
     use glyde_core::ingest::TimeAxis;
     use glyde_core::series::{Series, SeriesValues};
+    use std::time::{Duration, Instant};
 
     fn dataset() -> Arc<Dataset> {
         Arc::new(Dataset {
@@ -779,77 +863,92 @@ mod update_tests {
         })
     }
 
-    fn job_selection(panel: &PsdPanel) -> Option<Range<usize>> {
-        panel.job.as_ref().map(|job| job.request().0.clone())
-    }
-
-    #[test]
-    fn a_selection_is_only_computed_once_it_has_settled() {
-        let dataset = dataset();
-        let mut panel = PsdPanel::default();
-        let t0 = Instant::now();
-
-        assert!(panel.update(&dataset, 0..4096, t0));
-        assert!(panel.job.is_none(), "a fresh selection waits to settle");
-
-        assert!(panel.update(&dataset, 0..4096, t0 + SELECTION_SETTLE / 2));
-        assert!(panel.job.is_none());
-
-        panel.update(&dataset, 0..4096, t0 + SELECTION_SETTLE);
-        assert_eq!(job_selection(&panel), Some(0..4096));
-    }
-
-    #[test]
-    fn a_selection_still_moving_restarts_the_wait() {
-        let dataset = dataset();
-        let mut panel = PsdPanel::default();
-        let t0 = Instant::now();
-
-        panel.update(&dataset, 0..4096, t0);
-        panel.update(&dataset, 100..4000, t0 + SELECTION_SETTLE);
-        assert!(
-            panel.job.is_none(),
-            "the selection changed, so it has not settled"
-        );
-
-        panel.update(&dataset, 100..4000, t0 + 2 * SELECTION_SETTLE);
-        assert_eq!(job_selection(&panel), Some(100..4000));
-    }
-
-    #[test]
-    fn a_newer_selection_replaces_the_job_computing_an_older_one() {
-        let dataset = dataset();
-        let mut panel = PsdPanel::default();
-        let t0 = Instant::now();
-        panel.update(&dataset, 0..4096, t0);
-        panel.update(&dataset, 0..4096, t0 + SELECTION_SETTLE);
-        assert_eq!(job_selection(&panel), Some(0..4096));
-
-        let t1 = t0 + 2 * SELECTION_SETTLE;
-        panel.update(&dataset, 0..2048, t1);
-        panel.update(&dataset, 0..2048, t1 + SELECTION_SETTLE);
-        assert_eq!(job_selection(&panel), Some(0..2048));
-    }
-
-    #[test]
-    fn a_settings_change_recomputes_without_waiting_for_the_selection_to_settle() {
-        let dataset = dataset();
-        let mut panel = PsdPanel::default();
-        let t0 = Instant::now();
-        panel.update(&dataset, 0..4096, t0);
-        panel.update(&dataset, 0..4096, t0 + SELECTION_SETTLE);
-        // Pretend that job finished and its result is on screen.
-        while panel.job.is_some() {
-            panel.update(&dataset, 0..4096, t0 + SELECTION_SETTLE);
+    fn finish(panel: &mut PsdPanel) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while panel.poll() {
+            assert!(Instant::now() < deadline, "PSD never finished");
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(panel.shown.is_some());
+    }
+
+    fn render(panel: &mut PsdPanel, dataset: &Arc<Dataset>, selection: Range<usize>) -> String {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                panel.show(ui, dataset, Some(selection.clone()));
+            });
+        });
+        format!("{:?}", output.shapes)
+    }
+
+    #[test]
+    fn nothing_is_computed_until_the_user_asks() {
+        let dataset = dataset();
+        let mut panel = PsdPanel::default();
+        // Many frames with a moving time view: no computation starts.
+        for end in (100..4096).step_by(100) {
+            assert!(!panel.poll());
+            render(&mut panel, &dataset, 0..end);
+            assert!(panel.job.is_none(), "rendering must never start a PSD");
+        }
+        assert!(panel.shown.is_none());
+    }
+
+    #[test]
+    fn computing_takes_the_interval_given_and_shows_its_result() {
+        let dataset = dataset();
+        let mut panel = PsdPanel::default();
+        panel.compute(&dataset, 1000..3000);
+        assert_eq!(
+            panel.job.as_ref().map(|job| job.request().0.clone()),
+            Some(1000..3000)
+        );
+        finish(&mut panel);
+        let shown = panel.shown.as_ref().expect("a result");
+        assert_eq!(shown.selection, 1000..3000);
+        assert!(panel.spectra().is_some());
+    }
+
+    #[test]
+    fn moving_the_view_afterwards_keeps_the_result_and_never_recomputes() {
+        let dataset = dataset();
+        let mut panel = PsdPanel::default();
+        panel.compute(&dataset, 0..4096);
+        finish(&mut panel);
+
+        let text = render(&mut panel, &dataset, 0..2000);
+        assert!(panel.job.is_none());
+        assert_eq!(panel.shown.as_ref().unwrap().selection, 0..4096);
+        assert!(
+            text.contains("changed since this PSD was computed"),
+            "a PSD that no longer matches the view must say so"
+        );
+        let text = render(&mut panel, &dataset, 0..4096);
+        assert!(!text.contains("changed since this PSD was computed"));
+    }
+
+    #[test]
+    fn a_settings_change_marks_the_result_out_of_date_without_recomputing() {
+        let dataset = dataset();
+        let mut panel = PsdPanel::default();
+        panel.compute(&dataset, 0..4096);
+        finish(&mut panel);
 
         panel.settings.window = Window::Hamming;
-        panel.update(&dataset, 0..4096, t0 + 2 * SELECTION_SETTLE);
-        assert_eq!(
-            panel.job.as_ref().map(|job| job.request().1.window),
-            Some(Window::Hamming)
-        );
+        let text = render(&mut panel, &dataset, 0..4096);
+        assert!(panel.job.is_none());
+        assert!(text.contains("changed since this PSD was computed"));
+    }
+
+    #[test]
+    fn cancelling_stops_the_job_and_keeps_what_was_shown() {
+        let dataset = dataset();
+        let mut panel = PsdPanel::default();
+        panel.compute(&dataset, 0..4096);
+        finish(&mut panel);
+        panel.compute(&dataset, 0..2048);
+        panel.cancel();
+        assert!(panel.job.is_none());
+        assert_eq!(panel.shown.as_ref().unwrap().selection, 0..4096);
     }
 }

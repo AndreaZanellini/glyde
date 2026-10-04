@@ -13,12 +13,11 @@
 // limitations under the License.
 
 //! The background PSD job (docs/ARCHITECTURE.md Hard rule 3: DSP never runs
-//! on the UI thread). A [`PsdJob`] plans the selection with
-//! `glyde_core::dsp::psd::plan_psd`, then streams every numeric column
-//! through `compute_psd` on the `rayon` pool, one column per task. The UI
-//! polls it once per frame; dropping it cancels the work (a newer selection
-//! supersedes an older one, so a stale estimate is never finished, let alone
-//! shown).
+//! on the UI thread). A [`PsdJob`] is started only when the user asks for a
+//! PSD; it plans the selection with `glyde_core::dsp::psd::plan_psd` under
+//! the PSD memory cap, then streams every numeric column through
+//! `compute_psds`, which runs as many columns at once as the cap allows. The
+//! UI polls it once per frame; dropping it cancels the work.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -27,7 +26,9 @@ use std::sync::Arc;
 use std::thread;
 
 use glyde_core::budget::RamBudget;
-use glyde_core::dsp::psd::{compute_psd, plan_psd, PsdPlan, PsdSettings, PsdUnavailable};
+use glyde_core::dsp::psd::{
+    compute_psds, plan_psd, PsdMemoryCap, PsdPlan, PsdSettings, PsdUnavailable,
+};
 use glyde_core::dsp::welch::Psd;
 use glyde_core::ingest::Dataset;
 use glyde_core::series::ViewKind;
@@ -48,8 +49,8 @@ pub enum PsdOutcome {
         plan: PsdPlan,
         spectra: Vec<Spectrum>,
     },
-    /// The selection may not have a PSD; the explanation is the value's
-    /// `Display`.
+    /// The selection may not have a PSD (or would not fit the memory cap);
+    /// the explanation is the value's `Display`.
     Unavailable(PsdUnavailable),
     /// The file has no numeric series to take a spectrum of.
     NoNumericSeries,
@@ -57,14 +58,22 @@ pub enum PsdOutcome {
     Failed(String),
 }
 
+/// State the job thread and the UI share.
+#[derive(Default)]
+struct Shared {
+    cancel: AtomicBool,
+    /// Samples read so far, across all columns.
+    progress: AtomicUsize,
+    /// Samples the plan will read in total; 0 until planned.
+    total: AtomicUsize,
+    streaming: AtomicBool,
+}
+
 /// A PSD being computed off the UI thread. Cancelled when dropped.
 pub struct PsdJob {
     selection: Range<usize>,
     settings: PsdSettings,
-    cancel: Arc<AtomicBool>,
-    progress: Arc<AtomicUsize>,
-    streaming: Arc<AtomicBool>,
-    total: usize,
+    shared: Arc<Shared>,
     rx: Receiver<PsdOutcome>,
 }
 
@@ -72,37 +81,27 @@ impl PsdJob {
     /// Starts computing the PSD of `selection` (row indices) of every numeric
     /// column of `dataset` under `settings`.
     pub fn spawn(dataset: Arc<Dataset>, selection: Range<usize>, settings: PsdSettings) -> Self {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let progress = Arc::new(AtomicUsize::new(0));
-        let streaming = Arc::new(AtomicBool::new(false));
-        let numeric_columns = dataset
-            .columns
-            .iter()
-            .filter(|series| series.view_kind() == ViewKind::TimeDomain)
-            .count();
-        let total = selection.len().saturating_mul(numeric_columns).max(1);
+        let shared = Arc::new(Shared::default());
         let (tx, rx) = mpsc::channel();
 
         tracing::info!(
             ?selection,
             ?settings,
-            numeric_columns,
-            "PSD requested for the time view's selection"
+            "user requested a PSD of the visible interval"
         );
         {
             let selection = selection.clone();
-            let cancel = Arc::clone(&cancel);
-            let progress = Arc::clone(&progress);
-            let streaming = Arc::clone(&streaming);
+            let shared = Arc::clone(&shared);
             thread::Builder::new()
                 .name("glyde-psd".to_string())
                 .spawn(move || {
-                    let outcome = run(
-                        &dataset, selection, &settings, &cancel, &progress, &streaming,
-                    );
-                    if let Some(outcome) = outcome {
-                        // The receiver is gone if the job was superseded.
-                        let _ = tx.send(outcome);
+                    let outcome = run(&dataset, selection, &settings, &shared);
+                    match outcome {
+                        // The receiver is gone if the job was cancelled.
+                        Some(outcome) => {
+                            let _ = tx.send(outcome);
+                        }
+                        None => tracing::info!("PSD cancelled"),
                     }
                 })
                 .expect("spawning the PSD thread");
@@ -111,10 +110,7 @@ impl PsdJob {
         Self {
             selection,
             settings,
-            cancel,
-            progress,
-            streaming,
-            total,
+            shared,
             rx,
         }
     }
@@ -124,15 +120,19 @@ impl PsdJob {
         (&self.selection, &self.settings)
     }
 
-    /// Fraction of the selection's samples read so far, across all columns.
+    /// Fraction of the planned samples read so far, across all columns.
     pub fn progress(&self) -> f32 {
-        (self.progress.load(Ordering::Relaxed) as f64 / self.total as f64).min(1.0) as f32
+        let total = self.shared.total.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        (self.shared.progress.load(Ordering::Relaxed) as f64 / total as f64).min(1.0) as f32
     }
 
-    /// Whether the plan found the selection too large to hold in memory, so
-    /// it is being streamed progressively (SPEC §5.1).
+    /// Whether the selection's raw samples are larger than the PSD memory
+    /// cap, so they are being read progressively (SPEC §5.1).
     pub fn is_streaming(&self) -> bool {
-        self.streaming.load(Ordering::Relaxed)
+        self.shared.streaming.load(Ordering::Relaxed)
     }
 
     /// The outcome, once there is one. Never blocks.
@@ -149,7 +149,7 @@ impl PsdJob {
 
 impl Drop for PsdJob {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.shared.cancel.store(true, Ordering::Relaxed);
     }
 }
 
@@ -158,70 +158,58 @@ fn run(
     dataset: &Dataset,
     selection: Range<usize>,
     settings: &PsdSettings,
-    cancel: &AtomicBool,
-    progress: &AtomicUsize,
-    streaming: &AtomicBool,
+    shared: &Shared,
 ) -> Option<PsdOutcome> {
-    let numeric: Vec<_> = dataset
+    let (names, columns): (Vec<&str>, Vec<_>) = dataset
         .columns
         .iter()
         .filter(|series| series.view_kind() == ViewKind::TimeDomain)
         .filter_map(|series| Some((series.name(), series.values().sample_source()?)))
-        .collect();
-    if numeric.is_empty() {
+        .unzip();
+    if columns.is_empty() {
         return Some(PsdOutcome::NoNumericSeries);
     }
 
-    let plan = match plan_psd(
-        &dataset.time,
-        selection,
-        settings,
-        &RamBudget::from_system(),
-    ) {
+    let cap = PsdMemoryCap::for_budget(&RamBudget::from_system());
+    let plan = match plan_psd(&dataset.time, selection, settings, columns.len(), cap) {
         Ok(Ok(plan)) => plan,
         Ok(Err(unavailable)) => return Some(PsdOutcome::Unavailable(unavailable)),
         Err(error) => return Some(PsdOutcome::Failed(error.to_string())),
     };
-    streaming.store(plan.exceeds_memory_budget, Ordering::Relaxed);
-    if cancel.load(Ordering::Relaxed) {
+    shared
+        .total
+        .store(plan.samples_used * columns.len(), Ordering::Relaxed);
+    shared
+        .streaming
+        .store(plan.larger_than_memory_cap, Ordering::Relaxed);
+    if shared.cancel.load(Ordering::Relaxed) {
         return None;
     }
 
-    use rayon::prelude::*;
-    let spectra: Vec<_> = numeric
-        .par_iter()
-        .map(|(name, samples)| {
-            let mut reported = 0usize;
-            let psd = compute_psd(samples, &plan, &mut |read| {
-                progress.fetch_add(read - reported, Ordering::Relaxed);
-                reported = read;
-                !cancel.load(Ordering::Relaxed)
-            });
-            psd.map(|psd| {
-                psd.map(|psd| Spectrum {
-                    name: name.to_string(),
-                    psd,
-                })
-            })
-        })
-        .collect();
-
-    let mut ready = Vec::with_capacity(spectra.len());
-    for spectrum in spectra {
-        match spectrum {
-            Ok(Some(spectrum)) => ready.push(spectrum),
-            Ok(None) => return None,
-            Err(error) => return Some(PsdOutcome::Failed(error.to_string())),
-        }
-    }
+    let spectra = compute_psds(&dataset.time, &columns, &plan, &|read| {
+        shared.progress.fetch_add(read, Ordering::Relaxed);
+        !shared.cancel.load(Ordering::Relaxed)
+    });
+    let spectra = match spectra {
+        Ok(Some(spectra)) => spectra,
+        Ok(None) => return None,
+        Err(error) => return Some(PsdOutcome::Failed(error.to_string())),
+    };
     tracing::info!(
-        columns = ready.len(),
-        windows = ready.first().map(|s| s.psd.segment_count),
+        columns = spectra.len(),
+        windows = spectra.first().map(|psd| psd.segment_count),
         "PSD computed"
     );
     Some(PsdOutcome::Ready {
+        spectra: names
+            .into_iter()
+            .zip(spectra)
+            .map(|(name, psd)| Spectrum {
+                name: name.to_string(),
+                psd,
+            })
+            .collect(),
         plan,
-        spectra: ready,
     })
 }
 
@@ -299,8 +287,8 @@ mod tests {
             0..2_000_000,
             PsdSettings::default(),
         );
-        let cancel = Arc::clone(&job.cancel);
+        let shared = Arc::clone(&job.shared);
         drop(job);
-        assert!(cancel.load(Ordering::Relaxed));
+        assert!(shared.cancel.load(Ordering::Relaxed));
     }
 }

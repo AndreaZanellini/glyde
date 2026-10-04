@@ -15,13 +15,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
 - **Power spectral density (PSD) view — milestone M5.** Under the time plot
   there is now a resizable panel with the spectrum of every numeric series,
   computed with Welch's method on the **raw samples** (never on the
-  decimated plot data). It follows the time view: whatever interval the time
-  plot shows *is* the selection. Zoom or box-select a stretch and, a quarter
-  of a second after you stop moving, the PSD is recomputed for that stretch
-  only; "Fit to data" goes back to the whole signal. A newer selection
-  cancels a computation still running for an older one, and the work happens
-  in the background, so the window never freezes. (docs/SPEC.md §3.2, §3.3,
-  §4.2.)
+  decimated plot data). **It is computed only when you press "Compute
+  PSD"**, on the interval the time plot shows at that moment: zoom or
+  box-select the stretch you want first, or use "Fit to data" for the whole
+  signal. Scrolling or zooming afterwards never starts a computation (on a
+  big file, or one Glyde had to cache on disk, every PSD reads every
+  selected sample, so it is your call); the PSD on screen stays, with a note
+  when it no longer matches the view or the settings. A **Cancel** button
+  stops a computation in progress. The work happens in the background, so
+  the window never freezes. (docs/SPEC.md §3.2, §3.3, §4.2.)
   - **Overlay / Stacked**: all spectra on one plot, or one plot per series;
     every plot shares the same frequency axis (pan or zoom one, they all
     follow). Each spectrum uses its series' color from the time plot.
@@ -35,7 +37,7 @@ Versioning: [Semantic Versioning](https://semver.org/).
   - **PSD settings** (collapsed by default, never needed for a correct first
     result): window (Hann / Hamming / Rectangular), segment length (Auto or
     256 … 65,536) and overlap (0 / 25 / 50 / 75 %), plus a "Defaults" button.
-    Changing one recomputes immediately.
+    Changing one marks the PSD as out of date; press "Compute PSD" again.
   - **Data with gaps** (bursts separated by long pauses): the PSD is computed
     per burst — no analysis window ever crosses a gap — and averaged,
     weighted by burst length. The line says *"averaged over N segments (no
@@ -47,31 +49,46 @@ Versioning: [Semantic Versioning](https://semver.org/).
     Glyde does not resample it to fake a uniform rate."* If the file has a
     uniformly sampled stretch of at least 256 samples, a button **"Analyze
     the largest uniform stretch"** moves the time view onto it, which makes
-    it the new selection.
+    it the interval "Compute PSD" will analyze.
   - **Timestamps out of order**: no PSD, with a pointer to the inference
     bar's [Sort].
   - **Missing values (NaN / empty cells)**: windows that would contain one
     are skipped, never filled in, and the panel says how many missing samples
     each series had in the selection.
-  - **Large selections**: the PSD reads the samples in small chunks and only
-    ever holds one analysis window in memory, so any selection size works
-    without running out of memory. When the selection alone would not fit
-    Glyde's memory budget, the progress line says it is being read
-    progressively. A 10-million-sample PSD takes about 0.45 s on an Apple
-    Silicon laptop (budget: 1 s, now enforced by the `welch` benchmark).
+  - **A hard memory limit**: a PSD never uses more than **256 MB** (or Glyde's
+    whole memory budget on a machine where that is smaller), whatever the
+    length of the selection, the number of gaps in it, or the number of
+    series. The samples are read in small chunks, one analysis window at a
+    time; Glyde works out the peak memory *before* starting and computes as
+    many series at once as fit under the limit. If not even one series at a
+    time fits (very long windows on a file with very many series), the PSD is
+    refused before anything runs, with a button for the largest segment
+    length that fits. A line under the plot shows the memory used against
+    the limit, e.g. *"Memory: at most 23.0 MB of the 256.0 MB PSD limit (4
+    series at a time)"*. A test measures every byte actually allocated and
+    checks it never exceeds that estimate. A 10-million-sample PSD takes
+    about 0.3 s on an Apple Silicon laptop (budget: 1 s, enforced by the
+    `welch` benchmark).
 
   What to try (the M5 maintainer test): open a signal with known frequency
-  content and check the peak lands where physics says; box-select a
-  sub-interval and watch the PSD recompute for it; open a file with bursts
+  content, press "Compute PSD" and check the peak lands where physics says;
+  box-select a sub-interval, press it again and check it is computed for
+  that interval only; scroll around and check nothing recomputes on its
+  own; open a file with bursts
   separated by gaps and look for "averaged over N segments"; open an
   irregular event log (e.g. corpus case 39) and read the explanation; toggle
   both log axes.
 
   **Assumptions made (please veto by testing the app):**
-  - **The selection is the time view's visible interval**, not a separate
-    selection tool. SPEC §4.2 says "selection in the time view drives the PSD
-    view" without saying how a selection is made; reusing zoom/box-select
-    avoids adding a new interaction.
+  - **The selection is the time view's visible interval** at the moment you
+    press "Compute PSD", not a separate selection tool. SPEC §4.2 says
+    "selection in the time view drives the PSD view" without saying how a
+    selection is made; reusing zoom/box-select avoids adding a new
+    interaction. Computing only on request (instead of following the view
+    live) was your call on PR #121.
+  - **The PSD memory limit is 256 MB** (capped by the global budget,
+    `min(25% RAM, 4 GB)`). Generous for any realistic number of series at
+    the largest window, small next to the global budget.
   - **Log power is on by default, log frequency off.** Power usually spans
     many orders of magnitude, so a linear power axis shows only the biggest
     peak.
