@@ -176,7 +176,7 @@ them, so CI stays green while honoring "written first."
 ## M6 — State timeline (non-numeric & event data)
 
 - [x] Boolean series → on/off horizontal bands (not numeric step plots) → SPEC §4.3 · proven by: corpus 47 + manual · `glyde_core::series::bool_state_bands` collapses a `bool` column's raw samples into maximal on/off runs (product logic, ARCH Hard rule 2); `glyde-app`'s new `views::state_timeline` draws each as its own fixed, always-fit-to-data lane of colored bands. **Residual, split out**: this lane does not (yet) pan/zoom together with the time-domain plot above it, and `string`/categorical bands, markers, and the "multiple states" collapse glyph are the remaining M6 items, not yet built
-- [ ] String/categorical → labeled state bands; label when the band is wide enough, tooltip otherwise → SPEC §4.3 · proven by: corpus 48 + manual
+- [x] String/categorical → labeled state bands; label when the band is wide enough, tooltip otherwise → SPEC §4.3 · proven by: corpus 48 + manual · `glyde_core::series::string_state_bands`/`StateBandBuilder` (unit-tested on corpus 48's shape) feed `views::state_timeline`'s labeled lanes; dense columns fall back to a bounded overview with mixed-state cells flagged (the expand-on-zoom glyph is the collapse-rule item below)
 - [ ] Markers (single-sample events) → tick glyphs on their own lane, never decimated away → SPEC §4.3 · proven by: corpus 49 + manual
 - [ ] Collapse rule: when states collapse into one pixel column, render a "multiple states" glyph that expands on zoom — no event ever disappears → SPEC §4.3 · proven by: manual zoom test
 - [ ] Time-alignment: state lanes share the single synchronized time axis with the numeric plots, stacked → SPEC §4.1, §4.3 · proven by: manual

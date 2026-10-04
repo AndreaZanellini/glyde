@@ -49,7 +49,7 @@ use std::thread;
 use glyde_core::dsp::decimation::Bucket;
 use glyde_core::index::spill::SweepReport;
 use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary};
-use glyde_core::series::BoolLane;
+use glyde_core::series::{BoolLane, StateLane};
 
 use crate::views;
 
@@ -170,6 +170,8 @@ pub struct PreparedView {
     pub sample_cache: Vec<Option<Vec<f64>>>,
     /// See `views::state_timeline::cache_bool_bands`.
     pub bool_bands: Vec<Option<BoolLane>>,
+    /// See `views::state_timeline::cache_state_lanes`.
+    pub state_lanes: Vec<Option<StateLane>>,
     /// See `views::time::CursorLookup`.
     pub cursor: views::time::CursorLookup,
 }
@@ -188,11 +190,16 @@ impl PreparedView {
             dataset,
             &ticks[..ticks.len().min(bool_tick_limit)],
         );
+        let state_lanes = views::state_timeline::cache_state_lanes(
+            dataset,
+            &ticks[..ticks.len().min(bool_tick_limit)],
+        );
         let cursor = views::time::CursorLookup::for_time(&dataset.time);
         Self {
             ticks,
             sample_cache,
             bool_bands,
+            state_lanes,
             cursor,
         }
     }
@@ -616,6 +623,7 @@ mod tests {
                     ticks: Vec::new(),
                     sample_cache: Vec::new(),
                     bool_bands: Vec::new(),
+                    state_lanes: Vec::new(),
                     cursor: views::time::CursorLookup::default(),
                 }),
             }
