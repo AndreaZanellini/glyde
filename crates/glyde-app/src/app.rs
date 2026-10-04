@@ -332,6 +332,7 @@ impl eframe::App for GlydeApp {
                             &partial.dataset,
                             &ticks[..ticks.len().min(PROGRESS_BOOL_BAND_ROWS)],
                             &partial.prepared.bool_bands,
+                            &partial.prepared.state_lanes,
                         );
                     }
                     None => {
@@ -375,10 +376,16 @@ impl eframe::App for GlydeApp {
                     prepared.cursor,
                 );
                 // SPEC §4.3 / docs/ROADMAP.md M6 "Boolean series → on/off
-                // horizontal bands" (`string`/categorical bands, markers,
-                // and sharing this view's axis with the plot above are
-                // still-open M6 items, not yet built).
-                views::state_timeline::show(ui, dataset, &prepared.ticks, &prepared.bool_bands);
+                // horizontal bands" and "String/categorical → labeled state
+                // bands" (markers and sharing this view's axis with the plot
+                // above are still-open M6 items, not yet built).
+                views::state_timeline::show(
+                    ui,
+                    dataset,
+                    &prepared.ticks,
+                    &prepared.bool_bands,
+                    &prepared.state_lanes,
+                );
             }
             Status::Failed { path, message } => {
                 ui.colored_label(

@@ -22,10 +22,12 @@
 //! raw samples into bands (product logic, so it lives in `glyde-core` per
 //! `docs/ARCHITECTURE.md` Hard rule 2); this module only draws them.
 //!
+//! `string` columns get the same treatment as labeled bands
+//! ([`glyde_core::series::string_state_bands`]): the label is printed inside
+//! a band wide enough to hold it and shown as a hover tooltip otherwise.
+//!
 //! Deliberately out of scope here — remaining M6 roadmap items, not yet
 //! built:
-//! - `string`/categorical state bands (SPEC §4.3's other state-timeline
-//!   case; only `bool` columns are read by [`show`] today).
 //! - Markers (single-sample events on their own lane).
 //! - Zooming into a mixed-state interval to recover its individual runs.
 //!   Dense files use a bounded overview that visibly marks mixed intervals;
@@ -34,10 +36,13 @@
 //!   Each lane here is a fixed, always-fit-to-data, non-interactive view of
 //!   the *whole* file instead — panning/zooming the time-domain view above
 //!   does not (yet) move these bands with it.
-use egui_plot::{Plot, PlotBounds, PlotPoints, Polygon, VLine};
+use egui_plot::{Plot, PlotBounds, PlotPoint, PlotPoints, Polygon, Text, VLine};
 use glyde_core::index::spill::SpillVec;
 use glyde_core::ingest::{Dataset, TimeAxis};
-use glyde_core::series::{BoolBand, BoolBandBuilder, BoolLane, SeriesValues, SpilledValues};
+use glyde_core::series::{
+    state_label_id, BoolBand, BoolBandBuilder, BoolLane, SeriesValues, SpilledValues, StateBand,
+    StateBandBuilder, StateCell, StateLane,
+};
 
 use super::time::{format_x_axis_tick, tick_to_seconds};
 
@@ -62,15 +67,37 @@ const MIXED_COLOR: egui::Color32 = egui::Color32::from_rgb(205, 130, 45);
 /// as a parameter and computed by the caller once per status change — the
 /// same once-not-per-frame discipline [`super::time::show`] follows for the
 /// identical reason (see its own doc comment).
-pub fn show(ui: &mut egui::Ui, dataset: &Dataset, ticks: &[i128], bool_bands: &[Option<BoolLane>]) {
+pub fn show(
+    ui: &mut egui::Ui,
+    dataset: &Dataset,
+    ticks: &[i128],
+    bool_bands: &[Option<BoolLane>],
+    state_lanes: &[Option<StateLane>],
+) {
     let time = &dataset.time;
-    let Some(first_lane) = bool_bands.iter().flatten().next() else {
+    let bounds = bool_bands
+        .iter()
+        .flatten()
+        .next()
+        .map(BoolLane::tick_bounds)
+        .or_else(|| {
+            state_lanes
+                .iter()
+                .flatten()
+                .next()
+                .map(StateLane::tick_bounds)
+        });
+    let Some((min_tick, max_tick)) = bounds else {
         return;
     };
-    let (min_tick, max_tick) = first_lane.tick_bounds();
     let (axis_min, axis_max) = axis_bounds(min_tick, max_tick, time);
 
     for (index, series) in dataset.columns.iter().enumerate() {
+        if let Some(Some(lane)) = state_lanes.get(index) {
+            ui.label(series.name());
+            show_state_lane(ui, index, lane, ticks, time, (axis_min, axis_max));
+            continue;
+        }
         let Some(Some(bands)) = bool_bands.get(index) else {
             continue;
         };
@@ -290,6 +317,209 @@ fn bool_bands_from_spilled(
     builder.finish_lane()
 }
 
+/// Estimated width, in points, of one label glyph — a band narrower than
+/// `label.chars().count() * LABEL_CHAR_WIDTH` shows its label as a tooltip
+/// instead (SPEC §4.3: "label when wide enough, tooltip otherwise").
+const LABEL_CHAR_WIDTH: f64 = 7.0;
+const LABEL_PADDING: f64 = 6.0;
+
+/// A stable, readable fill for `label`, so the same state is the same color
+/// everywhere and across files.
+fn label_color(label_id: u32) -> egui::Color32 {
+    let hue = (f64::from(label_id) * 0.618_033_988_75).fract() as f32;
+    egui::ecolor::Hsva::new(hue, 0.55, 0.55, 1.0).into()
+}
+
+fn show_state_lane(
+    ui: &mut egui::Ui,
+    index: usize,
+    lane: &StateLane,
+    ticks: &[i128],
+    time: &TimeAxis,
+    (axis_min, axis_max): (f64, f64),
+) {
+    if let StateLane::Overview { .. } = lane {
+        ui.label("Many state changes: intervals holding several states are drawn as one block");
+    }
+    let mut hover_x = None;
+    let mut width_per_second = 1.0;
+    let response = Plot::new(format!("state_timeline_{index}"))
+        .height(LANE_HEIGHT)
+        .show_axes([true, false])
+        .show_grid([false, false])
+        .allow_zoom(false)
+        .allow_scroll(false)
+        .allow_drag(false)
+        .allow_boxed_zoom(false)
+        .x_axis_formatter(move |mark, _range| format_x_axis_tick(ticks, mark, time))
+        .show(ui, |plot_ui| {
+            plot_ui.set_plot_bounds(PlotBounds::from_min_max([axis_min, 0.0], [axis_max, 1.0]));
+            hover_x = plot_ui.pointer_coordinate().map(|point| point.x);
+            width_per_second = plot_ui.transform().dpos_dvalue_x().abs().recip();
+            match lane {
+                StateLane::Exact { bands, .. } => {
+                    for (position, band) in bands.iter().enumerate() {
+                        let (x0, x1) =
+                            state_band_span(time, band, position + 1 == bands.len(), axis_max);
+                        if x0 == x1 {
+                            continue;
+                        }
+                        fill_rect(plot_ui, x0, x1, label_color(state_label_id(&band.label)));
+                        let points_wide = (x1 - x0) / width_per_second.max(f64::EPSILON);
+                        let needed =
+                            band.label.chars().count() as f64 * LABEL_CHAR_WIDTH + LABEL_PADDING;
+                        if points_wide >= needed {
+                            plot_ui.text(
+                                Text::new(
+                                    PlotPoint::new((x0 + x1) / 2.0, 0.5),
+                                    egui::RichText::new(&band.label).color(egui::Color32::WHITE),
+                                )
+                                .anchor(egui::Align2::CENTER_CENTER),
+                            );
+                        }
+                    }
+                }
+                StateLane::Overview { cells, labels, .. } => {
+                    draw_state_overview(plot_ui, cells, labels, axis_min, axis_max);
+                }
+            }
+        });
+    // Tooltip for whatever band the pointer is over, narrow or not.
+    if let (Some(x), true) = (hover_x, response.response.hovered()) {
+        if let Some(text) = state_hover_text(lane, time, x, axis_max) {
+            response.response.on_hover_text(text);
+        }
+    }
+}
+
+fn state_band_span(time: &TimeAxis, band: &StateBand, is_last: bool, axis_max: f64) -> (f64, f64) {
+    let x0 = tick_to_seconds(time, band.start_tick);
+    let x1 = if is_last {
+        axis_max
+    } else {
+        tick_to_seconds(time, band.end_tick)
+    };
+    (x0, x1)
+}
+
+fn fill_rect(plot_ui: &mut egui_plot::PlotUi, x0: f64, x1: f64, color: egui::Color32) {
+    plot_ui.polygon(
+        Polygon::new(PlotPoints::new(vec![
+            [x0, 0.0],
+            [x1, 0.0],
+            [x1, 1.0],
+            [x0, 1.0],
+        ]))
+        .fill_color(color)
+        .stroke(egui::Stroke::NONE),
+    );
+}
+
+fn draw_state_overview(
+    plot_ui: &mut egui_plot::PlotUi,
+    cells: &[StateCell],
+    labels: &std::collections::BTreeMap<u32, String>,
+    min: f64,
+    max: f64,
+) {
+    let _ = labels;
+    let cell_x = |position: usize| min + (max - min) * position as f64 / cells.len() as f64;
+    let mut start = 0;
+    while start < cells.len() {
+        let cell = cells[start];
+        let mut end = start + 1;
+        while end < cells.len() && cells[end] == cell {
+            end += 1;
+        }
+        let color = match cell {
+            StateCell::Empty => None,
+            StateCell::Single(id) => Some(label_color(id)),
+            StateCell::Mixed => Some(MIXED_COLOR),
+        };
+        if let Some(color) = color {
+            fill_rect(plot_ui, cell_x(start), cell_x(end), color);
+        }
+        start = end;
+    }
+}
+
+/// What the tooltip says at plot-x `x` (seconds): the band's label and the
+/// interval it holds, or, in an overview lane, the cell's label / a mixed
+/// notice.
+fn state_hover_text(lane: &StateLane, time: &TimeAxis, x: f64, axis_max: f64) -> Option<String> {
+    match lane {
+        StateLane::Exact { bands, .. } => bands.iter().enumerate().find_map(|(position, band)| {
+            let (x0, x1) = state_band_span(time, band, position + 1 == bands.len(), axis_max);
+            (x >= x0 && x <= x1).then(|| format!("{:?}", band.label))
+        }),
+        StateLane::Overview {
+            cells,
+            labels,
+            min_tick,
+            max_tick,
+        } => {
+            let (min, max) = (
+                tick_to_seconds(time, *min_tick),
+                tick_to_seconds(time, *max_tick),
+            );
+            if max <= min || x < min || x > max {
+                return None;
+            }
+            let position = (((x - min) / (max - min)) * cells.len() as f64) as usize;
+            match cells.get(position.min(cells.len() - 1))? {
+                StateCell::Empty => None,
+                StateCell::Mixed => Some("several different states in this interval".to_owned()),
+                StateCell::Single(id) => Some(
+                    labels
+                        .get(id)
+                        .map_or_else(|| "(label not retained)".to_owned(), |l| format!("{l:?}")),
+                ),
+            }
+        }
+    }
+}
+
+/// Builds `state_lanes` for [`show`]: `dataset.columns`-parallel, `Some` for
+/// a `string` column, `None` otherwise. Same once-per-status-change,
+/// off-the-UI-thread contract as [`cache_bool_bands`].
+pub fn cache_state_lanes(dataset: &Dataset, ticks: &[i128]) -> Vec<Option<StateLane>> {
+    let is_string = |series: &glyde_core::series::Series| {
+        matches!(
+            series.values(),
+            SeriesValues::String(_) | SeriesValues::Spilled(SpilledValues::String(_))
+        )
+    };
+    let Some((&min_tick, &max_tick)) = ticks.iter().min().zip(ticks.iter().max()) else {
+        return vec![None; dataset.columns.len()];
+    };
+    dataset
+        .columns
+        .iter()
+        .map(|series| {
+            if !is_string(series) {
+                return None;
+            }
+            let mut builder = StateBandBuilder::for_view(min_tick, max_tick);
+            match series.values() {
+                SeriesValues::String(values) => {
+                    for (label, &tick) in values.iter().zip(ticks) {
+                        builder.push(label, tick);
+                    }
+                }
+                SeriesValues::Spilled(SpilledValues::String(values)) => {
+                    // `iter` borrows straight from the mapped arena — one
+                    // field at a time, never the whole column resident.
+                    for (label, &tick) in values.iter().zip(ticks) {
+                        builder.push(label, tick);
+                    }
+                }
+                _ => return None,
+            }
+            Some(builder.finish_lane())
+        })
+        .collect()
+}
+
 /// Builds a minimal-but-real dataset with a `bool` column and runs [`show`]
 /// through a headless `egui::Context` (docs/ROADMAP.md M6, proven by
 /// "corpus 47 + manual" — this is the same headless-render crash-free proof
@@ -344,7 +574,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &ticks, &lanes);
+                show(ui, &dataset, &ticks, &lanes, &[]);
             });
         });
         assert!(
@@ -371,7 +601,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &ticks, &bool_bands);
+                show(ui, &dataset, &ticks, &bool_bands, &[]);
             });
         });
 
@@ -379,6 +609,44 @@ mod render_tests {
             !output.shapes.is_empty(),
             "must draw something for a real bool column"
         );
+    }
+
+    #[test]
+    fn show_renders_a_string_column_as_labeled_bands() {
+        let dataset = Dataset {
+            columns: vec![Series::new(
+                "state",
+                SeriesValues::String(
+                    ["idle", "idle", "running", "fault"]
+                        .map(str::to_owned)
+                        .to_vec(),
+                ),
+            )],
+            ..sample_dataset()
+        };
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        let lanes = cache_state_lanes(&dataset, &ticks);
+        let Some(StateLane::Exact { bands, .. }) = &lanes[0] else {
+            panic!("a string column must get an exact lane: {lanes:?}");
+        };
+        assert_eq!(bands.len(), 3);
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, &dataset, &ticks, &[], &lanes);
+            });
+        });
+        assert!(!output.shapes.is_empty());
+    }
+
+    #[test]
+    fn non_string_columns_get_no_state_lane() {
+        let dataset = sample_dataset();
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        assert!(cache_state_lanes(&dataset, &ticks)
+            .iter()
+            .all(Option::is_none));
     }
 
     #[test]
@@ -393,7 +661,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &ticks, &bool_bands);
+                show(ui, &dataset, &ticks, &bool_bands, &[]);
             });
         });
 
@@ -420,7 +688,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &ticks, &bool_bands);
+                show(ui, &dataset, &ticks, &bool_bands, &[]);
             });
         });
 

@@ -12,6 +12,26 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Text state columns (like `idle` / `running` / `fault`) now show as labeled
+  colored bands under the plot, one lane per column.** Each run of the same
+  value is one band; the same state always gets the same color. If the band
+  is wide enough, its name is printed inside it; if not, hover over it to
+  read the name. Nothing is cleaned up: `Run`, `run` and `run ` are three
+  different states, and an empty cell is a state called "". When a column
+  changes state so often that individual bands would be unreadable, the lane
+  switches to a compact view where any stretch holding several different
+  states is drawn as one orange block (and says so) rather than hiding some
+  of them.
+
+  **Assumptions made (please veto by testing the app):**
+  - Colors are derived from the label text, so a state keeps its color from
+    file to file; two states could occasionally look alike.
+  - In the compact view the hover text names up to 256 distinct states;
+    beyond that, a single-state stretch says "label not retained".
+  - These lanes are still whole-file and do not pan/zoom with the plot above
+    (same as the on/off lanes); markers, the "multiple states" glyph that
+    expands on zoom, and axis sharing are the remaining state-timeline items.
+
 - **Files with no time column now open and plot every column, against a row
   index Glyde generates — and you can pick the time column yourself.** A file
   of plain signals (say `ax,ay,az`, no timestamps) used to be read as if its
