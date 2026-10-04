@@ -82,9 +82,11 @@ fn measured_psd(dataset: &Dataset, settings: PsdSettings, cap: PsdMemoryCap) -> 
         .filter(|series| series.view_kind() == ViewKind::TimeDomain)
         .filter_map(|series| series.values().sample_source())
         .collect();
-    // Start the rayon pool outside the measured window: its threads and
-    // queues are the application's, not this computation's.
+    // Start the rayon pool and plan the standard FFT lengths outside the
+    // measured window, as the application does at startup: both are the
+    // application's, not this computation's.
     rayon::join(|| (), || ());
+    glyde_core::dsp::welch::prepare_fft_plans();
 
     let baseline = CURRENT.load(Ordering::SeqCst);
     PEAK.store(baseline, Ordering::SeqCst);
@@ -141,6 +143,10 @@ fn roomy() -> PsdMemoryCap {
 }
 
 fn assert_within(plan: &PsdPlan, peak: usize, cap: PsdMemoryCap) {
+    eprintln!(
+        "MEASURED peak={peak} estimate={} k={}",
+        plan.memory.peak_bytes, plan.memory.concurrent_columns
+    );
     assert!(
         plan.memory.peak_bytes <= cap.bytes(),
         "the plan itself is over the cap: {} > {}",
@@ -187,6 +193,24 @@ fn a_cap_that_allows_one_column_at_a_time_is_never_exceeded() {
 
     assert_eq!(plan.memory.concurrent_columns, 1);
     assert_within(&plan, peak, cap);
+}
+
+#[test]
+fn a_selection_shorter_than_one_segment_with_an_awkward_length_stays_within_its_estimate() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    // 65 521 is prime: rustfft plans it with Bluestein's algorithm, the most
+    // memory-hungry kind of plan, and it cannot come from the shared cache.
+    let file = csv(65_521, 4, None);
+    let dataset = glyde_core::ingest::load(file.path()).expect("load");
+    let settings = PsdSettings {
+        segment_length: SegmentLength::Fixed(65536),
+        ..PsdSettings::default()
+    };
+
+    let (plan, peak) = measured_psd(&dataset, settings, roomy());
+
+    assert_eq!(plan.window_len(), 65_521);
+    assert_within(&plan, peak, roomy());
 }
 
 #[test]

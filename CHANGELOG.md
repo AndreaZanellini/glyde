@@ -69,7 +69,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
     **Reaching the limit never closes the app**: should a running computation
     still be about to go over it, or should the system refuse memory, that
     one computation stops with a message (*"The PSD was stopped because…"*)
-    and everything else keeps working. A line under the plot shows the memory used against
+    and everything else keeps working. For the same reason, the FFT tables
+    the PSD needs for every standard segment length (256 … 65,536) are
+    prepared once in the background when Glyde starts (about 2 MB, a few
+    milliseconds): a PSD then never has to ask the FFT library for memory.
+    Only a selection shorter than one segment (which uses a window of its own,
+    unusual length) has its table prepared on demand, after checking that the
+    memory is available — and all series of that PSD share it. A line under the plot shows the memory used against
     the limit, e.g. *"Memory: at most 23.0 MB of the 256.0 MB PSD limit (4
     series at a time)"*. A test measures every byte actually allocated and
     checks it never exceeds that estimate. A 10-million-sample PSD takes

@@ -35,7 +35,8 @@
 //! `dsp::psd`'s job, not this module's.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::detrend::{self, Detrend};
 use super::window::{self, Window};
@@ -209,7 +210,7 @@ impl WelchAccumulator {
         let buffer = try_filled(len, 0.0)?;
         let spectrum = try_filled(len, Complex::new(0.0, 0.0))?;
         let accumulated = try_filled(len / 2 + 1, 0.0)?;
-        let fft = FftPlanner::<f64>::new().plan_fft_forward(len);
+        let fft = fft_plan(len)?;
         let scratch = try_filled(fft.get_inplace_scratch_len(), Complex::new(0.0, 0.0))?;
         Ok(Self {
             len,
@@ -305,6 +306,97 @@ impl WelchAccumulator {
             non_finite_count: self.non_finite_count,
         })
     }
+}
+
+/// Every window length the software can choose by itself or offer in the
+/// PSD settings: the powers of two in `[MIN_SEGMENT_LEN, MAX_SEGMENT_LEN]`.
+const STANDARD_LENGTHS: usize =
+    (MAX_SEGMENT_LEN.trailing_zeros() - MIN_SEGMENT_LEN.trailing_zeros() + 1) as usize;
+
+/// One forward FFT plan per standard length, shared by every estimate and
+/// every thread. `rustfft` allocates a plan's twiddle factors infallibly —
+/// an allocation failure there would terminate the process — so the
+/// application plans them all once at startup ([`prepare_fft_plans`]), while
+/// memory is plentiful, and a PSD then never asks `rustfft` for memory.
+static STANDARD_PLANS: [OnceLock<Arc<dyn Fft<f64>>>; STANDARD_LENGTHS] =
+    [const { OnceLock::new() }; STANDARD_LENGTHS];
+
+/// How many FFT plans this process has created — so a test can prove the
+/// PSD path creates none once [`prepare_fft_plans`] has run.
+static PLANS_CREATED: AtomicUsize = AtomicUsize::new(0);
+
+/// Plans every standard window length now (a few milliseconds, about 2 MB
+/// held for the life of the process). Meant for a background thread at
+/// application startup; idempotent.
+pub fn prepare_fft_plans() {
+    for slot in 0..STANDARD_LENGTHS {
+        standard_plan(slot);
+    }
+}
+
+/// See [`PLANS_CREATED`].
+#[doc(hidden)]
+pub fn fft_plans_created() -> usize {
+    PLANS_CREATED.load(Ordering::Relaxed)
+}
+
+fn standard_plan(slot: usize) -> Arc<dyn Fft<f64>> {
+    Arc::clone(STANDARD_PLANS[slot].get_or_init(|| {
+        PLANS_CREATED.fetch_add(1, Ordering::Relaxed);
+        FftPlanner::<f64>::new().plan_fft_forward(MIN_SEGMENT_LEN << slot)
+    }))
+}
+
+/// Upper bound on what `rustfft` allocates to plan a length-`len` FFT of
+/// arbitrary factorization: twiddle factors plus, for an awkward (e.g.
+/// prime) length, Bluestein's inner power-of-two FFT of up to `4 × len`
+/// points and its own twiddles.
+pub(crate) fn plan_bytes_upper_bound(len: usize) -> u64 {
+    (len as u64).saturating_mul(16 * 8)
+}
+
+/// The forward FFT plan for a `len`-sample window. A standard length comes
+/// from the shared cache. Any other length — only a uniform selection
+/// shorter than one segment has one — is planned on demand, after checking
+/// that the system can provide the memory planning needs: the check is
+/// released just before `rustfft` allocates, so it makes a refusal there
+/// very unlikely, not impossible.
+fn fft_plan(len: usize) -> Result<Arc<dyn Fft<f64>>> {
+    if is_standard_length(len) {
+        let slot = (len.trailing_zeros() - MIN_SEGMENT_LEN.trailing_zeros()) as usize;
+        return Ok(standard_plan(slot));
+    }
+    // Every column of one PSD asks for the same length: keep the last
+    // on-demand plan so they share it, but only one, so the cache stays
+    // bounded whatever lengths a session goes through.
+    let mut last = LAST_ON_DEMAND_PLAN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((cached_len, plan)) = last.as_ref() {
+        if *cached_len == len {
+            return Ok(Arc::clone(plan));
+        }
+    }
+    // Free the previous plan before probing for and allocating the next.
+    *last = None;
+    drop(try_with_capacity::<u8>(
+        usize::try_from(plan_bytes_upper_bound(len)).unwrap_or(usize::MAX),
+    )?);
+    PLANS_CREATED.fetch_add(1, Ordering::Relaxed);
+    let plan = FftPlanner::<f64>::new().plan_fft_forward(len);
+    *last = Some((len, Arc::clone(&plan)));
+    Ok(plan)
+}
+
+/// The most recent plan [`fft_plan`] made for a non-standard length.
+static LAST_ON_DEMAND_PLAN: Mutex<Option<(usize, FftPlan)>> = Mutex::new(None);
+
+/// A forward FFT plan, shareable across threads.
+type FftPlan = Arc<dyn Fft<f64>>;
+
+/// Whether a `len`-sample window has a plan in the shared startup cache.
+pub(crate) fn is_standard_length(len: usize) -> bool {
+    len.is_power_of_two() && (MIN_SEGMENT_LEN..=MAX_SEGMENT_LEN).contains(&len)
 }
 
 /// A `Vec` with room for `len` elements, or [`GlydeError::OutOfMemory`] when

@@ -65,8 +65,8 @@ use tracing::{info, warn};
 
 use super::detrend::Detrend;
 use super::welch::{
-    default_segment_length, welch_source, LengthWeightedAverage, Psd, WelchConfig, DEFAULT_OVERLAP,
-    MAX_SEGMENT_LEN, MIN_SEGMENT_LEN,
+    default_segment_length, is_standard_length, plan_bytes_upper_bound, welch_source,
+    LengthWeightedAverage, Psd, WelchConfig, DEFAULT_OVERLAP, MAX_SEGMENT_LEN, MIN_SEGMENT_LEN,
 };
 use super::window::Window;
 use crate::budget::RamBudget;
@@ -169,10 +169,21 @@ impl PsdMemory {
     /// The peak for `columns` series at window length `len`, computing
     /// `concurrent` of them at a time.
     pub fn estimate(len: usize, columns: usize, concurrent: usize, cap: PsdMemoryCap) -> Self {
+        Self::estimate_for(len, len, columns, concurrent, cap)
+    }
+
+    /// [`Self::estimate`] when the window actually used is `window_len` —
+    /// shorter than `len` for a uniform selection shorter than one segment.
+    fn estimate_for(
+        len: usize,
+        window_len: usize,
+        columns: usize,
+        concurrent: usize,
+        cap: PsdMemoryCap,
+    ) -> Self {
         Self {
             concurrent_columns: concurrent,
-            peak_bytes: PLANNING_BYTES
-                + columns as u64 * result_bytes(len)
+            peak_bytes: fixed_bytes(len, window_len, columns)
                 + concurrent as u64 * in_flight_bytes(len),
             cap_bytes: cap.bytes(),
         }
@@ -182,11 +193,37 @@ impl PsdMemory {
     /// length `len` under `cap` — at most `parallelism` — or `None` when not
     /// even one does.
     fn fit(len: usize, columns: usize, parallelism: usize, cap: PsdMemoryCap) -> Option<Self> {
-        let fixed = PLANNING_BYTES + columns as u64 * result_bytes(len);
-        let room = cap.bytes().checked_sub(fixed)?;
-        let concurrent = (room / in_flight_bytes(len)).min(parallelism.min(columns).max(1) as u64);
-        (concurrent >= 1).then(|| Self::estimate(len, columns, concurrent as usize, cap))
+        Self::fit_for(len, len, columns, parallelism, cap)
     }
+
+    /// [`Self::fit`] for a window of `window_len` samples (see
+    /// [`Self::estimate_for`]).
+    fn fit_for(
+        len: usize,
+        window_len: usize,
+        columns: usize,
+        parallelism: usize,
+        cap: PsdMemoryCap,
+    ) -> Option<Self> {
+        let room = cap
+            .bytes()
+            .checked_sub(fixed_bytes(len, window_len, columns))?;
+        let concurrent = (room / in_flight_bytes(len)).min(parallelism.min(columns).max(1) as u64);
+        (concurrent >= 1)
+            .then(|| Self::estimate_for(len, window_len, columns, concurrent as usize, cap))
+    }
+}
+
+/// What a job holds from start to end: planning's overhead, every column's
+/// result, and — when the window length is not one of the standard lengths
+/// planned at startup — the one FFT plan all its columns share.
+fn fixed_bytes(len: usize, window_len: usize, columns: usize) -> u64 {
+    let on_demand_plan = if is_standard_length(window_len) {
+        0
+    } else {
+        plan_bytes_upper_bound(window_len)
+    };
+    PLANNING_BYTES + columns as u64 * result_bytes(len) + on_demand_plan
 }
 
 /// Bytes one column holds for the whole job at window length `len`: its
@@ -621,14 +658,21 @@ pub fn plan_psd_on<T: TickSource + ?Sized>(
         (1, selection.len(), ExcludedSegments::default())
     };
 
-    let Some(memory) = PsdMemory::fit(segment_len, columns, parallelism, cap) else {
+    let window_len = if segmented {
+        segment_len
+    } else {
+        segment_len.min(selection.len())
+    };
+    let Some(memory) = PsdMemory::fit_for(segment_len, window_len, columns, parallelism, cap)
+    else {
         let affordable_segment_len = SEGMENT_LENGTH_CHOICES
             .iter()
             .rev()
             .copied()
             .filter(|&len| len < segment_len)
             .find(|&len| PsdMemory::fit(len, columns, parallelism, cap).is_some());
-        let requested_bytes = PsdMemory::estimate(segment_len, columns, 1, cap).peak_bytes;
+        let requested_bytes =
+            PsdMemory::estimate_for(segment_len, window_len, columns, 1, cap).peak_bytes;
         info!(
             requested_bytes,
             cap_bytes = cap.bytes(),
@@ -731,7 +775,7 @@ where
     let ledger = MemoryLedger::new(plan.memory.cap_bytes);
     // Planning's overhead and every column's result are held for the whole
     // job; each column in flight claims its own working set on top.
-    let _held = ledger.claim(PLANNING_BYTES + columns.len() as u64 * result_bytes(len))?;
+    let _held = ledger.claim(fixed_bytes(len, plan.window_len(), columns.len()))?;
     let mut spectra = Vec::new();
     spectra
         .try_reserve_exact(columns.len())
