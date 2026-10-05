@@ -37,6 +37,7 @@ use crate::plumbing::{
     spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog, IndexingMessage,
     PreparedView, PROGRESS_BOOL_BAND_ROWS,
 };
+use crate::views::psd::{selection_rows, PsdPanel, PsdRequest};
 use crate::{inference_bar, views};
 
 /// One numeric column's min/max pyramid, or `None` for a non-numeric column
@@ -94,7 +95,9 @@ enum Status {
     Loaded {
         path: PathBuf,
         report: Box<InferenceReport>,
-        dataset: Box<Dataset>,
+        /// Shared with the background PSD job (`crate::plumbing::psd`),
+        /// which reads its raw samples off the UI thread.
+        dataset: Arc<Dataset>,
         pyramids: Pyramids,
         /// See [`PartialLoad::prepared`]: the same once-per-status-change
         /// derivations, for the completed dataset.
@@ -127,6 +130,16 @@ pub struct GlydeApp {
     /// [`IngestOverrides::default`] whenever a *different* file is opened —
     /// a correction never follows from one file to the next.
     overrides: IngestOverrides,
+    /// SPEC §4.2's PSD view for the file currently loaded; replaced with a
+    /// fresh one whenever a load completes, so nothing from a previous file
+    /// (or a previous reading of this one) is ever shown.
+    psd: PsdPanel,
+    /// The rows the time view showed last frame — the selection that drives
+    /// the PSD view (SPEC §4.2).
+    time_selection: Option<std::ops::Range<usize>>,
+    /// A horizontal span, in plot seconds, the time view should move to on
+    /// its next frame (the PSD view's "analyze the largest uniform stretch").
+    time_focus: Option<(f64, f64)>,
 }
 
 impl Default for GlydeApp {
@@ -138,6 +151,9 @@ impl Default for GlydeApp {
             rx,
             generation: 0,
             overrides: IngestOverrides::default(),
+            psd: PsdPanel::default(),
+            time_selection: None,
+            time_focus: None,
         }
     }
 }
@@ -218,6 +234,11 @@ impl GlydeApp {
                 );
                 continue;
             }
+            if matches!(message, IndexingMessage::Completed { .. }) {
+                self.psd = PsdPanel::default();
+                self.time_selection = None;
+                self.time_focus = None;
+            }
             self.status = match message {
                 IndexingMessage::Started { path, .. } => Status::Loading {
                     path,
@@ -252,7 +273,7 @@ impl GlydeApp {
                 } => Status::Loaded {
                     path,
                     report,
-                    dataset,
+                    dataset: Arc::from(dataset),
                     pyramids,
                     prepared,
                     level0_caches,
@@ -293,6 +314,37 @@ impl eframe::App for GlydeApp {
         });
 
         let mut pending_correction: Option<(PathBuf, Correction)> = None;
+
+        // SPEC §4.2: the PSD view, in a resizable panel under the time view.
+        // It computes only when the user presses "Compute PSD", on the
+        // interval the time view showed last frame.
+        if let Status::Loaded {
+            dataset, prepared, ..
+        } = &self.status
+        {
+            if self.psd.poll() {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+            let request = egui::TopBottomPanel::bottom("psd_view")
+                .resizable(true)
+                .default_height(320.0)
+                .show(ctx, |ui| {
+                    self.psd.show(ui, dataset, self.time_selection.clone())
+                })
+                .inner;
+            if let Some(PsdRequest::ShowRows(range)) = request {
+                let ticks = &prepared.ticks;
+                if let (Some(&first), Some(&last)) = (
+                    ticks.get(range.start),
+                    range.end.checked_sub(1).and_then(|last| ticks.get(last)),
+                ) {
+                    self.time_focus = Some((
+                        views::time::tick_to_seconds(&dataset.time, first),
+                        views::time::tick_to_seconds(&dataset.time, last),
+                    ));
+                }
+            }
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| match &self.status {
             Status::Idle => {
@@ -365,7 +417,8 @@ impl eframe::App for GlydeApp {
                 }
                 // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1"; SPEC
                 // §3.1 decimation via `pyramids` (docs/ROADMAP.md M3, issue #80).
-                views::time::show(
+                // Its visible interval is the PSD view's selection (SPEC §4.2).
+                let visible = views::time::show_with_selection(
                     ui,
                     dataset,
                     pyramids,
@@ -373,7 +426,13 @@ impl eframe::App for GlydeApp {
                     &prepared.sample_cache,
                     level0_caches,
                     prepared.cursor,
+                    self.time_focus.take(),
                 );
+                self.time_selection = Some(selection_rows(
+                    &prepared.ticks,
+                    prepared.cursor.is_sorted(),
+                    visible,
+                ));
                 // SPEC §4.3 / docs/ROADMAP.md M6 "Boolean series → on/off
                 // horizontal bands" (`string`/categorical bands, markers,
                 // and sharing this view's axis with the plot above are
@@ -433,6 +492,7 @@ mod tests {
     };
     use glyde_core::series::{Series, SeriesValues};
     use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
+    use std::time::Instant;
 
     fn sample_summary() -> Box<OpenSummary> {
         Box::new(OpenSummary {
@@ -889,5 +949,70 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    /// End to end, headless (docs/ROADMAP.md M5 maintainer test "the PSD
+    /// peak lands where physics says"): a real CSV opened through the real
+    /// background indexer, its whole time-view interval handed to the PSD
+    /// view, the PSD computed off-thread and rendered.
+    #[test]
+    fn opening_a_50_hz_sine_shows_its_psd_peak_at_50_hz() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("sine_50hz.csv");
+        let mut csv = String::from("t,sine,noise\n");
+        for n in 0..20_000 {
+            let t = n as f64 / 1000.0;
+            let sine = (2.0 * std::f64::consts::PI * 50.0 * t).sin();
+            let noise = ((n * 7919) % 1000) as f64 / 1000.0 - 0.5;
+            csv.push_str(&format!("{t:.3},{sine:.6},{noise:.3}\n"));
+        }
+        std::fs::write(&path, csv).expect("write fixture");
+
+        let mut app = GlydeApp::new();
+        app.open(path);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (dataset, ticks) = loop {
+            app.drain_indexing_messages();
+            if let Status::Loaded {
+                dataset, prepared, ..
+            } = &app.status
+            {
+                break (Arc::clone(dataset), prepared.ticks.clone());
+            }
+            assert!(Instant::now() < deadline, "file never finished loading");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        // The time view's "Fit to data" interval: every row.
+        let selection = selection_rows(&ticks, true, (ticks[0], *ticks.last().unwrap()));
+        assert_eq!(selection, 0..20_000);
+        // The user presses "Compute PSD".
+        app.psd.compute(&dataset, selection.clone());
+        while app.psd.poll() {
+            assert!(Instant::now() < deadline, "PSD never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.psd.show(ui, &dataset, Some(selection.clone()));
+            });
+        });
+        assert!(!output.shapes.is_empty());
+
+        let spectra = app.psd.spectra().expect("a uniform sine has a PSD");
+        let sine = &spectra[0].psd;
+        assert_eq!(spectra[0].name, "sine");
+        assert_eq!(spectra.len(), 2);
+        let peak = (0..sine.power.len())
+            .max_by(|&a, &b| sine.power[a].total_cmp(&sine.power[b]))
+            .unwrap();
+        assert!(
+            (sine.freqs[peak] - 50.0).abs() <= sine.delta_f / 2.0,
+            "peak at {} Hz, expected 50 Hz (Δf = {})",
+            sine.freqs[peak],
+            sine.delta_f
+        );
     }
 }

@@ -41,6 +41,8 @@
 //! "Background progressive build emitting partial levels", SPEC §5 "first
 //! meaningful plot ... ≤ 2s").
 
+pub mod psd;
+
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;

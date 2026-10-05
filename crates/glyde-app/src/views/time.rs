@@ -89,6 +89,34 @@ pub fn show(
     level0_caches: &[Option<Arc<Level0Cache>>],
     cursor: CursorLookup,
 ) {
+    show_with_selection(
+        ui,
+        dataset,
+        pyramids,
+        ticks,
+        sample_cache,
+        level0_caches,
+        cursor,
+        None,
+    );
+}
+
+/// [`show`], additionally reporting the tick range currently visible — the
+/// time-view selection that drives the PSD view (SPEC §4.2) — and, when
+/// `focus` is `Some((x_min, x_max))` in plot seconds, moving the view to
+/// exactly that horizontal span first (e.g. the uniform stretch an
+/// `Irregular` series offers instead of a PSD, SPEC §3.3).
+#[allow(clippy::too_many_arguments)]
+pub fn show_with_selection(
+    ui: &mut egui::Ui,
+    dataset: &Dataset,
+    pyramids: &[Option<Vec<Vec<Bucket>>>],
+    ticks: &[i128],
+    sample_cache: &[Option<Vec<f64>>],
+    level0_caches: &[Option<Arc<Level0Cache>>],
+    cursor: CursorLookup,
+    focus: Option<(f64, f64)>,
+) -> (i128, i128) {
     let fit_clicked = ui.button("Fit to data").clicked();
 
     let plot = Plot::new("time_domain_view")
@@ -112,6 +140,15 @@ pub fn show(
                     [bounds.x_max, bounds.y_max],
                 ));
             }
+        }
+
+        if let Some((x_min, x_max)) = focus {
+            let current = plot_ui.plot_bounds();
+            plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                [x_min, current.min()[1]],
+                [x_max, current.max()[1]],
+            ));
+            plot_ui.ctx().request_repaint();
         }
 
         // SPEC §3.1: resolve this frame's visible range and pixel width from
@@ -252,12 +289,14 @@ pub fn show(
         // O(log n) on a time-ordered axis and falls back to an exact linear
         // scan on a non-monotonic one (issue #114) — never by materializing
         // the whole axis as `f64` every hovered frame, as this used to.
-        plot_ui
+        let hovered = plot_ui
             .pointer_coordinate()
-            .and_then(|pointer| cursor.nearest(&dataset.time, pointer.x))
+            .and_then(|pointer| cursor.nearest(&dataset.time, pointer.x));
+        (hovered, range)
     });
+    let (hovered, visible) = response.inner;
 
-    if let Some(index) = response.inner {
+    if let Some(index) = hovered {
         ui.horizontal(|ui| {
             ui.label(format_cursor_time(&dataset.time, index));
             for series in &dataset.columns {
@@ -270,6 +309,7 @@ pub fn show(
             }
         });
     }
+    visible
 }
 
 /// `time`'s samples as plain `f64` x-coordinates for `egui_plot`, which only
@@ -401,7 +441,7 @@ fn nearest_tick_index(ticks: &[i128], target: i128) -> Option<usize> {
 /// gap fix, then — every series' color shifts relative to before, and a
 /// series' line and points now finally match, which they never did under
 /// the library's own auto-assignment.
-fn series_color(index: usize) -> egui::Color32 {
+pub(crate) fn series_color(index: usize) -> egui::Color32 {
     let golden_ratio = (5.0_f32.sqrt() - 1.0) / 2.0; // 0.61803398875
     let hue = index as f32 * golden_ratio;
     egui::epaint::Hsva::new(hue, 0.85, 0.5, 1.0).into()
