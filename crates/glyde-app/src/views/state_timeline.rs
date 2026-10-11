@@ -26,7 +26,6 @@
 //! built:
 //! - `string`/categorical state bands (SPEC §4.3's other state-timeline
 //!   case; only `bool` columns are read by [`show`] today).
-//! - Markers (single-sample events on their own lane).
 //! - Zooming into a mixed-state interval to recover its individual runs.
 //!   Dense files use a bounded overview that visibly marks mixed intervals;
 //!   interactive expansion is still a separate M6 item.
@@ -37,7 +36,10 @@
 use egui_plot::{Plot, PlotBounds, PlotPoints, Polygon, VLine};
 use glyde_core::index::spill::SpillVec;
 use glyde_core::ingest::{Dataset, TimeAxis};
-use glyde_core::series::{BoolBand, BoolBandBuilder, BoolLane, SeriesValues, SpilledValues};
+use glyde_core::series::{
+    is_marker_column, BoolBand, BoolBandBuilder, BoolLane, MarkerBuilder, MarkerLane, SeriesValues,
+    SpilledValues, MARKER_OVERVIEW_CELLS,
+};
 
 use super::time::{format_x_axis_tick, tick_to_seconds};
 
@@ -217,6 +219,125 @@ fn axis_bounds(min_tick: i128, max_tick: i128, time: &TimeAxis) -> (f64, f64) {
     }
 }
 
+/// Color of a single marker tick.
+const MARKER_COLOR: egui::Color32 = egui::Color32::from_rgb(235, 190, 60);
+
+/// Renders `dataset`'s marker columns (SPEC §4.3: single-sample events,
+/// "tick glyphs on their own lane, always visible regardless of zoom") into
+/// `ui`, one lane per column. `marker_lanes` is `dataset.columns`-parallel
+/// (see [`cache_marker_lanes`]); a `None` entry draws nothing. Every marker
+/// is drawn as its own full-height tick; a very dense column falls back to
+/// one tick per nonzero overview cell, colored differently when the cell
+/// holds several events, so no event ever disappears.
+pub fn show_markers(
+    ui: &mut egui::Ui,
+    dataset: &Dataset,
+    ticks: &[i128],
+    marker_lanes: &[Option<MarkerLane>],
+) {
+    let time = &dataset.time;
+    let Some(first_lane) = marker_lanes.iter().flatten().next() else {
+        return;
+    };
+    let (min_tick, max_tick) = first_lane.tick_bounds();
+    let (axis_min, axis_max) = axis_bounds(min_tick, max_tick, time);
+
+    for (index, series) in dataset.columns.iter().enumerate() {
+        let Some(Some(lane)) = marker_lanes.get(index) else {
+            continue;
+        };
+        ui.label(series.name());
+        Plot::new(format!("marker_lane_{index}"))
+            .height(LANE_HEIGHT)
+            .show_axes([true, false])
+            .show_grid([false, false])
+            .allow_zoom(false)
+            .allow_scroll(false)
+            .allow_drag(false)
+            .allow_boxed_zoom(false)
+            .x_axis_formatter(move |mark, _range| format_x_axis_tick(ticks, mark, time))
+            .show(ui, |plot_ui| {
+                plot_ui.set_plot_bounds(PlotBounds::from_min_max([axis_min, 0.0], [axis_max, 1.0]));
+                match lane {
+                    MarkerLane::Exact { markers, .. } => {
+                        for marker in markers {
+                            plot_ui.vline(
+                                VLine::new(tick_to_seconds(time, marker.tick))
+                                    .color(MARKER_COLOR)
+                                    .width(2.0_f32),
+                            );
+                        }
+                    }
+                    MarkerLane::Overview { counts, .. } => {
+                        let last = (MARKER_OVERVIEW_CELLS - 1) as f64;
+                        for (cell, &count) in counts.iter().enumerate() {
+                            if count == 0 {
+                                continue;
+                            }
+                            let x = axis_min + (axis_max - axis_min) * (cell as f64 / last);
+                            let color = if count > 1 { MIXED_COLOR } else { MARKER_COLOR };
+                            plot_ui.vline(VLine::new(x).color(color).width(2.0_f32));
+                        }
+                    }
+                }
+            });
+    }
+}
+
+/// Builds `marker_lanes` for [`show_markers`]: `dataset.columns`-parallel,
+/// `Some` for a `string` column that [`is_marker_column`] classifies as
+/// markers, `None` for everything else. A spilled string column is streamed
+/// through its iterator, never collected (SPEC §5.1).
+pub fn cache_marker_lanes(dataset: &Dataset, ticks: &[i128]) -> Vec<Option<MarkerLane>> {
+    let Some((&min_tick, &max_tick)) = ticks.iter().min().zip(ticks.iter().max()) else {
+        return vec![None; dataset.columns.len()];
+    };
+    dataset
+        .columns
+        .iter()
+        .map(|series| match series.values() {
+            SeriesValues::String(values) => marker_lane(
+                || values.iter().map(String::as_str),
+                values.len(),
+                ticks,
+                min_tick,
+                max_tick,
+            ),
+            SeriesValues::Spilled(SpilledValues::String(values)) => {
+                marker_lane(|| values.iter(), values.len(), ticks, min_tick, max_tick)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn marker_lane<'a, I>(
+    cells: impl Fn() -> I,
+    total: usize,
+    ticks: &[i128],
+    min_tick: i128,
+    max_tick: i128,
+) -> Option<MarkerLane>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let total = total.min(ticks.len());
+    let non_empty = cells().take(total).filter(|cell| !cell.is_empty()).count();
+    if !is_marker_column(non_empty, total) {
+        return None;
+    }
+    let mut builder = MarkerBuilder::for_view(min_tick, max_tick);
+    for (cell, &tick) in cells().zip(ticks) {
+        builder.push(cell, tick);
+    }
+    tracing::info!(
+        markers = non_empty,
+        rows = total,
+        "string column is mostly empty; drawing its non-empty cells as markers"
+    );
+    Some(builder.finish_lane())
+}
+
 /// Builds `bool_bands` for [`show`]: `dataset.columns`-parallel, `Some` with
 /// a bounded [`BoolLane`] for a `bool` column, `None` for every other dtype.
 /// The completed file is prepared on the indexer thread; progressive updates
@@ -379,6 +500,53 @@ mod render_tests {
             !output.shapes.is_empty(),
             "must draw something for a real bool column"
         );
+    }
+
+    #[test]
+    fn marker_lane_is_some_only_for_a_sparse_string_column() {
+        let mut dataset = sample_dataset();
+        dataset.columns.push(Series::new(
+            "marker",
+            SeriesValues::String(vec!["".into(), "a".into(), "".into(), "".into()]),
+        ));
+        dataset.columns.push(Series::new(
+            "state",
+            SeriesValues::String(vec!["x".into(), "y".into(), "x".into(), "y".into()]),
+        ));
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        let lanes = cache_marker_lanes(&dataset, &ticks);
+        assert!(lanes[0].is_none() && lanes[1].is_none());
+        assert!(matches!(&lanes[2], Some(MarkerLane::Exact { markers, .. }) if markers.len() == 1));
+        assert!(
+            lanes[3].is_none(),
+            "a dense string column is a state column"
+        );
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_markers(ui, &dataset, &ticks, &lanes);
+            });
+        });
+        assert!(!output.shapes.is_empty());
+    }
+
+    #[test]
+    fn corpus_case_49_yields_its_two_markers() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/corpus/case-49-sparse-markers.csv");
+        let dataset = glyde_core::ingest::load(&path).expect("case 49 loads");
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        let lanes = cache_marker_lanes(&dataset, &ticks);
+        let labels: Vec<&str> = lanes
+            .iter()
+            .flatten()
+            .flat_map(|lane| match lane {
+                MarkerLane::Exact { markers, .. } => markers.iter().map(|m| m.label.as_str()),
+                MarkerLane::Overview { .. } => panic!("two markers stay exact"),
+            })
+            .collect();
+        assert_eq!(labels, ["event_a", "event_b"]);
     }
 
     #[test]

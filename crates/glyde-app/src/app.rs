@@ -385,6 +385,12 @@ impl eframe::App for GlydeApp {
                             &ticks[..ticks.len().min(PROGRESS_BOOL_BAND_ROWS)],
                             &partial.prepared.bool_bands,
                         );
+                        views::state_timeline::show_markers(
+                            ui,
+                            &partial.dataset,
+                            &ticks[..ticks.len().min(PROGRESS_BOOL_BAND_ROWS)],
+                            &partial.prepared.marker_lanes,
+                        );
                     }
                     None => {
                         ui.centered_and_justified(|ui| {
@@ -438,6 +444,12 @@ impl eframe::App for GlydeApp {
                 // and sharing this view's axis with the plot above are
                 // still-open M6 items, not yet built).
                 views::state_timeline::show(ui, dataset, &prepared.ticks, &prepared.bool_bands);
+                views::state_timeline::show_markers(
+                    ui,
+                    dataset,
+                    &prepared.ticks,
+                    &prepared.marker_lanes,
+                );
             }
             Status::Failed { path, message } => {
                 ui.colored_label(

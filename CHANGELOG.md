@@ -12,6 +12,19 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Event markers in the state timeline (milestone M6).** A text column that
+  is mostly empty (like the `marker` column of corpus case 49: `event_a`,
+  `event_b` on otherwise blank rows) is now drawn as thin vertical ticks on
+  its own lane under the time plot, one tick per non-empty cell, at that
+  row's timestamp. Ticks are never thinned out: a file with more events than
+  fit individually switches to a fixed-size overview where every event still
+  gets a tick, shown in orange when several events share a spot. Labels are
+  not shown yet, and the lane does not pan/zoom with the plot above (same
+  limit as the on/off lanes).
+  **Assumptions made (please veto by testing the app):**
+  - A text column counts as "markers" when it has at least one non-empty
+    cell and at most half of its cells are non-empty. A denser text column
+    is a state column (labeled bands), which is a separate M6 item.
 - **Power spectral density (PSD) view — milestone M5.** Under the time plot
   there is now a resizable panel with the spectrum of every numeric series,
   computed with Welch's method on the **raw samples** (never on the

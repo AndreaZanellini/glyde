@@ -21,11 +21,15 @@
 
 mod anomaly;
 mod dtype;
+mod markers;
 mod samples;
 mod state;
 
 pub use anomaly::{detect_nan_runs, Anomalies, NanRunScan};
 pub use dtype::{Dtype, SeriesValues, SpilledValues, ViewKind};
+pub use markers::{
+    is_marker_column, Marker, MarkerBuilder, MarkerLane, MARKER_OVERVIEW_CELLS, MAX_EXACT_MARKERS,
+};
 pub use samples::{SampleSource, SeriesSamples, SAMPLE_CHUNK_LEN};
 pub use state::{
     bool_state_bands, BoolBand, BoolBandBuilder, BoolLane, BOOL_OVERVIEW_CELLS,
