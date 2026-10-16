@@ -35,7 +35,7 @@ use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache}
 use crate::inference_bar::Correction;
 use crate::plumbing::{
     spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog, CancelFlag,
-    IndexingMessage, PreparedView, PROGRESS_BOOL_BAND_ROWS,
+    IndexingMessage, PreparedView, TimeIndexPreview, PROGRESS_BOOL_BAND_ROWS,
 };
 use crate::views::psd::{selection_rows, PsdPanel, PsdRequest};
 use crate::{inference_bar, views};
@@ -79,6 +79,9 @@ struct PartialLoad {
     /// Glyde took for them, so they are stated rather than left to look like
     /// Glyde struggling.
     spilled: bool,
+    /// Issue #119: the time-index decision so far, for the time-column
+    /// picker shown while the file loads.
+    time_index: TimeIndexPreview,
 }
 
 /// What the central panel currently shows, driven by [`IndexingMessage`]s
@@ -274,6 +277,7 @@ impl GlydeApp {
                     rows_read,
                     spilled,
                     prepared,
+                    time_index,
                     ..
                 } => Status::Loading {
                     path,
@@ -283,6 +287,7 @@ impl GlydeApp {
                         prepared,
                         rows_read,
                         spilled,
+                        time_index,
                     }),
                 },
                 IndexingMessage::Completed {
@@ -387,6 +392,20 @@ impl eframe::App for GlydeApp {
                             ui.spinner();
                             ui.label(loading_label(path, partial.rows_read, partial.spilled));
                         });
+                        // Issue #119: a wrong time column is visible in the
+                        // preview for as long as a big file takes to load,
+                        // so it is correctable right away; picking one
+                        // cancels this load and starts the corrected one.
+                        let time_index = &partial.time_index;
+                        if let Some(picked) = inference_bar::show_loading(
+                            ui,
+                            &time_index.source,
+                            &time_index.column_names,
+                            time_index.is_final,
+                        ) {
+                            pending_correction =
+                                Some((path.clone(), Correction::TimeColumn(picked)));
+                        }
                         views::time::show(
                             ui,
                             &partial.dataset,
@@ -604,6 +623,17 @@ mod tests {
     }
 
     /// The indexer-prepared view inputs for [`sample_dataset`].
+    fn sample_time_index() -> TimeIndexPreview {
+        TimeIndexPreview {
+            column_names: vec!["timestamp".to_string(), "value".to_string()],
+            source: glyde_core::ingest::TimeIndexSource::Column {
+                index: 0,
+                name: "timestamp".to_string(),
+            },
+            is_final: false,
+        }
+    }
+
     fn sample_prepared() -> Box<PreparedView> {
         Box::new(PreparedView::new(
             &sample_dataset(),
@@ -668,6 +698,7 @@ mod tests {
                 rows_read: 1,
                 spilled: false,
                 prepared: sample_prepared(),
+                time_index: sample_time_index(),
             })
             .expect("channel send");
 
@@ -703,6 +734,7 @@ mod tests {
                 rows_read: 200_000,
                 spilled: true,
                 prepared: sample_prepared(),
+                time_index: sample_time_index(),
             })
             .expect("channel send");
 
@@ -768,6 +800,7 @@ mod tests {
                 rows_read: 1,
                 spilled: false,
                 prepared: sample_prepared(),
+                time_index: sample_time_index(),
             })
             .expect("channel send");
 

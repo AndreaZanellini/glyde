@@ -51,7 +51,9 @@ use std::thread;
 
 use glyde_core::dsp::decimation::Bucket;
 use glyde_core::index::spill::SweepReport;
-use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary};
+use glyde_core::ingest::{
+    Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary, TimeIndexSource,
+};
 use glyde_core::series::{BoolLane, StateLane};
 use glyde_core::GlydeError;
 
@@ -101,6 +103,9 @@ pub enum IndexingMessage {
         /// (issue #114) — each is O(rows), and the UI thread used to derive
         /// them itself on receipt, stalling a frame per checkpoint.
         prepared: Box<PreparedView>,
+        /// Issue #119: the time-index decision so far, so the time-column
+        /// picker can be offered before the open completes.
+        time_index: TimeIndexPreview,
     },
     /// `path` opened successfully; `summary` is what was inferred, `report`
     /// is the same inference surfaced as SPEC §1.2's mandatory UX fields
@@ -209,6 +214,18 @@ impl PreparedView {
             cursor,
         }
     }
+}
+
+/// Where a still-loading file's time index comes from (issue #119), taken
+/// from its latest checkpoint (`glyde_core::ingest::Checkpoint`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimeIndexPreview {
+    /// The file's whole header, the time column included.
+    pub column_names: Vec<String>,
+    pub source: TimeIndexSource,
+    /// `false` while a later row can still demote the time column (the
+    /// in-memory path); `true` once the decision is the open's final one.
+    pub is_final: bool,
 }
 
 /// How many rows a progress checkpoint's boolean bands preview.
@@ -341,6 +358,11 @@ fn run_index_job(
                 rows_read: checkpoint.rows_read,
                 spilled: checkpoint.spilled,
                 prepared: Box::new(prepared),
+                time_index: TimeIndexPreview {
+                    column_names: checkpoint.column_names,
+                    source: checkpoint.time_index,
+                    is_final: checkpoint.time_index_final,
+                },
             });
         },
     ) {
@@ -549,8 +571,13 @@ mod tests {
                     rows_read,
                     spilled,
                     prepared,
+                    time_index,
                 } => {
                     assert_eq!(generation, 3);
+                    // Issue #119: the picker shown while loading needs the
+                    // header and a decision; in memory it is provisional.
+                    assert!(!time_index.column_names.is_empty());
+                    assert!(!time_index.is_final);
                     assert_eq!(progress_path, path);
                     assert_eq!(dataset.time.len(), rows_read as usize);
                     assert_eq!(prepared.ticks.len(), rows_read as usize);
@@ -687,6 +714,13 @@ mod tests {
                     state_lanes: Vec::new(),
                     cursor: views::time::CursorLookup::default(),
                 }),
+                time_index: TimeIndexPreview {
+                    column_names: Vec::new(),
+                    source: TimeIndexSource::Generated(
+                        glyde_core::ingest::GeneratedIndexReason::Requested
+                    ),
+                    is_final: true,
+                },
             }
             .generation(),
             5

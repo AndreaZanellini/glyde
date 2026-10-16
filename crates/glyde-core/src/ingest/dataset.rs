@@ -48,6 +48,7 @@ use super::csv::{
 use super::infer::{
     log_dtype_choice, normalize_decimal_field, ColumnDtypeChoice, ColumnDtypeScan, ColumnInference,
 };
+use super::report::TimeIndexSource;
 use super::{IngestOverrides, TimeColumnChoice};
 use crate::budget::RamBudget;
 use crate::dsp::decimation::{build_pyramid, build_pyramid_streaming, extend_pyramid, Bucket};
@@ -1181,6 +1182,23 @@ pub(crate) struct TimeIndexInference {
     pub(crate) generated: Option<GeneratedIndexReason>,
 }
 
+impl TimeIndexInference {
+    /// The user-facing form of this decision, naming the column from
+    /// `column_names` (the file's whole header).
+    pub(crate) fn source(&self, column_names: &[String]) -> TimeIndexSource {
+        match (self.time_column, &self.generated) {
+            (_, Some(reason)) => TimeIndexSource::Generated(reason.clone()),
+            (Some(index), None) => TimeIndexSource::Column {
+                index,
+                name: column_names[index].clone(),
+            },
+            // Unreachable: ingestion reports a column or a reason, never
+            // neither.
+            (None, None) => TimeIndexSource::Generated(GeneratedIndexReason::Requested),
+        }
+    }
+}
+
 /// [`Dataset::time_column_name`] when the time index is generated rather
 /// than read from a column.
 pub const GENERATED_TIME_COLUMN_NAME: &str = "row index";
@@ -1512,6 +1530,7 @@ fn load_spilled(
         on_checkpoint,
         time_column_name.clone(),
         data_column_names.clone(),
+        (column_names.clone(), inference.source(&column_names)),
         &choices,
         timestamp_format.map(|inference| inference.format),
     );
@@ -1968,6 +1987,9 @@ struct SpillPreview<'a> {
     on_checkpoint: Option<&'a mut dyn FnMut(Checkpoint)>,
     time_column_name: String,
     column_names: Vec<String>,
+    /// The whole header and the time-index decision, for [`Checkpoint`].
+    file_column_names: Vec<String>,
+    time_index: TimeIndexSource,
     format: Option<TimestampFormat>,
     timestamps: Vec<Timestamp>,
     progressive: Vec<f64>,
@@ -2060,6 +2082,7 @@ impl<'a> SpillPreview<'a> {
         on_checkpoint: Option<&'a mut dyn FnMut(Checkpoint)>,
         time_column_name: String,
         column_names: Vec<String>,
+        (file_column_names, time_index): (Vec<String>, TimeIndexSource),
         choices: &[ColumnDtypeChoice],
         format: Option<TimestampFormat>,
     ) -> Self {
@@ -2067,6 +2090,8 @@ impl<'a> SpillPreview<'a> {
             on_checkpoint,
             time_column_name,
             column_names,
+            file_column_names,
+            time_index,
             format,
             timestamps: Vec::new(),
             progressive: Vec::new(),
@@ -2133,6 +2158,10 @@ impl<'a> SpillPreview<'a> {
                 // Issue #87: this preview exists *because* the file is being
                 // streamed to disk, so every checkpoint it emits says so.
                 spilled: true,
+                column_names: self.file_column_names.clone(),
+                time_index: self.time_index.clone(),
+                // Pass 1 settled it over the whole file before pass 2 began.
+                time_index_final: true,
             });
         }
     }
@@ -2183,6 +2212,19 @@ pub struct Checkpoint {
     /// and the moment it needs explaining is while the open is slow — which is
     /// exactly when only a checkpoint is available to carry it.
     pub spilled: bool,
+    /// The file's header, every column in order, the time column included
+    /// (issue #119): what the time-column picker offers while the open is
+    /// still running.
+    pub column_names: Vec<String>,
+    /// Where this checkpoint's time index comes from — a column, or a row
+    /// index Glyde generated and why (SPEC §2.1 "Files without a time
+    /// column"), so the loading view can say so before the open completes.
+    pub time_index: TimeIndexSource,
+    /// Whether [`Self::time_index`] is already the open's final answer. On
+    /// the spilled path it is (pass 1 read the whole file before the first
+    /// checkpoint); in memory it is provisional, since a later row running
+    /// backwards can still demote the time column to a series.
+    pub time_index_final: bool,
 }
 
 /// [`load_with_outcome`], additionally invoking `on_checkpoint` with a
@@ -2284,7 +2326,7 @@ fn load_with_outcome_progressive_using(
                     partial_columns,
                     overrides,
                 ) {
-                    Ok((dataset, _ambiguous)) => {
+                    Ok((dataset, inference)) => {
                         if builder.take_layout_changed() {
                             // The time column was demoted: the axis and the
                             // column set the cursor extends are gone.
@@ -2296,6 +2338,9 @@ fn load_with_outcome_progressive_using(
                             pyramids,
                             dataset,
                             spilled: false,
+                            column_names: partial_outcome.column_names.clone(),
+                            time_index: inference.source(&partial_outcome.column_names),
+                            time_index_final: false,
                         });
                     }
                     Err(err) => {
@@ -2371,7 +2416,7 @@ pub fn load_progressive_with_budget_cancellable(
                 overrides,
                 cancelled,
                 |partial, columns| {
-                    if let Ok((dataset, _ambiguous)) = builder.snapshot(partial, columns, overrides)
+                    if let Ok((dataset, inference)) = builder.snapshot(partial, columns, overrides)
                     {
                         if builder.take_layout_changed() {
                             pyramid_cursor = PyramidCursor::default();
@@ -2382,6 +2427,9 @@ pub fn load_progressive_with_budget_cancellable(
                             pyramids,
                             dataset,
                             spilled: false,
+                            column_names: partial.column_names.clone(),
+                            time_index: inference.source(&partial.column_names),
+                            time_index_final: false,
                         });
                     }
                 },

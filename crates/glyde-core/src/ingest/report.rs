@@ -539,15 +539,7 @@ fn build_summary_and_report(
         (_, Some(GeneratedIndexReason::Unreadable { .. })) => Confidence::Low,
         _ => Confidence::High,
     };
-    let time_index_source = match (time_index.time_column, time_index.generated) {
-        (_, Some(reason)) => TimeIndexSource::Generated(reason),
-        (Some(index), None) => TimeIndexSource::Column {
-            index,
-            name: outcome.column_names[index].clone(),
-        },
-        // Unreachable: ingestion reports a column or a reason, never neither.
-        (None, None) => TimeIndexSource::Generated(GeneratedIndexReason::Requested),
-    };
+    let time_index_source = time_index.source(&outcome.column_names);
 
     let report = InferenceReport {
         encoding: InferredField {

@@ -12,6 +12,23 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Opening another file, or correcting something, while a big file is
+  still loading now stops the old load right away.** It used to keep reading
+  the old file to the end in the background (and, for a file too big for
+  memory, keep writing its disk cache), only for the result to be thrown
+  away — on a multi-GB file that doubled the disk activity and the disk
+  space used. Now the old load stops within a few thousand rows and its
+  cache files are deleted. (#119)
+- **You can pick the time column while a file is still loading.** The
+  "time column" picker (and, if Glyde generated a row index, the notice
+  saying why) now appears above the growing plot as soon as the first part
+  of the file is read, so a wrong time column can be fixed without waiting
+  minutes for a big file to finish. Picking a column stops the current load
+  and reopens the file with your choice. For a file that fits in memory the
+  picker says "(from the rows read so far; may change while the file
+  loads)": a column that looks like time at first can still turn out not to
+  be one further down. For a file too big for memory the choice is already
+  final, because Glyde scans the whole file before showing anything. (#119)
 - **Text state columns (like `idle` / `running` / `fault`) now show as labeled
   colored bands under the plot, one lane per column.** Each run of the same
   value is one band; the same state always gets the same color. If the band
