@@ -81,7 +81,9 @@ impl Overview {
         }
         let span = self.max_tick.saturating_sub(self.min_tick) as f64;
         let offset = tick.saturating_sub(self.min_tick) as f64;
-        ((offset / span) * (BOOL_OVERVIEW_CELLS - 1) as f64)
+        // Cell `k` holds `[k, k + 1) / N` of the axis (the last one also
+        // holds `max_tick`) — the same split `glyde-app` draws.
+        ((offset / span) * BOOL_OVERVIEW_CELLS as f64)
             .floor()
             .clamp(0.0, (BOOL_OVERVIEW_CELLS - 1) as f64) as usize
     }
@@ -512,5 +514,26 @@ mod tests {
             panic!("the view must be bounded");
         };
         assert!(cells.iter().all(|&cell| cell == 3));
+    }
+
+    // Issue #124: cell `k` must hold `[k, k + 1) / N` of the axis — the
+    // split `glyde-app` draws — not `[k, k + 1) / (N - 1)`.
+    #[test]
+    fn overview_cells_split_the_axis_into_equal_fractions() {
+        let max = (BOOL_OVERVIEW_CELLS * 1000) as i128;
+        let mut builder = BoolBandBuilder::for_view(0, max);
+        for tick in 0..=(MAX_EXACT_BOOL_BANDS as i128) {
+            builder.push(tick % 2 == 0, tick);
+        }
+        // The last alternation pushed `true`; one `false` sample three
+        // quarters of the way along closes that long `true` run there.
+        builder.push(false, 3 * max / 4 + 10);
+        let BoolLane::Overview { cells, .. } = builder.finish_lane() else {
+            panic!("expected an overview");
+        };
+        let boundary = BOOL_OVERVIEW_CELLS * 3 / 4;
+        assert_eq!(cells[boundary - 1], 2, "only `true` before the change");
+        assert_eq!(cells[boundary], 3, "the change itself");
+        assert_eq!(cells[boundary + 1], 0, "nothing after the last sample");
     }
 }
