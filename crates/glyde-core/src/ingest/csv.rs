@@ -30,6 +30,7 @@ use crate::{GlydeError, Result};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
 /// Recognizes the delimited-text inputs SPEC §1.1 groups together.
@@ -446,6 +447,7 @@ pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
         Capture::None,
         None,
         super::IngestOverrides::default(),
+        &NEVER_CANCELLED,
     )
     .map(|(outcome, _)| outcome)
 }
@@ -466,6 +468,7 @@ pub(crate) fn parse_capturing_column(
         Capture::Column(column_index),
         None,
         super::IngestOverrides::default(),
+        &NEVER_CANCELLED,
     )?;
     Ok((outcome, columns.pop().unwrap_or_default()))
 }
@@ -481,7 +484,7 @@ pub(crate) fn parse_capturing_all_columns(
     bytes: &[u8],
     overrides: super::IngestOverrides,
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
-    parse_bytes(bytes, Capture::All, None, overrides)
+    parse_bytes(bytes, Capture::All, None, overrides, &NEVER_CANCELLED)
 }
 
 /// [`parse_capturing_all_columns`], additionally invoking `on_chunk` with a
@@ -500,12 +503,48 @@ pub(crate) fn parse_capturing_all_columns(
 /// [`FIRST_PROGRESS_CHECKPOINT_ROWS`] kept rows never checkpoints — it is
 /// fast enough end to end that a progress update would have nothing useful
 /// to add.
+#[cfg(test)]
 pub(crate) fn parse_capturing_all_columns_with_progress(
     bytes: &[u8],
     overrides: super::IngestOverrides,
+    on_chunk: impl FnMut(&CsvParseOutcome, &[ColumnText]),
+) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
+    parse_capturing_all_columns_with_progress_cancellable(
+        bytes,
+        overrides,
+        &NEVER_CANCELLED,
+        on_chunk,
+    )
+}
+
+/// [`parse_capturing_all_columns_with_progress`] that stops with
+/// [`GlydeError::Cancelled`] once `cancelled` is raised (issue #119).
+pub(crate) fn parse_capturing_all_columns_with_progress_cancellable(
+    bytes: &[u8],
+    overrides: super::IngestOverrides,
+    cancelled: &AtomicBool,
     mut on_chunk: impl FnMut(&CsvParseOutcome, &[ColumnText]),
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
-    parse_bytes(bytes, Capture::All, Some(&mut on_chunk), overrides)
+    parse_bytes(
+        bytes,
+        Capture::All,
+        Some(&mut on_chunk),
+        overrides,
+        cancelled,
+    )
+}
+
+/// The cancel flag of a parse no one can cancel.
+pub(crate) static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// How many rows [`parse_rows`] reads between two looks at its cancel flag:
+/// a cancel is noticed within this many rows, at the cost of one relaxed
+/// atomic load per batch of them.
+const CANCEL_CHECK_ROWS: usize = 4096;
+
+/// Whether the row loop should stop for a cancel before row `row_index`.
+fn cancel_requested(cancelled: &AtomicBool, row_index: usize) -> bool {
+    row_index.is_multiple_of(CANCEL_CHECK_ROWS) && cancelled.load(Ordering::Relaxed)
 }
 
 /// The first checkpoint [`parse_capturing_all_columns_with_progress`] fires
@@ -566,10 +605,11 @@ fn parse_bytes(
     capture: Capture,
     on_chunk: Option<ChunkCallback>,
     overrides: super::IngestOverrides,
+    cancelled: &AtomicBool,
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
     let sniff = sniff_bytes(bytes, overrides)?;
     let text = infer::decode(bytes, &sniff.encoding);
-    parse_rows(text.as_bytes(), &sniff, capture, on_chunk)
+    parse_rows(text.as_bytes(), &sniff, capture, on_chunk, cancelled)
 }
 
 /// Streams every row of the file at `path` through `on_row`, decoding and
@@ -583,9 +623,13 @@ fn parse_bytes(
 /// itself proportional to file size (SPEC §5's peak-RSS cap is a flat
 /// number, independent of it). The file is read through a fixed-size buffer
 /// instead — SPEC §5.1's "read in bounded chunks" taken literally.
+///
+/// Stops with [`GlydeError::Cancelled`] once `cancelled` is raised
+/// (issue #119).
 pub(crate) fn stream_path(
     path: &Path,
     sniff: &Sniff,
+    cancelled: &AtomicBool,
     on_row: &mut dyn FnMut(RowFields<'_>) -> Result<()>,
 ) -> Result<CsvParseOutcome> {
     let file = File::open(path).map_err(|source| GlydeError::Io {
@@ -596,7 +640,7 @@ pub(crate) fn stream_path(
         BufReader::with_capacity(READ_BUFFER_BYTES, file),
         sniff.encoding.new_decoder(),
     );
-    parse_rows(reader, sniff, Capture::Sink(on_row), None).map(|(outcome, _)| outcome)
+    parse_rows(reader, sniff, Capture::Sink(on_row), None, cancelled).map(|(outcome, _)| outcome)
 }
 
 /// The row loop, shared by every entry point above. `reader` yields the
@@ -607,6 +651,7 @@ fn parse_rows<R: BufRead>(
     sniff: &Sniff,
     mut capture: Capture,
     mut on_chunk: Option<ChunkCallback>,
+    cancelled: &AtomicBool,
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
     let expected_field_count = sniff.header.column_names.len();
 
@@ -642,6 +687,10 @@ fn parse_rows<R: BufRead>(
             let mut row_index = 0usize;
             let mut next_line_number = 1usize;
             while acc.error.is_none() {
+                if cancel_requested(cancelled, row_index) {
+                    acc.error = Some(GlydeError::Cancelled);
+                    break;
+                }
                 match reader.read_record(&mut record) {
                     Ok(true) => {
                         // csv-core may report the line of the preceding CR
@@ -716,6 +765,10 @@ fn parse_rows<R: BufRead>(
             let mut row_index = 0usize;
             let mut line_number = 0usize;
             while acc.error.is_none() {
+                if cancel_requested(cancelled, row_index) {
+                    acc.error = Some(GlydeError::Cancelled);
+                    break;
+                }
                 line.clear();
                 let read = reader
                     .read_line(&mut line)
@@ -753,6 +806,12 @@ fn parse_rows<R: BufRead>(
     }
 
     if let Some(error) = acc.error {
+        if matches!(error, GlydeError::Cancelled) {
+            info!(
+                rows_read = acc.row_count,
+                "parse stopped: the open was cancelled by its caller"
+            );
+        }
         return Err(error);
     }
 
@@ -940,10 +999,11 @@ pub(crate) fn open_path_capturing_all_columns(
 pub(crate) fn open_path_capturing_all_columns_with_progress(
     path: &Path,
     overrides: super::IngestOverrides,
+    cancelled: &AtomicBool,
     on_chunk: impl FnMut(&CsvParseOutcome, &[ColumnText]),
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
     let mmap = map_file(path)?;
-    parse_capturing_all_columns_with_progress(&mmap, overrides, on_chunk)
+    parse_capturing_all_columns_with_progress_cancellable(&mmap, overrides, cancelled, on_chunk)
 }
 
 /// Memory-maps `path` read-only. The mapping only backs the caller's parse;

@@ -43,15 +43,19 @@
 
 pub mod psd;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 
 use glyde_core::dsp::decimation::Bucket;
 use glyde_core::index::spill::SweepReport;
-use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary};
+use glyde_core::ingest::{
+    Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary, TimeIndexSource,
+};
 use glyde_core::series::{BoolLane, StateLane};
+use glyde_core::GlydeError;
 
 use crate::views;
 
@@ -99,6 +103,9 @@ pub enum IndexingMessage {
         /// (issue #114) — each is O(rows), and the UI thread used to derive
         /// them itself on receipt, stalling a frame per checkpoint.
         prepared: Box<PreparedView>,
+        /// Issue #119: the time-index decision so far, so the time-column
+        /// picker can be offered before the open completes.
+        time_index: TimeIndexPreview,
     },
     /// `path` opened successfully; `summary` is what was inferred, `report`
     /// is the same inference surfaced as SPEC §1.2's mandatory UX fields
@@ -209,11 +216,34 @@ impl PreparedView {
     }
 }
 
+/// Where a still-loading file's time index comes from (issue #119), taken
+/// from its latest checkpoint (`glyde_core::ingest::Checkpoint`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimeIndexPreview {
+    /// The file's whole header, the time column included.
+    pub column_names: Vec<String>,
+    pub source: TimeIndexSource,
+    /// `false` while a later row can still demote the time column (the
+    /// in-memory path); `true` once the decision is the open's final one.
+    pub is_final: bool,
+}
+
 /// How many rows a progress checkpoint's boolean bands preview.
 pub const PROGRESS_BOOL_BAND_ROWS: usize = 65_536;
 
-pub fn spawn_index_job(generation: u64, path: PathBuf, tx: Sender<IndexingMessage>) {
-    spawn_index_job_with_overrides(generation, path, IngestOverrides::default(), tx)
+/// The flag that cancels one index job (issue #119): the UI raises it when
+/// the job's generation is superseded, and the job then stops reading the
+/// file, drops what it built (its spill files included) and sends nothing
+/// more.
+pub type CancelFlag = Arc<AtomicBool>;
+
+pub fn spawn_index_job(
+    generation: u64,
+    path: PathBuf,
+    cancel: CancelFlag,
+    tx: Sender<IndexingMessage>,
+) {
+    spawn_index_job_with_overrides(generation, path, IngestOverrides::default(), cancel, tx)
 }
 
 /// [`spawn_index_job`] with [`IngestOverrides`] applied (docs/ROADMAP.md M4
@@ -224,11 +254,12 @@ pub fn spawn_index_job_with_overrides(
     generation: u64,
     path: PathBuf,
     overrides: IngestOverrides,
+    cancel: CancelFlag,
     tx: Sender<IndexingMessage>,
 ) {
     thread::Builder::new()
         .name("glyde-indexer".to_string())
-        .spawn(move || run_index_job(generation, path, overrides, &tx))
+        .spawn(move || run_index_job(generation, path, overrides, &cancel, &tx))
         .expect("failed to spawn the background indexer thread");
 }
 
@@ -239,12 +270,12 @@ pub fn spawn_index_job_with_overrides(
 ///
 /// Not unit-tested: `rfd`'s native dialog has no headless backend, so this
 /// can only be exercised manually (docs/ROADMAP.md M2's proof for this item).
-pub fn spawn_open_dialog(generation: u64, tx: Sender<IndexingMessage>) {
+pub fn spawn_open_dialog(generation: u64, cancel: CancelFlag, tx: Sender<IndexingMessage>) {
     thread::Builder::new()
         .name("glyde-file-dialog".to_string())
         .spawn(move || {
             if let Some(path) = rfd::FileDialog::new().pick_file() {
-                run_index_job(generation, path, IngestOverrides::default(), &tx);
+                run_index_job(generation, path, IngestOverrides::default(), &cancel, &tx);
             }
         })
         .expect("failed to spawn the file dialog thread");
@@ -271,6 +302,7 @@ fn run_index_job(
     generation: u64,
     path: PathBuf,
     overrides: IngestOverrides,
+    cancel: &AtomicBool,
     tx: &Sender<IndexingMessage>,
 ) {
     let _ = tx.send(IndexingMessage::Started {
@@ -308,9 +340,13 @@ fn run_index_job(
     // levels": every checkpoint along the way is forwarded as its own
     // `Progress` message, so the UI thread can render a growing plot instead
     // of only a spinner while a large file is still being read.
-    match glyde_core::ingest::open_dataset_progressive_with_overrides(
+    //
+    // Issue #119: `cancel` is raised once the user has moved on; the parse
+    // then stops within a few thousand rows and nothing more is sent.
+    match glyde_core::ingest::open_dataset_progressive_cancellable(
         &path,
         overrides,
+        cancel,
         |checkpoint| {
             let prepared =
                 PreparedView::new(&checkpoint.dataset, &Vec::new(), PROGRESS_BOOL_BAND_ROWS);
@@ -322,9 +358,15 @@ fn run_index_job(
                 rows_read: checkpoint.rows_read,
                 spilled: checkpoint.spilled,
                 prepared: Box::new(prepared),
+                time_index: TimeIndexPreview {
+                    column_names: checkpoint.column_names,
+                    source: checkpoint.time_index,
+                    is_final: checkpoint.time_index_final,
+                },
             });
         },
     ) {
+        Ok(_) if cancel.load(Ordering::Relaxed) => log_cancelled(&path),
         Ok((summary, report, dataset)) => {
             tracing::info!(
                 path = %path.display(),
@@ -361,6 +403,10 @@ fn run_index_job(
                         .collect(),
                 )
             };
+            if cancel.load(Ordering::Relaxed) {
+                log_cancelled(&path);
+                return;
+            }
             let prepared = PreparedView::new(&dataset, &level0_caches, usize::MAX);
             let _ = tx.send(IndexingMessage::Completed {
                 generation,
@@ -373,6 +419,7 @@ fn run_index_job(
                 prepared: Box::new(prepared),
             });
         }
+        Err(GlydeError::Cancelled) => log_cancelled(&path),
         Err(err) => {
             tracing::error!(path = %path.display(), error = %err, "failed to open file");
             let _ = tx.send(IndexingMessage::Failed {
@@ -384,12 +431,43 @@ fn run_index_job(
     }
 }
 
+/// A superseded job's last word: nothing is sent, so this log line is the
+/// only trace that it stopped early (SPEC §6: every user-visible action is
+/// logged at `info`).
+fn log_cancelled(path: &Path) {
+    tracing::info!(
+        path = %path.display(),
+        "open superseded by a newer request; stopped reading and discarded its partial data"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// Issue #119: a job whose flag is raised stops without sending a
+    /// result — neither `Completed` nor `Failed` — since the UI has already
+    /// moved on to a newer request.
+    #[test]
+    fn a_cancelled_job_sends_nothing_after_started() {
+        let path = corpus_path("case-01-comma-clean.csv");
+        let (tx, rx) = mpsc::channel();
+        let cancel = AtomicBool::new(true);
+
+        run_index_job(5, path.clone(), IngestOverrides::default(), &cancel, &tx);
+        drop(tx);
+
+        let messages: Vec<IndexingMessage> = rx.iter().collect();
+        assert_eq!(
+            messages,
+            vec![IndexingMessage::Started {
+                generation: 5,
+                path
+            }]
+        );
+    }
 
     /// docs/ARCHITECTURE.md §Hard rule 3: opening a file must not block the
     /// caller. Runs the real corpus fixture through the real
@@ -401,7 +479,7 @@ mod tests {
         let path = corpus_path("case-01-comma-clean.csv");
         let (tx, rx) = mpsc::channel();
 
-        spawn_index_job(7, path.clone(), tx);
+        spawn_index_job(7, path.clone(), CancelFlag::default(), tx);
 
         let started = rx
             .recv_timeout(Duration::from_secs(5))
@@ -473,7 +551,7 @@ mod tests {
         let path = file.path().to_path_buf();
         let (tx, rx) = mpsc::channel();
 
-        spawn_index_job(3, path.clone(), tx);
+        spawn_index_job(3, path.clone(), CancelFlag::default(), tx);
 
         let _started = rx
             .recv_timeout(Duration::from_secs(5))
@@ -493,8 +571,13 @@ mod tests {
                     rows_read,
                     spilled,
                     prepared,
+                    time_index,
                 } => {
                     assert_eq!(generation, 3);
+                    // Issue #119: the picker shown while loading needs the
+                    // header and a decision; in memory it is provisional.
+                    assert!(!time_index.column_names.is_empty());
+                    assert!(!time_index.is_final);
                     assert_eq!(progress_path, path);
                     assert_eq!(dataset.time.len(), rows_read as usize);
                     assert_eq!(prepared.ticks.len(), rows_read as usize);
@@ -533,7 +616,7 @@ mod tests {
         let path = PathBuf::from("readings.xyz");
         let (tx, rx) = mpsc::channel();
 
-        spawn_index_job(1, path.clone(), tx);
+        spawn_index_job(1, path.clone(), CancelFlag::default(), tx);
 
         let _started = rx
             .recv_timeout(Duration::from_secs(5))
@@ -584,7 +667,7 @@ mod tests {
         let path = PathBuf::from("does-not-exist-glyde-plumbing-test.csv");
         let (tx, rx) = mpsc::channel();
 
-        spawn_index_job(1, path.clone(), tx);
+        spawn_index_job(1, path.clone(), CancelFlag::default(), tx);
 
         let _started = rx.recv_timeout(Duration::from_secs(5));
 
@@ -631,6 +714,13 @@ mod tests {
                     state_lanes: Vec::new(),
                     cursor: views::time::CursorLookup::default(),
                 }),
+                time_index: TimeIndexPreview {
+                    column_names: Vec::new(),
+                    source: TimeIndexSource::Generated(
+                        glyde_core::ingest::GeneratedIndexReason::Requested
+                    ),
+                    is_final: true,
+                },
             }
             .generation(),
             5

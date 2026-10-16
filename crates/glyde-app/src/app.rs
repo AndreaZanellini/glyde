@@ -34,8 +34,8 @@ use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache}
 
 use crate::inference_bar::Correction;
 use crate::plumbing::{
-    spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog, IndexingMessage,
-    PreparedView, PROGRESS_BOOL_BAND_ROWS,
+    spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog, CancelFlag,
+    IndexingMessage, PreparedView, TimeIndexPreview, PROGRESS_BOOL_BAND_ROWS,
 };
 use crate::views::psd::{selection_rows, PsdPanel, PsdRequest};
 use crate::{inference_bar, views};
@@ -79,6 +79,9 @@ struct PartialLoad {
     /// Glyde took for them, so they are stated rather than left to look like
     /// Glyde struggling.
     spilled: bool,
+    /// Issue #119: the time-index decision so far, for the time-column
+    /// picker shown while the file loads.
+    time_index: TimeIndexPreview,
 }
 
 /// What the central panel currently shows, driven by [`IndexingMessage`]s
@@ -123,6 +126,11 @@ pub struct GlydeApp {
     /// must not overwrite the current status (SPEC §6: single file at a
     /// time; see `crate::plumbing` module docs).
     generation: u64,
+    /// Cancels the index job of the current `generation` (issue #119):
+    /// raised by [`Self::next_generation`] when a newer request supersedes
+    /// it, so the old job stops reading the file instead of running to the
+    /// end only for its messages to be dropped.
+    load_cancel: CancelFlag,
     /// SPEC §1.2 "[each field is] correctable in one click; correcting
     /// triggers a re-index" (docs/ROADMAP.md M4): every correction the user
     /// has made to the file currently open, applied on top of automatic
@@ -150,6 +158,7 @@ impl Default for GlydeApp {
             tx,
             rx,
             generation: 0,
+            load_cancel: CancelFlag::default(),
             overrides: IngestOverrides::default(),
             psd: PsdPanel::default(),
             time_selection: None,
@@ -163,17 +172,28 @@ impl GlydeApp {
         Self::default()
     }
 
+    /// Supersedes the current request: cancels its index job, if one is
+    /// still running, and returns the cancel flag for the next one (whose
+    /// `generation` this bumps).
+    fn next_generation(&mut self) -> CancelFlag {
+        self.load_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.generation += 1;
+        self.load_cancel = CancelFlag::default();
+        Arc::clone(&self.load_cancel)
+    }
+
     /// Hands `path` to the background indexer (never reads it on this
     /// thread) and switches the panel to a loading state.
     fn open(&mut self, path: PathBuf) {
         tracing::info!(path = %path.display(), "user requested to open file");
-        self.generation += 1;
+        let cancel = self.next_generation();
         self.overrides = IngestOverrides::default();
         self.status = Status::Loading {
             path: path.clone(),
             partial: None,
         };
-        spawn_index_job(self.generation, path, self.tx.clone());
+        spawn_index_job(self.generation, path, cancel, self.tx.clone());
     }
 
     /// A one-click field correction from the inference bar (docs/ROADMAP.md
@@ -217,12 +237,18 @@ impl GlydeApp {
             overrides = ?self.overrides,
             "user corrected an inferred field; re-indexing"
         );
-        self.generation += 1;
+        let cancel = self.next_generation();
         self.status = Status::Loading {
             path: path.clone(),
             partial: None,
         };
-        spawn_index_job_with_overrides(self.generation, path, self.overrides, self.tx.clone());
+        spawn_index_job_with_overrides(
+            self.generation,
+            path,
+            self.overrides,
+            cancel,
+            self.tx.clone(),
+        );
     }
 
     /// Drains every [`IndexingMessage`] currently queued, keeping only the
@@ -258,6 +284,7 @@ impl GlydeApp {
                     rows_read,
                     spilled,
                     prepared,
+                    time_index,
                     ..
                 } => Status::Loading {
                     path,
@@ -267,6 +294,7 @@ impl GlydeApp {
                         prepared,
                         rows_read,
                         spilled,
+                        time_index,
                     }),
                 },
                 IndexingMessage::Completed {
@@ -313,8 +341,8 @@ impl eframe::App for GlydeApp {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open…").clicked() {
                         ui.close_menu();
-                        self.generation += 1;
-                        spawn_open_dialog(self.generation, self.tx.clone());
+                        let cancel = self.next_generation();
+                        spawn_open_dialog(self.generation, cancel, self.tx.clone());
                     }
                 });
             });
@@ -371,6 +399,20 @@ impl eframe::App for GlydeApp {
                             ui.spinner();
                             ui.label(loading_label(path, partial.rows_read, partial.spilled));
                         });
+                        // Issue #119: a wrong time column is visible in the
+                        // preview for as long as a big file takes to load,
+                        // so it is correctable right away; picking one
+                        // cancels this load and starts the corrected one.
+                        let time_index = &partial.time_index;
+                        if let Some(picked) = inference_bar::show_loading(
+                            ui,
+                            &time_index.source,
+                            &time_index.column_names,
+                            time_index.is_final,
+                        ) {
+                            pending_correction =
+                                Some((path.clone(), Correction::TimeColumn(picked)));
+                        }
                         views::time::show(
                             ui,
                             &partial.dataset,
@@ -588,6 +630,17 @@ mod tests {
     }
 
     /// The indexer-prepared view inputs for [`sample_dataset`].
+    fn sample_time_index() -> TimeIndexPreview {
+        TimeIndexPreview {
+            column_names: vec!["timestamp".to_string(), "value".to_string()],
+            source: glyde_core::ingest::TimeIndexSource::Column {
+                index: 0,
+                name: "timestamp".to_string(),
+            },
+            is_final: false,
+        }
+    }
+
     fn sample_prepared() -> Box<PreparedView> {
         Box::new(PreparedView::new(
             &sample_dataset(),
@@ -652,6 +705,7 @@ mod tests {
                 rows_read: 1,
                 spilled: false,
                 prepared: sample_prepared(),
+                time_index: sample_time_index(),
             })
             .expect("channel send");
 
@@ -687,6 +741,7 @@ mod tests {
                 rows_read: 200_000,
                 spilled: true,
                 prepared: sample_prepared(),
+                time_index: sample_time_index(),
             })
             .expect("channel send");
 
@@ -752,6 +807,7 @@ mod tests {
                 rows_read: 1,
                 spilled: false,
                 prepared: sample_prepared(),
+                time_index: sample_time_index(),
             })
             .expect("channel send");
 
@@ -825,6 +881,34 @@ mod tests {
         app.apply_correction(path, Correction::Encoding(EncodingChoice::Utf16Le));
         assert_eq!(app.overrides.encoding, Some(EncodingChoice::Utf16Le));
         assert_eq!(app.overrides.time_column, None);
+    }
+
+    // Issue #119: every request that bumps the generation — a new file, a
+    // correction — must cancel the job it supersedes, and only that one.
+    #[test]
+    fn a_new_request_cancels_the_superseded_load() {
+        use std::sync::atomic::Ordering;
+        let mut app = GlydeApp::new();
+        let path = PathBuf::from("does-not-exist-glyde-app-test.csv");
+
+        app.open(path.clone());
+        let first = Arc::clone(&app.load_cancel);
+        assert!(!first.load(Ordering::Relaxed));
+
+        app.apply_correction(path.clone(), Correction::Delimiter(Delimiter::Semicolon));
+        let second = Arc::clone(&app.load_cancel);
+        assert!(
+            first.load(Ordering::Relaxed),
+            "the correction supersedes the open"
+        );
+        assert!(!second.load(Ordering::Relaxed));
+
+        app.open(path);
+        assert!(
+            second.load(Ordering::Relaxed),
+            "a new file supersedes the correction"
+        );
+        assert!(!app.load_cancel.load(Ordering::Relaxed));
     }
 
     // A correction must accumulate on top of previous ones for the same
