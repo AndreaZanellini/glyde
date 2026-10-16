@@ -127,7 +127,12 @@ pub fn show(
                 if let Some(picked) = decimal_separator_control(ui, &report.decimal_separator) {
                     correction = Some(Correction::DecimalSeparator(picked));
                 }
-                if let Some(picked) = time_column_control(ui, report) {
+                if let Some(picked) = time_column_control(
+                    ui,
+                    &report.time_index,
+                    &report.column_names,
+                    report.time_column.confidence == Confidence::Low,
+                ) {
                     correction = Some(Correction::TimeColumn(picked));
                 }
                 if let Some(picked) = timestamp_format_control(ui, &report.timestamp_format) {
@@ -161,12 +166,47 @@ pub fn show(
     response.body_returned.flatten()
 }
 
+/// The part of the bar that is already known while a file is still loading
+/// (issue #119): the time-column picker and, if Glyde generated a row
+/// index, why. Everything else in the bar describes the whole file and
+/// waits for the open to complete. `is_final` is `false` while a later row
+/// can still change the decision, which is then said next to the picker.
+/// Returns the column the user picked this frame, if any.
+pub fn show_loading(
+    ui: &mut egui::Ui,
+    source: &TimeIndexSource,
+    column_names: &[String],
+    is_final: bool,
+) -> Option<TimeColumnChoice> {
+    let low_confidence = matches!(
+        source,
+        TimeIndexSource::Generated(reason) if !matches!(reason, GeneratedIndexReason::Requested)
+    );
+    let picked = ui
+        .horizontal(|ui| {
+            let picked = time_column_control(ui, source, column_names, low_confidence);
+            if !is_final {
+                ui.weak(PROVISIONAL_TIME_INDEX);
+            }
+            picked
+        })
+        .inner;
+    if let Some(notice) = generated_index_text(source, None) {
+        ui.colored_label(ui.visuals().warn_fg_color, notice);
+    }
+    picked
+}
+
+/// Said next to the picker while the in-memory path may still demote the
+/// time column.
+const PROVISIONAL_TIME_INDEX: &str = "(from the rows read so far; may change while the file loads)";
+
 /// The time-column picker's label for the generated row index.
 const ROW_INDEX_OPTION: &str = "Row index (generated)";
 
 /// The choice the time index currently reflects.
-fn current_time_column(report: &InferenceReport) -> TimeColumnChoice {
-    match &report.time_index {
+fn current_time_column(source: &TimeIndexSource) -> TimeColumnChoice {
+    match source {
         TimeIndexSource::Column { index, .. } => TimeColumnChoice::Column(*index),
         TimeIndexSource::Generated(_) => TimeColumnChoice::RowIndex,
     }
@@ -174,11 +214,10 @@ fn current_time_column(report: &InferenceReport) -> TimeColumnChoice {
 
 /// Every choice the time-column picker offers, in display order: the
 /// generated row index, then each column of the file in header order.
-fn time_column_options(report: &InferenceReport) -> Vec<(TimeColumnChoice, String)> {
+fn time_column_options(column_names: &[String]) -> Vec<(TimeColumnChoice, String)> {
     std::iter::once((TimeColumnChoice::RowIndex, ROW_INDEX_OPTION.to_string()))
         .chain(
-            report
-                .column_names
+            column_names
                 .iter()
                 .enumerate()
                 .map(|(index, name)| (TimeColumnChoice::Column(index), name.clone())),
@@ -190,9 +229,14 @@ fn time_column_options(report: &InferenceReport) -> Vec<(TimeColumnChoice, Strin
 /// as an always-available picker (see the module docs for why this field
 /// alone is not gated on confidence). Returns the newly picked choice if the
 /// user chose one different from the current one this frame.
-fn time_column_control(ui: &mut egui::Ui, report: &InferenceReport) -> Option<TimeColumnChoice> {
-    let current = current_time_column(report);
-    let options = time_column_options(report);
+fn time_column_control(
+    ui: &mut egui::Ui,
+    source: &TimeIndexSource,
+    column_names: &[String],
+    low_confidence: bool,
+) -> Option<TimeColumnChoice> {
+    let current = current_time_column(source);
+    let options = time_column_options(column_names);
     let current_label = options
         .iter()
         .find(|(choice, _)| *choice == current)
@@ -210,7 +254,7 @@ fn time_column_control(ui: &mut egui::Ui, report: &InferenceReport) -> Option<Ti
                     }
                 }
             });
-        if report.time_column.confidence == Confidence::Low {
+        if low_confidence {
             ui.label("(low confidence)");
         }
     });
@@ -222,7 +266,14 @@ fn time_column_control(ui: &mut egui::Ui, report: &InferenceReport) -> Option<Ti
 /// done instead, and where to change it. `None` when the time index was read
 /// from a column, or when the user asked for the row index themselves.
 fn generated_index_notice(report: &InferenceReport) -> Option<String> {
-    let TimeIndexSource::Generated(reason) = &report.time_index else {
+    generated_index_text(&report.time_index, Some(report.sample_count))
+}
+
+/// [`generated_index_notice`]'s text for `source`. `rows` is the file's row
+/// count once known; while it is still loading (`None`) the notice leaves
+/// out what depends on it.
+fn generated_index_text(source: &TimeIndexSource, rows: Option<u64>) -> Option<String> {
+    let TimeIndexSource::Generated(reason) = source else {
         return None;
     };
     let why = match reason {
@@ -235,20 +286,28 @@ fn generated_index_notice(report: &InferenceReport) -> Option<String> {
             "No time column detected: \"{column}\" holds the same value on every row, so it is \
              plotted as a signal."
         ),
-        GeneratedIndexReason::MostlyRepeated { column, changes } => format!(
-            "No time column detected: \"{column}\" changes value on only {changes} of {} rows, \
-             so it is plotted as a signal.",
-            report.sample_count
-        ),
+        GeneratedIndexReason::MostlyRepeated { column, changes } => match rows {
+            Some(rows) => format!(
+                "No time column detected: \"{column}\" changes value on only {changes} of {rows} \
+                 rows, so it is plotted as a signal."
+            ),
+            None => format!(
+                "No time column detected: \"{column}\" changes value on only {changes} rows, so \
+                 it is plotted as a signal."
+            ),
+        },
         GeneratedIndexReason::Unreadable { column } => format!(
             "\"{column}\" is neither timestamps in a supported format nor numbers, so it is \
              plotted as a series, not used as time."
         ),
     };
-    let last_row = report.sample_count.saturating_sub(1);
+    let index = match rows {
+        Some(rows) => format!("a row index (0 … {})", rows.saturating_sub(1)),
+        None => "a row index".to_string(),
+    };
     Some(format!(
-        "{why} Glyde generated a row index (0 … {last_row}) and plots every column against it. \
-         If one of the columns is the time, pick it under \"time column\"."
+        "{why} Glyde generated {index} and plots every column against it. If one of the columns \
+         is the time, pick it under \"time column\"."
     ))
 }
 
@@ -919,16 +978,19 @@ mod tests {
         let report = sample_report(Confidence::High);
 
         assert_eq!(
-            time_column_options(&report),
+            time_column_options(&report.column_names),
             vec![
                 (TimeColumnChoice::RowIndex, ROW_INDEX_OPTION.to_string()),
                 (TimeColumnChoice::Column(0), "timestamp".to_string()),
                 (TimeColumnChoice::Column(1), "value".to_string()),
             ]
         );
-        assert_eq!(current_time_column(&report), TimeColumnChoice::Column(0));
         assert_eq!(
-            current_time_column(&generated_index_report()),
+            current_time_column(&report.time_index),
+            TimeColumnChoice::Column(0)
+        );
+        assert_eq!(
+            current_time_column(&generated_index_report().time_index),
             TimeColumnChoice::RowIndex
         );
     }
@@ -1001,5 +1063,70 @@ mod tests {
         requested.time_index = TimeIndexSource::Generated(GeneratedIndexReason::Requested);
 
         assert!(render_shape_count(&generated) > render_shape_count(&requested));
+    }
+
+    /// Every text `show_loading` painted in one headless frame.
+    fn loading_texts(source: &TimeIndexSource, is_final: bool) -> String {
+        let column_names = vec!["ax".to_string(), "ay".to_string()];
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_loading(ui, source, &column_names, is_final);
+            });
+        });
+        let mut texts = String::new();
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(text) = &clipped.shape {
+                texts.push_str(text.galley.text());
+                texts.push('\n');
+            }
+        }
+        texts
+    }
+
+    // Issue #119: while a file loads, the picker shows the column read so
+    // far and says when that can still change.
+    #[test]
+    fn the_loading_picker_shows_the_current_column_and_whether_it_is_final() {
+        let column = TimeIndexSource::Column {
+            index: 0,
+            name: "ax".to_string(),
+        };
+        let provisional = loading_texts(&column, false);
+        assert!(provisional.contains("time column:"), "{provisional}");
+        assert!(provisional.contains("ax"), "{provisional}");
+        assert!(
+            provisional.contains(PROVISIONAL_TIME_INDEX),
+            "{provisional}"
+        );
+
+        let settled = loading_texts(&column, true);
+        assert!(!settled.contains(PROVISIONAL_TIME_INDEX), "{settled}");
+        assert!(!settled.contains("No time column"), "{settled}");
+    }
+
+    // Golden Rule 2 holds during the load too: a generated row index is
+    // announced as soon as it is decided, without a row count it lacks.
+    #[test]
+    fn the_loading_view_announces_a_generated_row_index() {
+        let generated = TimeIndexSource::Generated(GeneratedIndexReason::NotMonotonic {
+            column: "ax".to_string(),
+            row: 1,
+        });
+        let texts = loading_texts(&generated, true);
+        assert!(texts.contains(ROW_INDEX_OPTION), "{texts}");
+        assert!(texts.contains("(low confidence)"), "{texts}");
+        assert!(
+            texts.contains("Glyde generated a row index and plots every column against it"),
+            "{texts}"
+        );
+    }
+
+    #[test]
+    fn a_requested_row_index_is_not_announced_while_loading() {
+        let requested = TimeIndexSource::Generated(GeneratedIndexReason::Requested);
+        let texts = loading_texts(&requested, true);
+        assert!(!texts.contains("No time column"), "{texts}");
+        assert!(!texts.contains("(low confidence)"), "{texts}");
     }
 }

@@ -36,10 +36,11 @@ pub use csv::{
 };
 pub use dataset::{
     derived_caches_for_dataset_cached, derived_caches_for_dataset_cached_with_cache_dir, load,
-    load_progressive, load_progressive_with_budget, load_with_budget, load_with_overrides,
-    load_with_overrides_and_budget, progressive_tick_to_value, progressive_value_to_tick,
-    pyramids_for_dataset, pyramids_for_dataset_cached, pyramids_for_dataset_cached_with_cache_dir,
-    Checkpoint, ColumnLevel0Caches, ColumnPyramids, Dataset, DerivedCaches, GeneratedIndexReason,
+    load_progressive, load_progressive_with_budget, load_progressive_with_budget_cancellable,
+    load_with_budget, load_with_overrides, load_with_overrides_and_budget,
+    progressive_tick_to_value, progressive_value_to_tick, pyramids_for_dataset,
+    pyramids_for_dataset_cached, pyramids_for_dataset_cached_with_cache_dir, Checkpoint,
+    ColumnLevel0Caches, ColumnPyramids, Dataset, DerivedCaches, GeneratedIndexReason,
     ProgressiveValues, TimeAxis, Timestamps, GENERATED_TIME_COLUMN_NAME, PROGRESSIVE_TICK_SCALE,
 };
 pub use infer::{
@@ -48,9 +49,9 @@ pub use infer::{
     DtypeInference, EncodingInference, EncodingSource, HeaderInference, HEAD_SAMPLE_BYTES,
 };
 pub use report::{
-    inspect, open_dataset, open_dataset_progressive, open_dataset_progressive_with_overrides,
-    open_dataset_with_budget, open_dataset_with_overrides, InferenceReport, InferredField,
-    OpenSummary, SamplingClass, TimeIndexSource, TimezoneLabel,
+    inspect, open_dataset, open_dataset_progressive, open_dataset_progressive_cancellable,
+    open_dataset_progressive_with_overrides, open_dataset_with_budget, open_dataset_with_overrides,
+    InferenceReport, InferredField, OpenSummary, SamplingClass, TimeIndexSource, TimezoneLabel,
 };
 
 use crate::time::TimestampFormat;
