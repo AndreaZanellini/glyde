@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Glyde
+Comment=Open and explore large time-series files
+Exec=glyde %f
+Icon=glyde
+Categories=Science;DataVisualization;
+Terminal=false
