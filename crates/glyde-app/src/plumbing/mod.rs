@@ -172,6 +172,8 @@ pub struct PreparedView {
     pub sample_cache: Vec<Option<Vec<f64>>>,
     /// See `views::state_timeline::cache_bool_bands`.
     pub bool_bands: Vec<Option<BoolLane>>,
+    /// See `views::state_timeline::cache_marker_lanes`.
+    pub marker_lanes: Vec<Option<views::state_timeline::MarkerColumn>>,
     /// See `views::state_timeline::cache_state_lanes`.
     pub state_lanes: Vec<Option<StateLane>>,
     /// See `views::time::CursorLookup`.
@@ -192,15 +194,15 @@ impl PreparedView {
             dataset,
             &ticks[..ticks.len().min(bool_tick_limit)],
         );
-        let state_lanes = views::state_timeline::cache_state_lanes(
-            dataset,
-            &ticks[..ticks.len().min(bool_tick_limit)],
-        );
+        let state_ticks = &ticks[..ticks.len().min(bool_tick_limit)];
+        let state_lanes = views::state_timeline::cache_state_lanes(dataset, state_ticks);
+        let marker_lanes = views::state_timeline::cache_marker_lanes(dataset, state_ticks);
         let cursor = views::time::CursorLookup::for_time(&dataset.time);
         Self {
             ticks,
             sample_cache,
             bool_bands,
+            marker_lanes,
             state_lanes,
             cursor,
         }
@@ -625,6 +627,7 @@ mod tests {
                     ticks: Vec::new(),
                     sample_cache: Vec::new(),
                     bool_bands: Vec::new(),
+                    marker_lanes: Vec::new(),
                     state_lanes: Vec::new(),
                     cursor: views::time::CursorLookup::default(),
                 }),

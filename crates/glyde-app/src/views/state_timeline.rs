@@ -26,9 +26,14 @@
 //! ([`glyde_core::series::string_state_bands`]): the label is printed inside
 //! a band wide enough to hold it and shown as a hover tooltip otherwise.
 //!
+//! A mostly-empty `string` column is an event column instead, drawn as
+//! marker ticks ([`glyde_core::series::MarkerBuilder`]). Which of the two a
+//! column is gets inferred ([`glyde_core::series::is_marker_column`]); the
+//! lane header always says what was inferred and switches to the other view
+//! in one click (SPEC §1.2: silent guessing is a bug).
+//!
 //! Deliberately out of scope here — remaining M6 roadmap items, not yet
 //! built:
-//! - Markers (single-sample events on their own lane).
 //! - Zooming into a mixed-state interval to recover its individual runs.
 //!   Dense files use a bounded overview that visibly marks mixed intervals;
 //!   interactive expansion is still a separate M6 item.
@@ -40,8 +45,9 @@ use egui_plot::{Plot, PlotBounds, PlotPoint, PlotPoints, Polygon, Text, VLine};
 use glyde_core::index::spill::SpillVec;
 use glyde_core::ingest::{Dataset, TimeAxis};
 use glyde_core::series::{
-    state_label_id, BoolBand, BoolBandBuilder, BoolLane, SeriesValues, SpilledValues, StateBand,
-    StateBandBuilder, StateCell, StateLane,
+    is_marker_column, state_label_id, BoolBand, BoolBandBuilder, BoolLane, MarkerBuilder,
+    MarkerLane, SeriesValues, SpilledValues, StateBand, StateBandBuilder, StateCell, StateLane,
+    MARKER_OVERVIEW_CELLS,
 };
 
 use super::time::{format_x_axis_tick, tick_to_seconds};
@@ -73,29 +79,39 @@ pub fn show(
     ticks: &[i128],
     bool_bands: &[Option<BoolLane>],
     state_lanes: &[Option<StateLane>],
+    marker_lanes: &[Option<MarkerColumn>],
 ) {
     let time = &dataset.time;
     let bounds = bool_bands
         .iter()
         .flatten()
-        .next()
         .map(BoolLane::tick_bounds)
-        .or_else(|| {
-            state_lanes
-                .iter()
-                .flatten()
-                .next()
-                .map(StateLane::tick_bounds)
-        });
+        .chain(state_lanes.iter().flatten().map(StateLane::tick_bounds))
+        .chain(marker_lanes.iter().flatten().map(|m| m.lane.tick_bounds()))
+        .next();
     let Some((min_tick, max_tick)) = bounds else {
         return;
     };
-    let (axis_min, axis_max) = axis_bounds(min_tick, max_tick, time);
+    let axis = axis_bounds(min_tick, max_tick, time);
+    let (axis_min, axis_max) = axis;
 
     for (index, series) in dataset.columns.iter().enumerate() {
-        if let Some(Some(lane)) = state_lanes.get(index) {
+        let state = state_lanes.get(index).and_then(Option::as_ref);
+        let markers = marker_lanes.get(index).and_then(Option::as_ref);
+        if state.is_some() || markers.is_some() {
             ui.label(series.name());
-            show_state_lane(ui, index, lane, ticks, time, (axis_min, axis_max));
+            let as_markers = match (state, markers) {
+                (Some(_), Some(markers)) => string_lane_toggle(ui, index, series.name(), markers),
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            match (as_markers, state, markers) {
+                (true, _, Some(markers)) => {
+                    show_marker_lane(ui, index, &markers.lane, ticks, time, axis);
+                }
+                (_, Some(state), _) => show_state_lane(ui, index, state, ticks, time, axis),
+                _ => {}
+            }
             continue;
         }
         let Some(Some(bands)) = bool_bands.get(index) else {
@@ -242,6 +258,182 @@ fn axis_bounds(min_tick: i128, max_tick: i128, time: &TimeAxis) -> (f64, f64) {
     } else {
         (min - 1.0, max + 1.0)
     }
+}
+
+/// Color of a single marker tick.
+const MARKER_COLOR: egui::Color32 = egui::Color32::from_rgb(235, 190, 60);
+
+/// Header line for a `string` column that can be drawn either way, and the
+/// one-click switch between the two; returns whether to draw it as markers.
+/// The choice starts at the inferred view and is remembered per column for
+/// the session (`egui` temp memory).
+fn string_lane_toggle(ui: &mut egui::Ui, index: usize, name: &str, markers: &MarkerColumn) -> bool {
+    let inferred = markers.inferred_as_markers();
+    let id = egui::Id::new(("string_lane_as_markers", index, name, markers.rows));
+    let mut as_markers = ui.data_mut(|data| *data.get_temp_mut_or(id, inferred));
+    ui.horizontal(|ui| {
+        ui.weak(string_lane_notice(inferred, as_markers, markers));
+        let button = if as_markers {
+            "Show as state bands"
+        } else {
+            "Show as events"
+        };
+        if ui.small_button(button).clicked() {
+            as_markers = !as_markers;
+            ui.data_mut(|data| data.insert_temp(id, as_markers));
+            tracing::info!(
+                column = name,
+                as_markers,
+                inferred_as_markers = inferred,
+                "user switched how a text column is drawn"
+            );
+        }
+    });
+    as_markers
+}
+
+/// What the header of a switchable `string` lane says: what is drawn, and
+/// what was inferred from how many rows hold text.
+fn string_lane_notice(inferred: bool, as_markers: bool, markers: &MarkerColumn) -> String {
+    let kind = |markers: bool| if markers { "events" } else { "state bands" };
+    let evidence = format!("{} of {} rows have text", markers.non_empty, markers.rows);
+    if inferred == as_markers {
+        format!("Drawn as {} (inferred: {evidence})", kind(as_markers))
+    } else {
+        format!(
+            "Drawn as {} (your choice; inferred {}: {evidence})",
+            kind(as_markers),
+            kind(inferred)
+        )
+    }
+}
+
+/// Draws one marker lane (SPEC §4.3: single-sample events, "tick glyphs on
+/// their own lane, always visible regardless of zoom"). Every marker is its
+/// own full-height tick; a very dense column falls back to one tick per
+/// nonzero overview cell, colored differently when the cell holds several
+/// events, so no event ever disappears.
+fn show_marker_lane(
+    ui: &mut egui::Ui,
+    index: usize,
+    lane: &MarkerLane,
+    ticks: &[i128],
+    time: &TimeAxis,
+    (axis_min, axis_max): (f64, f64),
+) {
+    Plot::new(format!("marker_lane_{index}"))
+        .height(LANE_HEIGHT)
+        .show_axes([true, false])
+        .show_grid([false, false])
+        .allow_zoom(false)
+        .allow_scroll(false)
+        .allow_drag(false)
+        .allow_boxed_zoom(false)
+        .x_axis_formatter(move |mark, _range| format_x_axis_tick(ticks, mark, time))
+        .show(ui, |plot_ui| {
+            plot_ui.set_plot_bounds(PlotBounds::from_min_max([axis_min, 0.0], [axis_max, 1.0]));
+            match lane {
+                MarkerLane::Exact { markers, .. } => {
+                    for marker in markers {
+                        plot_ui.vline(
+                            VLine::new(tick_to_seconds(time, marker.tick))
+                                .color(MARKER_COLOR)
+                                .width(2.0_f32),
+                        );
+                    }
+                }
+                MarkerLane::Overview { counts, .. } => {
+                    for (cell, &count) in counts.iter().enumerate() {
+                        if count == 0 {
+                            continue;
+                        }
+                        let x = overview_cell_center(cell, axis_min, axis_max);
+                        let color = if count > 1 { MIXED_COLOR } else { MARKER_COLOR };
+                        plot_ui.vline(VLine::new(x).color(color).width(2.0_f32));
+                    }
+                }
+            }
+        });
+}
+
+/// Plot-x of the middle of overview cell `cell`: cell `k` holds
+/// `[k, k + 1) / N` of the axis (`glyde_core::series::MarkerBuilder`).
+fn overview_cell_center(cell: usize, axis_min: f64, axis_max: f64) -> f64 {
+    axis_min + (axis_max - axis_min) * (cell as f64 + 0.5) / MARKER_OVERVIEW_CELLS as f64
+}
+
+/// A `string` column's event-marker view plus the counts that decide whether
+/// it is drawn as markers by default (see [`is_marker_column`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkerColumn {
+    pub lane: MarkerLane,
+    pub non_empty: usize,
+    pub rows: usize,
+}
+
+impl MarkerColumn {
+    pub fn inferred_as_markers(&self) -> bool {
+        is_marker_column(self.non_empty, self.rows)
+    }
+}
+
+/// Builds `marker_lanes` for [`show`]: `dataset.columns`-parallel, `Some`
+/// for every `string` column with at least one non-empty cell (whether it is
+/// *drawn* as markers by default is [`MarkerColumn::inferred_as_markers`]),
+/// `None` for everything else. One pass per column; a spilled string column
+/// is streamed through its iterator, never collected (SPEC §5.1).
+pub fn cache_marker_lanes(dataset: &Dataset, ticks: &[i128]) -> Vec<Option<MarkerColumn>> {
+    let Some((&min_tick, &max_tick)) = ticks.iter().min().zip(ticks.iter().max()) else {
+        return vec![None; dataset.columns.len()];
+    };
+    dataset
+        .columns
+        .iter()
+        .map(|series| {
+            let builder = MarkerBuilder::for_view(min_tick, max_tick);
+            let column = match series.values() {
+                SeriesValues::String(values) => {
+                    marker_column(values.iter().map(String::as_str), ticks, builder)
+                }
+                SeriesValues::Spilled(SpilledValues::String(values)) => {
+                    marker_column(values.iter(), ticks, builder)
+                }
+                _ => return None,
+            }?;
+            tracing::info!(
+                column = series.name(),
+                non_empty = column.non_empty,
+                rows = column.rows,
+                drawn_as = if column.inferred_as_markers() {
+                    "events"
+                } else {
+                    "state bands"
+                },
+                "inferred how a text column is drawn (at most half the rows holding text means events)"
+            );
+            Some(column)
+        })
+        .collect()
+}
+
+fn marker_column<'a>(
+    cells: impl Iterator<Item = &'a str>,
+    ticks: &[i128],
+    mut builder: MarkerBuilder,
+) -> Option<MarkerColumn> {
+    let (mut non_empty, mut rows) = (0, 0);
+    for (cell, &tick) in cells.zip(ticks) {
+        rows += 1;
+        if !cell.is_empty() {
+            non_empty += 1;
+            builder.push(cell, tick);
+        }
+    }
+    (non_empty > 0).then(|| MarkerColumn {
+        lane: builder.finish_lane(),
+        non_empty,
+        rows,
+    })
 }
 
 /// Builds `bool_bands` for [`show`]: `dataset.columns`-parallel, `Some` with
@@ -598,7 +790,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &ticks, &lanes, &[]);
+                show(ui, &dataset, &ticks, &lanes, &[], &[]);
             });
         });
         assert!(
@@ -625,7 +817,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &ticks, &bool_bands, &[]);
+                show(ui, &dataset, &ticks, &bool_bands, &[], &[]);
             });
         });
 
@@ -658,7 +850,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &ticks, &[], &lanes);
+                show(ui, &dataset, &ticks, &[], &lanes, &[]);
             });
         });
         assert!(!output.shapes.is_empty());
@@ -714,6 +906,141 @@ mod render_tests {
             .all(Option::is_none));
     }
 
+    fn sparse_and_dense_string_dataset() -> Dataset {
+        let mut dataset = sample_dataset();
+        dataset.columns.push(Series::new(
+            "marker",
+            SeriesValues::String(vec!["".into(), "a".into(), "".into(), "".into()]),
+        ));
+        dataset.columns.push(Series::new(
+            "state",
+            SeriesValues::String(vec!["x".into(), "y".into(), "x".into(), "y".into()]),
+        ));
+        dataset
+    }
+
+    #[test]
+    fn only_a_sparse_string_column_is_inferred_as_markers() {
+        let dataset = sparse_and_dense_string_dataset();
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        let lanes = cache_marker_lanes(&dataset, &ticks);
+        assert!(lanes[0].is_none() && lanes[1].is_none());
+
+        let sparse = lanes[2].as_ref().expect("a string column with text");
+        assert!(matches!(&sparse.lane, MarkerLane::Exact { markers, .. } if markers.len() == 1));
+        assert_eq!((sparse.non_empty, sparse.rows), (1, 4));
+        assert!(sparse.inferred_as_markers());
+
+        // The dense column still gets a marker view, so the user can switch
+        // to it in one click — it is just not the inferred default.
+        let dense = lanes[3].as_ref().expect("a string column with text");
+        assert_eq!((dense.non_empty, dense.rows), (4, 4));
+        assert!(!dense.inferred_as_markers());
+    }
+
+    #[test]
+    fn an_all_empty_string_column_has_no_marker_view() {
+        let mut dataset = sample_dataset();
+        dataset.columns = vec![Series::new(
+            "blank",
+            SeriesValues::String(vec![String::new(); 4]),
+        )];
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        assert_eq!(cache_marker_lanes(&dataset, &ticks), vec![None]);
+    }
+
+    #[test]
+    fn the_lane_header_names_what_was_inferred_and_what_is_drawn() {
+        let column = |non_empty| MarkerColumn {
+            lane: MarkerLane::Exact {
+                markers: Vec::new(),
+                min_tick: 0,
+                max_tick: 1,
+            },
+            non_empty,
+            rows: 9,
+        };
+        assert_eq!(
+            string_lane_notice(true, true, &column(2)),
+            "Drawn as events (inferred: 2 of 9 rows have text)"
+        );
+        assert_eq!(
+            string_lane_notice(true, false, &column(2)),
+            "Drawn as state bands (your choice; inferred events: 2 of 9 rows have text)"
+        );
+        assert_eq!(
+            string_lane_notice(false, false, &column(7)),
+            "Drawn as state bands (inferred: 7 of 9 rows have text)"
+        );
+        assert_eq!(
+            string_lane_notice(false, true, &column(7)),
+            "Drawn as events (your choice; inferred state bands: 7 of 9 rows have text)"
+        );
+    }
+
+    /// Every text `show` painted in one headless frame, one per line.
+    fn rendered_lane_texts(dataset: &Dataset, ticks: &[i128]) -> String {
+        let state = cache_state_lanes(dataset, ticks);
+        let markers = cache_marker_lanes(dataset, ticks);
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, dataset, ticks, &[], &state, &markers);
+            });
+        });
+        let mut texts = String::new();
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(text) = &clipped.shape {
+                texts.push_str(text.galley.text());
+                texts.push('\n');
+            }
+        }
+        texts
+    }
+
+    #[test]
+    fn each_string_column_is_drawn_once_with_its_inference_shown() {
+        let dataset = sparse_and_dense_string_dataset();
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        let texts = rendered_lane_texts(&dataset, &ticks);
+        assert!(
+            texts.contains("Drawn as events (inferred: 1 of 4 rows have text)"),
+            "{texts}"
+        );
+        assert!(
+            texts.contains("Drawn as state bands (inferred: 4 of 4 rows have text)"),
+            "{texts}"
+        );
+        assert_eq!(texts.matches("Show as state bands").count(), 1, "{texts}");
+        assert_eq!(texts.matches("Show as events").count(), 1, "{texts}");
+    }
+
+    #[test]
+    fn corpus_case_49_yields_its_two_markers() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/corpus/case-49-sparse-markers.csv");
+        let dataset = glyde_core::ingest::load(&path).expect("case 49 loads");
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        let lanes = cache_marker_lanes(&dataset, &ticks);
+        let columns: Vec<&MarkerColumn> = lanes.iter().flatten().collect();
+        assert_eq!(columns.len(), 1, "{lanes:?}");
+        assert!(columns[0].inferred_as_markers());
+        let MarkerLane::Exact { markers, .. } = &columns[0].lane else {
+            panic!("two markers stay exact");
+        };
+        let labels: Vec<&str> = markers.iter().map(|m| m.label.as_str()).collect();
+        assert_eq!(labels, ["event_a", "event_b"]);
+    }
+
+    #[test]
+    fn overview_cells_are_drawn_at_their_centers() {
+        let n = MARKER_OVERVIEW_CELLS as f64;
+        assert!((overview_cell_center(0, 0.0, n) - 0.5).abs() < 1e-12);
+        assert!(
+            (overview_cell_center(MARKER_OVERVIEW_CELLS - 1, 0.0, n) - (n - 0.5)).abs() < 1e-12
+        );
+    }
+
     #[test]
     fn show_renders_a_dataset_with_no_bool_columns_without_panicking() {
         let dataset = Dataset {
@@ -726,7 +1053,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &ticks, &bool_bands, &[]);
+                show(ui, &dataset, &ticks, &bool_bands, &[], &[]);
             });
         });
 
@@ -753,7 +1080,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &ticks, &bool_bands, &[]);
+                show(ui, &dataset, &ticks, &bool_bands, &[], &[]);
             });
         });
 

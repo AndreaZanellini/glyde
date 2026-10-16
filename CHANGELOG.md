@@ -31,9 +31,31 @@ Versioning: [Semantic Versioning](https://semver.org/).
   - In the compact view the hover text names up to 256 distinct states;
     beyond that, a single-state stretch says "label not retained".
   - These lanes are still whole-file and do not pan/zoom with the plot above
-    (same as the on/off lanes); markers, the "multiple states" glyph that
-    expands on zoom, and axis sharing are the remaining state-timeline items.
+    (same as the on/off lanes); the "multiple states" glyph that expands on
+    zoom and axis sharing are the remaining state-timeline items.
 
+- **Event markers in the state timeline (milestone M6).** A text column that
+  is mostly empty (like the `marker` column of corpus case 49: `event_a`,
+  `event_b` on otherwise blank rows) is now drawn as thin vertical ticks on
+  its own lane under the time plot, one tick per non-empty cell, at that
+  row's timestamp. Ticks are never thinned out: a file with more events than
+  fit individually switches to a fixed-size overview where every event still
+  gets a tick, shown in orange when several events share a spot. Labels are
+  not shown yet, and the lane does not pan/zoom with the plot above (same
+  limit as the on/off lanes).
+
+  **Glyde decides for you whether a text column is events or states, and
+  says so.** Above every text lane a line reads, for example, "Drawn as
+  events (inferred: 2 of 9 rows have text)", with a button to show the same
+  column the other way ("Show as state bands" / "Show as events") in one
+  click. Each text column is drawn once, never both ways at the same time.
+
+  **Assumptions made (please veto by testing the app):**
+  - A text column is inferred to be events when it has at least one
+    non-empty cell and at most half of its cells are non-empty; otherwise it
+    is inferred to be states.
+  - Your choice of view for a column is remembered until you quit Glyde, not
+    saved between sessions.
 - **Power spectral density (PSD) view — milestone M5.** Under the time plot
   there is now a resizable panel with the spectrum of every numeric series,
   computed with Welch's method on the **raw samples** (never on the
