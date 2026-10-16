@@ -2945,6 +2945,16 @@ pub fn derived_caches_for_dataset_cached_with_cache_dir(
     };
 
     let ticks = dataset.time.to_pyramid_ticks();
+    // Issue #115: the time axis is the same for every column, so its
+    // Level-0 file is written once here, before the columns run in parallel
+    // and each finds it, instead of once per column. A failure only costs
+    // that saving: each column then writes it itself.
+    if let Err(err) = level0::build_or_open_shared_timestamps(cache_dir, &key, &ticks) {
+        warn!(
+            error = %err,
+            "could not write the shared Level-0 timestamps; each column writes its own"
+        );
+    }
     // Columns are independent — each has its own cache files — so they are
     // built on the `rayon` compute pool (issue #114). The result keeps
     // `dataset.columns` order.
