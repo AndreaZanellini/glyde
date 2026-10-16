@@ -37,7 +37,7 @@
 //! [`glyde_core::ingest::IngestOverrides`] field set — this module only ever
 //! renders and reports the click, it never re-indexes anything itself
 //! (docs/ARCHITECTURE.md Hard rule 2: no product logic in the UI layer).
-//! Encoding correction is not covered yet (issue #97).
+//! Encoding gets the same dropdown (issue #97), over SPEC §1.2.1's set.
 //!
 //! **The time column is the one exception to the gating rule below**: its
 //! picker is always offered. Every other field's inference knows when it is
@@ -75,8 +75,8 @@
 //! Not worth offering as a one-click option.
 
 use glyde_core::ingest::{
-    Confidence, DecimalSeparator, Delimiter, GeneratedIndexReason, InferenceReport, InferredField,
-    TimeColumnChoice, TimeIndexSource, TimezoneLabel,
+    Confidence, DecimalSeparator, Delimiter, EncodingChoice, GeneratedIndexReason, InferenceReport,
+    InferredField, TimeColumnChoice, TimeIndexSource, TimezoneLabel,
 };
 use glyde_core::time::TimestampFormat;
 use std::path::Path;
@@ -94,6 +94,8 @@ pub enum Correction {
     /// SPEC §1.2's time-column correction: index by this column, or by the
     /// generated row index.
     TimeColumn(TimeColumnChoice),
+    /// SPEC §1.2's encoding correction (issue #97).
+    Encoding(EncodingChoice),
 }
 
 /// Renders `report` as a collapsible header into `ui`, one row of field
@@ -115,12 +117,9 @@ pub fn show(
         .show(ui, |ui| {
             let mut correction = None;
             ui.horizontal_wrapped(|ui| {
-                field_label(
-                    ui,
-                    "encoding",
-                    &report.encoding.value,
-                    report.encoding.confidence,
-                );
+                if let Some(picked) = encoding_control(ui, &report.encoding) {
+                    correction = Some(Correction::Encoding(picked));
+                }
                 if let Some(picked) = delimiter_control(ui, &report.delimiter) {
                     correction = Some(Correction::Delimiter(picked));
                 }
@@ -472,6 +471,45 @@ fn delimiter_control(
     picked
 }
 
+fn encoding_display(choice: EncodingChoice) -> &'static str {
+    match choice {
+        EncodingChoice::Utf8 => "UTF-8",
+        EncodingChoice::Utf16Le => "UTF-16 LE",
+        EncodingChoice::Utf16Be => "UTF-16 BE",
+        // `encoding_rs` decodes Latin-1 as Windows-1252, its superset.
+        EncodingChoice::Windows1252 => "Windows-1252 / Latin-1",
+    }
+}
+
+/// The encoding field, with a correction dropdown when it is low
+/// confidence (same gating as [`delimiter_control`]). Returns the newly
+/// picked encoding, if the user chose one different from the current one
+/// this frame.
+fn encoding_control(ui: &mut egui::Ui, field: &InferredField<String>) -> Option<EncodingChoice> {
+    let current = EncodingChoice::from_label(&field.value);
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        ui.label(field_text("encoding", &field.value, field.confidence));
+        if field.confidence == Confidence::Low {
+            egui::ComboBox::from_id_salt("inference-bar-encoding-correction")
+                .selected_text("Correct…")
+                .show_ui(ui, |ui| {
+                    for candidate in EncodingChoice::ALL {
+                        let is_current = current == Some(candidate);
+                        if ui
+                            .selectable_label(is_current, encoding_display(candidate))
+                            .clicked()
+                            && !is_current
+                        {
+                            picked = Some(candidate);
+                        }
+                    }
+                });
+        }
+    });
+    picked
+}
+
 fn decimal_separator_display(separator: DecimalSeparator) -> &'static str {
     match separator {
         DecimalSeparator::Dot => "Dot (.)",
@@ -587,11 +625,7 @@ fn display_option(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or("—")
 }
 
-fn field_label(ui: &mut egui::Ui, name: &str, value: &str, confidence: Confidence) {
-    ui.label(field_text(name, value, confidence));
-}
-
-/// The label text for one field (split out from [`field_label`] so the
+/// The label text for one field (split out so the
 /// SPEC §1.2 "never silently guess" caveat is unit-testable without a real
 /// `egui::Ui`).
 fn field_text(name: &str, value: &str, confidence: Confidence) -> String {
@@ -688,6 +722,55 @@ mod tests {
             });
         });
         output.shapes.len()
+    }
+
+    /// Every text `show` painted for `report` in one headless frame.
+    fn rendered_texts(report: &InferenceReport) -> String {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, report, Path::new("/some/file.csv"), true);
+            });
+        });
+        let mut texts = String::new();
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(text) = &clipped.shape {
+                texts.push_str(text.galley.text());
+                texts.push('\n');
+            }
+        }
+        texts
+    }
+
+    // Issue #97: a low-confidence encoding gets the same "Correct…"
+    // dropdown as the other fields; a confident one stays a plain label.
+    #[test]
+    fn a_low_confidence_encoding_offers_a_correction() {
+        let mut report = sample_report(Confidence::High);
+        report.time_column.confidence = Confidence::Low; // keep the bar open
+        let confident = rendered_texts(&report);
+        assert!(confident.contains("encoding: utf-8"), "{confident}");
+        assert!(!confident.contains("Correct…"), "{confident}");
+
+        report.encoding = InferredField {
+            value: "windows-1252".to_string(),
+            confidence: Confidence::Low,
+        };
+        let unsure = rendered_texts(&report);
+        assert!(
+            unsure.contains("encoding: windows-1252 (low confidence)"),
+            "{unsure}"
+        );
+        assert_eq!(unsure.matches("Correct…").count(), 1, "{unsure}");
+    }
+
+    #[test]
+    fn every_encoding_choice_has_a_distinct_label_naming_latin1() {
+        let labels: Vec<&str> = EncodingChoice::ALL.map(encoding_display).to_vec();
+        let mut unique = labels.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), labels.len());
+        assert!(labels.iter().any(|label| label.contains("Latin-1")));
     }
 
     // Crash-free rendering (SPEC §6) exercised through a real
