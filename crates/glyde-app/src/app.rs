@@ -194,6 +194,13 @@ impl GlydeApp {
             Correction::DecimalSeparator(separator) => {
                 self.overrides.decimal_separator = Some(separator)
             }
+            Correction::Encoding(encoding) => {
+                self.overrides.encoding = Some(encoding);
+                // Re-decoding can change how rows split into columns, as a
+                // new delimiter does: a picked position may no longer name
+                // the same column.
+                self.overrides.time_column = None;
+            }
             Correction::TimestampFormat(format) => self.overrides.timestamp_format = Some(format),
             Correction::SortByTime => self.overrides.sort_by_time = true,
             Correction::TimeColumn(choice) => {
@@ -802,6 +809,22 @@ mod tests {
         app.open(PathBuf::from("does-not-exist-glyde-app-test.csv"));
 
         assert_eq!(app.overrides, IngestOverrides::default());
+    }
+
+    // Issue #97: an encoding correction is kept for the file, and resets a
+    // picked time column whose position re-decoding may have shifted.
+    #[test]
+    fn an_encoding_correction_sets_the_override_and_resets_the_time_column() {
+        use glyde_core::ingest::{EncodingChoice, TimeColumnChoice};
+        let mut app = GlydeApp::new();
+        let path = PathBuf::from("does-not-exist-glyde-app-test.csv");
+        app.apply_correction(
+            path.clone(),
+            Correction::TimeColumn(TimeColumnChoice::Column(2)),
+        );
+        app.apply_correction(path, Correction::Encoding(EncodingChoice::Utf16Le));
+        assert_eq!(app.overrides.encoding, Some(EncodingChoice::Utf16Le));
+        assert_eq!(app.overrides.time_column, None);
     }
 
     // A correction must accumulate on top of previous ones for the same

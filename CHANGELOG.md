@@ -12,6 +12,23 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **The file's encoding can now be corrected in one click.** When Glyde is
+  unsure how a file's text is encoded (the bar then says "encoding: …
+  (low confidence)"), a "Correct…" dropdown next to it offers UTF-8,
+  UTF-16 LE, UTF-16 BE and Windows-1252 / Latin-1. Picking one re-reads the
+  file with it, so accented letters or symbols that came out garbled are
+  read correctly, and a UTF-16 file Glyde could not recognise becomes
+  readable. Your pick is always obeyed, even if the file starts with a
+  marker (a "byte-order mark") that says otherwise. This was the last field
+  of the inference bar without a one-click correction. (#97)
+
+  **Assumptions made (please veto by testing the app):**
+  - Like the delimiter and decimal separator, the dropdown only appears
+    when the encoding is low confidence. A file Glyde confidently read as
+    UTF-8 offers no encoding choice.
+  - Changing the encoding forgets a time column you picked by hand, since
+    re-reading the text can change how the columns split (same as changing
+    the delimiter).
 - **Text state columns (like `idle` / `running` / `fault`) now show as labeled
   colored bands under the plot, one lane per column.** Each run of the same
   value is one band; the same state always gets the same color. If the band

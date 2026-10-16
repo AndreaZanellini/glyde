@@ -381,7 +381,19 @@ fn sniff_bytes(bytes: &[u8], overrides: super::IngestOverrides) -> Result<Sniff>
     if bytes.is_empty() {
         return Err(GlydeError::EmptyFile);
     }
-    let encoding = infer::detect_encoding(bytes);
+    let encoding = match overrides.encoding {
+        Some(choice) => {
+            info!(
+                encoding = choice.encoding().name(),
+                "encoding set by user correction, bypassing inference (issue #97)"
+            );
+            infer::EncodingInference {
+                encoding: choice.encoding(),
+                source: infer::EncodingSource::UserCorrection,
+            }
+        }
+        None => infer::detect_encoding(bytes),
+    };
     let head_bytes = &bytes[..bytes.len().min(infer::HEAD_SAMPLE_BYTES)];
     let head_text = infer::decode(head_bytes, &encoding);
     Ok(sniff_from_head(
@@ -582,7 +594,7 @@ pub(crate) fn stream_path(
     })?;
     let reader = DecodedReader::new(
         BufReader::with_capacity(READ_BUFFER_BYTES, file),
-        sniff.encoding.encoding.new_decoder(),
+        sniff.encoding.new_decoder(),
     );
     parse_rows(reader, sniff, Capture::Sink(on_row), None).map(|(outcome, _)| outcome)
 }
