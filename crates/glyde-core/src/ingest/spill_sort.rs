@@ -42,9 +42,11 @@ use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
+use std::sync::atomic::AtomicBool;
+
 use super::dataset::{
-    progressive_value_to_tick, ColumnSpillWriter, ColumnValue, Dataset, ProgressiveValues,
-    TimeAxis, Timestamps,
+    ensure_not_cancelled, progressive_value_to_tick, ColumnSpillWriter, ColumnValue, Dataset,
+    ProgressiveValues, TimeAxis, Timestamps,
 };
 use crate::budget::RamBudget;
 use crate::index::spill::{SpillCursor, SpillSet, SpillStringsCursor, SpillVecWriter};
@@ -70,12 +72,17 @@ pub(super) fn sort_spilled_by_time(
     dataset: Dataset,
     cache_dir: &Path,
     budget: RamBudget,
+    cancelled: &AtomicBool,
 ) -> Result<Dataset> {
     let run_bytes = usize::try_from(budget.cap_bytes() / 8)
         .unwrap_or(usize::MAX)
         .clamp(MIN_SORT_RUN_BYTES, SORT_RUN_BYTES);
-    sort_spilled_by_time_with(dataset, cache_dir, run_bytes, SORT_FAN_IN)
+    sort_spilled_by_time_with(dataset, cache_dir, run_bytes, SORT_FAN_IN, cancelled)
 }
+
+/// Rows read or merged between two looks at the cancel flag (issue #119):
+/// a superseded open stops sorting as promptly as it stops parsing.
+const CANCEL_CHECK_ROWS: u64 = 4096;
 
 /// [`sort_spilled_by_time`] with explicit run size and fan-in, so a test can
 /// force several runs and several merge passes on a small file.
@@ -84,6 +91,7 @@ pub(super) fn sort_spilled_by_time_with(
     cache_dir: &Path,
     run_bytes: usize,
     fan_in: usize,
+    cancelled: &AtomicBool,
 ) -> Result<Dataset> {
     let Some(layout) = RowLayout::of(&dataset) else {
         warn!("sort-by-time requested on a dataset that is not fully spilled; left unsorted");
@@ -101,7 +109,7 @@ pub(super) fn sort_spilled_by_time_with(
 
     // --- 1. Cut sorted runs ---------------------------------------------
     let runs_set = SpillSet::create(cache_dir)?;
-    let mut runs = cut_runs(&dataset, &layout, &runs_set, run_bytes)?;
+    let mut runs = cut_runs(&dataset, &layout, &runs_set, run_bytes, cancelled)?;
     let time_column_name = dataset.time_column_name.clone();
     let names: Vec<String> = dataset
         .columns
@@ -120,7 +128,9 @@ pub(super) fn sort_spilled_by_time_with(
         for group in runs.chunks(fan_in) {
             let path = run_path(&runs_set, pass, merged.len());
             let mut out = BufWriter::with_capacity(RUN_BUFFER_BYTES, create(&path)?);
-            let count = merge(group, |record| write_record(&mut out, &path, record))?;
+            let count = merge(group, cancelled, |record| {
+                write_record(&mut out, &path, record)
+            })?;
             out.flush().map_err(io_error(&path))?;
             for run in group {
                 let _ = std::fs::remove_file(&run.path);
@@ -132,7 +142,7 @@ pub(super) fn sort_spilled_by_time_with(
 
     let set = SpillSet::create(cache_dir)?;
     let mut writer = RowWriter::create(&set, &layout)?;
-    let written = merge(&runs, |record| writer.push(&layout, record))?;
+    let written = merge(&runs, cancelled, |record| writer.push(&layout, record))?;
     debug_assert_eq!(written, rows);
     drop(runs_set);
     let sorted = writer.finish(&layout, time_column_name, names)?;
@@ -328,6 +338,7 @@ fn cut_runs(
     layout: &RowLayout,
     set: &SpillSet,
     run_bytes: usize,
+    cancelled: &AtomicBool,
 ) -> Result<Vec<Run>> {
     let mut time = TimeCursor::new(dataset)?;
     let mut columns = dataset
@@ -346,6 +357,9 @@ fn cut_runs(
     let mut index: Vec<(i128, u64, usize, usize)> = Vec::new();
     let mut row = 0u64;
     loop {
+        if row.is_multiple_of(CANCEL_CHECK_ROWS) {
+            ensure_not_cancelled(cancelled)?;
+        }
         let start = bytes.len();
         let Some(tick) = time.next_into(&mut bytes)? else {
             break;
@@ -448,7 +462,11 @@ impl RunReader {
 
 /// K-way merges `runs` in `(tick, row)` order, handing each record to
 /// `sink`. Returns how many records were merged.
-fn merge(runs: &[Run], mut sink: impl FnMut(&Record) -> Result<()>) -> Result<usize> {
+fn merge(
+    runs: &[Run],
+    cancelled: &AtomicBool,
+    mut sink: impl FnMut(&Record) -> Result<()>,
+) -> Result<usize> {
     let mut readers = runs
         .iter()
         .map(RunReader::open)
@@ -467,6 +485,9 @@ fn merge(runs: &[Run], mut sink: impl FnMut(&Record) -> Result<()>) -> Result<us
         let record = heads[index].take().expect("a queued run has a head");
         sink(&record)?;
         merged += 1;
+        if (merged as u64).is_multiple_of(CANCEL_CHECK_ROWS) {
+            ensure_not_cancelled(cancelled)?;
+        }
         if let Some(next) = readers[index].next_record()? {
             heap.push(Reverse((next.tick, next.row, index)));
             heads[index] = Some(next);
@@ -664,6 +685,33 @@ mod tests {
         path
     }
 
+    fn never() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+
+    // Issue #119: a superseded open stops sorting too, and the runs it had
+    // written go with it.
+    #[test]
+    fn a_cancelled_sort_stops_and_leaves_no_runs_behind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = tempfile::tempdir().expect("temp cache dir");
+        let path = fixture(dir.path());
+        let spilled = load_with_budget(&path, RamBudget::from_total_ram_bytes(0), cache.path())
+            .expect("open");
+        let result =
+            sort_spilled_by_time_with(spilled, cache.path(), 256, 2, &AtomicBool::new(true));
+        assert!(
+            matches!(result, Err(GlydeError::Cancelled)),
+            "{:?}",
+            result.err()
+        );
+        assert!(crate::index::spill::wait_for_pending_deletions());
+        let sets = std::fs::read_dir(cache.path().join("spill"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(sets, 0, "the unsorted set and the runs must be deleted");
+    }
+
     fn sorted_in_memory(path: &Path, cache: &Path) -> Dataset {
         load_with_overrides_and_budget(
             path,
@@ -689,7 +737,8 @@ mod tests {
                 .expect("open");
             assert!(spilled.is_spilled());
             let sorted =
-                sort_spilled_by_time_with(spilled, cache.path(), run_bytes, fan_in).expect("sort");
+                sort_spilled_by_time_with(spilled, cache.path(), run_bytes, fan_in, &never())
+                    .expect("sort");
             assert!(sorted.is_spilled());
             assert_eq!(
                 sorted.time, reference.time,
@@ -718,9 +767,13 @@ mod tests {
         )
         .expect("open");
         let time = in_memory.time.clone();
-        let result =
-            sort_spilled_by_time(in_memory, cache.path(), RamBudget::from_total_ram_bytes(0))
-                .expect("no error");
+        let result = sort_spilled_by_time(
+            in_memory,
+            cache.path(),
+            RamBudget::from_total_ram_bytes(0),
+            &never(),
+        )
+        .expect("no error");
         assert_eq!(result.time, time, "not spilled: never touched");
     }
 }

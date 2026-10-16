@@ -38,6 +38,12 @@ pub enum GlydeError {
     #[error("unrecognized format: {path}")]
     UnrecognizedFormat { path: PathBuf },
 
+    /// The caller withdrew the request before it finished (issue #119: the
+    /// user opened another file or corrected an inference mid-load). Not a
+    /// failure to report — the caller already moved on and drops it.
+    #[error("the open was cancelled")]
+    Cancelled,
+
     /// The input has no data to read (corpus case 23, docs/QUALITY.md §1.23:
     /// "clear message, no crash").
     #[error("empty file: no data to read")]
