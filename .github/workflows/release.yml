@@ -83,6 +83,9 @@ jobs:
 
       - name: Package (Windows installer + portable .exe)
         if: runner.os == 'Windows'
+        env:
+          # Git Bash would rewrite ISCC's `/D...` switches as paths.
+          MSYS_NO_PATHCONV: "1"
         run: |
           version="${{ steps.version.outputs.version }}"
           mkdir -p dist
