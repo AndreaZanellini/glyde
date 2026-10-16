@@ -43,7 +43,7 @@
 
 use super::csv::{
     open_path_capturing_all_columns, open_path_capturing_all_columns_with_progress, ColumnText,
-    CsvParseOutcome, RowFields, Sniff, FIRST_PROGRESS_CHECKPOINT_ROWS,
+    CsvParseOutcome, RowFields, Sniff, FIRST_PROGRESS_CHECKPOINT_ROWS, NEVER_CANCELLED,
 };
 use super::infer::{
     log_dtype_choice, normalize_decimal_field, ColumnDtypeChoice, ColumnDtypeScan, ColumnInference,
@@ -62,6 +62,7 @@ use crate::time::{
 use crate::{GlydeError, Result};
 use std::borrow::Cow;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
 /// An [`TimeAxis::Absolute`] axis's timestamps, either on the heap (the
@@ -721,7 +722,7 @@ fn load_with_outcome_using(
         }
         Storage::Spill(sniff) => {
             let cache_dir = cache_dir.expect("choose_storage refuses to spill without a cache dir");
-            load_spilled(path, &sniff, cache_dir, None, overrides)
+            load_spilled(path, &sniff, cache_dir, None, overrides, &NEVER_CANCELLED)
         }
     }
 }
@@ -1399,6 +1400,7 @@ fn load_spilled(
     cache_dir: &Path,
     on_checkpoint: Option<&mut dyn FnMut(Checkpoint)>,
     overrides: IngestOverrides,
+    cancelled: &AtomicBool,
 ) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     let column_names = sniff.column_names().to_vec();
     let column_count = column_names.len();
@@ -1424,7 +1426,7 @@ fn load_spilled(
     // (issue #114): every column's scan is independent and sees its own
     // fields in row order, so the result is the row-at-a-time scan's
     // exactly — and this pass is what a spilled open's first plot waits on.
-    stream_in_batches(path, sniff, column_count, |batch| {
+    stream_in_batches(path, sniff, column_count, cancelled, |batch| {
         rayon::join(
             || {
                 if let Some(index) = candidate {
@@ -1518,7 +1520,7 @@ fn load_spilled(
     // preview vector — sees its own fields in row order, on the `rayon`
     // pool, and the preview's checkpoints are emitted afterwards over
     // exactly the row prefixes the row-at-a-time loop emitted them at.
-    let outcome = stream_in_batches(path, sniff, column_count, |batch| {
+    let outcome = stream_in_batches(path, sniff, column_count, cancelled, |batch| {
         write_spill_batch(
             batch,
             time_column,
@@ -1581,6 +1583,7 @@ fn stream_in_batches(
     path: &Path,
     sniff: &Sniff,
     column_count: usize,
+    cancelled: &AtomicBool,
     mut process: impl FnMut(&[ColumnText]) -> Result<()>,
 ) -> Result<CsvParseOutcome> {
     let new_batch =
@@ -1596,18 +1599,19 @@ fn stream_in_batches(
                 source: std::io::Error::other("the spill writer stopped reading rows"),
             };
             let mut batch = new_batch();
-            let outcome = super::csv::stream_path(path, sniff, &mut |row: RowFields<'_>| {
-                for (index, column) in batch.iter_mut().enumerate() {
-                    column.push(row.get(index).unwrap_or_default());
-                }
-                if batch[0].len() >= SCAN_BATCH_ROWS {
-                    let next = drained_rx.try_recv().unwrap_or_else(|_| new_batch());
-                    filled_tx
-                        .send(std::mem::replace(&mut batch, next))
-                        .map_err(|_| consumer_stopped())?;
-                }
-                Ok(())
-            })?;
+            let outcome =
+                super::csv::stream_path(path, sniff, cancelled, &mut |row: RowFields<'_>| {
+                    for (index, column) in batch.iter_mut().enumerate() {
+                        column.push(row.get(index).unwrap_or_default());
+                    }
+                    if batch[0].len() >= SCAN_BATCH_ROWS {
+                        let next = drained_rx.try_recv().unwrap_or_else(|_| new_batch());
+                        filled_tx
+                            .send(std::mem::replace(&mut batch, next))
+                            .map_err(|_| consumer_stopped())?;
+                    }
+                    Ok(())
+                })?;
             if batch[0].len() > 0 {
                 filled_tx.send(batch).map_err(|_| consumer_stopped())?;
             }
@@ -2211,7 +2215,12 @@ pub(crate) fn load_with_outcome_progressive(
     path: &Path,
     on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
-    load_with_outcome_progressive_using(path, IngestOverrides::default(), on_checkpoint)
+    load_with_outcome_progressive_using(
+        path,
+        IngestOverrides::default(),
+        &NEVER_CANCELLED,
+        on_checkpoint,
+    )
 }
 
 /// [`load_with_outcome_progressive`] with [`IngestOverrides`] applied
@@ -2223,12 +2232,24 @@ pub(crate) fn load_with_outcome_progressive_with_overrides(
     overrides: IngestOverrides,
     on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
-    load_with_outcome_progressive_using(path, overrides, on_checkpoint)
+    load_with_outcome_progressive_using(path, overrides, &NEVER_CANCELLED, on_checkpoint)
+}
+
+/// [`load_with_outcome_progressive_with_overrides`] that stops with
+/// [`GlydeError::Cancelled`] once `cancelled` is raised (issue #119).
+pub(crate) fn load_with_outcome_progressive_cancellable(
+    path: &Path,
+    overrides: IngestOverrides,
+    cancelled: &AtomicBool,
+    on_checkpoint: impl FnMut(Checkpoint),
+) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
+    load_with_outcome_progressive_using(path, overrides, cancelled, on_checkpoint)
 }
 
 fn load_with_outcome_progressive_using(
     path: &Path,
     overrides: IngestOverrides,
+    cancelled: &AtomicBool,
     mut on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     let cache_dir = os_spill_dir();
@@ -2242,7 +2263,14 @@ fn load_with_outcome_progressive_using(
             let cache_dir = cache_dir
                 .as_deref()
                 .expect("choose_storage refuses to spill without a cache dir");
-            load_spilled(path, &sniff, cache_dir, Some(&mut on_checkpoint), overrides)
+            load_spilled(
+                path,
+                &sniff,
+                cache_dir,
+                Some(&mut on_checkpoint),
+                overrides,
+                cancelled,
+            )
         }
         Storage::InMemory => {
             let mut pyramid_cursor = PyramidCursor::default();
@@ -2250,6 +2278,7 @@ fn load_with_outcome_progressive_using(
             let (outcome, columns_text) = open_path_capturing_all_columns_with_progress(
                 path,
                 overrides,
+                cancelled,
                 |partial_outcome, partial_columns| match builder.snapshot(
                     partial_outcome,
                     partial_columns,
@@ -2278,6 +2307,7 @@ fn load_with_outcome_progressive_using(
                     }
                 },
             )?;
+            ensure_not_cancelled(cancelled)?;
             let (dataset, timestamp_format_ambiguous) =
                 builder.finish(&outcome, &columns_text, overrides)?;
             Ok((outcome, dataset, timestamp_format_ambiguous))
@@ -2299,20 +2329,47 @@ pub fn load_progressive_with_budget(
     path: &Path,
     budget: RamBudget,
     cache_dir: &Path,
+    on_checkpoint: impl FnMut(Checkpoint),
+) -> Result<Dataset> {
+    load_progressive_with_budget_cancellable(
+        path,
+        budget,
+        cache_dir,
+        &NEVER_CANCELLED,
+        on_checkpoint,
+    )
+}
+
+/// [`load_progressive_with_budget`] that stops early with
+/// [`GlydeError::Cancelled`] once `cancelled` is raised (issue #119): the
+/// same split [`load_with_outcome_progressive_cancellable`] gets from the
+/// host machine's own budget, against an explicit one so a test can choose
+/// the storage path.
+pub fn load_progressive_with_budget_cancellable(
+    path: &Path,
+    budget: RamBudget,
+    cache_dir: &Path,
+    cancelled: &AtomicBool,
     mut on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<Dataset> {
     let overrides = IngestOverrides::default();
     match choose_storage(path, budget, Some(cache_dir), overrides)? {
-        Storage::Spill(sniff) => {
-            load_spilled(path, &sniff, cache_dir, Some(&mut on_checkpoint), overrides)
-                .map(|(_outcome, dataset, _ambiguous)| dataset)
-        }
+        Storage::Spill(sniff) => load_spilled(
+            path,
+            &sniff,
+            cache_dir,
+            Some(&mut on_checkpoint),
+            overrides,
+            cancelled,
+        )
+        .map(|(_outcome, dataset, _ambiguous)| dataset),
         Storage::InMemory => {
             let mut pyramid_cursor = PyramidCursor::default();
             let mut builder = DatasetBuilder::default();
             let (outcome, columns_text) = open_path_capturing_all_columns_with_progress(
                 path,
                 overrides,
+                cancelled,
                 |partial, columns| {
                     if let Ok((dataset, _ambiguous)) = builder.snapshot(partial, columns, overrides)
                     {
@@ -2329,11 +2386,22 @@ pub fn load_progressive_with_budget(
                     }
                 },
             )?;
+            ensure_not_cancelled(cancelled)?;
             builder
                 .finish(&outcome, &columns_text, overrides)
                 .map(|(dataset, _ambiguous)| dataset)
         }
     }
+}
+
+/// [`GlydeError::Cancelled`] if `cancelled` is raised: checked between the
+/// stages of an open that read no rows (the row loop checks on its own).
+pub(crate) fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<()> {
+    if cancelled.load(Ordering::Relaxed) {
+        info!("open stopped between stages: cancelled by its caller");
+        return Err(GlydeError::Cancelled);
+    }
+    Ok(())
 }
 
 /// Per-column pyramid state carried between successive progressive

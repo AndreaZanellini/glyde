@@ -416,6 +416,28 @@ pub fn open_dataset_progressive_with_overrides(
     build_summary_and_report(outcome, dataset, time_index)
 }
 
+/// [`open_dataset_progressive_with_overrides`] that stops early with
+/// [`crate::GlydeError::Cancelled`] once `cancelled` is raised (issue #119):
+/// `glyde-app` raises it when the user opens another file or corrects an
+/// inference mid-load, so a superseded open stops reading the file and its
+/// spill files are deleted rather than written to the end. Checked every few
+/// thousand rows and between the stages that follow the parse.
+pub fn open_dataset_progressive_cancellable(
+    path: &Path,
+    overrides: super::IngestOverrides,
+    cancelled: &std::sync::atomic::AtomicBool,
+    on_checkpoint: impl FnMut(Checkpoint),
+) -> Result<(OpenSummary, InferenceReport, Dataset)> {
+    let (outcome, dataset, time_index) = dataset::load_with_outcome_progressive_cancellable(
+        path,
+        overrides,
+        cancelled,
+        on_checkpoint,
+    )?;
+    dataset::ensure_not_cancelled(cancelled)?;
+    build_summary_and_report(outcome, dataset, time_index)
+}
+
 /// The summary/report-building half of [`open_dataset`], shared with
 /// [`open_dataset_progressive`] so the two never independently (and
 /// possibly divergently) derive the same fields from a parsed [`Dataset`].
