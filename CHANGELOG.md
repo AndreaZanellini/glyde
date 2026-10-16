@@ -566,6 +566,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `blocking-decision` issue rather than decided here.
 
 ### Changed
+- **Groundwork for the gap view: listing a file's gaps no longer needs
+  memory for every gap at once.** Nothing visible changes yet. Glyde can now
+  walk through the gaps of any stretch of a file, including a file too big
+  for memory, one at a time, instead of only building a full list of them
+  for the whole file. A file can have millions of gaps (a new test file
+  shows how: when just over half the time steps are short and the rest
+  long, every long one counts as a gap), so the upcoming gap view (milestone
+  M8) can show them for what is on screen without that cost. How the gap
+  view presents them (by page, by pixel column, or a capped list) is still
+  to be decided with it. (#103)
 - **Files open about 2–3× faster, and the plot no longer stutters while the
   mouse is over it.** (issue #114) Measured on a 1 GB, 9.2-million-row,
   8-channel CSV, median of three runs, before → after:
