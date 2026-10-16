@@ -34,6 +34,23 @@
 //! §1.4 dtype whose conversion also runs a per-element precision check) —
 //! so a regression in either path fails the build.
 //!
+//! Every frame shows an explicit horizontal span (issue #107): the **full
+//! view**, every sample on screen (the worst case for decimation), and a
+//! **pan**, a window a tenth of the file wide that moves on every frame.
+//! Earlier versions left the plot at `egui_plot`'s default bounds, about one
+//! second wide, so each frame decimated only a handful of samples and every
+//! fixture measured ~35 µs whatever its size. Each measured frame now also
+//! asserts the tick range it really showed.
+//!
+//! A third fixture is a **spilled** file (issue #107): a file too large for
+//! the RAM budget renders through a different path — no pyramid at all
+//! (`plumbing::run_index_job` passes `None` per column for a spilled load,
+//! issue #102), so every frame decimates the raw, memory-mapped samples on
+//! screen. SPEC §5's frame budget applies to it just the same, and the full
+//! view (every sample on screen) is its worst case, which is the frame
+//! measured here. Should #102 ever give spilled files a pyramid, this is the
+//! fixture that gates that change.
+//!
 //! Per issue #61 decision 2 (mirrored from `glyde-core`'s benches), only the
 //! absolute SPEC §5 ceiling is build-blocking here; the >15% regression
 //! comparison is a manual check on the SPEC §5 reference machine using
@@ -62,6 +79,9 @@ const FRAME_TIME_CEILING: Duration = Duration::from_millis(100);
 
 struct Fixture {
     label: &'static str,
+    /// Keeps a spilled fixture's source CSV alive (its spill files live as
+    /// long as `dataset`).
+    _dir: Option<tempfile::TempDir>,
     dataset: Dataset,
     pyramids: Vec<Option<Vec<Vec<Bucket>>>>,
     ticks: Vec<i128>,
@@ -91,6 +111,7 @@ fn synthetic_fixture(label: &'static str, sample_count: usize, values: SeriesVal
     let cursor = views::time::CursorLookup::for_time(&dataset.time);
     Fixture {
         label,
+        _dir: None,
         dataset,
         pyramids,
         ticks,
@@ -115,12 +136,60 @@ fn i64_fixture(sample_count: usize) -> Fixture {
     )
 }
 
+/// The same shape as [`f64_fixture`], written to a CSV and opened with a
+/// zero RAM budget so it takes the spill path, then prepared exactly like
+/// the app prepares a completed spilled load: no pyramid for any column.
+fn spilled_fixture(sample_count: usize) -> Fixture {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("spilled.csv");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).expect("create fixture"));
+    writeln!(file, "timestamp,value").expect("write fixture");
+    for i in 0..sample_count {
+        writeln!(file, "{i},{}", (i as f64 * 0.001).sin()).expect("write fixture");
+    }
+    file.flush().expect("flush fixture");
+    drop(file);
+
+    let dataset = glyde_core::ingest::load_with_budget(
+        &path,
+        glyde_core::budget::RamBudget::from_total_ram_bytes(0),
+        dir.path(),
+    )
+    .expect("spilled fixture must open");
+    assert!(
+        dataset.is_spilled(),
+        "a zero budget must force the spill path"
+    );
+    assert_eq!(dataset.time.len(), sample_count);
+    let pyramids = vec![None; dataset.columns.len()];
+    let ticks = dataset.time.to_pyramid_ticks().into_owned();
+    let sample_cache = views::time::cache_column_samples(&dataset);
+    let cursor = views::time::CursorLookup::for_time(&dataset.time);
+    Fixture {
+        label: "f64 spilled (no pyramid)",
+        _dir: Some(dir),
+        dataset,
+        pyramids,
+        ticks,
+        sample_cache,
+        cursor,
+    }
+}
+
 /// One frame, on a persistent `Context` reused across calls exactly like
 /// `eframe` drives the real app across repaints. `hover` rests the pointer
 /// over the middle of the plot, which is what turns on the cursor readout
 /// (SPEC §4.1) — the state the view is in for as long as the user's mouse is
-/// over the plot while panning or zooming (issue #114).
-fn render_frame(ctx: &egui::Context, fixture: &Fixture, hover: bool) {
+/// over the plot while panning or zooming (issue #114). `view` is the
+/// horizontal span shown, in plot seconds. Returns the tick range the frame
+/// actually decimated.
+fn render_frame(
+    ctx: &egui::Context,
+    fixture: &Fixture,
+    hover: bool,
+    view: (f64, f64),
+) -> (i128, i128) {
     let events = if hover {
         vec![egui::Event::PointerMoved(Pos2::new(
             VIEWPORT_SIZE.x / 2.0,
@@ -134,9 +203,10 @@ fn render_frame(ctx: &egui::Context, fixture: &Fixture, hover: bool) {
         events,
         ..Default::default()
     };
+    let mut visible = (0, 0);
     let _ = ctx.run(input, |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            views::time::show(
+            visible = views::time::show_with_selection(
                 ui,
                 &fixture.dataset,
                 &fixture.pyramids,
@@ -144,52 +214,124 @@ fn render_frame(ctx: &egui::Context, fixture: &Fixture, hover: bool) {
                 &fixture.sample_cache,
                 &[],
                 fixture.cursor,
+                Some(view),
             );
         });
     });
+    visible
+}
+
+/// The fixture's whole time span, in plot seconds.
+fn full_view(fixture: &Fixture) -> (f64, f64) {
+    let time = &fixture.dataset.time;
+    let first = *fixture.ticks.first().expect("non-empty fixture");
+    let last = *fixture.ticks.last().expect("non-empty fixture");
+    (
+        views::time::tick_to_seconds(time, first),
+        views::time::tick_to_seconds(time, last),
+    )
+}
+
+/// The `step`-th frame of a pan: a window a tenth of the file wide, moved by
+/// a hundredth of the file per frame (wrapping), so every frame decimates a
+/// different range — what dragging the plot does.
+fn pan_view(fixture: &Fixture, step: usize) -> (f64, f64) {
+    let (min, max) = full_view(fixture);
+    let span = max - min;
+    let start = min + span * 0.9 * ((step % 90) as f64 / 90.0);
+    (start, start + span * 0.1)
+}
+
+/// Asserts SPEC §5's ceiling on one steady-state frame of `view`, after a
+/// warm-up frame, and that the frame really showed the samples it claims.
+fn assert_frame_budget(
+    ctx: &egui::Context,
+    fixture: &Fixture,
+    hover: bool,
+    view: (f64, f64),
+    what: &str,
+    min_visible_ticks: i128,
+) {
+    render_frame(ctx, fixture, hover, view);
+    let start = Instant::now();
+    let (first, last) = render_frame(ctx, fixture, hover, view);
+    let elapsed = start.elapsed();
+    assert!(
+        last - first >= min_visible_ticks,
+        "{what}: the frame showed ticks {first}..{last}, fewer than the \
+         {min_visible_ticks} this measurement is meant to cover"
+    );
+    assert!(
+        elapsed <= FRAME_TIME_CEILING,
+        "time-domain view render ({what}) took {elapsed:?} for {SAMPLE_COUNT} {} samples \
+         at a {VIEWPORT_SIZE:?} viewport, exceeding the {FRAME_TIME_CEILING:?} \
+         build-blocking ceiling (SPEC §5: pan/zoom p99 ≤100ms)",
+        fixture.label
+    );
 }
 
 fn bench_one_fixture(c: &mut Criterion, fixture: &Fixture) {
+    let full = full_view(fixture);
+    let span_ticks = fixture.ticks.last().expect("non-empty") - fixture.ticks[0];
     for hover in [false, true] {
         let ctx = egui::Context::default();
         let mode = if hover { "hovered" } else { "idle pointer" };
 
-        // Warm up egui's own font/layout caches so the ceiling check below
-        // measures steady-state per-frame cost, not one-time first-frame
-        // setup.
-        render_frame(&ctx, fixture, hover);
-
-        let start = Instant::now();
-        render_frame(&ctx, fixture, hover);
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed <= FRAME_TIME_CEILING,
-            "time-domain view render ({mode}) took {elapsed:?} for {SAMPLE_COUNT} {} samples \
-             at a {VIEWPORT_SIZE:?} viewport, exceeding the {FRAME_TIME_CEILING:?} \
-             build-blocking ceiling (SPEC §5: pan/zoom p99 ≤100ms)",
-            fixture.label
+        // The worst case: every sample of the file on screen.
+        assert_frame_budget(
+            &ctx,
+            fixture,
+            hover,
+            full,
+            &format!("full view, {mode}"),
+            span_ticks * 9 / 10,
+        );
+        // Panning: a different window every frame.
+        assert_frame_budget(
+            &ctx,
+            fixture,
+            hover,
+            pan_view(fixture, 37),
+            &format!("pan, {mode}"),
+            span_ticks / 20,
         );
 
-        let name = if hover {
-            format!("time_view_render/{}/hovered", fixture.label)
-        } else {
-            format!("time_view_render/{}", fixture.label)
-        };
-        c.bench_function(&name, |b| {
-            b.iter(|| {
-                render_frame(
-                    std::hint::black_box(&ctx),
-                    std::hint::black_box(fixture),
-                    hover,
-                )
-            })
-        });
+        let suffix = if hover { "/hovered" } else { "" };
+        c.bench_function(
+            &format!("time_view_render/{}/full view{suffix}", fixture.label),
+            |b| {
+                b.iter(|| {
+                    render_frame(
+                        std::hint::black_box(&ctx),
+                        std::hint::black_box(fixture),
+                        hover,
+                        full,
+                    )
+                })
+            },
+        );
+        let mut step = 0;
+        c.bench_function(
+            &format!("time_view_render/{}/pan{suffix}", fixture.label),
+            |b| {
+                b.iter(|| {
+                    step += 1;
+                    render_frame(
+                        std::hint::black_box(&ctx),
+                        std::hint::black_box(fixture),
+                        hover,
+                        pan_view(fixture, step),
+                    )
+                })
+            },
+        );
     }
 }
 
 fn bench_time_view_render(c: &mut Criterion) {
     bench_one_fixture(c, &f64_fixture(SAMPLE_COUNT));
     bench_one_fixture(c, &i64_fixture(SAMPLE_COUNT));
+    bench_one_fixture(c, &spilled_fixture(SAMPLE_COUNT));
 }
 
 criterion_group!(benches, bench_time_view_render);

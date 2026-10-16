@@ -639,7 +639,7 @@ fn absolute_ticks_per_second(time: &TimeAxis) -> Option<i128> {
 /// Inverse of [`seconds_to_tick`]: a pyramid tick (e.g. a [`Bucket`]'s
 /// midpoint) as a plot-seconds x-coordinate, the same coordinate space
 /// [`x_axis_seconds`] produces for real samples.
-pub(crate) fn tick_to_seconds(time: &TimeAxis, tick: i128) -> f64 {
+pub fn tick_to_seconds(time: &TimeAxis, tick: i128) -> f64 {
     match absolute_ticks_per_second(time) {
         Some(ticks_per_second) => tick as f64 / ticks_per_second as f64,
         None => progressive_tick_to_value(tick),

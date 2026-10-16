@@ -443,6 +443,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
      is the conventional default for this use.
 
 ### Fixed
+- **The scroll/zoom smoothness check now measures what it claims, including
+  for files too big for memory.** The automatic check that keeps
+  panning and zooming under SPEC §5's frame budget (≤ 100 ms) used to draw a
+  view only about one second wide, so it measured almost nothing, and it was
+  not even run by the automatic checks on every change. It now measures the
+  whole file on screen and a pan across it, for normal files and for a file
+  streamed from disk, and runs on every change. Measured on an Apple M1-class
+  Mac with 8 million samples: about 0.6 ms per frame in memory, 15.7 ms for
+  the whole of a disk-streamed file on screen, 1.8 ms while panning it. All
+  are well under the budget. The disk-streamed whole-file view grows with
+  file size (about 2 ms per million samples), which is what issue #102 is
+  about. (#107)
 - **The last on/off state of a file is now visible.** If a true/false
   column ended with a single sample in a new state (say `on, on, off`), that
   final `off` was never drawn. It now shows as a thin sliver at the right
