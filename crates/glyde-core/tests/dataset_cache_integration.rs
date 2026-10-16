@@ -23,9 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use glyde_core::budget::RamBudget;
-use glyde_core::ingest::{
-    self, Dataset, DecimalSeparator, InferenceReport, IngestOverrides, OpenSummary,
-};
+use glyde_core::ingest::{self, Dataset, InferenceReport, IngestOverrides, OpenSummary};
 use glyde_core::series::SeriesValues;
 
 /// Everything worth preserving at once: a semicolon delimiter and comma
@@ -140,6 +138,7 @@ fn a_reopen_is_identical_to_the_first_open() {
 #[cfg(unix)]
 #[test]
 fn a_reopen_does_not_read_the_source_file() {
+    use glyde_core::ingest::DecimalSeparator;
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("temp dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
