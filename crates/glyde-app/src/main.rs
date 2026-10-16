@@ -35,6 +35,20 @@ fn main() -> anyhow::Result<()> {
         Err(err) => tracing::warn!(error = %err, "no cache directory; skipping the spill sweep"),
     }
 
+    // Plan the PSD's FFTs now, off the UI thread, while memory is
+    // plentiful: rustfft allocates a plan infallibly, so a PSD must never be
+    // the one asking for it (`dsp::welch::prepare_fft_plans`).
+    let fft_planning = std::thread::Builder::new()
+        .name("glyde-fft-plans".to_string())
+        .spawn(|| {
+            let started = std::time::Instant::now();
+            glyde_core::dsp::welch::prepare_fft_plans();
+            tracing::info!(elapsed = ?started.elapsed(), "PSD FFT plans prepared");
+        });
+    if let Err(err) = fft_planning {
+        tracing::warn!(error = %err, "could not plan the PSD FFTs at startup; they will be planned on first use");
+    }
+
     // SPEC §6: single window, single file at a time.
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("Glyde"),

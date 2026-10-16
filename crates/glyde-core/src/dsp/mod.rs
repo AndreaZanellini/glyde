@@ -21,5 +21,6 @@
 
 pub mod decimation;
 pub mod detrend;
+pub mod psd;
 pub mod welch;
 pub mod window;

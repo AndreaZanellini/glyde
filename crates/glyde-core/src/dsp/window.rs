@@ -37,10 +37,17 @@ pub enum Window {
 
 /// Per-sample coefficients for `window` over a segment of `len` samples.
 pub fn coefficients(window: Window, len: usize) -> Vec<f64> {
+    (0..len).map(|n| coefficient(window, n, len)).collect()
+}
+
+/// The `n`-th of [`coefficients`]`(window, len)`, on its own — so a caller
+/// can fill a buffer it already reserved (fallibly) rather than have one
+/// allocated for it.
+pub fn coefficient(window: Window, n: usize, len: usize) -> f64 {
     match window {
-        Window::Rectangular => vec![1.0; len],
-        Window::Hann => raised_cosine(len, 0.5, 0.5),
-        Window::Hamming => raised_cosine(len, 0.54, 0.46),
+        Window::Rectangular => 1.0,
+        Window::Hann => raised_cosine(n, len, 0.5, 0.5),
+        Window::Hamming => raised_cosine(n, len, 0.54, 0.46),
     }
 }
 
@@ -48,14 +55,12 @@ pub fn coefficients(window: Window, len: usize) -> Vec<f64> {
 /// (`a = b = 0.5`) and Hamming (`a = 0.54`, `b = 0.46`) windows. A window of
 /// `len <= 1` has no `n / (len - 1)` interval to taper across, so every
 /// coefficient is `1.0` (matches `Rectangular` for the degenerate case).
-fn raised_cosine(len: usize, a: f64, b: f64) -> Vec<f64> {
+fn raised_cosine(n: usize, len: usize, a: f64, b: f64) -> f64 {
     if len <= 1 {
-        return vec![1.0; len];
+        return 1.0;
     }
     let denom = (len - 1) as f64;
-    (0..len)
-        .map(|n| a - b * (2.0 * PI * n as f64 / denom).cos())
-        .collect()
+    a - b * (2.0 * PI * n as f64 / denom).cos()
 }
 
 /// The mean-square of a window's coefficients, `(1/len) * sum(w[n]^2)`. This

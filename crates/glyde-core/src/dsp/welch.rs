@@ -26,17 +26,24 @@
 //! raw samples ... never on decimated/pyramid data": the type system makes it
 //! impossible to hand this module anything else.
 //!
-//! Still not covered here (docs/ROADMAP.md M5, separate items): streaming
-//! accumulation for a selection too large for the memory budget, and the
-//! `Irregular`-sampling product behavior (PSD disabled + offered sub-range).
-//! Both `welch` and `welch_segmented` require resident input slices, although
-//! their FFT scratch buffers are only one analysis window long. A future
-//! source-based entry point must read raw samples in bounded chunks.
+//! `welch_source`/`welch_segmented_source` are the streaming entry points
+//! (SPEC §3.2, docs/ROADMAP.md M5 "Streaming Welch"): they read a
+//! [`SampleSource`] in its own bounded chunks and hold one analysis window at
+//! a time, never the selection. `welch`/`welch_segmented` are the same code
+//! fed from a resident slice. Choosing *what* to compute on — which samples,
+//! which segments, whether the selection may have a PSD at all — is
+//! `dsp::psd`'s job, not this module's.
+
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::detrend::{self, Detrend};
 use super::window::{self, Window};
+use crate::series::SampleSource;
+use crate::{GlydeError, Result};
 use rustfft::num_complex::Complex;
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner};
 
 /// Smallest segment length the software's default ever picks (SPEC §3.2).
 pub const MIN_SEGMENT_LEN: usize = 256;
@@ -48,7 +55,7 @@ pub const DEFAULT_OVERLAP: f64 = 0.5;
 /// The (at most three) user-facing controls behind the PSD settings
 /// affordance (SPEC §3.2), plus the detrend method (documented, not exposed
 /// as a fourth control).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WelchConfig {
     pub window: Window,
     pub segment_len: usize,
@@ -68,8 +75,12 @@ pub struct Psd {
     pub power: Vec<f64>,
     /// Frequency resolution `sample_rate_hz / segment_len`.
     pub delta_f: f64,
-    /// Number of segments averaged into this estimate.
+    /// Number of analysis windows averaged into this estimate.
     pub segment_count: usize,
+    /// How many non-finite (missing) samples the selection held. None of them
+    /// ever reached an FFT: every window that would have spanned one was
+    /// skipped (see [`welch_source`]).
+    pub non_finite_count: usize,
 }
 
 /// The software's default segment length: the largest power of two `<= N /
@@ -94,84 +105,316 @@ pub fn default_segment_length(sample_count: usize) -> usize {
 /// `config.segment_len`, the whole slice is used as one shorter segment
 /// (matching the length actually handed in, so `freqs`/`delta_f` describe
 /// what was really computed rather than a padded fiction).
+///
+/// The in-memory face of [`welch_source`]: both feed the same
+/// [`WelchAccumulator`], so there is exactly one Welch implementation
+/// (docs/ARCHITECTURE.md Hard rule 4).
 pub fn welch(samples: &[f64], sample_rate_hz: f64, config: &WelchConfig) -> Psd {
-    let effective_len = config.segment_len.min(samples.len());
+    welch_source(
+        samples,
+        0..samples.len(),
+        sample_rate_hz,
+        config,
+        &mut |_| true,
+    )
+    .expect("reading an in-memory slice cannot fail")
+    .expect("an estimate that is never cancelled always completes")
+}
+
+/// Welch's method over `range` of `source`, streaming (SPEC §3.2: "accumulate
+/// segment periodograms while reading, never by loading everything"): the
+/// samples are read in the source's own bounded chunks, and the only memory
+/// held is one analysis window's worth of buffers plus the running sum of
+/// periodograms — independent of how many samples the selection holds.
+///
+/// `keep_going` is called after every chunk with the number of samples read
+/// so far; returning `false` cancels the estimate, which then returns
+/// `Ok(None)` — never a spectrum of whatever part happened to be read.
+///
+/// A non-finite sample (a missing value, SPEC §1.3) is never fed to an FFT:
+/// the window being filled is discarded and the next one starts right after
+/// the hole, so no analysis window ever spans one. How many there were is
+/// reported in [`Psd::non_finite_count`].
+pub fn welch_source<S: SampleSource + ?Sized>(
+    source: &S,
+    range: Range<usize>,
+    sample_rate_hz: f64,
+    config: &WelchConfig,
+    keep_going: &mut dyn FnMut(usize) -> bool,
+) -> Result<Option<Psd>> {
+    let end = range.end.min(source.sample_count());
+    let start = range.start.min(end);
+    let selected = end - start;
+    let effective_len = config.segment_len.min(selected);
     if effective_len == 0 {
-        return Psd {
+        return Ok(Some(Psd {
             freqs: Vec::new(),
             power: Vec::new(),
             delta_f: sample_rate_hz / config.segment_len.max(1) as f64,
             segment_count: 0,
-        };
+            non_finite_count: 0,
+        }));
     }
 
-    let step = sub_segment_step(effective_len, config.overlap);
-    let window_coeffs = window::coefficients(config.window, effective_len);
-    let window_sum_sq: f64 = window_coeffs.iter().map(|w| w * w).sum();
+    let mut accumulator = WelchAccumulator::new(effective_len, config)?;
+    let mut read = 0usize;
+    let mut cancelled = false;
+    source.visit_sample_chunks(start..end, &mut |chunk| {
+        if cancelled {
+            return Ok(());
+        }
+        accumulator.push(chunk);
+        read += chunk.len();
+        cancelled = !keep_going(read);
+        Ok(())
+    })?;
+    if cancelled {
+        return Ok(None);
+    }
+    accumulator.finish(sample_rate_hz).map(Some)
+}
 
-    let mut planner = FftPlanner::<f64>::new();
-    let fft = planner.plan_fft_forward(effective_len);
+/// The running state of one Welch estimate: the window being filled, the
+/// FFT plan and its scratch, and the sum of every completed window's
+/// periodogram. Its footprint is a fixed multiple of the window length, so
+/// it is the same whether it is fed ten thousand samples or ten billion.
+struct WelchAccumulator {
+    len: usize,
+    step: usize,
+    detrend: Detrend,
+    window_coeffs: Vec<f64>,
+    window_sum_sq: f64,
+    fft: Arc<dyn Fft<f64>>,
+    /// The samples of the window currently being filled, in order.
+    pending: Vec<f64>,
+    // Reuse every scratch buffer across windows. A large selection may have
+    // hundreds of overlapping windows; allocating per window would add
+    // avoidable latency to the PSD path.
+    buffer: Vec<f64>,
+    spectrum: Vec<Complex<f64>>,
+    scratch: Vec<Complex<f64>>,
+    accumulated: Vec<f64>,
+    segment_count: usize,
+    non_finite_count: usize,
+}
 
-    let bin_count = effective_len / 2 + 1;
-    let mut accumulated = vec![0.0; bin_count];
-    let mut segment_count = 0usize;
-    // Reuse both scratch buffers across windows. A large selection may have
-    // hundreds of overlapping windows; allocating two vectors per window
-    // would add avoidable latency to the PSD path.
-    let mut buffer = vec![0.0; effective_len];
-    let mut spectrum = vec![Complex::new(0.0, 0.0); effective_len];
+impl WelchAccumulator {
+    /// Every buffer is reserved fallibly, before the FFT is planned: if the
+    /// system cannot provide the memory, this is an error the caller can
+    /// report, never a terminated process.
+    fn new(len: usize, config: &WelchConfig) -> Result<Self> {
+        let mut window_coeffs = try_with_capacity::<f64>(len)?;
+        window_coeffs.extend((0..len).map(|n| window::coefficient(config.window, n, len)));
+        let window_sum_sq = window_coeffs.iter().map(|w| w * w).sum();
+        let pending = try_with_capacity::<f64>(len)?;
+        let buffer = try_filled(len, 0.0)?;
+        let spectrum = try_filled(len, Complex::new(0.0, 0.0))?;
+        let accumulated = try_filled(len / 2 + 1, 0.0)?;
+        let fft = fft_plan(len)?;
+        let scratch = try_filled(fft.get_inplace_scratch_len(), Complex::new(0.0, 0.0))?;
+        Ok(Self {
+            len,
+            step: sub_segment_step(len, config.overlap),
+            detrend: config.detrend,
+            window_coeffs,
+            window_sum_sq,
+            fft,
+            pending,
+            buffer,
+            spectrum,
+            scratch,
+            accumulated,
+            segment_count: 0,
+            non_finite_count: 0,
+        })
+    }
 
-    let mut start = 0usize;
-    while start + effective_len <= samples.len() {
-        buffer.copy_from_slice(&samples[start..start + effective_len]);
-        detrend::apply(&mut buffer, config.detrend);
-        for ((frequency_sample, &sample), &w) in
-            spectrum.iter_mut().zip(buffer.iter()).zip(&window_coeffs)
+    /// Feeds the next samples, in order, completing every window they fill.
+    fn push(&mut self, mut samples: &[f64]) {
+        while !samples.is_empty() {
+            let wanted = self.len - self.pending.len();
+            let take = wanted.min(samples.len());
+            let (head, rest) = samples.split_at(take);
+            samples = rest;
+            match head.iter().rposition(|sample| !sample.is_finite()) {
+                Some(last_hole) => {
+                    // Every window touching a hole is discarded; the next
+                    // one starts on the sample right after the last hole.
+                    self.non_finite_count += head.iter().filter(|s| !s.is_finite()).count();
+                    self.pending.clear();
+                    self.pending.extend_from_slice(&head[last_hole + 1..]);
+                }
+                None => self.pending.extend_from_slice(head),
+            }
+            if self.pending.len() == self.len {
+                self.complete_window();
+                self.pending.drain(..self.step);
+            }
+        }
+    }
+
+    fn complete_window(&mut self) {
+        self.buffer.copy_from_slice(&self.pending);
+        detrend::apply(&mut self.buffer, self.detrend);
+        for ((frequency_sample, &sample), &w) in self
+            .spectrum
+            .iter_mut()
+            .zip(self.buffer.iter())
+            .zip(&self.window_coeffs)
         {
             *frequency_sample = Complex::new(sample * w, 0.0);
         }
-        fft.process(&mut spectrum);
-
-        for (bin, power) in accumulated.iter_mut().enumerate() {
-            *power += spectrum[bin].norm_sqr();
+        self.fft
+            .process_with_scratch(&mut self.spectrum, &mut self.scratch);
+        for (bin, power) in self.accumulated.iter_mut().enumerate() {
+            *power += self.spectrum[bin].norm_sqr();
         }
-
-        segment_count += 1;
-        start += step;
-        if step == 0 {
-            break;
-        }
+        self.segment_count += 1;
     }
 
-    let scale_denominator = sample_rate_hz * window_sum_sq;
-    let nyquist_bin = if effective_len.is_multiple_of(2) {
-        Some(effective_len / 2)
-    } else {
-        None
-    };
-    let power: Vec<f64> = accumulated
-        .into_iter()
-        .enumerate()
-        .map(|(bin, sum)| {
-            let mean_power = sum / segment_count.max(1) as f64;
+    /// The averaged, one-sided, density-scaled estimate (SPEC §3.2). The
+    /// power is scaled in place; only the frequency axis is a new
+    /// (fallibly reserved) allocation.
+    fn finish(self, sample_rate_hz: f64) -> Result<Psd> {
+        let scale_denominator = sample_rate_hz * self.window_sum_sq;
+        let nyquist_bin = if self.len.is_multiple_of(2) {
+            Some(self.len / 2)
+        } else {
+            None
+        };
+        let segment_count = self.segment_count;
+        let mut power = self.accumulated;
+        for (bin, sum) in power.iter_mut().enumerate() {
+            let mean_power = *sum / segment_count.max(1) as f64;
             let one_sided_factor = if bin == 0 || Some(bin) == nyquist_bin {
                 1.0
             } else {
                 2.0
             };
-            one_sided_factor * mean_power / scale_denominator
+            *sum = one_sided_factor * mean_power / scale_denominator;
+        }
+
+        let delta_f = sample_rate_hz / self.len as f64;
+        let mut freqs = try_with_capacity::<f64>(power.len())?;
+        freqs.extend((0..power.len()).map(|bin| bin as f64 * delta_f));
+
+        Ok(Psd {
+            freqs,
+            power,
+            delta_f,
+            segment_count,
+            non_finite_count: self.non_finite_count,
         })
-        .collect();
-
-    let delta_f = sample_rate_hz / effective_len as f64;
-    let freqs = (0..bin_count).map(|bin| bin as f64 * delta_f).collect();
-
-    Psd {
-        freqs,
-        power,
-        delta_f,
-        segment_count,
     }
+}
+
+/// Every window length the software can choose by itself or offer in the
+/// PSD settings: the powers of two in `[MIN_SEGMENT_LEN, MAX_SEGMENT_LEN]`.
+const STANDARD_LENGTHS: usize =
+    (MAX_SEGMENT_LEN.trailing_zeros() - MIN_SEGMENT_LEN.trailing_zeros() + 1) as usize;
+
+/// One forward FFT plan per standard length, shared by every estimate and
+/// every thread. `rustfft` allocates a plan's twiddle factors infallibly —
+/// an allocation failure there would terminate the process — so the
+/// application plans them all once at startup ([`prepare_fft_plans`]), while
+/// memory is plentiful, and a PSD then never asks `rustfft` for memory.
+static STANDARD_PLANS: [OnceLock<Arc<dyn Fft<f64>>>; STANDARD_LENGTHS] =
+    [const { OnceLock::new() }; STANDARD_LENGTHS];
+
+/// How many FFT plans this process has created — so a test can prove the
+/// PSD path creates none once [`prepare_fft_plans`] has run.
+static PLANS_CREATED: AtomicUsize = AtomicUsize::new(0);
+
+/// Plans every standard window length now (a few milliseconds, about 2 MB
+/// held for the life of the process). Meant for a background thread at
+/// application startup; idempotent.
+pub fn prepare_fft_plans() {
+    for slot in 0..STANDARD_LENGTHS {
+        standard_plan(slot);
+    }
+}
+
+/// See [`PLANS_CREATED`].
+#[doc(hidden)]
+pub fn fft_plans_created() -> usize {
+    PLANS_CREATED.load(Ordering::Relaxed)
+}
+
+fn standard_plan(slot: usize) -> Arc<dyn Fft<f64>> {
+    Arc::clone(STANDARD_PLANS[slot].get_or_init(|| {
+        PLANS_CREATED.fetch_add(1, Ordering::Relaxed);
+        FftPlanner::<f64>::new().plan_fft_forward(MIN_SEGMENT_LEN << slot)
+    }))
+}
+
+/// Upper bound on what `rustfft` allocates to plan a length-`len` FFT of
+/// arbitrary factorization: twiddle factors plus, for an awkward (e.g.
+/// prime) length, Bluestein's inner power-of-two FFT of up to `4 × len`
+/// points and its own twiddles.
+pub(crate) fn plan_bytes_upper_bound(len: usize) -> u64 {
+    (len as u64).saturating_mul(16 * 8)
+}
+
+/// The forward FFT plan for a `len`-sample window. A standard length comes
+/// from the shared cache. Any other length — only a uniform selection
+/// shorter than one segment has one — is planned on demand, after checking
+/// that the system can provide the memory planning needs: the check is
+/// released just before `rustfft` allocates, so it makes a refusal there
+/// very unlikely, not impossible.
+fn fft_plan(len: usize) -> Result<Arc<dyn Fft<f64>>> {
+    if is_standard_length(len) {
+        let slot = (len.trailing_zeros() - MIN_SEGMENT_LEN.trailing_zeros()) as usize;
+        return Ok(standard_plan(slot));
+    }
+    // Every column of one PSD asks for the same length: keep the last
+    // on-demand plan so they share it, but only one, so the cache stays
+    // bounded whatever lengths a session goes through.
+    let mut last = LAST_ON_DEMAND_PLAN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((cached_len, plan)) = last.as_ref() {
+        if *cached_len == len {
+            return Ok(Arc::clone(plan));
+        }
+    }
+    // Free the previous plan before probing for and allocating the next.
+    *last = None;
+    drop(try_with_capacity::<u8>(
+        usize::try_from(plan_bytes_upper_bound(len)).unwrap_or(usize::MAX),
+    )?);
+    PLANS_CREATED.fetch_add(1, Ordering::Relaxed);
+    let plan = FftPlanner::<f64>::new().plan_fft_forward(len);
+    *last = Some((len, Arc::clone(&plan)));
+    Ok(plan)
+}
+
+/// The most recent plan [`fft_plan`] made for a non-standard length.
+static LAST_ON_DEMAND_PLAN: Mutex<Option<(usize, FftPlan)>> = Mutex::new(None);
+
+/// A forward FFT plan, shareable across threads.
+type FftPlan = Arc<dyn Fft<f64>>;
+
+/// Whether a `len`-sample window has a plan in the shared startup cache.
+pub(crate) fn is_standard_length(len: usize) -> bool {
+    len.is_power_of_two() && (MIN_SEGMENT_LEN..=MAX_SEGMENT_LEN).contains(&len)
+}
+
+/// A `Vec` with room for `len` elements, or [`GlydeError::OutOfMemory`] when
+/// the system refuses the allocation — never an aborted process.
+fn try_with_capacity<T>(len: usize) -> Result<Vec<T>> {
+    let mut vec = Vec::new();
+    vec.try_reserve_exact(len)
+        .map_err(|_| GlydeError::OutOfMemory {
+            requested_bytes: (len as u64).saturating_mul(std::mem::size_of::<T>() as u64),
+        })?;
+    Ok(vec)
+}
+
+/// [`try_with_capacity`], filled with `len` copies of `value`.
+fn try_filled<T: Clone>(len: usize, value: T) -> Result<Vec<T>> {
+    let mut vec = try_with_capacity(len)?;
+    vec.resize(len, value);
+    Ok(vec)
 }
 
 /// The sample step between consecutive analysis windows for a given overlap
@@ -191,49 +434,112 @@ fn sub_segment_step(segment_len: usize, overlap: f64) -> usize {
 /// from the average (the caller is responsible for reporting them, SPEC
 /// §3.3).
 pub fn welch_segmented(segments: &[&[f64]], sample_rate_hz: f64, config: &WelchConfig) -> Psd {
-    let mut qualifying = segments
+    let mut average = LengthWeightedAverage::default();
+    for seg in segments
         .iter()
-        .copied()
-        .filter(|seg| seg.len() >= config.segment_len);
+        .filter(|seg| seg.len() >= config.segment_len)
+    {
+        average.add(seg.len(), welch(seg, sample_rate_hz, config));
+    }
+    average.finish(sample_rate_hz, config)
+}
 
-    let Some(first) = qualifying.next() else {
-        return Psd {
-            freqs: Vec::new(),
-            power: Vec::new(),
-            delta_f: sample_rate_hz / config.segment_len.max(1) as f64,
-            segment_count: 0,
+/// [`welch_segmented`] over `segments` — ranges of one `source`, each a
+/// contiguous, gap-free run — streaming each exactly as [`welch_source`]
+/// does and folding it into the average as soon as it completes, so memory
+/// stays one window's worth however many segments there are. `keep_going`
+/// sees the running total of samples read across all segments; cancelling
+/// returns `Ok(None)`.
+pub fn welch_segmented_source<S: SampleSource + ?Sized>(
+    source: &S,
+    segments: &[Range<usize>],
+    sample_rate_hz: f64,
+    config: &WelchConfig,
+    keep_going: &mut dyn FnMut(usize) -> bool,
+) -> Result<Option<Psd>> {
+    let mut average = LengthWeightedAverage::default();
+    let mut read_before = 0usize;
+    for segment in segments.iter().filter(|r| r.len() >= config.segment_len) {
+        let estimate = welch_source(
+            source,
+            segment.clone(),
+            sample_rate_hz,
+            config,
+            &mut |read| keep_going(read_before + read),
+        )?;
+        let Some(estimate) = estimate else {
+            return Ok(None);
         };
-    };
+        read_before += segment.len();
+        average.add(segment.len(), estimate);
+    }
+    Ok(Some(average.finish(sample_rate_hz, config)))
+}
 
-    let reference = welch(first, sample_rate_hz, config);
-    let mut weighted_power: Vec<f64> = reference
-        .power
-        .iter()
-        .map(|&power| power * first.len() as f64)
-        .collect();
-    let mut total_weight = first.len() as f64;
-    let mut total_segment_count = reference.segment_count;
+/// SPEC §3.3: per-segment estimates averaged, each weighted by its segment's
+/// length in samples, folded in one at a time. The one place this average is
+/// computed, for both the in-memory and the streaming segmented entry points.
+#[derive(Default)]
+pub(crate) struct LengthWeightedAverage {
+    reference: Option<Psd>,
+    weighted_power: Vec<f64>,
+    total_weight: f64,
+    segment_count: usize,
+    non_finite_count: usize,
+}
 
-    for seg in qualifying {
-        let psd = welch(seg, sample_rate_hz, config);
-        let weight = seg.len() as f64;
-        for (acc, &p) in weighted_power.iter_mut().zip(psd.power.iter()) {
-            *acc += weight * p;
+impl LengthWeightedAverage {
+    /// Folds one segment's estimate in. The first one's own power array
+    /// becomes the running sum, so adding never allocates.
+    pub(crate) fn add(&mut self, len: usize, psd: Psd) {
+        let weight = len as f64;
+        self.total_weight += weight;
+        self.segment_count += psd.segment_count;
+        self.non_finite_count += psd.non_finite_count;
+        if self.reference.is_some() {
+            for (acc, &p) in self.weighted_power.iter_mut().zip(psd.power.iter()) {
+                *acc += weight * p;
+            }
+            return;
         }
-        total_weight += weight;
-        total_segment_count += psd.segment_count;
+        let Psd {
+            freqs,
+            mut power,
+            delta_f,
+            segment_count,
+            non_finite_count,
+        } = psd;
+        power.iter_mut().for_each(|p| *p *= weight);
+        self.weighted_power = power;
+        self.reference = Some(Psd {
+            freqs,
+            power: Vec::new(),
+            delta_f,
+            segment_count,
+            non_finite_count,
+        });
     }
 
-    let power = weighted_power
-        .into_iter()
-        .map(|p| p / total_weight)
-        .collect();
-
-    Psd {
-        freqs: reference.freqs,
-        power,
-        delta_f: reference.delta_f,
-        segment_count: total_segment_count,
+    pub(crate) fn finish(self, sample_rate_hz: f64, config: &WelchConfig) -> Psd {
+        let Some(reference) = self.reference else {
+            return Psd {
+                freqs: Vec::new(),
+                power: Vec::new(),
+                delta_f: sample_rate_hz / config.segment_len.max(1) as f64,
+                segment_count: 0,
+                non_finite_count: 0,
+            };
+        };
+        let total_weight = self.total_weight;
+        let mut power = self.weighted_power;
+        power.iter_mut().for_each(|p| *p /= total_weight);
+        Psd {
+            freqs: reference.freqs,
+            power,
+            delta_f: reference.delta_f,
+            segment_count: self.segment_count,
+            non_finite_count: self.non_finite_count,
+        }
     }
 }
 

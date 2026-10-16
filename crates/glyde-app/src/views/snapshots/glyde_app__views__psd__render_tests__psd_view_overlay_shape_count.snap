@@ -1,0 +1,5 @@
+---
+source: crates/glyde-app/src/views/psd.rs
+expression: output.shapes.len()
+---
+1001

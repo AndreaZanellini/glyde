@@ -259,7 +259,16 @@ fn a_cached_entrys_timestamps_match_the_datasets_own_pyramid_ticks() {
 // ---------------------------------------------------------------------------
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Held by every test that converts the `i64` fixture. The counter below is a
+/// *thread-local* subscriber, while the precision-loss `warn!` call site is
+/// shared by the whole test binary: when another test thread reaches that
+/// call site (with no subscriber of its own) at the moment the counter is
+/// being installed, `tracing` can cache the call site as uninteresting and
+/// the counter sees 0 events. Never letting the two run concurrently removes
+/// that race; the counts themselves are unchanged.
+static PRECISION_LOSS_CALLSITE: Mutex<()> = Mutex::new(());
 
 /// Counts `WARN` events emitted from `glyde_core::series` — i.e. SPEC §1.4's
 /// per-value precision-loss warning, one per `i64` element actually converted
@@ -318,6 +327,9 @@ fn large_i64_csv(row_count: usize) -> tempfile::NamedTempFile {
 
 #[test]
 fn a_reopen_of_an_i64_column_converts_it_to_f64_no_times_and_a_first_open_exactly_once() {
+    let _serialized = PRECISION_LOSS_CALLSITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     const ROWS: usize = 2_000;
 
     let file = large_i64_csv(ROWS);
@@ -395,6 +407,9 @@ fn a_reopen_of_an_i64_column_converts_it_to_f64_no_times_and_a_first_open_exactl
 /// mean skipping fidelity (Golden Rule 1).
 #[test]
 fn an_i64_columns_cached_samples_match_an_in_memory_conversion_exactly() {
+    let _serialized = PRECISION_LOSS_CALLSITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let file = large_i64_csv(500);
     let dataset = glyde_core::ingest::load(file.path()).expect("load must succeed");
     let cache_dir = tempfile::tempdir().expect("temp cache dir");

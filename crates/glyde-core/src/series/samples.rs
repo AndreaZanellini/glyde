@@ -67,6 +67,22 @@ pub trait SampleSource {
     ) -> Result<()>;
 }
 
+/// A borrowed source is a source: lets a caller hand over a list of
+/// `&[f64]` (or of any other source) without copying.
+impl<S: SampleSource + ?Sized> SampleSource for &S {
+    fn sample_count(&self) -> usize {
+        (**self).sample_count()
+    }
+
+    fn visit_sample_chunks(
+        &self,
+        range: Range<usize>,
+        visit: &mut dyn FnMut(&[f64]) -> Result<()>,
+    ) -> Result<()> {
+        (**self).visit_sample_chunks(range, visit)
+    }
+}
+
 /// The in-memory `f64` case: one borrow of the samples that are already
 /// there, handed over in [`SAMPLE_CHUNK_LEN`] pieces so a chunk-boundary bug
 /// cannot hide on the slice path and show up only on the spilled one.
