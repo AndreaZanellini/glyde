@@ -566,6 +566,20 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `blocking-decision` issue rather than decided here.
 
 ### Changed
+- **Files too large for memory now scroll and zoom as fast as small ones.**
+  For such a file, Glyde used to have no overview structure (the "pyramid"
+  of min/max summaries) to draw from, because it would have cost too much
+  memory, so showing the whole file meant reading every sample on every
+  frame: about 15 ms per frame for 8 million samples, growing with the file.
+  The pyramid is now kept on disk instead of in memory, so it costs no RAM:
+  the whole-file view takes about 0.3 ms per frame and no longer grows with
+  file size. What is drawn is exactly the same as before. Building it takes
+  about 0.1 s per million samples per column after the file is read, and
+  disk space of about 9 bytes per sample per column (for a 100-million-row,
+  8-column file, about 7 GB), deleted when the file is closed. Glyde checks
+  that space first; if it is missing, the file still opens and draws the
+  same picture, just as slowly as before when the whole file is on screen.
+  (#102)
 - **Files open about 2–3× faster, and the plot no longer stutters while the
   mouse is over it.** (issue #114) Measured on a 1 GB, 9.2-million-row,
   8-channel CSV, median of three runs, before → after:

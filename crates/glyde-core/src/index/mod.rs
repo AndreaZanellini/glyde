@@ -17,6 +17,7 @@
 //! reopening a known file instant (docs/ARCHITECTURE.md §The index, issue
 //! #59).
 
+pub mod disk_pyramid;
 pub mod level0;
 pub mod pyramid;
 pub mod spill;

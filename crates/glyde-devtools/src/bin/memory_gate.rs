@@ -30,14 +30,18 @@
 //! the time view renders from, which reads every sample and every tick. Until
 //! this gate covered that too, the flat-RSS property was only ever proven for
 //! the path that skips it, and a whole-column read there would have gone
-//! unnoticed. `--pyramid-columns` decides how many of the fixture's numeric
-//! columns get one; see its own documentation for why the default is not "all
-//! of them".
+//! unnoticed. Since issue #102 a spilled dataset's pyramids are built on disk
+//! (one memory-mapped file per level), exactly as the app builds them, so the
+//! gate builds one for **every** numeric column by default — the assertion
+//! that proves the pyramid itself no longer grows RAM with file size.
+//! `--pyramid-columns` limits that, for comparison runs.
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use glyde_core::budget::RamBudget;
 use glyde_core::dsp::decimation::{build_pyramid_streaming, Bucket};
+use glyde_core::index::disk_pyramid::{build_disk_pyramid, DiskPyramid};
+use glyde_core::index::spill::SpillSet;
 use glyde_core::ingest::{self, Dataset};
 use glyde_devtools::{fixture_path, write_csv_fixture, PeakRssSampler};
 use std::time::Duration;
@@ -75,38 +79,73 @@ struct Args {
     budget_gb: Option<f64>,
 
     /// How many of the fixture's numeric columns to build a full min/max
-    /// pyramid for, with the peak-RSS sampler still running (issue #88). `0`
-    /// measures the open alone, as this gate did before.
-    ///
-    /// The default is 1, not "every column", and deliberately so: reading the
-    /// source columns to build a pyramid is bounded, but the pyramid it
-    /// produces is not — about 9 bytes per sample per column across all
-    /// levels, which for this gate's 8-column fixture would be a multiple of
-    /// the SPEC §5 cap on its own and would say nothing about the bug class
-    /// this gate exists to catch. One column proves the *reading* is bounded;
-    /// bounding the pyramid's own size is issue #102.
-    #[arg(long, default_value_t = 1)]
-    pyramid_columns: usize,
+    /// pyramid for, with the peak-RSS sampler still running (issue #88).
+    /// Every numeric column when omitted (issue #102); `0` measures the open
+    /// alone.
+    #[arg(long)]
+    pyramid_columns: Option<usize>,
+}
+
+/// The pyramids the gate built, kept alive until the sampler stops — in
+/// memory for an in-memory dataset, on disk for a spilled one, as the app
+/// does (issue #102).
+enum GatePyramids {
+    Memory(Vec<Vec<Vec<Bucket>>>),
+    Disk(Vec<DiskPyramid>),
+}
+
+impl GatePyramids {
+    fn count(&self) -> usize {
+        match self {
+            GatePyramids::Memory(pyramids) => pyramids.len(),
+            GatePyramids::Disk(pyramids) => pyramids.len(),
+        }
+    }
+
+    /// Bytes of buckets held in RAM (none for on-disk pyramids).
+    fn ram_bytes(&self) -> usize {
+        match self {
+            GatePyramids::Memory(pyramids) => pyramid_bytes(pyramids),
+            GatePyramids::Disk(_) => 0,
+        }
+    }
 }
 
 /// Builds a full pyramid for up to `column_limit` of `dataset`'s numeric
 /// columns, through the bounded-chunk reader so a spilled column is never made
 /// resident (issue #88). Returns the pyramids themselves — the caller must
 /// keep them alive until the RSS sampler stops, or their cost is not measured.
-fn build_gate_pyramids(dataset: &Dataset, column_limit: usize) -> Result<Vec<Vec<Vec<Bucket>>>> {
-    let mut pyramids = Vec::new();
-    for (index, series) in dataset.columns.iter().enumerate() {
-        if pyramids.len() >= column_limit {
-            break;
+fn build_gate_pyramids(
+    dataset: &Dataset,
+    column_limit: usize,
+    spill_dir: &std::path::Path,
+) -> Result<GatePyramids> {
+    let numeric = dataset
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, series)| Some((index, series.values().sample_source()?)))
+        .take(column_limit);
+    if dataset.is_spilled() {
+        let set = SpillSet::create(spill_dir).context("creating the pyramids' spill set")?;
+        let mut pyramids = Vec::new();
+        for (index, samples) in numeric {
+            pyramids.push(
+                build_disk_pyramid(&set, &samples, &dataset.time)
+                    .with_context(|| format!("building the on-disk pyramid for column {index}"))?,
+            );
         }
-        let Some(samples) = series.values().sample_source() else {
-            continue; // bool/string: no numeric plot, no pyramid
-        };
-        let pyramid = build_pyramid_streaming(&samples, &dataset.time)
-            .with_context(|| format!("building the pyramid for column {index}"))?;
-        pyramids.push(pyramid);
+        Ok(GatePyramids::Disk(pyramids))
+    } else {
+        let mut pyramids = Vec::new();
+        for (index, samples) in numeric {
+            pyramids.push(
+                build_pyramid_streaming(&samples, &dataset.time)
+                    .with_context(|| format!("building the pyramid for column {index}"))?,
+            );
+        }
+        Ok(GatePyramids::Memory(pyramids))
     }
-    Ok(pyramids)
 }
 
 /// Total bytes the built pyramids occupy, so the printed line separates the
@@ -164,15 +203,17 @@ fn main() -> Result<()> {
     // Build the pyramid *while the sampler is still running* and keep it alive
     // until it stops: this is the whole point of measuring it (issue #88).
     let pyramids = match open_result.as_ref() {
-        Ok((_summary, _report, dataset)) => {
-            Some(build_gate_pyramids(dataset, args.pyramid_columns))
-        }
+        Ok((_summary, _report, dataset)) => Some(build_gate_pyramids(
+            dataset,
+            args.pyramid_columns.unwrap_or(usize::MAX),
+            &spill_dir,
+        )),
         Err(_) => None,
     };
     let pyramid_summary = pyramids.as_ref().map(|built| {
         built
             .as_ref()
-            .map(|pyramids| (pyramids.len(), pyramid_bytes(pyramids)))
+            .map(|pyramids| (pyramids.count(), pyramids.ram_bytes()))
             .map_err(|err| err.to_string())
     });
     let peak_bytes = sampler.stop();
@@ -197,19 +238,20 @@ fn main() -> Result<()> {
         .expect("the open succeeded, so the pyramid build was attempted")
         .map_err(anyhow::Error::msg)
         .with_context(|| format!("building pyramids over fixture {}", path.display()))?;
-    anyhow::ensure!(
-        pyramided_columns == args.pyramid_columns,
-        "memory_gate: asked for {} pyramided columns but only {pyramided_columns} of the \
-         fixture's columns are numeric",
-        args.pyramid_columns
-    );
+    if let Some(asked) = args.pyramid_columns {
+        anyhow::ensure!(
+            pyramided_columns == asked,
+            "memory_gate: asked for {asked} pyramided columns but only {pyramided_columns} of \
+             the fixture's columns are numeric"
+        );
+    }
 
     let cap_bytes = budget.cap_bytes();
     let ratio = peak_bytes as f64 / file_bytes.max(1) as f64;
 
     println!(
         "memory_gate: {row_count} rows, file {file_bytes} bytes, storage {storage}, \
-         {pyramided_columns} pyramided columns ({pyramid_byte_count} bytes of buckets), \
+         {pyramided_columns} pyramided columns ({pyramid_byte_count} bytes of buckets in RAM), \
          peak RSS {peak_bytes} bytes ({ratio:.2}x file size), cap {cap_bytes} bytes"
     );
 

@@ -41,7 +41,7 @@
 use std::sync::Arc;
 
 use egui_plot::{GridMark, Legend, Line, Plot, PlotBounds, PlotPoints, Points};
-use glyde_core::dsp::decimation::{decimate_viewport, Bucket};
+use glyde_core::dsp::decimation::{decimate_viewport, Bucket, Pyramid};
 use glyde_core::ingest::{
     progressive_tick_to_value, progressive_value_to_tick, Dataset, Level0Cache, TimeAxis,
 };
@@ -80,10 +80,10 @@ use glyde_core::time::{format_timestamp, Timestamp};
 /// reopen that produced it never had to convert them again
 /// (`ingest::derived_caches_for_dataset_cached`). `&[]` for a still-loading
 /// partial dataset, which has no cache of its own yet.
-pub fn show(
+pub fn show<P: Pyramid + Sync>(
     ui: &mut egui::Ui,
     dataset: &Dataset,
-    pyramids: &[Option<Vec<Vec<Bucket>>>],
+    pyramids: &[Option<P>],
     ticks: &[i128],
     sample_cache: &[Option<Vec<f64>>],
     level0_caches: &[Option<Arc<Level0Cache>>],
@@ -107,10 +107,10 @@ pub fn show(
 /// exactly that horizontal span first (e.g. the uniform stretch an
 /// `Irregular` series offers instead of a PSD, SPEC §3.3).
 #[allow(clippy::too_many_arguments)]
-pub fn show_with_selection(
+pub fn show_with_selection<P: Pyramid + Sync>(
     ui: &mut egui::Ui,
     dataset: &Dataset,
-    pyramids: &[Option<Vec<Vec<Bucket>>>],
+    pyramids: &[Option<P>],
     ticks: &[i128],
     sample_cache: &[Option<Vec<f64>>],
     level0_caches: &[Option<Arc<Level0Cache>>],
@@ -189,18 +189,18 @@ pub fn show_with_selection(
             .filter(|(_, series)| series.view_kind() == ViewKind::TimeDomain)
             .collect();
         let decimate = |&(column_index, series): &(usize, &Series)| {
-            let pyramid = pyramids
-                .get(column_index)
-                .and_then(Option::as_ref)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
             let cached = sample_cache.get(column_index).and_then(Option::as_ref);
             let level0 = level0_caches
                 .get(column_index)
                 .and_then(Option::as_ref)
                 .map(Arc::as_ref);
             let samples = column_f64_samples(series.values(), cached, level0);
-            decimate_viewport(pyramid, samples, ticks, range, pixel_columns)
+            // In memory, or on disk for a spilled file (issue #102); a column
+            // without one decimates its raw samples.
+            match pyramids.get(column_index).and_then(Option::as_ref) {
+                Some(pyramid) => pyramid.decimate(samples, ticks, range, pixel_columns),
+                None => decimate_viewport(&[], samples, ticks, range, pixel_columns),
+            }
         };
         // A lone column has nothing to run alongside, and the pool hand-off
         // would only add its own latency to the frame.
@@ -1024,7 +1024,7 @@ mod render_tests {
 
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &dataset, &[], &[], &[], &[], CursorLookup::default());
+                show::<Vec<Vec<Bucket>>>(ui, &dataset, &[], &[], &[], &[], CursorLookup::default());
             });
         });
 

@@ -50,6 +50,7 @@ use std::sync::Arc;
 use std::thread;
 
 use glyde_core::dsp::decimation::Bucket;
+use glyde_core::index::disk_pyramid::ColumnPyramid;
 use glyde_core::index::spill::SweepReport;
 use glyde_core::ingest::{
     Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary, TimeIndexSource,
@@ -62,6 +63,10 @@ use crate::views;
 /// One numeric column's min/max pyramid, or `None` for a non-numeric column
 /// — parallel to `Dataset::columns` (see `glyde_core::ingest::Checkpoint::pyramids`).
 type Pyramids = Vec<Option<Vec<Vec<Bucket>>>>;
+
+/// A completed load's pyramids: in memory, or on disk for a spilled file
+/// (issue #102) — see [`IndexingMessage::Completed`].
+pub type ColumnPyramids = Vec<Option<ColumnPyramid>>;
 
 /// One numeric column's cached raw `(timestamp, value)` pairs, or `None` for
 /// a non-numeric column or a cache miss — parallel to `Dataset::columns`,
@@ -136,7 +141,7 @@ pub enum IndexingMessage {
         summary: Box<OpenSummary>,
         report: Box<InferenceReport>,
         dataset: Box<Dataset>,
-        pyramids: Pyramids,
+        pyramids: ColumnPyramids,
         level0_caches: Level0Caches,
         /// Prepared on the indexer thread so no O(rows) pass (ticks, sample
         /// conversion, boolean bands, cursor lookup) ever runs on the UI
@@ -385,18 +390,36 @@ fn run_index_job(
             // is what keeps a non-`f64` column from being converted twice per
             // open (and at all on a reopen) — see
             // `derived_caches_for_dataset_cached`.
-            let (pyramids, level0_caches) = if dataset.is_spilled() {
-                (
-                    vec![None; dataset.columns.len()],
-                    (0..dataset.columns.len()).map(|_| None).collect(),
-                )
+            //
+            // issue #102: a spilled dataset gets its pyramids too, built on
+            // disk (one memory-mapped file per level) instead of in RAM, so
+            // panning it is pyramid-accelerated without breaking SPEC §5's
+            // flat memory cap.
+            let (pyramids, level0_caches): (ColumnPyramids, _) = if dataset.is_spilled() {
+                let pyramids = match glyde_core::index::level0::os_cache_dir() {
+                    Ok(cache_dir) => {
+                        tracing::info!("building on-disk pyramids for a spilled file (issue #102)");
+                        glyde_core::ingest::disk_pyramids_for_dataset(&dataset, &cache_dir)
+                            .into_iter()
+                            .map(|pyramid| pyramid.map(ColumnPyramid::Disk))
+                            .collect()
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "no cache directory for on-disk pyramids");
+                        (0..dataset.columns.len()).map(|_| None).collect()
+                    }
+                };
+                (pyramids, (0..dataset.columns.len()).map(|_| None).collect())
             } else {
                 let (pyramids, level0_caches) =
                     glyde_core::ingest::derived_caches_for_dataset_cached(
                         &path, &dataset, overrides,
                     );
                 (
-                    pyramids,
+                    pyramids
+                        .into_iter()
+                        .map(|pyramid| pyramid.map(ColumnPyramid::Memory))
+                        .collect(),
                     level0_caches
                         .into_iter()
                         .map(|cache| cache.map(Arc::new))

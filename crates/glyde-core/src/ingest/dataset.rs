@@ -2490,6 +2490,70 @@ pub(crate) fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
+/// Every numeric column's min/max pyramid for a *spilled* dataset, built on
+/// disk (issue #102, [`crate::index::disk_pyramid`]) into a spill set of its
+/// own under `cache_dir`, so a file too large for memory gets the same
+/// pyramid-accelerated rendering as one that fits — without the ~9 bytes per
+/// sample of RAM an in-memory pyramid would cost. `None` for a non-numeric
+/// column, and for any column whose pyramid could not be written (logged at
+/// `warn`): the view then decimates its raw samples, as before.
+///
+/// The pyramids take about as much disk as they would have taken RAM (one
+/// 64-byte bucket per ~7 samples, per numeric column), so that space is
+/// checked first, with the same headroom the spill itself keeps (SPEC §5.1:
+/// check affordability before acting); if it is not there, no pyramid is
+/// built and the file still renders, from its raw samples.
+pub fn disk_pyramids_for_dataset(
+    dataset: &Dataset,
+    cache_dir: &Path,
+) -> Vec<Option<crate::index::disk_pyramid::DiskPyramid>> {
+    let none = || (0..dataset.columns.len()).map(|_| None).collect();
+    let numeric = dataset
+        .columns
+        .iter()
+        .filter(|series| series.values().sample_source().is_some())
+        .count() as u64;
+    let rows = dataset.time.len() as u64;
+    let pyramid_bytes = rows.div_ceil(7).saturating_mul(64).saturating_mul(numeric);
+    if let Some(available) = crate::budget::available_disk_bytes(cache_dir) {
+        if let Err(err) = crate::budget::check_disk_affordable(pyramid_bytes, available, cache_dir)
+        {
+            warn!(
+                error = %err,
+                pyramid_bytes,
+                "not enough free disk for the on-disk pyramids; this file renders from its raw \
+                 samples (slower to pan over the whole file, same picture)"
+            );
+            return none();
+        }
+    }
+    let set = match SpillSet::create(cache_dir) {
+        Ok(set) => set,
+        Err(err) => {
+            warn!(error = %err, "could not create a spill set for the on-disk pyramids");
+            return none();
+        }
+    };
+    dataset
+        .columns
+        .iter()
+        .map(|series| {
+            let samples = series.values().sample_source()?;
+            match crate::index::disk_pyramid::build_disk_pyramid(&set, &samples, &dataset.time) {
+                Ok(pyramid) => Some(pyramid),
+                Err(err) => {
+                    warn!(
+                        column = series.name(),
+                        error = %err,
+                        "could not build this column's on-disk pyramid; it renders from raw samples"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 /// Per-column pyramid state carried between successive progressive
 /// checkpoints (docs/ROADMAP.md M3, issue #90), so a later, larger
 /// checkpoint's pyramid is built by *extending* the previous checkpoint's

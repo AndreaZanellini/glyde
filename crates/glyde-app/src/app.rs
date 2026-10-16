@@ -34,7 +34,7 @@ use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache}
 
 use crate::inference_bar::Correction;
 use crate::plumbing::{
-    spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog, CancelFlag,
+    spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog, CancelFlag, ColumnPyramids,
     IndexingMessage, PreparedView, TimeIndexPreview, PROGRESS_BOOL_BAND_ROWS,
 };
 use crate::views::psd::{selection_rows, PsdPanel, PsdRequest};
@@ -101,7 +101,7 @@ enum Status {
         /// Shared with the background PSD job (`crate::plumbing::psd`),
         /// which reads its raw samples off the UI thread.
         dataset: Arc<Dataset>,
-        pyramids: Pyramids,
+        pyramids: ColumnPyramids,
         /// See [`PartialLoad::prepared`]: the same once-per-status-change
         /// derivations, for the completed dataset.
         prepared: Box<PreparedView>,
@@ -542,6 +542,7 @@ fn loading_label(path: &Path, rows_read: u64, spilled: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glyde_core::index::disk_pyramid::ColumnPyramid;
     use glyde_core::ingest::{
         Confidence, DecimalSeparator, Delimiter, InferredField, OpenSummary, SamplingClass,
         TimeAxis, TimeColumnChoice,
@@ -617,6 +618,13 @@ mod tests {
     /// One `None` pyramid per [`sample_dataset`] column — a plausible
     /// `Progress`/`Completed` payload without needing a real
     /// `pyramids_for_dataset` build for these single-sample fixtures.
+    fn sample_column_pyramids() -> ColumnPyramids {
+        sample_pyramids()
+            .into_iter()
+            .map(|pyramid| pyramid.map(ColumnPyramid::Memory))
+            .collect()
+    }
+
     fn sample_pyramids() -> Pyramids {
         vec![None]
     }
@@ -668,7 +676,7 @@ mod tests {
                 summary: sample_summary(),
                 report: sample_report(),
                 dataset: sample_dataset(),
-                pyramids: sample_pyramids(),
+                pyramids: sample_column_pyramids(),
                 level0_caches: sample_level0_caches(),
                 prepared: sample_prepared(),
             })
@@ -835,7 +843,7 @@ mod tests {
                 summary: sample_summary(),
                 report: sample_report(),
                 dataset: sample_dataset(),
-                pyramids: sample_pyramids(),
+                pyramids: sample_column_pyramids(),
                 level0_caches: sample_level0_caches(),
                 prepared: sample_prepared(),
             })

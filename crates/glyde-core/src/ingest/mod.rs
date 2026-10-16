@@ -36,12 +36,12 @@ pub use csv::{
     MAX_SKIPPED_ROW_DETAILS,
 };
 pub use dataset::{
-    derived_caches_for_dataset_cached, derived_caches_for_dataset_cached_with_cache_dir, load,
-    load_progressive, load_progressive_with_budget, load_progressive_with_budget_cancellable,
-    load_with_budget, load_with_overrides, load_with_overrides_and_budget,
-    progressive_tick_to_value, progressive_value_to_tick, pyramids_for_dataset,
-    pyramids_for_dataset_cached, pyramids_for_dataset_cached_with_cache_dir, Checkpoint,
-    ColumnLevel0Caches, ColumnPyramids, Dataset, DerivedCaches, GeneratedIndexReason,
+    derived_caches_for_dataset_cached, derived_caches_for_dataset_cached_with_cache_dir,
+    disk_pyramids_for_dataset, load, load_progressive, load_progressive_with_budget,
+    load_progressive_with_budget_cancellable, load_with_budget, load_with_overrides,
+    load_with_overrides_and_budget, progressive_tick_to_value, progressive_value_to_tick,
+    pyramids_for_dataset, pyramids_for_dataset_cached, pyramids_for_dataset_cached_with_cache_dir,
+    Checkpoint, ColumnLevel0Caches, ColumnPyramids, Dataset, DerivedCaches, GeneratedIndexReason,
     ProgressiveValues, TimeAxis, Timestamps, GENERATED_TIME_COLUMN_NAME, PROGRESSIVE_TICK_SCALE,
 };
 pub use infer::{
