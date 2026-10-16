@@ -188,6 +188,18 @@ Resolved as follows:
   second implementation: both entry points feed the same private level-0
   accumulator and the same level-growing step, and a golden test locks them to
   bucket-for-bucket equality at every chunk size, so Hard rule 4 still holds.
+- **Amendment (issue #102): the pyramid's *buckets* may live on disk.** The
+  built pyramid is ~9 bytes per sample per column, so for a spilled file it
+  is written as one memory-mapped file per level
+  (`index::disk_pyramid`) instead of held as `Vec<Vec<Bucket>>`. Samples and
+  ticks are still the same `&[f64]`/`&[i128]` slices; only the bucket
+  levels are read through a small `dsp::decimation::BucketLevel` trait
+  ("bucket *i* of this level"). `decimate_viewport` keeps its signature and
+  delegates to `decimate_viewport_levels`, the one implementation, so the
+  golden tests still lock the algorithm for both storages; the disk builder
+  reuses the same level-0 bucketing (`Level0Stream`) and `merge_buckets`, and
+  `tests/disk_pyramid_integration.rs` locks it bucket for bucket to
+  `build_pyramid`.
   `ingest::pyramids_for_dataset` picks between them by
   `Dataset::is_spilled()` — the zero-copy slice path stays the in-memory
   default, so no small-file cost was added.

@@ -153,6 +153,11 @@ jobs:
       # reference-machine recipe. See issues #61, #83.
       - name: Criterion benchmarks (build-blocking budgets)
         run: cargo bench -p glyde-core
+      # SPEC §5 pan/zoom frame time through the app's real render path, for
+      # in-memory and spilled files (issues #80, #107). macOS builds the GUI
+      # without extra system packages, which is why it runs on this job.
+      - name: Time-view frame-time benchmark (build-blocking budget)
+        run: cargo bench -p glyde-app --bench time_view_render
 
   deny:
     name: Licenses & advisories

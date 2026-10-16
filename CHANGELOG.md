@@ -467,6 +467,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
      is the conventional default for this use.
 
 ### Fixed
+- **The scroll/zoom smoothness check now measures what it claims, including
+  for files too big for memory.** The automatic check that keeps
+  panning and zooming under SPEC §5's frame budget (≤ 100 ms) used to draw a
+  view only about one second wide, so it measured almost nothing, and it was
+  not even run by the automatic checks on every change. It now measures the
+  whole file on screen and a pan across it, for normal files and for a file
+  streamed from disk, and runs on every change. Measured on an Apple M1-class
+  Mac with 8 million samples: about 0.6 ms per frame for every case, the
+  disk-streamed file included, now that it has its own on-disk overview
+  (#102); before that it took 15.7 ms with the whole file on screen. (#107)
 - **The last on/off state of a file is now visible.** If a true/false
   column ended with a single sample in a new state (say `on, on, off`), that
   final `off` was never drawn. It now shows as a thin sliver at the right
@@ -566,6 +576,54 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `blocking-decision` issue rather than decided here.
 
 ### Changed
+- **Files too large for memory now scroll and zoom as fast as small ones.**
+  For such a file, Glyde used to have no overview structure (the "pyramid"
+  of min/max summaries) to draw from, because it would have cost too much
+  memory, so showing the whole file meant reading every sample on every
+  frame: about 15 ms per frame for 8 million samples, growing with the file.
+  The pyramid is now kept on disk instead of in memory, so it costs no RAM:
+  the whole-file view takes about 0.3 ms per frame and no longer grows with
+  file size. What is drawn is exactly the same as before. Building it takes
+  about 0.1 s per million samples per column after the file is read, and
+  disk space of about 9 bytes per sample per column (for a 100-million-row,
+  8-column file, about 7 GB), deleted when the file is closed. Glyde checks
+  that space first; if it is missing, the file still opens and draws the
+  same picture, just as slowly as before when the whole file is on screen.
+  (#102)
+- **Reopening a file you opened before is now much faster: Glyde no longer
+  re-reads its text.** Until now a reopen reused the plot's caches but still
+  read and parsed the whole file again. Now, for a file that fits in memory,
+  the first open also saves everything the parse found (the values of every
+  column, the timestamps, and what was inferred: encoding, delimiter,
+  decimal separator, time column, skipped rows), and a reopen of the same,
+  unchanged file with the same corrections loads that instead. On a 1 GB,
+  9-million-row test file: about 5–6 s for the first open, 0.5 s for a
+  reopen. The inference bar is recomputed from the saved results exactly
+  as after a parse, so it is always as accurate as on the first open. If the
+  file changed, a different correction is applied, or the saved copy is
+  damaged or from another Glyde version, the file is simply read again.
+  (#106)
+
+  **Assumptions made (please veto):**
+  - The saved copy takes about as much disk as the data itself (888 MB for
+    that 1 GB file), in Glyde's cache folder, and is not cleaned up
+    automatically yet (true of Glyde's other caches too).
+  - Files too large for memory are not saved this way (they are read again
+    on every open); that waits on #102.
+- **Opening a file with many columns for the first time is faster and uses
+  much less disk for Glyde's cache.** Glyde keeps a cache of each opened
+  file's samples so that reopening it is instant. It used to store the file's
+  timestamps once per numeric column, identical every time; now it stores
+  them once and every column shares them. On a 1 GB, 8-column test file,
+  building the cache went from 2.5 s to 1.7 s, and the cache takes about
+  1 GB less disk. Caches written by earlier versions are rebuilt
+  automatically the first time a file is reopened. (#115)
+
+  **Assumption made (please veto):** the issue asked for your decision
+  because this changes the cache's on-disk format. I went ahead with the
+  design the issue proposed. The old cache files are simply ignored and
+  rebuilt (they are never misread), and old leftover files are not deleted,
+  since cache cleanup does not exist yet.
 - **Groundwork for the gap view: listing a file's gaps no longer needs
   memory for every gap at once.** Nothing visible changes yet. Glyde can now
   walk through the gaps of any stretch of a file, including a file too big

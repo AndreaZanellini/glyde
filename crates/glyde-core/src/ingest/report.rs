@@ -438,6 +438,30 @@ pub fn open_dataset_progressive_cancellable(
     build_summary_and_report(outcome, dataset, time_index)
 }
 
+/// [`open_dataset_progressive_cancellable`] against an explicit RAM budget
+/// and cache directory (the app uses the system's), so a test can open the
+/// same file twice under a cache directory of its own and check the second
+/// open is served from the whole-dataset cache (issue #106).
+pub fn open_dataset_progressive_in(
+    path: &Path,
+    overrides: super::IngestOverrides,
+    budget: crate::budget::RamBudget,
+    cache_dir: &Path,
+    cancelled: &std::sync::atomic::AtomicBool,
+    on_checkpoint: impl FnMut(Checkpoint),
+) -> Result<(OpenSummary, InferenceReport, Dataset)> {
+    let (outcome, dataset, time_index) = dataset::load_with_outcome_progressive_in(
+        path,
+        overrides,
+        budget,
+        Some(cache_dir),
+        cancelled,
+        on_checkpoint,
+    )?;
+    dataset::ensure_not_cancelled(cancelled)?;
+    build_summary_and_report(outcome, dataset, time_index)
+}
+
 /// The summary/report-building half of [`open_dataset`], shared with
 /// [`open_dataset_progressive`] so the two never independently (and
 /// possibly divergently) derive the same fields from a parsed [`Dataset`].
