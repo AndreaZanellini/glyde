@@ -2332,15 +2332,46 @@ fn load_with_outcome_progressive_using(
     path: &Path,
     overrides: IngestOverrides,
     cancelled: &AtomicBool,
+    on_checkpoint: impl FnMut(Checkpoint),
+) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
+    load_with_outcome_progressive_in(
+        path,
+        overrides,
+        RamBudget::from_system(),
+        os_spill_dir().as_deref(),
+        cancelled,
+        on_checkpoint,
+    )
+}
+
+/// [`load_with_outcome_progressive_using`] against an explicit budget and
+/// cache directory. A file opened before, unchanged, under the same
+/// overrides, is served from the whole-dataset cache without reading its
+/// source at all (issue #106, [`super::dataset_cache`]); any other open
+/// parses it and, when it fits in memory, caches the result.
+pub(crate) fn load_with_outcome_progressive_in(
+    path: &Path,
+    overrides: IngestOverrides,
+    budget: RamBudget,
+    cache_dir: Option<&Path>,
+    cancelled: &AtomicBool,
     mut on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
-    let cache_dir = os_spill_dir();
-    let budget = RamBudget::from_system();
-    match choose_storage(path, budget, cache_dir.as_deref(), overrides)? {
+    let dataset_key = cache_dir.and_then(|_| match CacheKey::for_path(path) {
+        Ok(key) => Some(key.with_overrides_signature(super::overrides_signature(overrides))),
+        Err(err) => {
+            warn!(error = %err, "could not key the dataset cache; parsing without it");
+            None
+        }
+    });
+    if let (Some(dir), Some(key)) = (cache_dir, &dataset_key) {
+        if let Some(parsed) = super::dataset_cache::try_load(dir, key, budget) {
+            return Ok(parsed);
+        }
+    }
+    match choose_storage(path, budget, cache_dir, overrides)? {
         Storage::Spill(sniff) => {
-            let cache_dir = cache_dir
-                .as_deref()
-                .expect("choose_storage refuses to spill without a cache dir");
+            let cache_dir = cache_dir.expect("choose_storage refuses to spill without a cache dir");
             load_spilled(
                 path,
                 &sniff,
@@ -2390,9 +2421,12 @@ fn load_with_outcome_progressive_using(
                 },
             )?;
             ensure_not_cancelled(cancelled)?;
-            let (dataset, timestamp_format_ambiguous) =
-                builder.finish(&outcome, &columns_text, overrides)?;
-            Ok((outcome, dataset, timestamp_format_ambiguous))
+            let (dataset, inference) = builder.finish(&outcome, &columns_text, overrides)?;
+            drop(columns_text);
+            if let (Some(dir), Some(key)) = (cache_dir, &dataset_key) {
+                super::dataset_cache::store(dir, key, (&outcome, &dataset, &inference));
+            }
+            Ok((outcome, dataset, inference))
         }
     }
 }
