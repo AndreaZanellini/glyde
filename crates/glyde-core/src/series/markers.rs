@@ -103,7 +103,9 @@ impl MarkerBuilder {
         }
         let span = self.max_tick.saturating_sub(self.min_tick) as f64;
         let offset = tick.saturating_sub(self.min_tick) as f64;
-        ((offset / span) * (MARKER_OVERVIEW_CELLS - 1) as f64)
+        // Cell `k` holds `[k, k + 1) / N` of the axis (the last one also
+        // holds `max_tick`); `glyde-app` draws each tick at its cell's center.
+        ((offset / span) * MARKER_OVERVIEW_CELLS as f64)
             .floor()
             .clamp(0.0, (MARKER_OVERVIEW_CELLS - 1) as f64) as usize
     }
@@ -229,5 +231,21 @@ mod tests {
             panic!("expected an overview");
         };
         assert_eq!(counts[MARKER_OVERVIEW_CELLS - 1], 1);
+    }
+
+    #[test]
+    fn overview_cells_split_the_axis_into_equal_fractions() {
+        let max = (MARKER_OVERVIEW_CELLS * 1000) as i128;
+        let mut builder = MarkerBuilder::for_view(0, max);
+        for tick in 0..=(MAX_EXACT_MARKERS as i128) {
+            builder.push("e", tick);
+        }
+        builder.push("late", 3 * max / 4 + 10);
+        let MarkerLane::Overview { counts, .. } = builder.finish_lane() else {
+            panic!("expected an overview");
+        };
+        let three_quarters = MARKER_OVERVIEW_CELLS * 3 / 4;
+        assert_eq!(counts[three_quarters], 1);
+        assert_eq!(counts[three_quarters - 1], 0);
     }
 }

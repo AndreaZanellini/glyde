@@ -12,6 +12,28 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Text state columns (like `idle` / `running` / `fault`) now show as labeled
+  colored bands under the plot, one lane per column.** Each run of the same
+  value is one band; the same state always gets the same color. If the band
+  is wide enough, its name is printed inside it; if not, hover over it to
+  read the name. A state that lasts less than a pixel (for example the very
+  last sample of the file) is still drawn as a thin sliver you can hover,
+  never hidden. Nothing is cleaned up: `Run`, `run` and `run ` are three
+  different states, and an empty cell is a state called "". When a column
+  changes state so often that individual bands would be unreadable, the lane
+  switches to a compact view where any stretch holding several different
+  states is drawn as one orange block (and says so) rather than hiding some
+  of them.
+
+  **Assumptions made (please veto by testing the app):**
+  - Colors are derived from the label text, so a state keeps its color from
+    file to file; two states could occasionally look alike.
+  - In the compact view the hover text names up to 256 distinct states;
+    beyond that, a single-state stretch says "label not retained".
+  - These lanes are still whole-file and do not pan/zoom with the plot above
+    (same as the on/off lanes); the "multiple states" glyph that expands on
+    zoom and axis sharing are the remaining state-timeline items.
+
 - **Event markers in the state timeline (milestone M6).** A text column that
   is mostly empty (like the `marker` column of corpus case 49: `event_a`,
   `event_b` on otherwise blank rows) is now drawn as thin vertical ticks on
@@ -21,10 +43,19 @@ Versioning: [Semantic Versioning](https://semver.org/).
   gets a tick, shown in orange when several events share a spot. Labels are
   not shown yet, and the lane does not pan/zoom with the plot above (same
   limit as the on/off lanes).
+
+  **Glyde decides for you whether a text column is events or states, and
+  says so.** Above every text lane a line reads, for example, "Drawn as
+  events (inferred: 2 of 9 rows have text)", with a button to show the same
+  column the other way ("Show as state bands" / "Show as events") in one
+  click. Each text column is drawn once, never both ways at the same time.
+
   **Assumptions made (please veto by testing the app):**
-  - A text column counts as "markers" when it has at least one non-empty
-    cell and at most half of its cells are non-empty. A denser text column
-    is a state column (labeled bands), which is a separate M6 item.
+  - A text column is inferred to be events when it has at least one
+    non-empty cell and at most half of its cells are non-empty; otherwise it
+    is inferred to be states.
+  - Your choice of view for a column is remembered until you quit Glyde, not
+    saved between sessions.
 - **Power spectral density (PSD) view — milestone M5.** Under the time plot
   there is now a resizable panel with the spectrum of every numeric series,
   computed with Welch's method on the **raw samples** (never on the
