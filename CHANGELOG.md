@@ -12,6 +12,33 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **The file's encoding can now be corrected in one click.** When Glyde is
+  unsure how a file's text is encoded (the bar then says "encoding: …
+  (low confidence)"), a "Correct…" dropdown next to it offers UTF-8,
+  UTF-16 LE, UTF-16 BE and Windows-1252 / Latin-1. Picking one re-reads the
+  file with it, so accented letters or symbols that came out garbled are
+  read correctly, and a UTF-16 file Glyde could not recognise becomes
+  readable. Your pick is always obeyed, even if the file starts with a
+  marker (a "byte-order mark") that says otherwise. This was the last field
+  of the inference bar without a one-click correction. (#97)
+
+  **Assumptions made (please veto by testing the app):**
+  - Like the delimiter and decimal separator, the dropdown only appears
+    when the encoding is low confidence. A file Glyde confidently read as
+    UTF-8 offers no encoding choice.
+  - Changing the encoding forgets a time column you picked by hand, since
+    re-reading the text can change how the columns split (same as changing
+    the delimiter).
+- **[Sort] now works on files too large for memory.** When a file's
+  timestamps run out of order, clicking **Sort** in the inference bar used
+  to work only for files Glyde could hold in memory; for bigger files the
+  bar said sorting was unavailable. Now every file can be sorted: a big one
+  is sorted on disk, in pieces, with the same result as for a small file
+  (rows with equal timestamps keep their original order) and without using
+  more memory as the file grows. It takes extra time after the file is
+  read, and it needs free disk space for about two copies of the file's
+  cache while it runs. Glyde checks that space before starting and refuses
+  with a clear message if it is not there. (#110)
 - **Opening another file, or correcting something, while a big file is
   still loading now stops the old load right away.** It used to keep reading
   the old file to the end in the background (and, for a file too big for
@@ -324,18 +351,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
   also shows a **timezone** field: `"timezone: +02:00 (honored)"` for an
   explicit offset, `"timezone: UTC (implicit)"` for Unix/LabVIEW epoch
   counters, and `"timezone: naive local time"` for dates with no timezone
-  (including Excel serial dates). For a file streamed to disk, the bar
-  explains that sorting is unavailable instead of offering a button that
-  cannot work. (docs/ROADMAP.md M4)
+  (including Excel serial dates). Files too large for memory can be sorted
+  too (see the "[Sort] now works on files too large for memory" entry).
+  (docs/ROADMAP.md M4)
 
   The in-memory correction permutes columns in place, including string
   columns, instead of allocating a full second copy of each column.
 
-  **Assumptions made:** (1) sorting is only offered for a file small enough
-  to be held in memory — a file large enough to stream from disk opens
-  unsorted and the bar explains why, since a streamed file's on-disk cache
-  cannot be reordered in place; making a huge file sortable is a materially
-  bigger change tracked as a follow-up rather than folded in here. (2) the
+  **Assumptions made:** (1) superseded — sorting was first offered only
+  for files that fit in memory; it now works for every file. (2) the
   timezone field is a one-line, whole-column summary taken from the file's
   first row; a file whose offset genuinely changes partway through (e.g. a
   DST transition mid-file) is already handled correctly *per sample* on the
@@ -463,6 +487,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
     `packaging/linux/glyde.png` with the real icon when there is one.
   - Builds stay unsigned. Signing needs your Apple Developer account and a
     Windows certificate (SPEC §7); it remains a blocker before going public.
+- **The scroll/zoom smoothness check now measures what it claims, including
+  for files too big for memory.** The automatic check that keeps
+  panning and zooming under SPEC §5's frame budget (≤ 100 ms) used to draw a
+  view only about one second wide, so it measured almost nothing, and it was
+  not even run by the automatic checks on every change. It now measures the
+  whole file on screen and a pan across it, for normal files and for a file
+  streamed from disk, and runs on every change. Measured on an Apple M1-class
+  Mac with 8 million samples: about 0.6 ms per frame for every case, the
+  disk-streamed file included, now that it has its own on-disk overview
+  (#102); before that it took 15.7 ms with the whole file on screen. (#107)
 - **The last on/off state of a file is now visible.** If a true/false
   column ended with a single sample in a new state (say `on, on, off`), that
   final `off` was never drawn. It now shows as a thin sliver at the right
@@ -562,6 +596,64 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `blocking-decision` issue rather than decided here.
 
 ### Changed
+- **Files too large for memory now scroll and zoom as fast as small ones.**
+  For such a file, Glyde used to have no overview structure (the "pyramid"
+  of min/max summaries) to draw from, because it would have cost too much
+  memory, so showing the whole file meant reading every sample on every
+  frame: about 15 ms per frame for 8 million samples, growing with the file.
+  The pyramid is now kept on disk instead of in memory, so it costs no RAM:
+  the whole-file view takes about 0.3 ms per frame and no longer grows with
+  file size. What is drawn is exactly the same as before. Building it takes
+  about 0.1 s per million samples per column after the file is read, and
+  disk space of about 9 bytes per sample per column (for a 100-million-row,
+  8-column file, about 7 GB), deleted when the file is closed. Glyde checks
+  that space first; if it is missing, the file still opens and draws the
+  same picture, just as slowly as before when the whole file is on screen.
+  (#102)
+- **Reopening a file you opened before is now much faster: Glyde no longer
+  re-reads its text.** Until now a reopen reused the plot's caches but still
+  read and parsed the whole file again. Now, for a file that fits in memory,
+  the first open also saves everything the parse found (the values of every
+  column, the timestamps, and what was inferred: encoding, delimiter,
+  decimal separator, time column, skipped rows), and a reopen of the same,
+  unchanged file with the same corrections loads that instead. On a 1 GB,
+  9-million-row test file: about 5–6 s for the first open, 0.5 s for a
+  reopen. The inference bar is recomputed from the saved results exactly
+  as after a parse, so it is always as accurate as on the first open. If the
+  file changed, a different correction is applied, or the saved copy is
+  damaged or from another Glyde version, the file is simply read again.
+  (#106)
+
+  **Assumptions made (please veto):**
+  - The saved copy takes about as much disk as the data itself (888 MB for
+    that 1 GB file), in Glyde's cache folder, and is not cleaned up
+    automatically yet (true of Glyde's other caches too).
+  - Files too large for memory are not saved this way (they are read again
+    on every open); that waits on #102.
+- **Opening a file with many columns for the first time is faster and uses
+  much less disk for Glyde's cache.** Glyde keeps a cache of each opened
+  file's samples so that reopening it is instant. It used to store the file's
+  timestamps once per numeric column, identical every time; now it stores
+  them once and every column shares them. On a 1 GB, 8-column test file,
+  building the cache went from 2.5 s to 1.7 s, and the cache takes about
+  1 GB less disk. Caches written by earlier versions are rebuilt
+  automatically the first time a file is reopened. (#115)
+
+  **Assumption made (please veto):** the issue asked for your decision
+  because this changes the cache's on-disk format. I went ahead with the
+  design the issue proposed. The old cache files are simply ignored and
+  rebuilt (they are never misread), and old leftover files are not deleted,
+  since cache cleanup does not exist yet.
+- **Groundwork for the gap view: listing a file's gaps no longer needs
+  memory for every gap at once.** Nothing visible changes yet. Glyde can now
+  walk through the gaps of any stretch of a file, including a file too big
+  for memory, one at a time, instead of only building a full list of them
+  for the whole file. A file can have millions of gaps (a new test file
+  shows how: when just over half the time steps are short and the rest
+  long, every long one counts as a gap), so the upcoming gap view (milestone
+  M8) can show them for what is on screen without that cost. How the gap
+  view presents them (by page, by pixel column, or a capped list) is still
+  to be decided with it. (#103)
 - **Files open about 2–3× faster, and the plot no longer stutters while the
   mouse is over it.** (issue #114) Measured on a 1 GB, 9.2-million-row,
   8-channel CSV, median of three runs, before → after:

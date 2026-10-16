@@ -81,6 +81,7 @@ Build it *before* the features it protects. Minimum set for v1:
 57. `YYYY-MM-DD HH:MM:SS` space-separated datetime (issue #82, `file-wont-open`)
 58. Time column in a format Glyde does not recognize at all (`01-Jan-2026 00:00:00`) — must open against a row-ordinal index, never abort (issue #94, `bug`/`blocking-decision`)
 59. No time column at all — every column is a signal (`ax,ay,az`); the numeric first column runs backwards, so it must stay a series and the file must plot against a generated row index, reported low-confidence (SPEC §2.1 "Files without a time column")
+60. Pathological gap median (issue #103) — 51% of the time steps are 1 s and 49% are 1000 s, so the median step is 1 s and the 1000 s steps all count as gaps (98 of 199): far more gaps than a normal file, which is what any gap listing must handle without holding one entry per gap in memory (SPEC §2.2–2.3)
 
 **Growth rule:** every `file-wont-open` issue must add its (anonymized) file to the corpus *with the fix in the same PR*. This is the product's growth engine.
 
