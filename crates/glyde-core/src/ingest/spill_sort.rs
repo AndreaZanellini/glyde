@@ -194,13 +194,19 @@ fn is_sorted(dataset: &Dataset) -> Result<bool> {
 
 /// Reads the time axis row by row: the sort key, with the row's time
 /// payload appended to a buffer.
+///
+/// `Absolute` is boxed: three cursors to `Progressive`'s one, each holding
+/// a buffer handle and a `PathBuf` (`clippy::large_enum_variant`, as for
+/// `dataset::TimeAxisSpillWriter`).
 enum TimeCursor {
-    Absolute {
-        ticks: SpillCursor<i128>,
-        units: SpillCursor<u8>,
-        offsets: SpillCursor<i64>,
-    },
+    Absolute(Box<AbsoluteCursors>),
     Progressive(SpillCursor<f64>),
+}
+
+struct AbsoluteCursors {
+    ticks: SpillCursor<i128>,
+    units: SpillCursor<u8>,
+    offsets: SpillCursor<i64>,
 }
 
 impl TimeCursor {
@@ -214,11 +220,11 @@ impl TimeCursor {
                         offsets,
                     },
                 ..
-            } => Ok(TimeCursor::Absolute {
+            } => Ok(TimeCursor::Absolute(Box::new(AbsoluteCursors {
                 ticks: ticks.cursor()?,
                 units: units.cursor()?,
                 offsets: offsets.cursor()?,
-            }),
+            }))),
             TimeAxis::Progressive {
                 values: ProgressiveValues::Spilled(values),
             } => Ok(TimeCursor::Progressive(values.cursor()?)),
@@ -229,11 +235,12 @@ impl TimeCursor {
     /// The next row's tick, appending its time payload to `payload`.
     fn next_into(&mut self, payload: &mut Vec<u8>) -> Result<Option<i128>> {
         match self {
-            TimeCursor::Absolute {
-                ticks,
-                units,
-                offsets,
-            } => {
+            TimeCursor::Absolute(cursors) => {
+                let AbsoluteCursors {
+                    ticks,
+                    units,
+                    offsets,
+                } = &mut **cursors;
                 let Some(tick) = ticks.next_value()? else {
                     return Ok(None);
                 };
@@ -474,23 +481,26 @@ struct RowWriter {
     columns: Vec<ColumnSpillWriter>,
 }
 
+/// `Absolute` is boxed for the same reason as [`TimeCursor::Absolute`].
 enum TimeWriter {
-    Absolute {
-        ticks: SpillVecWriter<i128>,
-        units: SpillVecWriter<u8>,
-        offsets: SpillVecWriter<i64>,
-    },
+    Absolute(Box<AbsoluteWriters>),
     Progressive(SpillVecWriter<f64>),
+}
+
+struct AbsoluteWriters {
+    ticks: SpillVecWriter<i128>,
+    units: SpillVecWriter<u8>,
+    offsets: SpillVecWriter<i64>,
 }
 
 impl RowWriter {
     fn create(set: &SpillSet, layout: &RowLayout) -> Result<RowWriter> {
         let time = match layout.time {
-            TimeLayout::Absolute(_) => TimeWriter::Absolute {
+            TimeLayout::Absolute(_) => TimeWriter::Absolute(Box::new(AbsoluteWriters {
                 ticks: SpillVecWriter::create(set, "ts")?,
                 units: SpillVecWriter::create(set, "tsunit")?,
                 offsets: SpillVecWriter::create(set, "tsoffset")?,
-            },
+            })),
             TimeLayout::Progressive => {
                 TimeWriter::Progressive(SpillVecWriter::create(set, "tsprogressive")?)
             }
@@ -507,11 +517,12 @@ impl RowWriter {
     fn push(&mut self, layout: &RowLayout, record: &Record) -> Result<()> {
         let mut payload = PayloadReader(&record.payload);
         match &mut self.time {
-            TimeWriter::Absolute {
-                ticks,
-                units,
-                offsets,
-            } => {
+            TimeWriter::Absolute(writers) => {
+                let AbsoluteWriters {
+                    ticks,
+                    units,
+                    offsets,
+                } = &mut **writers;
                 ticks.push(record.tick)?;
                 units.push(payload.take::<1>()?[0])?;
                 offsets.push(i64::from_le_bytes(payload.take::<8>()?))?;
@@ -544,26 +555,26 @@ impl RowWriter {
         names: Vec<String>,
     ) -> Result<Dataset> {
         let time = match (self.time, layout.time) {
-            (
-                TimeWriter::Absolute {
+            (TimeWriter::Absolute(writers), TimeLayout::Absolute(format)) => {
+                let AbsoluteWriters {
                     ticks,
                     units,
                     offsets,
-                },
-                TimeLayout::Absolute(format),
-            ) => TimeAxis::Absolute {
-                timestamps: Timestamps::Spilled {
-                    ticks: ticks.finish()?,
-                    units: units.finish()?,
-                    offsets: offsets.finish()?,
-                },
-                format,
-            },
+                } = *writers;
+                TimeAxis::Absolute {
+                    timestamps: Timestamps::Spilled {
+                        ticks: ticks.finish()?,
+                        units: units.finish()?,
+                        offsets: offsets.finish()?,
+                    },
+                    format,
+                }
+            }
             (TimeWriter::Progressive(values), _) => TimeAxis::Progressive {
                 values: ProgressiveValues::Spilled(values.finish()?),
             },
             // Unreachable: both come from the same `layout.time`.
-            (TimeWriter::Absolute { .. }, TimeLayout::Progressive) => return Err(corrupt_record()),
+            (TimeWriter::Absolute(_), TimeLayout::Progressive) => return Err(corrupt_record()),
         };
         let columns = self
             .columns
