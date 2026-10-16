@@ -474,11 +474,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   not even run by the automatic checks on every change. It now measures the
   whole file on screen and a pan across it, for normal files and for a file
   streamed from disk, and runs on every change. Measured on an Apple M1-class
-  Mac with 8 million samples: about 0.6 ms per frame in memory, 15.7 ms for
-  the whole of a disk-streamed file on screen, 1.8 ms while panning it. All
-  are well under the budget. The disk-streamed whole-file view grows with
-  file size (about 2 ms per million samples), which is what issue #102 is
-  about. (#107)
+  Mac with 8 million samples: about 0.6 ms per frame for every case, the
+  disk-streamed file included, now that it has its own on-disk overview
+  (#102); before that it took 15.7 ms with the whole file on screen. (#107)
 - **The last on/off state of a file is now visible.** If a true/false
   column ended with a single sample in a new state (say `on, on, off`), that
   final `off` was never drawn. It now shows as a thin sliver at the right

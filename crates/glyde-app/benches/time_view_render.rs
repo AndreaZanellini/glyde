@@ -43,13 +43,11 @@
 //! asserts the tick range it really showed.
 //!
 //! A third fixture is a **spilled** file (issue #107): a file too large for
-//! the RAM budget renders through a different path — no pyramid at all
-//! (`plumbing::run_index_job` passes `None` per column for a spilled load,
-//! issue #102), so every frame decimates the raw, memory-mapped samples on
-//! screen. SPEC §5's frame budget applies to it just the same, and the full
-//! view (every sample on screen) is its worst case, which is the frame
-//! measured here. Should #102 ever give spilled files a pyramid, this is the
-//! fixture that gates that change.
+//! the RAM budget renders through a different path — its pyramid lives on
+//! disk, one memory-mapped file per level (issue #102), prepared here
+//! exactly as `plumbing::run_index_job` prepares a completed spilled load.
+//! SPEC §5's frame budget applies to it just the same; this fixture is the
+//! regression gate for that path.
 //!
 //! Per issue #61 decision 2 (mirrored from `glyde-core`'s benches), only the
 //! absolute SPEC §5 ceiling is build-blocking here; the >15% regression
@@ -61,7 +59,7 @@ use std::time::{Duration, Instant};
 use criterion::{criterion_group, criterion_main, Criterion};
 use egui::{Pos2, Rect, Vec2};
 use glyde_app::views;
-use glyde_core::dsp::decimation::Bucket;
+use glyde_core::index::disk_pyramid::ColumnPyramid;
 use glyde_core::ingest::{pyramids_for_dataset, Dataset, TimeAxis};
 use glyde_core::series::{Series, SeriesValues};
 use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
@@ -83,7 +81,7 @@ struct Fixture {
     /// long as `dataset`).
     _dir: Option<tempfile::TempDir>,
     dataset: Dataset,
-    pyramids: Vec<Option<Vec<Vec<Bucket>>>>,
+    pyramids: Vec<Option<ColumnPyramid>>,
     ticks: Vec<i128>,
     sample_cache: Vec<Option<Vec<f64>>>,
     cursor: views::time::CursorLookup,
@@ -105,7 +103,10 @@ fn dataset_with_column(sample_count: usize, values: SeriesValues) -> Dataset {
 
 fn synthetic_fixture(label: &'static str, sample_count: usize, values: SeriesValues) -> Fixture {
     let dataset = dataset_with_column(sample_count, values);
-    let pyramids = pyramids_for_dataset(&dataset);
+    let pyramids = pyramids_for_dataset(&dataset)
+        .into_iter()
+        .map(|pyramid| pyramid.map(ColumnPyramid::Memory))
+        .collect();
     let ticks = dataset.time.to_pyramid_ticks().into_owned();
     let sample_cache = views::time::cache_column_samples(&dataset);
     let cursor = views::time::CursorLookup::for_time(&dataset.time);
@@ -162,12 +163,16 @@ fn spilled_fixture(sample_count: usize) -> Fixture {
         "a zero budget must force the spill path"
     );
     assert_eq!(dataset.time.len(), sample_count);
-    let pyramids = vec![None; dataset.columns.len()];
+    // Exactly what the app builds for a completed spilled load (issue #102).
+    let pyramids = glyde_core::ingest::disk_pyramids_for_dataset(&dataset, dir.path())
+        .into_iter()
+        .map(|pyramid| pyramid.map(ColumnPyramid::Disk))
+        .collect();
     let ticks = dataset.time.to_pyramid_ticks().into_owned();
     let sample_cache = views::time::cache_column_samples(&dataset);
     let cursor = views::time::CursorLookup::for_time(&dataset.time);
     Fixture {
-        label: "f64 spilled (no pyramid)",
+        label: "f64 spilled (disk pyramid)",
         _dir: Some(dir),
         dataset,
         pyramids,
