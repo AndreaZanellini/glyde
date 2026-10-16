@@ -461,9 +461,7 @@ impl eframe::App for GlydeApp {
                 // widget: persistent and discreet; opens expanded when any
                 // inference is low-confidence; each field correctable in one
                 // click, correcting triggers a re-index".
-                if let Some(correction) =
-                    inference_bar::show(ui, report, path, !dataset.is_spilled())
-                {
+                if let Some(correction) = inference_bar::show(ui, report, path) {
                     pending_correction = Some((path.clone(), correction));
                 }
                 // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1"; SPEC
