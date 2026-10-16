@@ -29,7 +29,10 @@
 //! trips the `dead_code` lint (each integration-test file is its own
 //! crate), so `corpus_dir()` is reproduced here in one line instead.
 
-use glyde_core::series::{bool_state_bands, BoolBand, Dtype, Series, SeriesValues, ViewKind};
+use glyde_core::series::{
+    bool_state_bands, string_state_bands, BoolBand, Dtype, Series, SeriesValues, StateBand,
+    ViewKind,
+};
 use std::path::{Path, PathBuf};
 
 fn corpus_dir() -> PathBuf {
@@ -150,6 +153,43 @@ fn corpus_case_47_bool_columns_collapse_into_state_bands() {
                 end_tick: ticks[3],
                 value: false,
             },
+        ]
+    );
+}
+
+// docs/ROADMAP.md M6 "String/categorical → labeled state bands", SPEC §4.3:
+// corpus case 48 through the real ingestion pipeline — its `state` column
+// must load as `string` and collapse into four labeled runs, the final
+// single-sample `idle` included.
+#[test]
+fn corpus_case_48_string_column_collapses_into_labeled_state_bands() {
+    let path = corpus_dir().join("case-48-string-state-column.csv");
+    let dataset = glyde_core::ingest::load(&path).expect("case 48 must load");
+    let ticks = dataset.time.to_pyramid_ticks();
+
+    let state = dataset
+        .columns
+        .iter()
+        .find(|series| series.name() == "state")
+        .expect("case 48 has a state column");
+    assert_eq!(state.view_kind(), ViewKind::StateTimeline);
+    let values = match state.values() {
+        SeriesValues::String(values) => values.as_slice(),
+        other => panic!("expected a string column, got {other:?}"),
+    };
+
+    let band = |start: usize, end: usize, label: &str| StateBand {
+        start_tick: ticks[start],
+        end_tick: ticks[end],
+        label: label.to_owned(),
+    };
+    assert_eq!(
+        string_state_bands(values, &ticks),
+        vec![
+            band(0, 2, "idle"),
+            band(2, 4, "running"),
+            band(4, 5, "fault"),
+            band(5, 5, "idle"),
         ]
     );
 }
