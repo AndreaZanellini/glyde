@@ -559,6 +559,20 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `blocking-decision` issue rather than decided here.
 
 ### Changed
+- **Opening a file with many columns for the first time is faster and uses
+  much less disk for Glyde's cache.** Glyde keeps a cache of each opened
+  file's samples so that reopening it is instant. It used to store the file's
+  timestamps once per numeric column, identical every time; now it stores
+  them once and every column shares them. On a 1 GB, 8-column test file,
+  building the cache went from 2.5 s to 1.7 s, and the cache takes about
+  1 GB less disk. Caches written by earlier versions are rebuilt
+  automatically the first time a file is reopened. (#115)
+
+  **Assumption made (please veto):** the issue asked for your decision
+  because this changes the cache's on-disk format. I went ahead with the
+  design the issue proposed. The old cache files are simply ignored and
+  rebuilt (they are never misread), and old leftover files are not deleted,
+  since cache cleanup does not exist yet.
 - **Files open about 2–3× faster, and the plot no longer stutters while the
   mouse is over it.** (issue #114) Measured on a 1 GB, 9.2-million-row,
   8-channel CSV, median of three runs, before → after:
