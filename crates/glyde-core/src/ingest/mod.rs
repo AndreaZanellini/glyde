@@ -26,8 +26,10 @@
 
 mod csv;
 mod dataset;
+mod dataset_cache;
 mod infer;
 mod report;
+mod spill_sort;
 
 pub use crate::index::level0::Level0Cache;
 pub use csv::{
@@ -35,12 +37,12 @@ pub use csv::{
     MAX_SKIPPED_ROW_DETAILS,
 };
 pub use dataset::{
-    derived_caches_for_dataset_cached, derived_caches_for_dataset_cached_with_cache_dir, load,
-    load_progressive, load_progressive_with_budget, load_progressive_with_budget_cancellable,
-    load_with_budget, load_with_overrides, load_with_overrides_and_budget,
-    progressive_tick_to_value, progressive_value_to_tick, pyramids_for_dataset,
-    pyramids_for_dataset_cached, pyramids_for_dataset_cached_with_cache_dir, Checkpoint,
-    ColumnLevel0Caches, ColumnPyramids, Dataset, DerivedCaches, GeneratedIndexReason,
+    derived_caches_for_dataset_cached, derived_caches_for_dataset_cached_with_cache_dir,
+    disk_pyramids_for_dataset, load, load_progressive, load_progressive_with_budget,
+    load_progressive_with_budget_cancellable, load_with_budget, load_with_overrides,
+    load_with_overrides_and_budget, progressive_tick_to_value, progressive_value_to_tick,
+    pyramids_for_dataset, pyramids_for_dataset_cached, pyramids_for_dataset_cached_with_cache_dir,
+    Checkpoint, ColumnLevel0Caches, ColumnPyramids, Dataset, DerivedCaches, GeneratedIndexReason,
     ProgressiveValues, TimeAxis, Timestamps, GENERATED_TIME_COLUMN_NAME, PROGRESSIVE_TICK_SCALE,
 };
 pub use infer::{
@@ -50,8 +52,9 @@ pub use infer::{
 };
 pub use report::{
     inspect, open_dataset, open_dataset_progressive, open_dataset_progressive_cancellable,
-    open_dataset_progressive_with_overrides, open_dataset_with_budget, open_dataset_with_overrides,
-    InferenceReport, InferredField, OpenSummary, SamplingClass, TimeIndexSource, TimezoneLabel,
+    open_dataset_progressive_in, open_dataset_progressive_with_overrides, open_dataset_with_budget,
+    open_dataset_with_overrides, InferenceReport, InferredField, OpenSummary, SamplingClass,
+    TimeIndexSource, TimezoneLabel,
 };
 
 use crate::time::TimestampFormat;
@@ -77,10 +80,10 @@ pub struct IngestOverrides {
     /// SPEC §2.1's "[Sort]" affordance for a non-monotonic time axis: rows
     /// are reordered by ascending timestamp instead of kept in source order.
     /// Unlike the other three fields, this is not a bypassed inference — it
-    /// is a data transform, and only ever applied on the in-memory ingestion
-    /// path (`dataset::build_dataset`); a spilled open logs a warning and
-    /// opens unsorted instead, since a spill file cannot be permuted in
-    /// place (see `dataset::choose_storage`).
+    /// is a data transform: a stable sort on the in-memory path
+    /// (`dataset::build_dataset`), and the same order produced on disk by
+    /// an external merge sort on the spilled path (`spill_sort`, issue
+    /// #110).
     pub sort_by_time: bool,
     /// SPEC §1.2's time-column correction: which column is the time index,
     /// or none at all. `None` keeps SPEC §2.1's automatic detection (column
@@ -91,6 +94,51 @@ pub struct IngestOverrides {
     /// instead), but one that cannot be read as an index at all still falls
     /// back to the generated row index rather than failing the open.
     pub time_column: Option<TimeColumnChoice>,
+    /// SPEC §1.2's encoding correction (issue #97): decode with this
+    /// encoding instead of SPEC §1.2.1's BOM-then-heuristic detection. A
+    /// byte-order mark is then only stripped when it belongs to the chosen
+    /// encoding — it never switches the decoder away from it.
+    pub encoding: Option<EncodingChoice>,
+}
+
+/// The encodings a user can pick in the inference bar: SPEC §1.2.1's v1
+/// set. Latin-1 has no entry of its own because `encoding_rs` (following
+/// WHATWG) decodes it as Windows-1252, its superset; the bar labels that
+/// option with both names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EncodingChoice {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+    Windows1252,
+}
+
+impl EncodingChoice {
+    /// Every choice, in the order the inference bar lists them.
+    pub const ALL: [EncodingChoice; 4] = [
+        EncodingChoice::Utf8,
+        EncodingChoice::Utf16Le,
+        EncodingChoice::Utf16Be,
+        EncodingChoice::Windows1252,
+    ];
+
+    /// The `encoding_rs` decoder for this choice.
+    pub fn encoding(self) -> &'static encoding_rs::Encoding {
+        match self {
+            EncodingChoice::Utf8 => encoding_rs::UTF_8,
+            EncodingChoice::Utf16Le => encoding_rs::UTF_16LE,
+            EncodingChoice::Utf16Be => encoding_rs::UTF_16BE,
+            EncodingChoice::Windows1252 => encoding_rs::WINDOWS_1252,
+        }
+    }
+
+    /// The choice matching an inferred encoding's label (as the inference
+    /// bar shows it, e.g. `"windows-1252"`), if it is one of these.
+    pub fn from_label(label: &str) -> Option<EncodingChoice> {
+        EncodingChoice::ALL
+            .into_iter()
+            .find(|choice| choice.encoding().name().eq_ignore_ascii_case(label))
+    }
 }
 
 /// Which column the user settled on as the time index (see
@@ -212,5 +260,26 @@ mod tests {
             .expect_err("an unsupported extension must be a reported error, not a panic");
 
         assert!(matches!(err, GlydeError::UnrecognizedFormat { .. }));
+    }
+
+    #[test]
+    fn encoding_choices_round_trip_through_the_report_label() {
+        for choice in EncodingChoice::ALL {
+            let label = choice.encoding().name().to_ascii_lowercase();
+            assert_eq!(EncodingChoice::from_label(&label), Some(choice));
+        }
+        assert_eq!(EncodingChoice::from_label("shift_jis"), None);
+    }
+
+    #[test]
+    fn an_encoding_override_changes_the_cache_signature() {
+        let picked = IngestOverrides {
+            encoding: Some(EncodingChoice::Windows1252),
+            ..IngestOverrides::default()
+        };
+        assert_ne!(
+            overrides_signature(picked),
+            overrides_signature(IngestOverrides::default())
+        );
     }
 }

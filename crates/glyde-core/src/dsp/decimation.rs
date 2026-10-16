@@ -173,10 +173,7 @@ fn grow_levels(level0: Vec<Bucket>) -> Vec<Vec<Bucket>> {
 /// short.
 struct Level0Builder {
     buckets: Vec<Bucket>,
-    /// The bucket currently being filled, and how many samples are in it
-    /// (always `1..PYRAMID_FACTOR` while `Some`: a bucket is pushed the moment
-    /// it fills).
-    pending: Option<(Bucket, usize)>,
+    stream: Level0Stream,
 }
 
 impl Level0Builder {
@@ -186,13 +183,57 @@ impl Level0Builder {
             // so the accumulator never reallocates (and never spikes to 1.5x
             // its own size doing so) as it fills.
             buckets: Vec::with_capacity(sample_count.div_ceil(PYRAMID_FACTOR)),
-            pending: None,
+            stream: Level0Stream::default(),
         }
     }
 
     /// Adds one contiguous run of samples, in row order, continuing from
     /// whatever the previous run left half-finished.
     fn push_chunk(&mut self, samples: &[f64], timestamps: &[i128]) {
+        let buckets = &mut self.buckets;
+        self.stream
+            .push_chunk(samples, timestamps, &mut |bucket| {
+                buckets.push(bucket);
+                Ok(())
+            })
+            .expect("pushing into a Vec cannot fail");
+    }
+
+    /// The finished level 0, including a final short bucket if the column's
+    /// length is not a multiple of [`PYRAMID_FACTOR`].
+    fn finish(mut self) -> Vec<Bucket> {
+        let buckets = &mut self.buckets;
+        self.stream
+            .finish(&mut |bucket| {
+                buckets.push(bucket);
+                Ok(())
+            })
+            .expect("pushing into a Vec cannot fail");
+        self.buckets
+    }
+}
+
+/// The bucketing half of [`Level0Builder`], handing each level-0 bucket to a
+/// sink the moment it is complete instead of collecting them — what lets
+/// `index::disk_pyramid` write level 0 straight to disk (issue #102) with the
+/// exact same grouping the in-memory pyramid uses.
+#[derive(Default)]
+pub(crate) struct Level0Stream {
+    /// The bucket currently being filled, and how many samples are in it
+    /// (always `1..PYRAMID_FACTOR` while `Some`: a bucket is emitted the
+    /// moment it fills).
+    pending: Option<(Bucket, usize)>,
+}
+
+impl Level0Stream {
+    /// Adds one contiguous run of samples, in row order, emitting every
+    /// bucket it completes.
+    pub(crate) fn push_chunk(
+        &mut self,
+        samples: &[f64],
+        timestamps: &[i128],
+        emit: &mut dyn FnMut(Bucket) -> Result<()>,
+    ) -> Result<()> {
         debug_assert_eq!(
             samples.len(),
             timestamps.len(),
@@ -217,18 +258,19 @@ impl Level0Builder {
                 .is_some_and(|(_, filled)| filled == PYRAMID_FACTOR)
             {
                 let (bucket, _) = self.pending.take().expect("checked as Some above");
-                self.buckets.push(bucket);
+                emit(bucket)?;
             }
         }
+        Ok(())
     }
 
-    /// The finished level 0, including a final short bucket if the column's
-    /// length is not a multiple of [`PYRAMID_FACTOR`].
-    fn finish(mut self) -> Vec<Bucket> {
-        if let Some((bucket, _)) = self.pending.take() {
-            self.buckets.push(bucket);
+    /// Emits the final short bucket, if the column's length is not a
+    /// multiple of [`PYRAMID_FACTOR`].
+    pub(crate) fn finish(mut self, emit: &mut dyn FnMut(Bucket) -> Result<()>) -> Result<()> {
+        match self.pending.take() {
+            Some((bucket, _)) => emit(bucket),
+            None => Ok(()),
         }
-        self.buckets
     }
 }
 
@@ -283,7 +325,7 @@ fn raw_range_bucket(samples: &[f64], timestamps: &[i128]) -> Bucket {
 
 /// Merges two buckets that cover adjacent ranges, `left` before `right` in
 /// time/index order.
-fn merge_buckets(left: Bucket, right: Bucket) -> Bucket {
+pub(crate) fn merge_buckets(left: Bucket, right: Bucket) -> Bucket {
     Bucket {
         min: left.min.min(right.min),
         max: left.max.max(right.max),
@@ -386,6 +428,65 @@ pub fn decimate_viewport(
     range: (i128, i128),
     pixel_columns: usize,
 ) -> Vec<Bucket> {
+    decimate_viewport_levels(pyramid, samples, timestamps, range, pixel_columns)
+}
+
+/// One level of a min/max pyramid, wherever its buckets live: an in-memory
+/// `Vec<Bucket>` ([`build_pyramid`]), or a memory-mapped file
+/// (`index::disk_pyramid`, issue #102). [`decimate_viewport_levels`] reads
+/// at most a few buckets per pixel column through it.
+pub trait BucketLevel {
+    fn bucket_count(&self) -> usize;
+    /// The bucket at `index` (`< bucket_count()`).
+    fn bucket(&self, index: usize) -> Bucket;
+}
+
+impl BucketLevel for Vec<Bucket> {
+    fn bucket_count(&self) -> usize {
+        self.len()
+    }
+
+    fn bucket(&self, index: usize) -> Bucket {
+        self[index]
+    }
+}
+
+/// A whole column pyramid, however it is stored, as the view decimates it:
+/// in memory ([`build_pyramid`]'s `Vec<Vec<Bucket>>`) or on disk
+/// (`index::disk_pyramid`, issue #102). Every implementation goes through
+/// [`decimate_viewport_levels`].
+pub trait Pyramid {
+    fn decimate(
+        &self,
+        samples: &[f64],
+        timestamps: &[i128],
+        range: (i128, i128),
+        pixel_columns: usize,
+    ) -> Vec<Bucket>;
+}
+
+impl Pyramid for Vec<Vec<Bucket>> {
+    fn decimate(
+        &self,
+        samples: &[f64],
+        timestamps: &[i128],
+        range: (i128, i128),
+        pixel_columns: usize,
+    ) -> Vec<Bucket> {
+        decimate_viewport_levels(self, samples, timestamps, range, pixel_columns)
+    }
+}
+
+/// [`decimate_viewport`] over a pyramid stored any way [`BucketLevel`]
+/// allows. The one implementation of SPEC §3.1's decimation: the golden
+/// tests lock it through [`decimate_viewport`], which only delegates here.
+pub fn decimate_viewport_levels<L: BucketLevel>(
+    pyramid: &[L],
+    samples: &[f64],
+    timestamps: &[i128],
+    range: (i128, i128),
+    pixel_columns: usize,
+) -> Vec<Bucket> {
     debug_assert_eq!(
         samples.len(),
         timestamps.len(),
@@ -443,8 +544,8 @@ pub fn decimate_viewport(
 /// boundary buckets that straddle the edge of the query. This is the
 /// "exact edges, aggregated interior" requirement the spike-preservation
 /// golden test locks in: O(PYRAMID_FACTOR · log(n)) per column, not O(n).
-fn aggregate_range(
-    pyramid: &[Vec<Bucket>],
+fn aggregate_range<L: BucketLevel>(
+    pyramid: &[L],
     samples: &[f64],
     timestamps: &[i128],
     lo: usize,
@@ -467,8 +568,8 @@ fn aggregate_range(
 /// samples ([`slice::chunks`] only ever leaves a short group at the end), so
 /// every bucket's start index is exactly `index * span`; only its end needs
 /// clamping to the real sample count.
-fn aggregate_at_level(
-    pyramid: &[Vec<Bucket>],
+fn aggregate_at_level<L: BucketLevel>(
+    pyramid: &[L],
     samples: &[f64],
     timestamps: &[i128],
     level: isize,
@@ -482,11 +583,11 @@ fn aggregate_at_level(
     let span = PYRAMID_FACTOR.pow((level + 1) as u32);
     let buckets = &pyramid[level];
     let bucket_lo = lo / span;
-    let bucket_hi = (hi / span).min(buckets.len() - 1);
+    let bucket_hi = (hi / span).min(buckets.bucket_count() - 1);
 
     let mut merged: Option<Bucket> = None;
-    for (offset, &bucket) in buckets[bucket_lo..=bucket_hi].iter().enumerate() {
-        let bucket_index = bucket_lo + offset;
+    for bucket_index in bucket_lo..=bucket_hi {
+        let bucket = buckets.bucket(bucket_index);
         let bucket_start = bucket_index * span;
         let bucket_end = (bucket_start + span - 1).min(samples.len() - 1);
 

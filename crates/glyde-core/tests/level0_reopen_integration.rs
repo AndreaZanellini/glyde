@@ -423,3 +423,52 @@ fn an_i64_columns_cached_samples_match_an_in_memory_conversion_exactly() {
 
     assert_eq!(cached_samples(&cached), uncached_samples(&dataset));
 }
+
+// Issue #115: a multi-column file's time axis is written to the Level-0
+// cache once, not once per column, and every column's cache maps it.
+#[test]
+fn every_column_shares_one_timestamps_file() {
+    let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+    let mut text = String::from("time,a,b,c,d,e,f,g,h\n");
+    for i in 0..3_000 {
+        text.push_str(&format!("{i}"));
+        for column in 0..8 {
+            text.push_str(&format!(",{}", (i * (column + 1)) as f64 * 0.5));
+        }
+        text.push('\n');
+    }
+    std::io::Write::write_all(&mut file, text.as_bytes()).expect("write temp file");
+    let dataset = glyde_core::ingest::load(file.path()).expect("load must succeed");
+    let cache_dir = tempfile::tempdir().expect("temp cache dir");
+
+    let (_, caches) = derived_caches_for_dataset_cached_with_cache_dir(
+        file.path(),
+        &dataset,
+        cache_dir.path(),
+        IngestOverrides::default(),
+    );
+    let count = |suffix: &str| {
+        std::fs::read_dir(cache_dir.path())
+            .expect("read cache dir")
+            .filter(|entry| {
+                let name = entry.as_ref().expect("entry").file_name();
+                name.to_string_lossy().ends_with(suffix)
+            })
+            .count()
+    };
+    assert_eq!(count(".ts.glyc0"), 1, "one time axis for all eight columns");
+    assert_eq!(count(".val.glyc0"), 8, "one values file per column");
+
+    let ticks = dataset.time.to_pyramid_ticks();
+    for cache in &caches {
+        let cache = cache.as_ref().expect("every column is cached");
+        assert_eq!(cache.timestamps(), &ticks[..]);
+    }
+    let (_, reopened) = derived_caches_for_dataset_cached_with_cache_dir(
+        file.path(),
+        &dataset,
+        cache_dir.path(),
+        IngestOverrides::default(),
+    );
+    assert_eq!(reopened, caches, "a reopen serves the same shared caches");
+}

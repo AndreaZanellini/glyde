@@ -56,6 +56,10 @@ pub enum EncodingSource {
     /// Windows-1252 (also covers Latin-1, which WHATWG treats as an alias of
     /// Windows-1252), and the other encodings it supports.
     Heuristic,
+    /// The user picked it in the inference bar (issue #97,
+    /// [`super::IngestOverrides::encoding`]): nothing was inferred, and a
+    /// byte-order mark does not overrule it.
+    UserCorrection,
 }
 
 /// Result of SPEC §1.2.1 encoding inference: which [`Encoding`] to decode
@@ -93,9 +97,20 @@ impl EncodingInference {
     /// check) is the result `Low`.
     pub fn confidence(&self) -> Confidence {
         match self.source {
-            EncodingSource::Bom => Confidence::High,
+            EncodingSource::Bom | EncodingSource::UserCorrection => Confidence::High,
             EncodingSource::Heuristic if self.encoding.name() == "UTF-8" => Confidence::High,
             EncodingSource::Heuristic => Confidence::Low,
+        }
+    }
+
+    /// A streaming decoder for this encoding. An inferred encoding lets a
+    /// byte-order mark decide (that is how a BOM was inferred in the first
+    /// place); a user's pick only strips a BOM of its own encoding, so it is
+    /// never silently switched to another one.
+    pub fn new_decoder(&self) -> encoding_rs::Decoder {
+        match self.source {
+            EncodingSource::UserCorrection => self.encoding.new_decoder_with_bom_removal(),
+            EncodingSource::Bom | EncodingSource::Heuristic => self.encoding.new_decoder(),
         }
     }
 }
@@ -199,7 +214,14 @@ fn utf8_invalid_byte_fraction(bytes: &[u8]) -> f64 {
 /// and duplicate the entire memory-mapped file onto the heap regardless,
 /// see issue #58).
 pub fn decode<'a>(bytes: &'a [u8], inference: &EncodingInference) -> Cow<'a, str> {
-    let (text, _, had_errors) = inference.encoding.decode(bytes);
+    // Same BOM rule as `EncodingInference::new_decoder`.
+    let (text, had_errors) = match inference.source {
+        EncodingSource::UserCorrection => inference.encoding.decode_with_bom_removal(bytes),
+        EncodingSource::Bom | EncodingSource::Heuristic => {
+            let (text, _, had_errors) = inference.encoding.decode(bytes);
+            (text, had_errors)
+        }
+    };
     if had_errors {
         warn!(
             encoding = inference.encoding.name(),

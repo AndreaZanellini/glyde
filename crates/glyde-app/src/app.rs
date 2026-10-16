@@ -34,7 +34,7 @@ use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache}
 
 use crate::inference_bar::Correction;
 use crate::plumbing::{
-    spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog, CancelFlag,
+    spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog, CancelFlag, ColumnPyramids,
     IndexingMessage, PreparedView, TimeIndexPreview, PROGRESS_BOOL_BAND_ROWS,
 };
 use crate::views::psd::{selection_rows, PsdPanel, PsdRequest};
@@ -101,7 +101,7 @@ enum Status {
         /// Shared with the background PSD job (`crate::plumbing::psd`),
         /// which reads its raw samples off the UI thread.
         dataset: Arc<Dataset>,
-        pyramids: Pyramids,
+        pyramids: ColumnPyramids,
         /// See [`PartialLoad::prepared`]: the same once-per-status-change
         /// derivations, for the completed dataset.
         prepared: Box<PreparedView>,
@@ -213,6 +213,13 @@ impl GlydeApp {
             }
             Correction::DecimalSeparator(separator) => {
                 self.overrides.decimal_separator = Some(separator)
+            }
+            Correction::Encoding(encoding) => {
+                self.overrides.encoding = Some(encoding);
+                // Re-decoding can change how rows split into columns, as a
+                // new delimiter does: a picked position may no longer name
+                // the same column.
+                self.overrides.time_column = None;
             }
             Correction::TimestampFormat(format) => self.overrides.timestamp_format = Some(format),
             Correction::SortByTime => self.overrides.sort_by_time = true,
@@ -454,9 +461,7 @@ impl eframe::App for GlydeApp {
                 // widget: persistent and discreet; opens expanded when any
                 // inference is low-confidence; each field correctable in one
                 // click, correcting triggers a re-index".
-                if let Some(correction) =
-                    inference_bar::show(ui, report, path, !dataset.is_spilled())
-                {
+                if let Some(correction) = inference_bar::show(ui, report, path) {
                     pending_correction = Some((path.clone(), correction));
                 }
                 // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1"; SPEC
@@ -537,6 +542,7 @@ fn loading_label(path: &Path, rows_read: u64, spilled: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glyde_core::index::disk_pyramid::ColumnPyramid;
     use glyde_core::ingest::{
         Confidence, DecimalSeparator, Delimiter, InferredField, OpenSummary, SamplingClass,
         TimeAxis, TimeColumnChoice,
@@ -612,6 +618,13 @@ mod tests {
     /// One `None` pyramid per [`sample_dataset`] column — a plausible
     /// `Progress`/`Completed` payload without needing a real
     /// `pyramids_for_dataset` build for these single-sample fixtures.
+    fn sample_column_pyramids() -> ColumnPyramids {
+        sample_pyramids()
+            .into_iter()
+            .map(|pyramid| pyramid.map(ColumnPyramid::Memory))
+            .collect()
+    }
+
     fn sample_pyramids() -> Pyramids {
         vec![None]
     }
@@ -663,7 +676,7 @@ mod tests {
                 summary: sample_summary(),
                 report: sample_report(),
                 dataset: sample_dataset(),
-                pyramids: sample_pyramids(),
+                pyramids: sample_column_pyramids(),
                 level0_caches: sample_level0_caches(),
                 prepared: sample_prepared(),
             })
@@ -830,7 +843,7 @@ mod tests {
                 summary: sample_summary(),
                 report: sample_report(),
                 dataset: sample_dataset(),
-                pyramids: sample_pyramids(),
+                pyramids: sample_column_pyramids(),
                 level0_caches: sample_level0_caches(),
                 prepared: sample_prepared(),
             })
@@ -858,6 +871,22 @@ mod tests {
         app.open(PathBuf::from("does-not-exist-glyde-app-test.csv"));
 
         assert_eq!(app.overrides, IngestOverrides::default());
+    }
+
+    // Issue #97: an encoding correction is kept for the file, and resets a
+    // picked time column whose position re-decoding may have shifted.
+    #[test]
+    fn an_encoding_correction_sets_the_override_and_resets_the_time_column() {
+        use glyde_core::ingest::{EncodingChoice, TimeColumnChoice};
+        let mut app = GlydeApp::new();
+        let path = PathBuf::from("does-not-exist-glyde-app-test.csv");
+        app.apply_correction(
+            path.clone(),
+            Correction::TimeColumn(TimeColumnChoice::Column(2)),
+        );
+        app.apply_correction(path, Correction::Encoding(EncodingChoice::Utf16Le));
+        assert_eq!(app.overrides.encoding, Some(EncodingChoice::Utf16Le));
+        assert_eq!(app.overrides.time_column, None);
     }
 
     // Issue #119: every request that bumps the generation — a new file, a

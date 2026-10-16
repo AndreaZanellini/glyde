@@ -27,7 +27,7 @@ mod support;
 
 use support::{corpus_dir, discover_cases, load_expected};
 
-const EXPECTED_CORPUS_SIZE: usize = 59;
+const EXPECTED_CORPUS_SIZE: usize = 60;
 
 #[test]
 fn every_committed_case_has_a_well_formed_expected_json() {
@@ -48,7 +48,7 @@ fn every_committed_case_has_a_well_formed_expected_json() {
 }
 
 #[test]
-fn corpus_has_all_59_cases() {
+fn corpus_has_all_60_cases() {
     let dir = corpus_dir();
     let cases = discover_cases(&dir).expect("read testdata/corpus");
 

@@ -675,12 +675,18 @@ fn choose_storage_with_disk(
     // A dataset this open replaces may still be giving its space back.
     crate::index::spill::wait_for_pending_deletions();
     crate::index::spill::sweep_orphaned_spill_files(cache_dir);
+    // Issue #110: sorting a spilled file holds two copies of it on disk at
+    // its peak (the unsorted columns and the sorted runs, then the runs and
+    // the sorted columns — see `spill_sort`), so it needs room for both.
+    let spill_bytes = if overrides.sort_by_time {
+        footprint.estimated_spill_bytes.saturating_mul(2)
+    } else {
+        footprint.estimated_spill_bytes
+    };
     match available_disk_bytes(cache_dir) {
-        Some(available_bytes) => crate::budget::check_disk_affordable(
-            footprint.estimated_spill_bytes,
-            available_bytes,
-            cache_dir,
-        )?,
+        Some(available_bytes) => {
+            crate::budget::check_disk_affordable(spill_bytes, available_bytes, cache_dir)?
+        }
         None => warn!(
             cache_dir = %cache_dir.display(),
             estimated_spill_bytes = footprint.estimated_spill_bytes,
@@ -698,14 +704,6 @@ fn choose_storage_with_disk(
         "spilling to the on-disk cache: materializing this file in memory would exceed the RAM \
          budget (SPEC §5.1)"
     );
-    if overrides.sort_by_time {
-        warn!(
-            file_bytes,
-            "sort-by-time was requested, but this file must spill to the on-disk cache (SPEC \
-             §5.1) — a spilled column cannot be permuted in place, so it opens unsorted \
-             (SPEC §2.1's [Sort] affordance is not available for a spilled file)"
-        );
-    }
     Ok(Storage::Spill(Box::new(sniff)))
 }
 
@@ -723,7 +721,15 @@ fn load_with_outcome_using(
         }
         Storage::Spill(sniff) => {
             let cache_dir = cache_dir.expect("choose_storage refuses to spill without a cache dir");
-            load_spilled(path, &sniff, cache_dir, None, overrides, &NEVER_CANCELLED)
+            load_spilled(
+                path,
+                &sniff,
+                cache_dir,
+                None,
+                overrides,
+                budget,
+                &NEVER_CANCELLED,
+            )
         }
     }
 }
@@ -1418,6 +1424,7 @@ fn load_spilled(
     cache_dir: &Path,
     on_checkpoint: Option<&mut dyn FnMut(Checkpoint)>,
     overrides: IngestOverrides,
+    budget: RamBudget,
     cancelled: &AtomicBool,
 ) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     let column_names = sniff.column_names().to_vec();
@@ -1571,15 +1578,19 @@ fn load_spilled(
         "file materialized through the on-disk spill cache (SPEC §5.1)"
     );
 
-    Ok((
-        outcome,
-        Dataset {
-            time,
-            time_column_name,
-            columns,
-        },
-        inference,
-    ))
+    let mut dataset = Dataset {
+        time,
+        time_column_name,
+        columns,
+    };
+    // SPEC §2.1 "[Sort]" (issue #110): the same stable time order the
+    // in-memory path's `sort_dataset_by_time` gives, done on disk.
+    if overrides.sort_by_time {
+        drop(set);
+        dataset = super::spill_sort::sort_spilled_by_time(dataset, cache_dir, budget, cancelled)?;
+    }
+
+    Ok((outcome, dataset, inference))
 }
 
 /// Streams every row of `path` (see [`super::csv::stream_path`]) to
@@ -1866,7 +1877,7 @@ enum TimeValue {
 /// One row's typed data value, handed back by [`ColumnSpillWriter::push`],
 /// borrowing the source text for the string case so the common numeric path
 /// costs no allocation.
-enum ColumnValue<'a> {
+pub(super) enum ColumnValue<'a> {
     Bool(bool),
     I64(i64),
     F64(f64),
@@ -1877,7 +1888,7 @@ enum ColumnValue<'a> {
 /// sample at a time. A field that does not parse under the dtype the scan
 /// pass settled on cannot happen — the scan saw the same field — so the
 /// fallbacks here mirror `infer_column`'s own.
-enum ColumnSpillWriter {
+pub(super) enum ColumnSpillWriter {
     Bool(SpillVecWriter<u8>),
     I64(SpillVecWriter<i64>),
     /// SPEC §1.3's NaN runs are flagged as the samples stream past, so the
@@ -1887,7 +1898,7 @@ enum ColumnSpillWriter {
 }
 
 impl ColumnSpillWriter {
-    fn create(set: &SpillSet, stem: &str, dtype: Dtype) -> Result<Self> {
+    pub(super) fn create(set: &SpillSet, stem: &str, dtype: Dtype) -> Result<Self> {
         Ok(match dtype {
             Dtype::Bool => ColumnSpillWriter::Bool(SpillVecWriter::create(set, stem)?),
             Dtype::I64 => ColumnSpillWriter::I64(SpillVecWriter::create(set, stem)?),
@@ -1929,7 +1940,30 @@ impl ColumnSpillWriter {
         }
     }
 
-    fn finish(self, name: String) -> Result<Series> {
+    /// Appends an already-typed value — the [`super::spill_sort`] rewrite of
+    /// a column whose fields were typed once already, on the way in. The
+    /// NaN-run scan sees it exactly as [`Self::push`] would.
+    pub(super) fn push_value(&mut self, value: ColumnValue<'_>) -> Result<()> {
+        match (self, value) {
+            (ColumnSpillWriter::Bool(values), ColumnValue::Bool(value)) => {
+                values.push(u8::from(value))
+            }
+            (ColumnSpillWriter::I64(values), ColumnValue::I64(value)) => values.push(value),
+            (ColumnSpillWriter::F64(values, nan_runs), ColumnValue::F64(value)) => {
+                nan_runs.observe(value);
+                values.push(value)
+            }
+            (ColumnSpillWriter::String(values), ColumnValue::Str(value)) => values.push(value),
+            // Unreachable: the sort builds each writer from the very column
+            // whose values it then pushes.
+            _ => Err(GlydeError::Io {
+                path: std::path::PathBuf::from("<spill sort>"),
+                source: std::io::Error::other("a value does not match its column's dtype"),
+            }),
+        }
+    }
+
+    pub(super) fn finish(self, name: String) -> Result<Series> {
         Ok(match self {
             ColumnSpillWriter::Bool(values) => Series::new(
                 name,
@@ -2298,25 +2332,53 @@ fn load_with_outcome_progressive_using(
     path: &Path,
     overrides: IngestOverrides,
     cancelled: &AtomicBool,
+    on_checkpoint: impl FnMut(Checkpoint),
+) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
+    load_with_outcome_progressive_in(
+        path,
+        overrides,
+        RamBudget::from_system(),
+        os_spill_dir().as_deref(),
+        cancelled,
+        on_checkpoint,
+    )
+}
+
+/// [`load_with_outcome_progressive_using`] against an explicit budget and
+/// cache directory. A file opened before, unchanged, under the same
+/// overrides, is served from the whole-dataset cache without reading its
+/// source at all (issue #106, [`super::dataset_cache`]); any other open
+/// parses it and, when it fits in memory, caches the result.
+pub(crate) fn load_with_outcome_progressive_in(
+    path: &Path,
+    overrides: IngestOverrides,
+    budget: RamBudget,
+    cache_dir: Option<&Path>,
+    cancelled: &AtomicBool,
     mut on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
-    let cache_dir = os_spill_dir();
-    match choose_storage(
-        path,
-        RamBudget::from_system(),
-        cache_dir.as_deref(),
-        overrides,
-    )? {
+    let dataset_key = cache_dir.and_then(|_| match CacheKey::for_path(path) {
+        Ok(key) => Some(key.with_overrides_signature(super::overrides_signature(overrides))),
+        Err(err) => {
+            warn!(error = %err, "could not key the dataset cache; parsing without it");
+            None
+        }
+    });
+    if let (Some(dir), Some(key)) = (cache_dir, &dataset_key) {
+        if let Some(parsed) = super::dataset_cache::try_load(dir, key, budget) {
+            return Ok(parsed);
+        }
+    }
+    match choose_storage(path, budget, cache_dir, overrides)? {
         Storage::Spill(sniff) => {
-            let cache_dir = cache_dir
-                .as_deref()
-                .expect("choose_storage refuses to spill without a cache dir");
+            let cache_dir = cache_dir.expect("choose_storage refuses to spill without a cache dir");
             load_spilled(
                 path,
                 &sniff,
                 cache_dir,
                 Some(&mut on_checkpoint),
                 overrides,
+                budget,
                 cancelled,
             )
         }
@@ -2359,9 +2421,12 @@ fn load_with_outcome_progressive_using(
                 },
             )?;
             ensure_not_cancelled(cancelled)?;
-            let (dataset, timestamp_format_ambiguous) =
-                builder.finish(&outcome, &columns_text, overrides)?;
-            Ok((outcome, dataset, timestamp_format_ambiguous))
+            let (dataset, inference) = builder.finish(&outcome, &columns_text, overrides)?;
+            drop(columns_text);
+            if let (Some(dir), Some(key)) = (cache_dir, &dataset_key) {
+                super::dataset_cache::store(dir, key, (&outcome, &dataset, &inference));
+            }
+            Ok((outcome, dataset, inference))
         }
     }
 }
@@ -2411,6 +2476,7 @@ pub fn load_progressive_with_budget_cancellable(
             cache_dir,
             Some(&mut on_checkpoint),
             overrides,
+            budget,
             cancelled,
         )
         .map(|(_outcome, dataset, _ambiguous)| dataset),
@@ -2456,6 +2522,70 @@ pub(crate) fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<()> {
         return Err(GlydeError::Cancelled);
     }
     Ok(())
+}
+
+/// Every numeric column's min/max pyramid for a *spilled* dataset, built on
+/// disk (issue #102, [`crate::index::disk_pyramid`]) into a spill set of its
+/// own under `cache_dir`, so a file too large for memory gets the same
+/// pyramid-accelerated rendering as one that fits — without the ~9 bytes per
+/// sample of RAM an in-memory pyramid would cost. `None` for a non-numeric
+/// column, and for any column whose pyramid could not be written (logged at
+/// `warn`): the view then decimates its raw samples, as before.
+///
+/// The pyramids take about as much disk as they would have taken RAM (one
+/// 64-byte bucket per ~7 samples, per numeric column), so that space is
+/// checked first, with the same headroom the spill itself keeps (SPEC §5.1:
+/// check affordability before acting); if it is not there, no pyramid is
+/// built and the file still renders, from its raw samples.
+pub fn disk_pyramids_for_dataset(
+    dataset: &Dataset,
+    cache_dir: &Path,
+) -> Vec<Option<crate::index::disk_pyramid::DiskPyramid>> {
+    let none = || (0..dataset.columns.len()).map(|_| None).collect();
+    let numeric = dataset
+        .columns
+        .iter()
+        .filter(|series| series.values().sample_source().is_some())
+        .count() as u64;
+    let rows = dataset.time.len() as u64;
+    let pyramid_bytes = rows.div_ceil(7).saturating_mul(64).saturating_mul(numeric);
+    if let Some(available) = crate::budget::available_disk_bytes(cache_dir) {
+        if let Err(err) = crate::budget::check_disk_affordable(pyramid_bytes, available, cache_dir)
+        {
+            warn!(
+                error = %err,
+                pyramid_bytes,
+                "not enough free disk for the on-disk pyramids; this file renders from its raw \
+                 samples (slower to pan over the whole file, same picture)"
+            );
+            return none();
+        }
+    }
+    let set = match SpillSet::create(cache_dir) {
+        Ok(set) => set,
+        Err(err) => {
+            warn!(error = %err, "could not create a spill set for the on-disk pyramids");
+            return none();
+        }
+    };
+    dataset
+        .columns
+        .iter()
+        .map(|series| {
+            let samples = series.values().sample_source()?;
+            match crate::index::disk_pyramid::build_disk_pyramid(&set, &samples, &dataset.time) {
+                Ok(pyramid) => Some(pyramid),
+                Err(err) => {
+                    warn!(
+                        column = series.name(),
+                        error = %err,
+                        "could not build this column's on-disk pyramid; it renders from raw samples"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// Per-column pyramid state carried between successive progressive
@@ -2879,6 +3009,16 @@ pub fn derived_caches_for_dataset_cached_with_cache_dir(
     };
 
     let ticks = dataset.time.to_pyramid_ticks();
+    // Issue #115: the time axis is the same for every column, so its
+    // Level-0 file is written once here, before the columns run in parallel
+    // and each finds it, instead of once per column. A failure only costs
+    // that saving: each column then writes it itself.
+    if let Err(err) = level0::build_or_open_shared_timestamps(cache_dir, &key, &ticks) {
+        warn!(
+            error = %err,
+            "could not write the shared Level-0 timestamps; each column writes its own"
+        );
+    }
     // Columns are independent — each has its own cache files — so they are
     // built on the `rayon` compute pool (issue #114). The result keeps
     // `dataset.columns` order.
