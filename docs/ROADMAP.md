@@ -229,7 +229,7 @@ them, so CI stays green while honoring "written first."
 - [ ] Release binary size gate ≤ 50 MB + cold-start ≤ 500 ms bench → SPEC §5, §7 · proven by: artifact-size CI check + cold-start bench
 - [ ] Light/dark follows the OS; no theme settings → SPEC §6 · proven by: manual OS theme switch
 - [ ] CI release job on tags: macOS arm64 `.dmg`, Windows x64 installer + portable `.exe`, Linux x64 `AppImage` + tarball, attached to the GitHub Release → SPEC §7, QUALITY §4.7 · proven by: tag build produces + attaches all artifacts
-- [ ] Unsigned-build workaround steps for macOS & Windows in release notes → SPEC §7 · proven by: release-notes template contains them
+- [x] Unsigned-build workaround steps for macOS & Windows in release notes → SPEC §7 · proven by: release-notes template contains them · `packaging/release-notes.md`, locked by `glyde-devtools/tests/release_packaging.rs`
 - [ ] `CHANGELOG.md` finalized in plain language + manual-QA reminder ("run the 10-file smoke ritual") printed in release notes → CLAUDE.md §Release checklist, QUALITY §5 · proven by: release notes contain the ritual reminder
 
 > **MAINTAINER TEST — M9**

@@ -467,6 +467,26 @@ Versioning: [Semantic Versioning](https://semver.org/).
      is the conventional default for this use.
 
 ### Fixed
+- **A release can no longer be published from untested code, and it now
+  ships in the formats people expect.** Pushing a version tag used to build
+  bare binaries and publish them straight away, without running any test.
+  Now the release first runs the full test suite (formatting, lint, every
+  test, the performance budgets, the license check) and publishes nothing
+  unless all of it passes. It then builds what the spec asks for: a `.dmg`
+  for macOS (drag Glyde to Applications), an installer and a portable `.exe`
+  for Windows, and an AppImage and a `.tar.gz` for Linux, each checked
+  against the 50 MB size limit. The release page starts with the steps to
+  open an unsigned build the first time on macOS and Windows, and with the
+  reminder to run the 10-file smoke ritual before announcing. Running the
+  release workflow by hand (without a tag) is a dry run: it builds and keeps
+  the packages as downloads of that run, and publishes nothing. (#30)
+
+  **Assumptions made (please veto):**
+  - The app icon is a placeholder (a white wave on blue), only used by the
+    Linux AppImage, which requires one. Replace
+    `packaging/linux/glyde.png` with the real icon when there is one.
+  - Builds stay unsigned. Signing needs your Apple Developer account and a
+    Windows certificate (SPEC §7); it remains a blocker before going public.
 - **The scroll/zoom smoothness check now measures what it claims, including
   for files too big for memory.** The automatic check that keeps
   panning and zooming under SPEC §5's frame budget (≤ 100 ms) used to draw a

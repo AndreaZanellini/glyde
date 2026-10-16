@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Issue #30: the release workflow runs this whole suite first and builds
+  # nothing unless every job here is green.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always

@@ -1,5 +1,11 @@
 name: Release
 
+# Issue #30 / docs/SPEC.md §7 / docs/ROADMAP.md M9.
+#
+# - A `v*` tag publishes a GitHub Release, but only after the full CI suite
+#   (fmt, clippy, tests, benchmarks, licenses) has passed on that commit.
+# - `workflow_dispatch` is a dry run: same CI gate, same packages, uploaded as
+#   workflow artifacts — nothing is published. Use it to check packaging.
 on:
   push:
     tags: ["v*"]
@@ -8,9 +14,18 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  ci:
+    name: CI gate
+    uses: ./.github/workflows/ci.yml
+
   build:
-    name: Build ${{ matrix.target }}
+    name: Package ${{ matrix.target }}
+    needs: ci
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -35,22 +50,55 @@ jobs:
           sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev
       - run: cargo build --release --target ${{ matrix.target }} -p glyde-app
 
-      # TODO(before going public): macOS signing + notarization (Apple Developer),
-      # Windows code signing. An unsigned first-run warning is a release blocker
-      # for the public repo. See docs/SPEC.md §7.
-
-      - name: Package
-        shell: bash
+      - name: Version
+        id: version
         run: |
-          mkdir -p dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp target/${{ matrix.target }}/release/glyde.exe dist/glyde-${{ matrix.target }}.exe
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
           else
-            cp target/${{ matrix.target }}/release/glyde dist/glyde-${{ matrix.target }}
+            version="$(cargo metadata --no-deps --format-version 1 \
+              | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="glyde-app"))')-dryrun"
           fi
-      - name: Assert binary size budget (<= 50 MB, docs/SPEC.md §5)
-        shell: bash
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Packaging version $version"
+
+      # Unsigned until the Apple Developer account and a Windows code-signing
+      # certificate exist (docs/SPEC.md §7, a release blocker for going
+      # public). packaging/release-notes.md carries the first-run workaround.
+      - name: Package (macOS .dmg)
+        if: runner.os == 'macOS'
+        run: packaging/macos/package.sh target/${{ matrix.target }}/release/glyde "${{ steps.version.outputs.version }}" dist
+
+      - name: Package (Linux AppImage + tarball)
+        if: runner.os == 'Linux'
+        env:
+          # Pinned appimagetool; extract-and-run because runners have no FUSE.
+          APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL "$APPIMAGETOOL_URL" -o "$RUNNER_TEMP/bin/appimagetool"
+          chmod +x "$RUNNER_TEMP/bin/appimagetool"
+          PATH="$RUNNER_TEMP/bin:$PATH" packaging/linux/package.sh target/${{ matrix.target }}/release/glyde "${{ steps.version.outputs.version }}" dist
+
+      - name: Package (Windows installer + portable .exe)
+        if: runner.os == 'Windows'
+        env:
+          # Git Bash would rewrite ISCC's `/D...` switches as paths.
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/glyde.exe "dist/glyde-$version-windows-x64.exe"
+          exe="$(cygpath -w "$PWD/target/${{ matrix.target }}/release/glyde.exe")"
+          outdir="$(cygpath -w "$PWD/dist")"
+          iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          "$iscc" "/DAppVersion=$version" "/DSourceExe=$exe" "/DOutputDir=$outdir" packaging/windows/glyde.iss
+
+      - name: Assert artifact size budget (<= 50 MB, docs/SPEC.md §5)
+        run: |
+          ls -la dist
+          [ -n "$(ls -A dist)" ] || { echo "::error::no artifacts were produced"; exit 1; }
           for f in dist/*; do
             size=$(wc -c < "$f")
             echo "$f: $size bytes"
@@ -62,15 +110,29 @@ jobs:
           path: dist/*
 
   release:
+    name: Publish GitHub Release
     needs: build
+    # A dry run (workflow_dispatch) stops at the uploaded artifacts.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           path: dist
+      - name: Expect every SPEC §7 artifact
+        run: |
+          find dist -type f | sort
+          for pattern in '*-macos-arm64.dmg' '*-windows-x64-setup.exe' '*-windows-x64.exe' \
+                         '*-linux-x86_64.AppImage' '*-linux-x86_64.tar.gz'; do
+            [ -n "$(find dist -type f -name "$pattern")" ] \
+              || { echo "::error::missing release artifact $pattern"; exit 1; }
+          done
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/**/*
+          # Unsigned-build workaround steps and the maintainer's smoke-ritual
+          # reminder (docs/SPEC.md §7, CLAUDE.md §Release checklist), followed
+          # by the generated commit list.
+          body_path: packaging/release-notes.md
           generate_release_notes: true
-          # Release notes must include, until signing is in place, the exact
-          # "unsigned build" workaround steps for macOS and Windows.
