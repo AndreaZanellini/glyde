@@ -12,6 +12,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **[Sort] now works on files too large for memory.** When a file's
+  timestamps run out of order, clicking **Sort** in the inference bar used
+  to work only for files Glyde could hold in memory; for bigger files the
+  bar said sorting was unavailable. Now every file can be sorted: a big one
+  is sorted on disk, in pieces, with the same result as for a small file
+  (rows with equal timestamps keep their original order) and without using
+  more memory as the file grows. It takes extra time after the file is
+  read, and it needs free disk space for about two copies of the file's
+  cache while it runs. Glyde checks that space before starting and refuses
+  with a clear message if it is not there. (#110)
 - **Text state columns (like `idle` / `running` / `fault`) now show as labeled
   colored bands under the plot, one lane per column.** Each run of the same
   value is one band; the same state always gets the same color. If the band
@@ -301,18 +311,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
   also shows a **timezone** field: `"timezone: +02:00 (honored)"` for an
   explicit offset, `"timezone: UTC (implicit)"` for Unix/LabVIEW epoch
   counters, and `"timezone: naive local time"` for dates with no timezone
-  (including Excel serial dates). For a file streamed to disk, the bar
-  explains that sorting is unavailable instead of offering a button that
-  cannot work. (docs/ROADMAP.md M4)
+  (including Excel serial dates). Files too large for memory can be sorted
+  too (see the "[Sort] now works on files too large for memory" entry).
+  (docs/ROADMAP.md M4)
 
   The in-memory correction permutes columns in place, including string
   columns, instead of allocating a full second copy of each column.
 
-  **Assumptions made:** (1) sorting is only offered for a file small enough
-  to be held in memory — a file large enough to stream from disk opens
-  unsorted and the bar explains why, since a streamed file's on-disk cache
-  cannot be reordered in place; making a huge file sortable is a materially
-  bigger change tracked as a follow-up rather than folded in here. (2) the
+  **Assumptions made:** (1) superseded — sorting was first offered only
+  for files that fit in memory; it now works for every file. (2) the
   timezone field is a one-line, whole-column summary taken from the file's
   first row; a file whose offset genuinely changes partway through (e.g. a
   DST transition mid-file) is already handled correctly *per sample* on the

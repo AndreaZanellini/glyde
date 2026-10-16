@@ -673,12 +673,18 @@ fn choose_storage_with_disk(
     // A dataset this open replaces may still be giving its space back.
     crate::index::spill::wait_for_pending_deletions();
     crate::index::spill::sweep_orphaned_spill_files(cache_dir);
+    // Issue #110: sorting a spilled file holds two copies of it on disk at
+    // its peak (the unsorted columns and the sorted runs, then the runs and
+    // the sorted columns — see `spill_sort`), so it needs room for both.
+    let spill_bytes = if overrides.sort_by_time {
+        footprint.estimated_spill_bytes.saturating_mul(2)
+    } else {
+        footprint.estimated_spill_bytes
+    };
     match available_disk_bytes(cache_dir) {
-        Some(available_bytes) => crate::budget::check_disk_affordable(
-            footprint.estimated_spill_bytes,
-            available_bytes,
-            cache_dir,
-        )?,
+        Some(available_bytes) => {
+            crate::budget::check_disk_affordable(spill_bytes, available_bytes, cache_dir)?
+        }
         None => warn!(
             cache_dir = %cache_dir.display(),
             estimated_spill_bytes = footprint.estimated_spill_bytes,
@@ -696,14 +702,6 @@ fn choose_storage_with_disk(
         "spilling to the on-disk cache: materializing this file in memory would exceed the RAM \
          budget (SPEC §5.1)"
     );
-    if overrides.sort_by_time {
-        warn!(
-            file_bytes,
-            "sort-by-time was requested, but this file must spill to the on-disk cache (SPEC \
-             §5.1) — a spilled column cannot be permuted in place, so it opens unsorted \
-             (SPEC §2.1's [Sort] affordance is not available for a spilled file)"
-        );
-    }
     Ok(Storage::Spill(Box::new(sniff)))
 }
 
@@ -721,7 +719,7 @@ fn load_with_outcome_using(
         }
         Storage::Spill(sniff) => {
             let cache_dir = cache_dir.expect("choose_storage refuses to spill without a cache dir");
-            load_spilled(path, &sniff, cache_dir, None, overrides)
+            load_spilled(path, &sniff, cache_dir, None, overrides, budget)
         }
     }
 }
@@ -1399,6 +1397,7 @@ fn load_spilled(
     cache_dir: &Path,
     on_checkpoint: Option<&mut dyn FnMut(Checkpoint)>,
     overrides: IngestOverrides,
+    budget: RamBudget,
 ) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     let column_names = sniff.column_names().to_vec();
     let column_count = column_names.len();
@@ -1550,15 +1549,19 @@ fn load_spilled(
         "file materialized through the on-disk spill cache (SPEC §5.1)"
     );
 
-    Ok((
-        outcome,
-        Dataset {
-            time,
-            time_column_name,
-            columns,
-        },
-        inference,
-    ))
+    let mut dataset = Dataset {
+        time,
+        time_column_name,
+        columns,
+    };
+    // SPEC §2.1 "[Sort]" (issue #110): the same stable time order the
+    // in-memory path's `sort_dataset_by_time` gives, done on disk.
+    if overrides.sort_by_time {
+        drop(set);
+        dataset = super::spill_sort::sort_spilled_by_time(dataset, cache_dir, budget)?;
+    }
+
+    Ok((outcome, dataset, inference))
 }
 
 /// Streams every row of `path` (see [`super::csv::stream_path`]) to
@@ -1837,7 +1840,7 @@ enum TimeValue {
 /// One row's typed data value, handed back by [`ColumnSpillWriter::push`],
 /// borrowing the source text for the string case so the common numeric path
 /// costs no allocation.
-enum ColumnValue<'a> {
+pub(super) enum ColumnValue<'a> {
     Bool(bool),
     I64(i64),
     F64(f64),
@@ -1848,7 +1851,7 @@ enum ColumnValue<'a> {
 /// sample at a time. A field that does not parse under the dtype the scan
 /// pass settled on cannot happen — the scan saw the same field — so the
 /// fallbacks here mirror `infer_column`'s own.
-enum ColumnSpillWriter {
+pub(super) enum ColumnSpillWriter {
     Bool(SpillVecWriter<u8>),
     I64(SpillVecWriter<i64>),
     /// SPEC §1.3's NaN runs are flagged as the samples stream past, so the
@@ -1858,7 +1861,7 @@ enum ColumnSpillWriter {
 }
 
 impl ColumnSpillWriter {
-    fn create(set: &SpillSet, stem: &str, dtype: Dtype) -> Result<Self> {
+    pub(super) fn create(set: &SpillSet, stem: &str, dtype: Dtype) -> Result<Self> {
         Ok(match dtype {
             Dtype::Bool => ColumnSpillWriter::Bool(SpillVecWriter::create(set, stem)?),
             Dtype::I64 => ColumnSpillWriter::I64(SpillVecWriter::create(set, stem)?),
@@ -1900,7 +1903,30 @@ impl ColumnSpillWriter {
         }
     }
 
-    fn finish(self, name: String) -> Result<Series> {
+    /// Appends an already-typed value — the [`super::spill_sort`] rewrite of
+    /// a column whose fields were typed once already, on the way in. The
+    /// NaN-run scan sees it exactly as [`Self::push`] would.
+    pub(super) fn push_value(&mut self, value: ColumnValue<'_>) -> Result<()> {
+        match (self, value) {
+            (ColumnSpillWriter::Bool(values), ColumnValue::Bool(value)) => {
+                values.push(u8::from(value))
+            }
+            (ColumnSpillWriter::I64(values), ColumnValue::I64(value)) => values.push(value),
+            (ColumnSpillWriter::F64(values, nan_runs), ColumnValue::F64(value)) => {
+                nan_runs.observe(value);
+                values.push(value)
+            }
+            (ColumnSpillWriter::String(values), ColumnValue::Str(value)) => values.push(value),
+            // Unreachable: the sort builds each writer from the very column
+            // whose values it then pushes.
+            _ => Err(GlydeError::Io {
+                path: std::path::PathBuf::from("<spill sort>"),
+                source: std::io::Error::other("a value does not match its column's dtype"),
+            }),
+        }
+    }
+
+    pub(super) fn finish(self, name: String) -> Result<Series> {
         Ok(match self {
             ColumnSpillWriter::Bool(values) => Series::new(
                 name,
@@ -2232,17 +2258,20 @@ fn load_with_outcome_progressive_using(
     mut on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     let cache_dir = os_spill_dir();
-    match choose_storage(
-        path,
-        RamBudget::from_system(),
-        cache_dir.as_deref(),
-        overrides,
-    )? {
+    let budget = RamBudget::from_system();
+    match choose_storage(path, budget, cache_dir.as_deref(), overrides)? {
         Storage::Spill(sniff) => {
             let cache_dir = cache_dir
                 .as_deref()
                 .expect("choose_storage refuses to spill without a cache dir");
-            load_spilled(path, &sniff, cache_dir, Some(&mut on_checkpoint), overrides)
+            load_spilled(
+                path,
+                &sniff,
+                cache_dir,
+                Some(&mut on_checkpoint),
+                overrides,
+                budget,
+            )
         }
         Storage::InMemory => {
             let mut pyramid_cursor = PyramidCursor::default();
@@ -2303,10 +2332,15 @@ pub fn load_progressive_with_budget(
 ) -> Result<Dataset> {
     let overrides = IngestOverrides::default();
     match choose_storage(path, budget, Some(cache_dir), overrides)? {
-        Storage::Spill(sniff) => {
-            load_spilled(path, &sniff, cache_dir, Some(&mut on_checkpoint), overrides)
-                .map(|(_outcome, dataset, _ambiguous)| dataset)
-        }
+        Storage::Spill(sniff) => load_spilled(
+            path,
+            &sniff,
+            cache_dir,
+            Some(&mut on_checkpoint),
+            overrides,
+            budget,
+        )
+        .map(|(_outcome, dataset, _ambiguous)| dataset),
         Storage::InMemory => {
             let mut pyramid_cursor = PyramidCursor::default();
             let mut builder = DatasetBuilder::default();

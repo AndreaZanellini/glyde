@@ -106,7 +106,6 @@ pub fn show(
     ui: &mut egui::Ui,
     report: &InferenceReport,
     open_id_source: &Path,
-    can_sort: bool,
 ) -> Option<Correction> {
     let low_confidence = report.has_low_confidence_field();
     let response = egui::CollapsingHeader::new(header_text(report, low_confidence))
@@ -138,7 +137,7 @@ pub fn show(
                 }
                 ui.label(format!("{} samples", report.sample_count));
                 ui.label(format!("sampling: {:?}", report.sampling_class));
-                if let Some(picked) = monotonicity_affordance(ui, report, can_sort) {
+                if let Some(picked) = monotonicity_affordance(ui, report) {
                     correction = Some(picked);
                 }
             });
@@ -313,11 +312,7 @@ fn timezone_label_text(timezone: &Option<TimezoneLabel>) -> Option<String> {
 /// default (SPEC §2.1: rows are "not reordered silently" until this button
 /// is *not* the one clicked), so it reports no correction at all — clicking
 /// it changes nothing, which is the point.
-fn monotonicity_affordance(
-    ui: &mut egui::Ui,
-    report: &InferenceReport,
-    can_sort: bool,
-) -> Option<Correction> {
+fn monotonicity_affordance(ui: &mut egui::Ui, report: &InferenceReport) -> Option<Correction> {
     if report.non_monotonic_count == 0 {
         return None;
     }
@@ -332,12 +327,10 @@ fn monotonicity_affordance(
                 "s"
             }
         ));
-        if can_sort {
-            if ui.button("Sort").clicked() {
-                correction = Some(Correction::SortByTime);
-            }
-        } else {
-            ui.label("sorting unavailable for files streamed to disk");
+        // Every file can be sorted: one too large for memory is sorted on
+        // disk (issue #110).
+        if ui.button("Sort").clicked() {
+            correction = Some(Correction::SortByTime);
         }
         let _ = ui.button("Keep as-is");
     });
@@ -625,7 +618,7 @@ mod tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, report, Path::new("/some/file.csv"), true);
+                show(ui, report, Path::new("/some/file.csv"));
             });
         });
         output.shapes.len()
@@ -772,7 +765,7 @@ mod tests {
         let mut correction = None;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                correction = show(ui, &report, Path::new("/some/file.csv"), true);
+                correction = show(ui, &report, Path::new("/some/file.csv"));
             });
         });
 
@@ -904,7 +897,7 @@ mod tests {
         let report = sample_report_with_skipped_rows();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &report, Path::new("/some/file.csv"), true);
+                show(ui, &report, Path::new("/some/file.csv"));
             });
         });
 

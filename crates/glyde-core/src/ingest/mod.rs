@@ -28,6 +28,7 @@ mod csv;
 mod dataset;
 mod infer;
 mod report;
+mod spill_sort;
 
 pub use crate::index::level0::Level0Cache;
 pub use csv::{
@@ -76,10 +77,10 @@ pub struct IngestOverrides {
     /// SPEC §2.1's "[Sort]" affordance for a non-monotonic time axis: rows
     /// are reordered by ascending timestamp instead of kept in source order.
     /// Unlike the other three fields, this is not a bypassed inference — it
-    /// is a data transform, and only ever applied on the in-memory ingestion
-    /// path (`dataset::build_dataset`); a spilled open logs a warning and
-    /// opens unsorted instead, since a spill file cannot be permuted in
-    /// place (see `dataset::choose_storage`).
+    /// is a data transform: a stable sort on the in-memory path
+    /// (`dataset::build_dataset`), and the same order produced on disk by
+    /// an external merge sort on the spilled path (`spill_sort`, issue
+    /// #110).
     pub sort_by_time: bool,
     /// SPEC §1.2's time-column correction: which column is the time index,
     /// or none at all. `None` keeps SPEC §2.1's automatic detection (column

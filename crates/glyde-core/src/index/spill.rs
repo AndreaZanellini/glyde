@@ -63,7 +63,7 @@
 //! caches, not backing stores, and their eviction is still deferred.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::ops::Range;
@@ -531,6 +531,58 @@ impl<T: Pod> SpillVec<T> {
     }
 }
 
+impl<T: Pod> SpillVec<T> {
+    /// A pull-based reader over every element, in order, reading through a
+    /// fixed-size buffer rather than the mapping — [`Self::read_chunks`]'s
+    /// bounded-memory guarantee in a form several columns can be advanced
+    /// in lockstep (issue #110's on-disk sort reads a whole row at a time).
+    pub fn cursor(&self) -> Result<SpillCursor<T>> {
+        let io_error = |source: std::io::Error| GlydeError::Io {
+            path: self.file.path.clone(),
+            source,
+        };
+        let mut file = File::open(&self.file.path).map_err(io_error)?;
+        file.seek(SeekFrom::Start(HEADER_LEN as u64))
+            .map_err(io_error)?;
+        Ok(SpillCursor {
+            reader: BufReader::with_capacity(CURSOR_BUFFER_BYTES, file),
+            path: self.file.path.clone(),
+            remaining: self.len,
+            marker: PhantomData,
+        })
+    }
+}
+
+/// Buffer size of one [`SpillCursor`]: a few of them are open at once (one
+/// per column of a row), so smaller than [`READ_CHUNK_BYTES`].
+const CURSOR_BUFFER_BYTES: usize = 256 * 1024;
+
+/// See [`SpillVec::cursor`].
+pub struct SpillCursor<T> {
+    reader: BufReader<File>,
+    path: PathBuf,
+    remaining: usize,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T: Pod> SpillCursor<T> {
+    /// The next element, or `None` past the last one.
+    pub fn next_value(&mut self) -> Result<Option<T>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let mut value = T::zeroed();
+        self.reader
+            .read_exact(bytemuck::bytes_of_mut(&mut value))
+            .map_err(|source| GlydeError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.remaining -= 1;
+        Ok(Some(value))
+    }
+}
+
 /// Prints the shape only, never the samples: a spilled column can hold
 /// billions of elements and `Debug` is reached from log lines and test
 /// output alike.
@@ -762,6 +814,46 @@ impl SpillStrings {
     /// Every field, in row order.
     pub fn iter(&self) -> impl Iterator<Item = &str> + '_ {
         (0..self.len()).map(move |index| self.get(index).unwrap_or_default())
+    }
+
+    /// [`SpillVec::cursor`] for strings: every field in order, read through
+    /// fixed-size buffers rather than the mapped arena.
+    pub fn cursor(&self) -> Result<SpillStringsCursor> {
+        Ok(SpillStringsCursor {
+            arena: self.arena.cursor()?,
+            ends: self.ends.cursor()?,
+            previous_end: 0,
+        })
+    }
+}
+
+/// See [`SpillStrings::cursor`].
+pub struct SpillStringsCursor {
+    arena: SpillCursor<u8>,
+    ends: SpillCursor<u64>,
+    previous_end: u64,
+}
+
+impl SpillStringsCursor {
+    /// Replaces `field` with the next field's bytes (UTF-8, as written by
+    /// [`SpillStringsWriter`]); `false` past the last one.
+    pub fn next_into(&mut self, field: &mut Vec<u8>) -> Result<bool> {
+        let Some(end) = self.ends.next_value()? else {
+            return Ok(false);
+        };
+        let len = end.saturating_sub(self.previous_end) as usize;
+        self.previous_end = end;
+        field.clear();
+        field.resize(len, 0);
+        self.arena
+            .reader
+            .read_exact(field)
+            .map_err(|source| GlydeError::Io {
+                path: self.arena.path.clone(),
+                source,
+            })?;
+        self.arena.remaining = self.arena.remaining.saturating_sub(len);
+        Ok(true)
     }
 }
 
