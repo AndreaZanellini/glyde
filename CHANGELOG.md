@@ -19,6 +19,12 @@ Versioning: [Semantic Versioning](https://semver.org/).
   away — on a multi-GB file that doubled the disk activity and the disk
   space used. Now the old load stops within a few thousand rows and its
   cache files are deleted. (#119)
+
+  **Assumption made (please veto by testing the app):** choosing File → Open
+  stops the current load as soon as the file dialog opens, even if you then
+  cancel the dialog. This was already the case for what you see (the old
+  load's results were ignored from that moment); now the old load also
+  stops working in the background.
 - **You can pick the time column while a file is still loading.** The
   "time column" picker (and, if Glyde generated a row index, the notice
   saying why) now appears above the growing plot as soon as the first part
