@@ -580,6 +580,50 @@ Versioning: [Semantic Versioning](https://semver.org/).
   that space first; if it is missing, the file still opens and draws the
   same picture, just as slowly as before when the whole file is on screen.
   (#102)
+- **Reopening a file you opened before is now much faster: Glyde no longer
+  re-reads its text.** Until now a reopen reused the plot's caches but still
+  read and parsed the whole file again. Now, for a file that fits in memory,
+  the first open also saves everything the parse found (the values of every
+  column, the timestamps, and what was inferred: encoding, delimiter,
+  decimal separator, time column, skipped rows), and a reopen of the same,
+  unchanged file with the same corrections loads that instead. On a 1 GB,
+  9-million-row test file: about 5–6 s for the first open, 0.5 s for a
+  reopen. The inference bar is recomputed from the saved results exactly
+  as after a parse, so it is always as accurate as on the first open. If the
+  file changed, a different correction is applied, or the saved copy is
+  damaged or from another Glyde version, the file is simply read again.
+  (#106)
+
+  **Assumptions made (please veto):**
+  - The saved copy takes about as much disk as the data itself (888 MB for
+    that 1 GB file), in Glyde's cache folder, and is not cleaned up
+    automatically yet (true of Glyde's other caches too).
+  - Files too large for memory are not saved this way (they are read again
+    on every open); that waits on #102.
+- **Opening a file with many columns for the first time is faster and uses
+  much less disk for Glyde's cache.** Glyde keeps a cache of each opened
+  file's samples so that reopening it is instant. It used to store the file's
+  timestamps once per numeric column, identical every time; now it stores
+  them once and every column shares them. On a 1 GB, 8-column test file,
+  building the cache went from 2.5 s to 1.7 s, and the cache takes about
+  1 GB less disk. Caches written by earlier versions are rebuilt
+  automatically the first time a file is reopened. (#115)
+
+  **Assumption made (please veto):** the issue asked for your decision
+  because this changes the cache's on-disk format. I went ahead with the
+  design the issue proposed. The old cache files are simply ignored and
+  rebuilt (they are never misread), and old leftover files are not deleted,
+  since cache cleanup does not exist yet.
+- **Groundwork for the gap view: listing a file's gaps no longer needs
+  memory for every gap at once.** Nothing visible changes yet. Glyde can now
+  walk through the gaps of any stretch of a file, including a file too big
+  for memory, one at a time, instead of only building a full list of them
+  for the whole file. A file can have millions of gaps (a new test file
+  shows how: when just over half the time steps are short and the rest
+  long, every long one counts as a gap), so the upcoming gap view (milestone
+  M8) can show them for what is on screen without that cost. How the gap
+  view presents them (by page, by pixel column, or a capped list) is still
+  to be decided with it. (#103)
 - **Files open about 2–3× faster, and the plot no longer stutters while the
   mouse is over it.** (issue #114) Measured on a 1 GB, 9.2-million-row,
   8-channel CSV, median of three runs, before → after:

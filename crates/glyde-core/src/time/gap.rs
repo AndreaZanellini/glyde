@@ -509,19 +509,19 @@ pub fn summarize_ticks<S: TickSource + ?Sized>(source: &S) -> Result<TimeAxisSta
 /// §2.2–2.3). Feeds both sampling classification (`SegmentedUniform` vs.
 /// `Irregular`, SPEC §2.2) and the gap view (docs/ROADMAP.md M8).
 ///
-/// Returns one [`Gap`] per gap found, so a caller that only needs the *count*
-/// of them over a multi-GB file should use [`summarize_ticks`] instead, which
-/// counts without collecting.
+/// Returns one [`Gap`] per gap found — a convenience over [`gap_threshold`]
+/// and [`visit_gaps`] for a small, in-memory axis. A caller that only needs
+/// the *count* over a multi-GB file should use [`summarize_ticks`], and one
+/// that needs the gaps of a large or spilled axis should stream them with
+/// [`visit_gaps`] over the range it shows, never collect them all (issue
+/// #103: their number is not bounded by anything but the row count).
 pub fn detect_gaps(timestamps: &[i128]) -> Vec<Gap> {
-    let Some(median_delta) =
-        median_delta(timestamps, 0..timestamps.len()).expect(SLICE_SCAN_IS_INFALLIBLE)
-    else {
+    let Some(threshold) = gap_threshold(timestamps).expect(SLICE_SCAN_IS_INFALLIBLE) else {
         return Vec::new();
     };
-    let threshold = GAP_MULTIPLE_OF_MEDIAN * median_delta;
 
     let mut gaps = Vec::new();
-    for_each_gap(timestamps, 0..timestamps.len(), threshold, &mut |gap| {
+    visit_gaps(timestamps, 0..timestamps.len(), threshold, &mut |gap| {
         gaps.push(gap);
         Ok(())
     })
@@ -536,6 +536,31 @@ pub fn detect_gaps(timestamps: &[i128]) -> Vec<Gap> {
     }
 
     gaps
+}
+
+/// SPEC §2.2–2.3's gap threshold for the whole of `source`, in ticks: a step
+/// longer than this (`Δt > 10 × median Δt`) is a gap. `None` with fewer than
+/// two samples. Computed in bounded memory over any [`TickSource`], spilled
+/// included. A gap is a property of the whole axis, so a caller scanning a
+/// window ([`visit_gaps`]) passes this, never a window's own median.
+pub fn gap_threshold<S: TickSource + ?Sized>(source: &S) -> Result<Option<f64>> {
+    Ok(median_delta(source, 0..source.tick_count())?
+        .map(|median_delta| GAP_MULTIPLE_OF_MEDIAN * median_delta))
+}
+
+/// Streams every gap between consecutive rows of `range` (a gap whose two
+/// rows both lie in it) against `threshold` ([`gap_threshold`]), in row
+/// order, holding no list of them: the bounded primitive any gap view is
+/// built on, whether it shows a window around the viewport, per-pixel
+/// aggregates or pages of gaps (issue #103). `visit` returning an error stops
+/// the scan.
+pub fn visit_gaps<S: TickSource + ?Sized>(
+    source: &S,
+    range: Range<usize>,
+    threshold: f64,
+    visit: &mut dyn FnMut(Gap) -> Result<()>,
+) -> Result<()> {
+    for_each_gap(source, range, threshold, visit)
 }
 
 /// Classifies `timestamps` (non-decreasing, all in the same tick unit) per

@@ -49,13 +49,18 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use memmap2::Mmap;
 
 use crate::{GlydeError, Result};
 
 const MAGIC: &[u8; 8] = b"GLYDEC0\0";
-const FORMAT_VERSION: u32 = 1;
+/// 2: the timestamps file is shared by every column of one file (issue
+/// #115) — a version-1 values file, written next to its own per-column
+/// timestamps, is rebuilt rather than paired with a shared axis.
+const FORMAT_VERSION: u32 = 2;
 /// Fixed header size for both the timestamps and values cache files: an
 /// 8-byte magic, a 4-byte format version, 4 bytes reserved. 16 is itself a
 /// multiple of `size_of::<i128>()` (16), so data immediately following the
@@ -158,6 +163,25 @@ impl CacheKey {
         self.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
     }
+
+    /// The stem of the timestamps file every column of this key's file
+    /// shares (issue #115): this key without its column, so the source
+    /// file and the overrides still pick it, but the column no longer does.
+    fn timestamps_stem(&self) -> String {
+        Self {
+            column: None,
+            ..self.clone()
+        }
+        .cache_stem()
+    }
+
+    fn timestamps_path(&self, cache_dir: &Path) -> PathBuf {
+        cache_dir.join(format!("{}.ts.glyc0", self.timestamps_stem()))
+    }
+
+    fn values_path(&self, cache_dir: &Path) -> PathBuf {
+        cache_dir.join(format!("{}.val.glyc0", self.cache_stem()))
+    }
 }
 
 /// A memory-mapped Level-0 cache: the raw `timestamps`/`samples` of one
@@ -166,7 +190,8 @@ impl CacheKey {
 /// [`crate::dsp::decimation::build_pyramid`]/[`crate::dsp::decimation::decimate_viewport`]
 /// take `&[f64]`/`&[i128]`.
 pub struct Level0Cache {
-    timestamps_mmap: Mmap,
+    /// Shared by every column of the same file (issue #115).
+    timestamps_mmap: Arc<Mmap>,
     values_mmap: Mmap,
     sample_count: usize,
 }
@@ -216,18 +241,43 @@ impl PartialEq for Level0Cache {
 /// (docs/SPEC.md §5.1 "the full file is never loaded"). Construct with
 /// [`Level0CacheWriter::create`], call [`Self::push`] once per sample in
 /// order, then [`Self::finish`].
+///
+/// The timestamps are only written when no valid shared timestamps file
+/// exists for the key's file yet (issue #115); otherwise the existing one is
+/// reused and the pushed timestamps are only counted.
 pub struct Level0CacheWriter {
-    timestamps_writer: BufWriter<File>,
+    timestamps: TimestampsSink,
     values_writer: BufWriter<File>,
-    timestamps_tmp_path: PathBuf,
     values_tmp_path: PathBuf,
-    timestamps_final_path: PathBuf,
     values_final_path: PathBuf,
     sample_count: u64,
 }
 
+/// Where a [`Level0CacheWriter`]'s timestamps go.
+enum TimestampsSink {
+    /// This file's shared timestamps already exist.
+    Shared { mmap: Arc<Mmap>, path: PathBuf },
+    /// First writer for this file: write them, to a temp file of its own.
+    Writing {
+        writer: BufWriter<File>,
+        tmp_path: PathBuf,
+        final_path: PathBuf,
+    },
+}
+
+/// Makes concurrent writers' temp files distinct (two columns of one file
+/// may both find no shared timestamps yet and both write them).
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_tmp(path: &Path) -> PathBuf {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}-{n}.tmp", std::process::id()));
+    PathBuf::from(name)
+}
+
 impl Level0CacheWriter {
-    /// Creates the two backing files (as `.tmp` siblings, swapped into place
+    /// Creates the backing files (as `.tmp` siblings, swapped into place
     /// atomically on [`Self::finish`] so a reader can never observe a
     /// half-written cache) and writes their headers.
     pub fn create(cache_dir: &Path, key: &CacheKey) -> Result<Self> {
@@ -236,23 +286,33 @@ impl Level0CacheWriter {
             source,
         })?;
 
-        let stem = key.cache_stem();
-        let timestamps_final_path = cache_dir.join(format!("{stem}.ts.glyc0"));
-        let values_final_path = cache_dir.join(format!("{stem}.val.glyc0"));
-        let timestamps_tmp_path = cache_dir.join(format!("{stem}.ts.glyc0.tmp"));
-        let values_tmp_path = cache_dir.join(format!("{stem}.val.glyc0.tmp"));
+        let timestamps_final_path = key.timestamps_path(cache_dir);
+        let values_final_path = key.values_path(cache_dir);
+        let values_tmp_path = unique_tmp(&values_final_path);
 
-        let mut timestamps_writer = BufWriter::new(create_file(&timestamps_tmp_path)?);
+        let timestamps = match open_shared_timestamps(&timestamps_final_path)? {
+            Some(mmap) => TimestampsSink::Shared {
+                mmap,
+                path: timestamps_final_path,
+            },
+            None => {
+                let tmp_path = unique_tmp(&timestamps_final_path);
+                let mut writer = BufWriter::new(create_file(&tmp_path)?);
+                write_header(&mut writer, &tmp_path)?;
+                TimestampsSink::Writing {
+                    writer,
+                    tmp_path,
+                    final_path: timestamps_final_path,
+                }
+            }
+        };
         let mut values_writer = BufWriter::new(create_file(&values_tmp_path)?);
-        write_header(&mut timestamps_writer, &timestamps_tmp_path)?;
         write_header(&mut values_writer, &values_tmp_path)?;
 
         Ok(Self {
-            timestamps_writer,
+            timestamps,
             values_writer,
-            timestamps_tmp_path,
             values_tmp_path,
-            timestamps_final_path,
             values_final_path,
             sample_count: 0,
         })
@@ -262,20 +322,7 @@ impl Level0CacheWriter {
     /// same order the dataset's [`Level0Cache::timestamps`]/
     /// [`Level0Cache::samples`] should later report them.
     pub fn push(&mut self, timestamp: i128, value: f64) -> Result<()> {
-        self.timestamps_writer
-            .write_all(bytemuck::bytes_of(&timestamp))
-            .map_err(|source| GlydeError::Io {
-                path: self.timestamps_tmp_path.clone(),
-                source,
-            })?;
-        self.values_writer
-            .write_all(bytemuck::bytes_of(&value))
-            .map_err(|source| GlydeError::Io {
-                path: self.values_tmp_path.clone(),
-                source,
-            })?;
-        self.sample_count += 1;
-        Ok(())
+        self.push_slices(&[timestamp], &[value])
     }
 
     /// Appends many `(timestamp, value)` pairs at once — byte for byte what
@@ -290,12 +337,17 @@ impl Level0CacheWriter {
             "samples and timestamps must be the same length"
         );
         let count = timestamps.len().min(samples.len());
-        self.timestamps_writer
-            .write_all(bytemuck::cast_slice(&timestamps[..count]))
-            .map_err(|source| GlydeError::Io {
-                path: self.timestamps_tmp_path.clone(),
-                source,
-            })?;
+        if let TimestampsSink::Writing {
+            writer, tmp_path, ..
+        } = &mut self.timestamps
+        {
+            writer
+                .write_all(bytemuck::cast_slice(&timestamps[..count]))
+                .map_err(|source| GlydeError::Io {
+                    path: tmp_path.clone(),
+                    source,
+                })?;
+        }
         self.values_writer
             .write_all(bytemuck::cast_slice(&samples[..count]))
             .map_err(|source| GlydeError::Io {
@@ -306,16 +358,9 @@ impl Level0CacheWriter {
         Ok(())
     }
 
-    /// Flushes and syncs both files, then atomically renames them into
+    /// Flushes and syncs the files written, atomically renames them into
     /// place and memory-maps the result.
     pub fn finish(mut self) -> Result<Level0Cache> {
-        self.timestamps_writer
-            .flush()
-            .and_then(|()| self.timestamps_writer.get_ref().sync_all())
-            .map_err(|source| GlydeError::Io {
-                path: self.timestamps_tmp_path.clone(),
-                source,
-            })?;
         self.values_writer
             .flush()
             .and_then(|()| self.values_writer.get_ref().sync_all())
@@ -323,28 +368,135 @@ impl Level0CacheWriter {
                 path: self.values_tmp_path.clone(),
                 source,
             })?;
-        drop(self.timestamps_writer);
         drop(self.values_writer);
 
-        std::fs::rename(&self.timestamps_tmp_path, &self.timestamps_final_path).map_err(
-            |source| GlydeError::Io {
-                path: self.timestamps_final_path.clone(),
-                source,
-            },
-        )?;
+        let timestamps_mmap = match self.timestamps {
+            TimestampsSink::Shared { mmap, path } => {
+                let shared = (mmap.len() - HEADER_LEN) / size_of::<i128>();
+                if shared as u64 != self.sample_count {
+                    let _ = std::fs::remove_file(&self.values_tmp_path);
+                    return Err(GlydeError::CorruptCache {
+                        path,
+                        reason: format!(
+                            "the shared timestamps hold {shared} samples, this column \
+                             {}",
+                            self.sample_count
+                        ),
+                    });
+                }
+                mmap
+            }
+            TimestampsSink::Writing {
+                mut writer,
+                tmp_path,
+                final_path,
+            } => {
+                writer
+                    .flush()
+                    .and_then(|()| writer.get_ref().sync_all())
+                    .map_err(|source| GlydeError::Io {
+                        path: tmp_path.clone(),
+                        source,
+                    })?;
+                drop(writer);
+                // A concurrent writer for another column may have published
+                // the same timestamps meanwhile; its file is identical, so
+                // either one is the one kept. Windows refuses to replace a
+                // file another column already has mapped: keep that one.
+                if let Err(source) = std::fs::rename(&tmp_path, &final_path) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    let published = open_shared_timestamps(&final_path)?.filter(|mmap| {
+                        (mmap.len() - HEADER_LEN) / size_of::<i128>() == self.sample_count as usize
+                    });
+                    if published.is_none() {
+                        let _ = std::fs::remove_file(&self.values_tmp_path);
+                        return Err(GlydeError::Io {
+                            path: final_path,
+                            source,
+                        });
+                    }
+                }
+                open_shared_timestamps(&final_path)?.ok_or_else(|| GlydeError::CorruptCache {
+                    path: final_path.clone(),
+                    reason: "cache file disappeared immediately after being written".to_string(),
+                })?
+            }
+        };
+
         std::fs::rename(&self.values_tmp_path, &self.values_final_path).map_err(|source| {
             GlydeError::Io {
                 path: self.values_final_path.clone(),
                 source,
             }
         })?;
-
-        open_cache_files(
-            &self.timestamps_final_path,
-            &self.values_final_path,
-            self.sample_count,
-        )
+        let values_mmap =
+            map_file(&self.values_final_path)?.ok_or_else(|| GlydeError::CorruptCache {
+                path: self.values_final_path.clone(),
+                reason: "cache file disappeared immediately after being written".to_string(),
+            })?;
+        Ok(Level0Cache {
+            timestamps_mmap,
+            values_mmap,
+            sample_count: self.sample_count as usize,
+        })
     }
+}
+
+/// The shared timestamps at `path`, mapped, if present with a valid header.
+fn open_shared_timestamps(path: &Path) -> Result<Option<Arc<Mmap>>> {
+    let Some(mmap) = map_file(path)? else {
+        return Ok(None);
+    };
+    if validated_sample_count(&mmap, size_of::<i128>()).is_none() {
+        tracing::warn!(path = %path.display(), "Level-0 timestamps header invalid, rebuilding");
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(mmap)))
+}
+
+/// Builds the timestamps every column of `key`'s file shares, unless a valid
+/// file of the same length already exists (issue #115). Called once per load,
+/// before the columns' caches are built in parallel, so they all find it.
+pub fn build_or_open_shared_timestamps(
+    cache_dir: &Path,
+    key: &CacheKey,
+    timestamps: &[i128],
+) -> Result<()> {
+    let path = key.timestamps_path(cache_dir);
+    if let Some(mmap) = open_shared_timestamps(&path)? {
+        if (mmap.len() - HEADER_LEN) / size_of::<i128>() == timestamps.len() {
+            return Ok(());
+        }
+    }
+    std::fs::create_dir_all(cache_dir).map_err(|source| GlydeError::Io {
+        path: cache_dir.to_path_buf(),
+        source,
+    })?;
+    let tmp_path = unique_tmp(&path);
+    let mut writer = BufWriter::new(create_file(&tmp_path)?);
+    write_header(&mut writer, &tmp_path)?;
+    let io = |source| GlydeError::Io {
+        path: tmp_path.clone(),
+        source,
+    };
+    writer
+        .write_all(bytemuck::cast_slice(timestamps))
+        .map_err(io)?;
+    writer
+        .flush()
+        .and_then(|()| writer.get_ref().sync_all())
+        .map_err(io)?;
+    drop(writer);
+    std::fs::rename(&tmp_path, &path).map_err(|source| GlydeError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    tracing::info!(
+        path = %path.display(),
+        samples = timestamps.len(),
+        "Level-0 timestamps written once, shared by every column (issue #115)"
+    );
+    Ok(())
 }
 
 fn create_file(path: &Path) -> Result<File> {
@@ -413,27 +565,17 @@ pub fn build_or_open(
 /// absorbed anomalies are logged, never silently ignored, but also never
 /// escalated to a hard failure over what is only a cache).
 pub fn try_open(cache_dir: &Path, key: &CacheKey) -> Result<Option<Level0Cache>> {
-    let stem = key.cache_stem();
-    let timestamps_path = cache_dir.join(format!("{stem}.ts.glyc0"));
-    let values_path = cache_dir.join(format!("{stem}.val.glyc0"));
+    let timestamps_path = key.timestamps_path(cache_dir);
+    let values_path = key.values_path(cache_dir);
 
-    if !timestamps_path.exists() || !values_path.exists() {
-        return Ok(None);
-    }
-
-    let timestamps_mmap = match map_file(&timestamps_path)? {
-        Some(mmap) => mmap,
-        None => return Ok(None),
-    };
-    let values_mmap = match map_file(&values_path)? {
-        Some(mmap) => mmap,
-        None => return Ok(None),
-    };
-
-    let Some(ts_sample_count) = validated_sample_count(&timestamps_mmap, size_of::<i128>()) else {
-        tracing::warn!(path = %timestamps_path.display(), "Level-0 cache header invalid, rebuilding");
+    let Some(timestamps_mmap) = open_shared_timestamps(&timestamps_path)? else {
         return Ok(None);
     };
+    let Some(values_mmap) = map_file(&values_path)? else {
+        return Ok(None);
+    };
+
+    let ts_sample_count = (timestamps_mmap.len() - HEADER_LEN) / size_of::<i128>();
     let Some(val_sample_count) = validated_sample_count(&values_mmap, size_of::<f64>()) else {
         tracing::warn!(path = %values_path.display(), "Level-0 cache header invalid, rebuilding");
         return Ok(None);
@@ -517,26 +659,6 @@ fn validated_sample_count(mmap: &Mmap, element_size: usize) -> Option<usize> {
         return None;
     }
     Some(data_len / element_size)
-}
-
-fn open_cache_files(
-    timestamps_path: &Path,
-    values_path: &Path,
-    sample_count: u64,
-) -> Result<Level0Cache> {
-    let timestamps_mmap = map_file(timestamps_path)?.ok_or_else(|| GlydeError::CorruptCache {
-        path: timestamps_path.to_path_buf(),
-        reason: "cache file disappeared immediately after being written".to_string(),
-    })?;
-    let values_mmap = map_file(values_path)?.ok_or_else(|| GlydeError::CorruptCache {
-        path: values_path.to_path_buf(),
-        reason: "cache file disappeared immediately after being written".to_string(),
-    })?;
-    Ok(Level0Cache {
-        timestamps_mmap,
-        values_mmap,
-        sample_count: sample_count as usize,
-    })
 }
 
 /// Resolves the OS-standard cache directory for Glyde's Level-0/pyramid
@@ -705,13 +827,14 @@ mod tests {
             "different columns must never share a cache file stem"
         );
 
-        let timestamps_0: Vec<i128> = vec![0, 1, 2];
+        // Columns of one file share its time axis (issue #115); only their
+        // values differ.
+        let timestamps: Vec<i128> = vec![0, 1, 2];
         let samples_0: Vec<f64> = vec![10.0, 20.0, 30.0];
-        let timestamps_1: Vec<i128> = vec![100, 200];
-        let samples_1: Vec<f64> = vec![-1.0, -2.0];
+        let samples_1: Vec<f64> = vec![-1.0, -2.0, -3.0];
 
-        build(dir.path(), &column_0, &samples_0, &timestamps_0).expect("build column 0");
-        build(dir.path(), &column_1, &samples_1, &timestamps_1).expect("build column 1");
+        build(dir.path(), &column_0, &samples_0, &timestamps).expect("build column 0");
+        build(dir.path(), &column_1, &samples_1, &timestamps).expect("build column 1");
 
         let reopened_0 = try_open(dir.path(), &column_0)
             .expect("try_open must not error")
@@ -743,5 +866,89 @@ mod tests {
             result.is_none(),
             "an unrecognized format version must be treated as a cache miss, never misread as v1 data"
         );
+    }
+
+    fn files_ending(dir: &Path, suffix: &str) -> usize {
+        std::fs::read_dir(dir)
+            .expect("read cache dir")
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(suffix)
+            })
+            .count()
+    }
+
+    // Issue #115: the time axis is the same for every column of a file, so
+    // it is written once and shared, not once per column.
+    #[test]
+    fn columns_of_one_file_share_a_single_timestamps_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key = temp_key(dir.path(), 4);
+        let timestamps: Vec<i128> = vec![0, 10, 20, 30];
+
+        let caches: Vec<Level0Cache> = (0..3)
+            .map(|column| {
+                let samples: Vec<f64> = (0..4).map(|i| (column * 10 + i) as f64).collect();
+                build(dir.path(), &key.with_column(column), &samples, &timestamps)
+                    .expect("build column")
+            })
+            .collect();
+
+        assert_eq!(files_ending(dir.path(), ".ts.glyc0"), 1);
+        assert_eq!(files_ending(dir.path(), ".val.glyc0"), 3);
+        for (column, cache) in caches.iter().enumerate() {
+            assert_eq!(cache.timestamps(), timestamps.as_slice());
+            let reopened = try_open(dir.path(), &key.with_column(column))
+                .expect("no error")
+                .expect("cache hit");
+            assert_eq!(&reopened, cache);
+        }
+    }
+
+    // A different reading of the same file (an override) is a different time
+    // axis, so it never shares the other reading's timestamps.
+    #[test]
+    fn different_overrides_never_share_timestamps() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key = temp_key(dir.path(), 2);
+        let plain = key.with_column(0);
+        let corrected = key.with_overrides_signature(7).with_column(0);
+
+        build(dir.path(), &plain, &[1.0, 2.0], &[0, 1]).expect("build plain");
+        build(dir.path(), &corrected, &[1.0, 2.0], &[5, 9]).expect("build corrected");
+
+        assert_eq!(files_ending(dir.path(), ".ts.glyc0"), 2);
+        let reopened = try_open(dir.path(), &plain)
+            .expect("no error")
+            .expect("hit");
+        assert_eq!(reopened.timestamps(), &[0, 1]);
+    }
+
+    // Values that do not line up with the shared timestamps are never served.
+    #[test]
+    fn values_that_disagree_with_the_shared_timestamps_are_a_miss() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key = temp_key(dir.path(), 3);
+        build(
+            dir.path(),
+            &key.with_column(0),
+            &[1.0, 2.0, 3.0],
+            &[0, 1, 2],
+        )
+        .expect("build");
+        let values = dir
+            .path()
+            .join(format!("{}.val.glyc0", key.with_column(0).cache_stem()));
+        let mut bytes = std::fs::read(&values).expect("read values");
+        bytes.truncate(bytes.len() - 8);
+        std::fs::write(&values, bytes).expect("truncate values");
+
+        assert!(try_open(dir.path(), &key.with_column(0))
+            .expect("no error")
+            .is_none());
     }
 }

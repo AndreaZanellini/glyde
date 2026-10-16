@@ -26,6 +26,7 @@
 
 mod csv;
 mod dataset;
+mod dataset_cache;
 mod infer;
 mod report;
 mod spill_sort;
@@ -51,8 +52,9 @@ pub use infer::{
 };
 pub use report::{
     inspect, open_dataset, open_dataset_progressive, open_dataset_progressive_cancellable,
-    open_dataset_progressive_with_overrides, open_dataset_with_budget, open_dataset_with_overrides,
-    InferenceReport, InferredField, OpenSummary, SamplingClass, TimeIndexSource, TimezoneLabel,
+    open_dataset_progressive_in, open_dataset_progressive_with_overrides, open_dataset_with_budget,
+    open_dataset_with_overrides, InferenceReport, InferredField, OpenSummary, SamplingClass,
+    TimeIndexSource, TimezoneLabel,
 };
 
 use crate::time::TimestampFormat;
