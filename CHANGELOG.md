@@ -437,6 +437,12 @@ Versioning: [Semantic Versioning](https://semver.org/).
      is the conventional default for this use.
 
 ### Fixed
+- **The last on/off state of a file is now visible.** If a true/false
+  column ended with a single sample in a new state (say `on, on, off`), that
+  final `off` was never drawn. It now shows as a thin sliver at the right
+  edge. Also, on columns that switch so often that the lane shows the
+  compact orange view, each switch is now drawn where it happened instead
+  of up to one block (about 1/2000 of the width) too early. (#124)
 - **Opening a large file no longer fills your disk.** A file too big to hold in
   memory is first copied to a cache on disk, and every earlier version left
   that copy behind for good, about the file's own size each time. Two opens
