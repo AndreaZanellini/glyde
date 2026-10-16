@@ -133,10 +133,12 @@ pub fn show(
             .x_axis_formatter(move |mark, _range| format_x_axis_tick(ticks, mark, time))
             .show(ui, |plot_ui| {
                 plot_ui.set_plot_bounds(PlotBounds::from_min_max([axis_min, 0.0], [axis_max, 1.0]));
+                let min_width = MIN_BAND_POINTS * plot_ui.transform().dpos_dvalue_x().abs().recip();
                 match bands {
                     BoolLane::Exact { bands, .. } => {
                         for (index, band) in bands.iter().enumerate() {
-                            draw_band(plot_ui, time, band, index + 1 == bands.len(), axis_max);
+                            let is_last = index + 1 == bands.len();
+                            draw_band(plot_ui, time, band, is_last, axis, min_width);
                         }
                         // A state that changes again at the same timestamp has
                         // zero duration. Draw it above the filled bands so the
@@ -209,21 +211,18 @@ fn draw_overview(
 
 /// Draws one [`BoolBand`] as a filled rectangle spanning its own vertical
 /// lane (`y` in `[0, 1]`, an arbitrary unit range — this view has no
-/// numeric axis, SPEC §4.3). Only the final still-open run is extended
-/// visually to `axis_max`; an earlier run may also have equal start/end ticks
-/// when two state changes share a timestamp.
+/// numeric axis, SPEC §4.3), over [`bool_band_span`].
 fn draw_band(
     plot_ui: &mut egui_plot::PlotUi,
     time: &TimeAxis,
     band: &BoolBand,
     is_last: bool,
-    axis_max: f64,
+    axis: (f64, f64),
+    min_width: f64,
 ) {
-    let x0 = tick_to_seconds(time, band.start_tick);
-    let x1 = band_end_seconds(time, band, is_last, axis_max);
-    if x0 == x1 {
+    let Some((x0, x1)) = bool_band_span(time, band, is_last, axis, min_width) else {
         return;
-    }
+    };
     let color = if band.value { ON_COLOR } else { OFF_COLOR };
     plot_ui.polygon(
         Polygon::new(PlotPoints::new(vec![
@@ -235,6 +234,37 @@ fn draw_band(
         .fill_color(color)
         .stroke(egui::Stroke::NONE),
     );
+}
+
+/// The plot-x span a [`BoolBand`] is filled over, or `None` for a
+/// zero-duration run before the last (two state changes sharing a
+/// timestamp), which is drawn as a glyph instead. The final still-open run
+/// is extended to `axis_max`, then widened to at least `min_width` seconds
+/// like a state band (issue #124): a final single-sample run starts *at*
+/// `axis_max` and would otherwise have no width at all.
+fn bool_band_span(
+    time: &TimeAxis,
+    band: &BoolBand,
+    is_last: bool,
+    axis: (f64, f64),
+    min_width: f64,
+) -> Option<(f64, f64)> {
+    let x0 = tick_to_seconds(time, band.start_tick);
+    let x1 = band_end_seconds(time, band, is_last, axis.1);
+    if is_last {
+        Some(widen_span(x0, x1, axis, min_width))
+    } else {
+        (x0 != x1).then_some((x0, x1))
+    }
+}
+
+/// `x0..x1` widened to at least `min_width`, kept inside `axis`.
+fn widen_span(x0: f64, x1: f64, (axis_min, axis_max): (f64, f64), min_width: f64) -> (f64, f64) {
+    if x1 - x0 >= min_width {
+        return (x0, x1);
+    }
+    let x1 = (x0 + min_width).min(axis_max);
+    ((x1 - min_width).max(axis_min), x1)
 }
 
 fn band_end_seconds(time: &TimeAxis, band: &BoolBand, is_last: bool, axis_max: f64) -> f64 {
@@ -600,20 +630,16 @@ fn state_band_span(
     time: &TimeAxis,
     band: &StateBand,
     is_last: bool,
-    (axis_min, axis_max): (f64, f64),
+    axis: (f64, f64),
     min_width: f64,
 ) -> (f64, f64) {
     let x0 = tick_to_seconds(time, band.start_tick);
     let x1 = if is_last {
-        axis_max
+        axis.1
     } else {
         tick_to_seconds(time, band.end_tick)
     };
-    if x1 - x0 >= min_width {
-        return (x0, x1);
-    }
-    let x1 = (x0 + min_width).min(axis_max);
-    ((x1 - min_width).max(axis_min), x1)
+    widen_span(x0, x1, axis, min_width)
 }
 
 fn fill_rect(plot_ui: &mut egui_plot::PlotUi, x0: f64, x1: f64, color: egui::Color32) {
@@ -1160,6 +1186,44 @@ mod tests {
         assert_eq!(band_end_seconds(&time, &bands[0], false, 10.0), 0.0);
         assert_eq!(band_end_seconds(&time, &bands[1], false, 10.0), 1.0);
         assert_eq!(band_end_seconds(&time, &bands[2], true, 10.0), 10.0);
+    }
+
+    // Issue #124: a final single-sample run starts at `axis_max`, so it used
+    // to be skipped as zero-width and the file's last state never showed.
+    #[test]
+    fn a_final_single_sample_bool_run_is_widened_not_skipped() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        let bands = bool_state_bands(&[true, true, false], &[0, 1, 2]);
+        let last = bands.last().expect("bands");
+        assert_eq!((last.start_tick, last.end_tick), (2, 2));
+
+        let axis = (0.0, 2.0);
+        let span = bool_band_span(&time, last, true, axis, 0.1).expect("drawn");
+        assert!(
+            (span.0 - 1.9).abs() < 1e-12 && (span.1 - 2.0).abs() < 1e-12,
+            "{span:?}"
+        );
+        // A wide run is drawn over exactly its own ticks.
+        assert_eq!(
+            bool_band_span(&time, &bands[0], false, axis, 0.1),
+            Some((0.0, 2.0))
+        );
+    }
+
+    #[test]
+    fn a_zero_duration_run_before_the_last_stays_a_glyph_not_a_band() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        let bands = bool_state_bands(&[false, true, false], &[0, 0, 1]);
+        assert_eq!(
+            bool_band_span(&time, &bands[0], false, (0.0, 1.0), 0.1),
+            None
+        );
     }
 
     // Found on this PR's own review: `cache_bool_bands`'s spilled-column arm
