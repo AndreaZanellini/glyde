@@ -1644,6 +1644,12 @@ fn stream_in_batches(
             if let Err(error) = process(&batch) {
                 break Err(error);
             }
+            // The reader may be batches ahead, or done with the whole file,
+            // when a checkpoint emitted from `process` raises the flag; the
+            // reader's own check would then never see it (issue #119).
+            if let Err(error) = ensure_not_cancelled(cancelled) {
+                break Err(error);
+            }
             batch.iter_mut().for_each(ColumnText::clear);
             let _ = drained_tx.send(batch);
         };
