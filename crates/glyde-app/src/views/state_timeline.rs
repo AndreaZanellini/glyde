@@ -322,6 +322,11 @@ fn bool_bands_from_spilled(
 /// instead (SPEC §4.3: "label when wide enough, tooltip otherwise").
 const LABEL_CHAR_WIDTH: f64 = 7.0;
 const LABEL_PADDING: f64 = 6.0;
+/// Narrowest a state band is drawn, in points. A run shorter than that —
+/// always the case for a final single-sample run, whose start and end tick
+/// coincide — is widened rather than skipped, so it stays visible and
+/// hoverable (SPEC §4.3: no state may silently disappear).
+const MIN_BAND_POINTS: f64 = 2.0;
 
 /// A stable, readable fill for `label`, so the same state is the same color
 /// everywhere and across files.
@@ -342,7 +347,7 @@ fn show_state_lane(
         ui.label("Many state changes: intervals holding several states are drawn as one block");
     }
     let mut hover_x = None;
-    let mut width_per_second = 1.0;
+    let mut seconds_per_point = 1.0;
     let response = Plot::new(format!("state_timeline_{index}"))
         .height(LANE_HEIGHT)
         .show_axes([true, false])
@@ -355,17 +360,20 @@ fn show_state_lane(
         .show(ui, |plot_ui| {
             plot_ui.set_plot_bounds(PlotBounds::from_min_max([axis_min, 0.0], [axis_max, 1.0]));
             hover_x = plot_ui.pointer_coordinate().map(|point| point.x);
-            width_per_second = plot_ui.transform().dpos_dvalue_x().abs().recip();
+            seconds_per_point = plot_ui.transform().dpos_dvalue_x().abs().recip();
+            let min_width = MIN_BAND_POINTS * seconds_per_point;
             match lane {
                 StateLane::Exact { bands, .. } => {
                     for (position, band) in bands.iter().enumerate() {
-                        let (x0, x1) =
-                            state_band_span(time, band, position + 1 == bands.len(), axis_max);
-                        if x0 == x1 {
-                            continue;
-                        }
+                        let (x0, x1) = state_band_span(
+                            time,
+                            band,
+                            position + 1 == bands.len(),
+                            (axis_min, axis_max),
+                            min_width,
+                        );
                         fill_rect(plot_ui, x0, x1, label_color(state_label_id(&band.label)));
-                        let points_wide = (x1 - x0) / width_per_second.max(f64::EPSILON);
+                        let points_wide = (x1 - x0) / seconds_per_point.max(f64::EPSILON);
                         let needed =
                             band.label.chars().count() as f64 * LABEL_CHAR_WIDTH + LABEL_PADDING;
                         if points_wide >= needed {
@@ -379,27 +387,41 @@ fn show_state_lane(
                         }
                     }
                 }
-                StateLane::Overview { cells, labels, .. } => {
-                    draw_state_overview(plot_ui, cells, labels, axis_min, axis_max);
+                StateLane::Overview { cells, .. } => {
+                    draw_state_overview(plot_ui, cells, axis_min, axis_max);
                 }
             }
         });
     // Tooltip for whatever band the pointer is over, narrow or not.
     if let (Some(x), true) = (hover_x, response.response.hovered()) {
-        if let Some(text) = state_hover_text(lane, time, x, axis_max) {
+        let min_width = MIN_BAND_POINTS * seconds_per_point;
+        if let Some(text) = state_hover_text(lane, time, x, (axis_min, axis_max), min_width) {
             response.response.on_hover_text(text);
         }
     }
 }
 
-fn state_band_span(time: &TimeAxis, band: &StateBand, is_last: bool, axis_max: f64) -> (f64, f64) {
+/// The plot-x span `band` is drawn and hovered over: its own ticks (the
+/// final run extended to `axis_max`, as for bool lanes), widened to at least
+/// `min_width` seconds and kept inside the axis.
+fn state_band_span(
+    time: &TimeAxis,
+    band: &StateBand,
+    is_last: bool,
+    (axis_min, axis_max): (f64, f64),
+    min_width: f64,
+) -> (f64, f64) {
     let x0 = tick_to_seconds(time, band.start_tick);
     let x1 = if is_last {
         axis_max
     } else {
         tick_to_seconds(time, band.end_tick)
     };
-    (x0, x1)
+    if x1 - x0 >= min_width {
+        return (x0, x1);
+    }
+    let x1 = (x0 + min_width).min(axis_max);
+    ((x1 - min_width).max(axis_min), x1)
 }
 
 fn fill_rect(plot_ui: &mut egui_plot::PlotUi, x0: f64, x1: f64, color: egui::Color32) {
@@ -415,14 +437,7 @@ fn fill_rect(plot_ui: &mut egui_plot::PlotUi, x0: f64, x1: f64, color: egui::Col
     );
 }
 
-fn draw_state_overview(
-    plot_ui: &mut egui_plot::PlotUi,
-    cells: &[StateCell],
-    labels: &std::collections::BTreeMap<u32, String>,
-    min: f64,
-    max: f64,
-) {
-    let _ = labels;
+fn draw_state_overview(plot_ui: &mut egui_plot::PlotUi, cells: &[StateCell], min: f64, max: f64) {
     let cell_x = |position: usize| min + (max - min) * position as f64 / cells.len() as f64;
     let mut start = 0;
     while start < cells.len() {
@@ -443,15 +458,24 @@ fn draw_state_overview(
     }
 }
 
-/// What the tooltip says at plot-x `x` (seconds): the band's label and the
-/// interval it holds, or, in an overview lane, the cell's label / a mixed
-/// notice.
-fn state_hover_text(lane: &StateLane, time: &TimeAxis, x: f64, axis_max: f64) -> Option<String> {
+/// What the tooltip says at plot-x `x` (seconds): the label of the band
+/// drawn there (the last one wins where widened bands overlap, matching
+/// draw order), or, in an overview lane, the cell's label / a mixed notice.
+fn state_hover_text(
+    lane: &StateLane,
+    time: &TimeAxis,
+    x: f64,
+    axis: (f64, f64),
+    min_width: f64,
+) -> Option<String> {
     match lane {
-        StateLane::Exact { bands, .. } => bands.iter().enumerate().find_map(|(position, band)| {
-            let (x0, x1) = state_band_span(time, band, position + 1 == bands.len(), axis_max);
-            (x >= x0 && x <= x1).then(|| format!("{:?}", band.label))
-        }),
+        StateLane::Exact { bands, .. } => {
+            bands.iter().enumerate().rev().find_map(|(position, band)| {
+                let is_last = position + 1 == bands.len();
+                let (x0, x1) = state_band_span(time, band, is_last, axis, min_width);
+                (x >= x0 && x <= x1).then(|| format!("{:?}", band.label))
+            })
+        }
         StateLane::Overview {
             cells,
             labels,
@@ -638,6 +662,47 @@ mod render_tests {
             });
         });
         assert!(!output.shapes.is_empty());
+    }
+
+    #[test]
+    fn a_final_single_sample_state_is_widened_and_hoverable() {
+        // Corpus 48's shape: the last `idle` is one sample, so its band has
+        // equal start/end ticks. It must still get a visible span and own
+        // the tooltip at the right edge, not be hidden under `fault`.
+        let dataset = Dataset {
+            columns: vec![Series::new(
+                "state",
+                SeriesValues::String(
+                    ["idle", "running", "fault", "idle"]
+                        .map(str::to_owned)
+                        .to_vec(),
+                ),
+            )],
+            ..sample_dataset()
+        };
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        let lanes = cache_state_lanes(&dataset, &ticks);
+        let lane = lanes[0].as_ref().expect("string column gets a lane");
+        let StateLane::Exact { bands, .. } = lane else {
+            panic!("expected an exact lane: {lane:?}");
+        };
+        let last = bands.last().expect("bands");
+        assert_eq!(last.start_tick, last.end_tick);
+
+        let (min, max) = lane.tick_bounds();
+        let axis = axis_bounds(min, max, &dataset.time);
+        let min_width = (axis.1 - axis.0) / 100.0;
+        let (x0, x1) = state_band_span(&dataset.time, last, true, axis, min_width);
+        assert!((x1 - x0 - min_width).abs() < 1e-12, "{x0}..{x1}");
+        assert!(x0 >= axis.0 && x1 <= axis.1);
+        assert_eq!(
+            state_hover_text(lane, &dataset.time, axis.1, axis, min_width).as_deref(),
+            Some("\"idle\"")
+        );
+        assert_eq!(
+            state_hover_text(lane, &dataset.time, x0 - min_width, axis, min_width).as_deref(),
+            Some("\"fault\"")
+        );
     }
 
     #[test]

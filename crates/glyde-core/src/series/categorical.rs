@@ -107,7 +107,9 @@ impl Overview {
         }
         let span = self.max_tick.saturating_sub(self.min_tick) as f64;
         let offset = tick.saturating_sub(self.min_tick) as f64;
-        ((offset / span) * (STATE_OVERVIEW_CELLS - 1) as f64)
+        // Cell `k` holds `[k, k + 1) / N` of the axis (the last one also
+        // holds `max_tick`) — the same split `glyde-app` draws and hovers.
+        ((offset / span) * STATE_OVERVIEW_CELLS as f64)
             .floor()
             .clamp(0.0, (STATE_OVERVIEW_CELLS - 1) as f64) as usize
     }
@@ -380,5 +382,26 @@ mod tests {
         assert_eq!(cells[0], StateCell::Mixed);
         assert_eq!(cells[1000], StateCell::Single(state_label_id("q")));
         assert!(labels.contains_key(&state_label_id("z")));
+    }
+
+    #[test]
+    fn overview_cells_split_the_axis_into_equal_fractions() {
+        // Force the overview, then leave a long "p" run that the "m"
+        // sample closes exactly three quarters of the way along the axis.
+        // The run boundary must land in cell 3N/4 — where the app draws and
+        // hovers that fraction of the axis — not one cell earlier.
+        let max = (STATE_OVERVIEW_CELLS * 1000) as i128;
+        let mut builder = StateBandBuilder::for_view(0, max);
+        for tick in 0..=(MAX_EXACT_STATE_BANDS as i128) {
+            builder.push(if tick % 2 == 0 { "p" } else { "q" }, tick);
+        }
+        builder.push("m", 3 * max / 4 + 10);
+        let StateLane::Overview { cells, .. } = builder.finish_lane() else {
+            panic!("expected overview");
+        };
+        let boundary = STATE_OVERVIEW_CELLS * 3 / 4;
+        assert_eq!(cells[boundary - 1], StateCell::Single(state_label_id("p")));
+        assert_eq!(cells[boundary], StateCell::Mixed);
+        assert_eq!(cells[boundary + 1], StateCell::Empty);
     }
 }

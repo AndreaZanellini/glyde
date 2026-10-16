@@ -16,7 +16,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   colored bands under the plot, one lane per column.** Each run of the same
   value is one band; the same state always gets the same color. If the band
   is wide enough, its name is printed inside it; if not, hover over it to
-  read the name. Nothing is cleaned up: `Run`, `run` and `run ` are three
+  read the name. A state that lasts less than a pixel (for example the very
+  last sample of the file) is still drawn as a thin sliver you can hover,
+  never hidden. Nothing is cleaned up: `Run`, `run` and `run ` are three
   different states, and an empty cell is a state called "". When a column
   changes state so often that individual bands would be unreadable, the lane
   switches to a compact view where any stretch holding several different
