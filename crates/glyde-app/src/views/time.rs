@@ -2392,8 +2392,9 @@ mod render_tests {
                 continue;
             };
             let clip = primitive.clip_rect;
-            for triangle in mesh.indices.chunks_exact(3) {
-                let vertices = [0, 1, 2].map(|k| mesh.vertices[triangle[k] as usize]);
+            let (triangles, _) = mesh.indices.as_chunks::<3>();
+            for triangle in triangles {
+                let vertices = triangle.map(|index| mesh.vertices[index as usize]);
                 if !vertices.iter().any(|v| v.color == color) {
                     continue;
                 }
