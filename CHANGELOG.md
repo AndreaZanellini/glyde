@@ -677,10 +677,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
   still shows: an intermediate version of this change lost them on Retina
   displays, leaving gaps in the line. Measured on this machine, including
   the step that prepares the picture for the screen: a 32-channel full view
-  went from about 15.4 ms to about 9.4 ms per frame, a click in the channel
-  picker from about 13.4 ms to about 6.4 ms, panning a large file stored on
-  disk from about 12.5 ms to about 5.0 ms, and a single-channel file from
-  about 0.77 ms to about 0.56 ms. (#137)
+  went from about 15.4 ms to about 10.0 ms per frame, a click in the
+  channel picker from about 13.4 ms to about 6.6 ms, panning a large file
+  stored on disk from about 12.5 ms to about 5.3 ms, and a single-channel
+  file from about 0.77 ms to about 0.61 ms. (#137)
 
 - **Files too large for memory now scroll and zoom as fast as small ones.**
   For such a file, Glyde used to have no overview structure (the "pyramid"
