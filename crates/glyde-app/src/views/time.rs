@@ -737,8 +737,8 @@ enum BarEncoding {
     /// ~2,000 separate shapes per channel (issue #137).
     #[default]
     Mesh,
-    /// One line-segment shape per extent: the reference the mesh is tested
-    /// against.
+    /// One two-point path shape per extent: the reference the mesh is
+    /// tested against.
     #[cfg_attr(not(test), allow(dead_code))]
     Strokes,
 }
@@ -809,6 +809,9 @@ impl egui_plot::PlotItem for MinMaxBars {
                 transform.position_from_point(&extent[1]),
             ]
         });
+        // Two-point paths, exactly what each `egui_plot::Line` drew: never
+        // line segments, whose tessellation snaps both ends to pixel
+        // centres and so erases a bar shorter than about a pixel.
         match self.encoding {
             BarEncoding::Mesh => {
                 // Exactly what `egui::Context::tessellate` would set up for
@@ -823,15 +826,19 @@ impl egui_plot::PlotItem for MinMaxBars {
                 );
                 tessellator.set_clip_rect(transform.frame().intersect(ui.clip_rect()));
                 let mut mesh = egui::Mesh::default();
+                // One path reused for every bar: no allocation per bar.
+                let mut path = egui::epaint::PathShape::line(Vec::with_capacity(2), stroke);
                 for extent in extents {
-                    tessellator.tessellate_line_segment(extent, stroke, &mut mesh);
+                    path.points.clear();
+                    path.points.extend(extent);
+                    tessellator.tessellate_path(&path, &mut mesh);
                 }
                 if !mesh.is_empty() {
                     shapes.push(egui::Shape::mesh(mesh));
                 }
             }
             BarEncoding::Strokes => {
-                shapes.extend(extents.map(|extent| egui::Shape::line_segment(extent, stroke)));
+                shapes.extend(extents.map(|extent| egui::Shape::line(extent.to_vec(), stroke)));
             }
         }
     }
@@ -2368,6 +2375,173 @@ mod render_tests {
                 assert_eq!(radius, 2.0);
                 assert!(close(center.x, x * sx + ox) && close(center.y, value * sy + oy));
             }
+        }
+    }
+
+    /// The device pixels the tessellated `primitives` ink in `color` with
+    /// at least 20% coverage, sampled at pixel centres the way a GPU
+    /// rasterizes a frame without multisampling.
+    fn inked_pixels(
+        primitives: &[egui::ClippedPrimitive],
+        color: egui::Color32,
+        pixels_per_point: f32,
+    ) -> std::collections::HashSet<(i32, i32)> {
+        let mut inked = std::collections::HashSet::new();
+        for primitive in primitives {
+            let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive else {
+                continue;
+            };
+            let clip = primitive.clip_rect;
+            for triangle in mesh.indices.chunks_exact(3) {
+                let vertices = [0, 1, 2].map(|k| mesh.vertices[triangle[k] as usize]);
+                if !vertices.iter().any(|v| v.color == color) {
+                    continue;
+                }
+                let at = vertices.map(|v| v.pos.to_vec2() * pixels_per_point);
+                let edge = |a: egui::Vec2, b: egui::Vec2, p: egui::Vec2| {
+                    (b - a).x * (p - a).y - (b - a).y * (p - a).x
+                };
+                let area = edge(at[0], at[1], at[2]);
+                if area == 0.0 {
+                    continue;
+                }
+                let (min, max) = at.iter().fold(
+                    (egui::Vec2::splat(f32::MAX), egui::Vec2::splat(f32::MIN)),
+                    |(min, max), p| (min.min(*p), max.max(*p)),
+                );
+                for y in min.y.floor() as i32..=max.y.ceil() as i32 {
+                    for x in min.x.floor() as i32..=max.x.ceil() as i32 {
+                        let centre = egui::vec2(x as f32 + 0.5, y as f32 + 0.5);
+                        if !clip.contains((centre / pixels_per_point).to_pos2()) {
+                            continue;
+                        }
+                        let weights = [
+                            edge(at[1], at[2], centre) / area,
+                            edge(at[2], at[0], centre) / area,
+                            edge(at[0], at[1], centre) / area,
+                        ];
+                        if weights.iter().any(|&w| w < 0.0) {
+                            continue;
+                        }
+                        let coverage: f32 = weights
+                            .iter()
+                            .zip(&vertices)
+                            .map(|(w, v)| w * v.color.a() as f32 / 255.0)
+                            .sum();
+                        if coverage >= 0.2 {
+                            inked.insert((x, y));
+                        }
+                    }
+                }
+            }
+        }
+        inked
+    }
+
+    // SPEC §3.1: every aggregated bucket stays visible however small its
+    // min/max extent. A slowly drifting signal gives every pixel column an
+    // extent of a fraction of a point; drawn as `egui` line segments, whose
+    // tessellation snaps their ends to pixel centres, those collapsed to
+    // nothing on a 2 px/pt (Retina) display and left columns of the plot
+    // empty — found on a real file's slowly varying temperature channel.
+    #[test]
+    fn bars_shorter_than_a_pixel_still_ink_their_pixel_column() {
+        let n = 20_000usize;
+        let ramp: Vec<f64> = (0..n)
+            .map(|i| -0.9 + 0.8 * i as f64 / (n - 1) as f64)
+            .collect();
+        let mut dataset = sample_dataset();
+        dataset.time = TimeAxis::Absolute {
+            timestamps: (0..n as i128)
+                .map(|i| Timestamp::new(i, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        dataset.columns = vec![Series::new("ramp", SeriesValues::F64(ramp))];
+        let fixture = ViewFixture::new(dataset);
+        let plot_id = std::cell::Cell::new(None);
+
+        for pixels_per_point in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(pixels_per_point);
+            let mut state = TimeViewState::default();
+            let mut frame = |focus| {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    ..Default::default()
+                };
+                ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        plot_id.set(Some(
+                            ui.make_persistent_id(egui::Id::new("time_domain_view")),
+                        ));
+                        show_with_selection(
+                            ui,
+                            &fixture.dataset,
+                            &fixture.pyramids,
+                            &fixture.ticks,
+                            &fixture.sample_cache,
+                            &[],
+                            CursorLookup::for_time(&fixture.dataset.time),
+                            &mut state,
+                            focus,
+                        );
+                    });
+                })
+            };
+            for _ in 0..3 {
+                frame(Some((0.0, (n - 1) as f64)));
+            }
+            // A known vertical span, as zooming would set it.
+            let id = plot_id.get().expect("a frame ran");
+            let mut memory = egui_plot::PlotMemory::load(&ctx, id).expect("plot memory");
+            memory.auto_bounds = egui::Vec2b::FALSE;
+            memory.set_bounds(PlotBounds::from_min_max([0.0, -1.0], [(n - 1) as f64, 1.0]));
+            memory.store(&ctx, id);
+            frame(None);
+            let output = frame(None);
+            let transform = egui_plot::PlotMemory::load(&ctx, id)
+                .expect("plot memory")
+                .transform();
+            let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+            let inked = inked_pixels(&primitives, series_color(0), pixels_per_point);
+
+            let cached = state.decimated[0].as_ref().expect("decimated");
+            assert!(!cached.converged, "this view must be aggregated");
+            let (mut bars, mut sub_pixel, mut empty) = (0, 0, Vec::new());
+            for bucket in cached.buckets.iter().filter(|b| !bucket_is_gap(b)) {
+                let x = tick_to_seconds(
+                    &fixture.dataset.time,
+                    (bucket.first_ts + bucket.last_ts) / 2,
+                );
+                let at = |y| {
+                    transform.position_from_point(&egui_plot::PlotPoint::new(x, y))
+                        * pixels_per_point
+                };
+                let (top, bottom) = (at(bucket.max), at(bucket.min));
+                bars += 1;
+                sub_pixel += usize::from(bottom.y - top.y < 1.0);
+                let middle = top.lerp(bottom, 0.5);
+                let (px, py) = (middle.x.floor() as i32, middle.y.floor() as i32);
+                if !(-1..=1).any(|dx| (-1..=1).any(|dy| inked.contains(&(px + dx, py + dy)))) {
+                    empty.push(x);
+                }
+            }
+            assert!(
+                sub_pixel * 2 > bars,
+                "the fixture must be mostly sub-pixel bars: {sub_pixel} of {bars}"
+            );
+            assert!(
+                empty.is_empty(),
+                "at {pixels_per_point} px/pt, {} of {bars} bars left their pixel \
+                 column empty, the first at x = {:?}",
+                empty.len(),
+                empty.first()
+            );
         }
     }
 
