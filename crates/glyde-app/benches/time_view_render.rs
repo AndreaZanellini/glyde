@@ -49,6 +49,12 @@
 //! SPEC §5's frame budget applies to it just the same; this fixture is the
 //! regression gate for that path.
 //!
+//! A fourth fixture is a spilled file with **many channels**
+//! ([`MULTI_CHANNELS`]), rendered twice: every channel shown, and only one
+//! shown through the channel picker (`views::channels`). A hidden channel
+//! must cost nothing — the picker's reason to exist on a spilled file — so
+//! the one-shown variant is the gate for that.
+//!
 //! Per issue #61 decision 2 (mirrored from `glyde-core`'s benches), only the
 //! absolute SPEC §5 ceiling is build-blocking here; the >15% regression
 //! comparison is a manual check on the SPEC §5 reference machine using
@@ -59,12 +65,20 @@ use std::time::{Duration, Instant};
 use criterion::{criterion_group, criterion_main, Criterion};
 use egui::{Pos2, Rect, Vec2};
 use glyde_app::views;
+use glyde_app::views::channels::ChannelVisibility;
 use glyde_core::index::disk_pyramid::ColumnPyramid;
 use glyde_core::ingest::{pyramids_for_dataset, Dataset, TimeAxis};
 use glyde_core::series::{Series, SeriesValues};
 use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
 
 const SAMPLE_COUNT: usize = 8_000_000;
+
+/// The channel count of the many-channel spilled fixture.
+const MULTI_CHANNELS: usize = 32;
+
+/// Samples per channel in the many-channel spilled fixture: the same total
+/// sample count as the single-channel fixtures, spread across its channels.
+const MULTI_CHANNEL_SAMPLES: usize = SAMPLE_COUNT / MULTI_CHANNELS;
 
 /// A typical desktop viewport, not the headless test harness's oversized
 /// 10,000 x 10,000 fallback (`egui`'s `InputState` default screen size) —
@@ -137,17 +151,26 @@ fn i64_fixture(sample_count: usize) -> Fixture {
     )
 }
 
-/// The same shape as [`f64_fixture`], written to a CSV and opened with a
-/// zero RAM budget so it takes the spill path, then prepared exactly like
-/// the app prepares a completed spilled load: no pyramid for any column.
-fn spilled_fixture(sample_count: usize) -> Fixture {
+/// The same shape as [`f64_fixture`] with `channels` value columns (each a
+/// differently-phased sine), written to a CSV and opened with a zero RAM
+/// budget so it takes the spill path, then prepared exactly like the app
+/// prepares a completed spilled load (issue #102).
+fn spilled_fixture(label: &'static str, sample_count: usize, channels: usize) -> Fixture {
     use std::io::Write as _;
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("spilled.csv");
     let mut file = std::io::BufWriter::new(std::fs::File::create(&path).expect("create fixture"));
-    writeln!(file, "timestamp,value").expect("write fixture");
+    write!(file, "timestamp").expect("write fixture");
+    for channel in 0..channels {
+        write!(file, ",value{channel}").expect("write fixture");
+    }
+    writeln!(file).expect("write fixture");
     for i in 0..sample_count {
-        writeln!(file, "{i},{}", (i as f64 * 0.001).sin()).expect("write fixture");
+        write!(file, "{i}").expect("write fixture");
+        for channel in 0..channels {
+            write!(file, ",{}", (i as f64 * 0.001 + channel as f64).sin()).expect("write fixture");
+        }
+        writeln!(file).expect("write fixture");
     }
     file.flush().expect("flush fixture");
     drop(file);
@@ -172,7 +195,7 @@ fn spilled_fixture(sample_count: usize) -> Fixture {
     let sample_cache = views::time::cache_column_samples(&dataset);
     let cursor = views::time::CursorLookup::for_time(&dataset.time);
     Fixture {
-        label: "f64 spilled (disk pyramid)",
+        label,
         _dir: Some(dir),
         dataset,
         pyramids,
@@ -192,6 +215,7 @@ fn spilled_fixture(sample_count: usize) -> Fixture {
 fn render_frame(
     ctx: &egui::Context,
     fixture: &Fixture,
+    channels: &mut ChannelVisibility,
     hover: bool,
     view: (f64, f64),
 ) -> (i128, i128) {
@@ -219,6 +243,7 @@ fn render_frame(
                 &fixture.sample_cache,
                 &[],
                 fixture.cursor,
+                channels,
                 Some(view),
             );
         });
@@ -252,14 +277,15 @@ fn pan_view(fixture: &Fixture, step: usize) -> (f64, f64) {
 fn assert_frame_budget(
     ctx: &egui::Context,
     fixture: &Fixture,
+    channels: &mut ChannelVisibility,
     hover: bool,
     view: (f64, f64),
     what: &str,
     min_visible_ticks: i128,
 ) {
-    render_frame(ctx, fixture, hover, view);
+    render_frame(ctx, fixture, channels, hover, view);
     let start = Instant::now();
-    let (first, last) = render_frame(ctx, fixture, hover, view);
+    let (first, last) = render_frame(ctx, fixture, channels, hover, view);
     let elapsed = start.elapsed();
     assert!(
         last - first >= min_visible_ticks,
@@ -268,14 +294,28 @@ fn assert_frame_budget(
     );
     assert!(
         elapsed <= FRAME_TIME_CEILING,
-        "time-domain view render ({what}) took {elapsed:?} for {SAMPLE_COUNT} {} samples \
+        "time-domain view render ({what}) took {elapsed:?} for {} {} samples \
          at a {VIEWPORT_SIZE:?} viewport, exceeding the {FRAME_TIME_CEILING:?} \
          build-blocking ceiling (SPEC §5: pan/zoom p99 ≤100ms)",
+        fixture.ticks.len(),
         fixture.label
     );
 }
 
-fn bench_one_fixture(c: &mut Criterion, fixture: &Fixture) {
+/// Benches `fixture` with `channels` as the picker's choice; `shown`, when
+/// non-empty, names that choice in the bench ids (e.g. "1 of 32 shown").
+fn bench_one_fixture(
+    c: &mut Criterion,
+    fixture: &Fixture,
+    channels: ChannelVisibility,
+    shown: &str,
+) {
+    let label = if shown.is_empty() {
+        fixture.label.to_owned()
+    } else {
+        format!("{}, {shown}", fixture.label)
+    };
+    let mut channels = channels;
     let full = full_view(fixture);
     let span_ticks = fixture.ticks.last().expect("non-empty") - fixture.ticks[0];
     for hover in [false, true] {
@@ -286,6 +326,7 @@ fn bench_one_fixture(c: &mut Criterion, fixture: &Fixture) {
         assert_frame_budget(
             &ctx,
             fixture,
+            &mut channels,
             hover,
             full,
             &format!("full view, {mode}"),
@@ -295,6 +336,7 @@ fn bench_one_fixture(c: &mut Criterion, fixture: &Fixture) {
         assert_frame_budget(
             &ctx,
             fixture,
+            &mut channels,
             hover,
             pan_view(fixture, 37),
             &format!("pan, {mode}"),
@@ -303,12 +345,13 @@ fn bench_one_fixture(c: &mut Criterion, fixture: &Fixture) {
 
         let suffix = if hover { "/hovered" } else { "" };
         c.bench_function(
-            &format!("time_view_render/{}/full view{suffix}", fixture.label),
+            &format!("time_view_render/{label}/full view{suffix}"),
             |b| {
                 b.iter(|| {
                     render_frame(
                         std::hint::black_box(&ctx),
                         std::hint::black_box(fixture),
+                        &mut channels,
                         hover,
                         full,
                     )
@@ -316,27 +359,43 @@ fn bench_one_fixture(c: &mut Criterion, fixture: &Fixture) {
             },
         );
         let mut step = 0;
-        c.bench_function(
-            &format!("time_view_render/{}/pan{suffix}", fixture.label),
-            |b| {
-                b.iter(|| {
-                    step += 1;
-                    render_frame(
-                        std::hint::black_box(&ctx),
-                        std::hint::black_box(fixture),
-                        hover,
-                        pan_view(fixture, step),
-                    )
-                })
-            },
-        );
+        c.bench_function(&format!("time_view_render/{label}/pan{suffix}"), |b| {
+            b.iter(|| {
+                step += 1;
+                render_frame(
+                    std::hint::black_box(&ctx),
+                    std::hint::black_box(fixture),
+                    &mut channels,
+                    hover,
+                    pan_view(fixture, step),
+                )
+            })
+        });
     }
 }
 
 fn bench_time_view_render(c: &mut Criterion) {
-    bench_one_fixture(c, &f64_fixture(SAMPLE_COUNT));
-    bench_one_fixture(c, &i64_fixture(SAMPLE_COUNT));
-    bench_one_fixture(c, &spilled_fixture(SAMPLE_COUNT));
+    let all = ChannelVisibility::default;
+    bench_one_fixture(c, &f64_fixture(SAMPLE_COUNT), all(), "");
+    bench_one_fixture(c, &i64_fixture(SAMPLE_COUNT), all(), "");
+    bench_one_fixture(
+        c,
+        &spilled_fixture("f64 spilled (disk pyramid)", SAMPLE_COUNT, 1),
+        all(),
+        "",
+    );
+
+    let many = spilled_fixture(
+        "f64 spilled, many channels",
+        MULTI_CHANNEL_SAMPLES,
+        MULTI_CHANNELS,
+    );
+    bench_one_fixture(c, &many, all(), &format!("all {MULTI_CHANNELS} shown"));
+    let mut one_shown = ChannelVisibility::default();
+    one_shown.sync((0..MULTI_CHANNELS).map(|channel| many.dataset.columns[channel].name()));
+    one_shown.solo(0);
+    assert_eq!(one_shown.visible_count(), 1);
+    bench_one_fixture(c, &many, one_shown, &format!("1 of {MULTI_CHANNELS} shown"));
 }
 
 criterion_group!(benches, bench_time_view_render);

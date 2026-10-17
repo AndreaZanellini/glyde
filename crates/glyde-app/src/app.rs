@@ -148,6 +148,10 @@ pub struct GlydeApp {
     /// A horizontal span, in plot seconds, the time view should move to on
     /// its next frame (the PSD view's "analyze the largest uniform stretch").
     time_focus: Option<(f64, f64)>,
+    /// Which channels the time view plots (its channel picker). Kept across
+    /// frames and across the preview-to-completed switch of one file; it
+    /// resets itself to every channel shown when the channel list changes.
+    channels: views::channels::ChannelVisibility,
 }
 
 impl Default for GlydeApp {
@@ -163,6 +167,7 @@ impl Default for GlydeApp {
             psd: PsdPanel::default(),
             time_selection: None,
             time_focus: None,
+            channels: Default::default(),
         }
     }
 }
@@ -426,6 +431,7 @@ impl eframe::App for GlydeApp {
                             // always has, same as a `None` entry would.
                             &[],
                             partial.prepared.cursor,
+                            &mut self.channels,
                         );
                         let ticks = &partial.prepared.ticks;
                         views::state_timeline::show(
@@ -475,6 +481,7 @@ impl eframe::App for GlydeApp {
                     &prepared.sample_cache,
                     level0_caches,
                     prepared.cursor,
+                    &mut self.channels,
                     self.time_focus.take(),
                 );
                 self.time_selection = Some(selection_rows(
