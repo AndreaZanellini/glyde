@@ -729,8 +729,8 @@ fn nearest_tick_index(ticks: &[i128], target: i128) -> Option<usize> {
 struct MinMaxBars {
     name: String,
     color: egui::Color32,
-    /// Two per extent, in order: `(x, min)`, `(x, max)`.
-    ends: Vec<egui_plot::PlotPoint>,
+    /// One `[(x, min), (x, max)]` pair per extent.
+    extents: Vec<[egui_plot::PlotPoint; 2]>,
     bounds: PlotBounds,
     highlighted: bool,
 }
@@ -743,22 +743,25 @@ impl MinMaxBars {
         Self {
             name: name.to_owned(),
             color,
-            ends: Vec::new(),
+            extents: Vec::new(),
             bounds: PlotBounds::NOTHING,
             highlighted: false,
         }
     }
 
     fn push(&mut self, x: f64, min: f64, max: f64) {
-        for y in [min, max] {
-            let end = egui_plot::PlotPoint::new(x, y);
-            self.bounds.extend_with(&end);
-            self.ends.push(end);
+        let extent = [
+            egui_plot::PlotPoint::new(x, min),
+            egui_plot::PlotPoint::new(x, max),
+        ];
+        for end in &extent {
+            self.bounds.extend_with(end);
         }
+        self.extents.push(extent);
     }
 
     fn is_empty(&self) -> bool {
-        self.ends.is_empty()
+        self.extents.is_empty()
     }
 }
 
@@ -775,8 +778,8 @@ impl egui_plot::PlotItem for MinMaxBars {
             Self::STROKE_WIDTH
         };
         let stroke = egui::Stroke::new(width, self.color);
-        shapes.reserve(self.ends.len() / 2);
-        for extent in self.ends.chunks_exact(2) {
+        shapes.reserve(self.extents.len());
+        for extent in &self.extents {
             shapes.push(egui::Shape::line_segment(
                 [
                     transform.position_from_point(&extent[0]),
@@ -810,7 +813,8 @@ impl egui_plot::PlotItem for MinMaxBars {
     }
 
     fn geometry(&self) -> egui_plot::PlotGeometry<'_> {
-        egui_plot::PlotGeometry::Points(&self.ends)
+        // Hoverable at either end of every extent, like each `Line` was.
+        egui_plot::PlotGeometry::Points(self.extents.as_flattened())
     }
 
     fn bounds(&self) -> PlotBounds {
