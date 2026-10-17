@@ -667,18 +667,20 @@ Versioning: [Semantic Versioning](https://semver.org/).
 - **Plots draw faster, especially with many channels.** When a time
   view shows more data than it has pixels, each channel is drawn as one
   thin vertical bar per pixel column. Each of those bars used to be a
-  separate drawing object, which was expensive with many channels. They are
-  now drawn together, one object per channel. The picture is exactly the
-  same: same bars, same positions, same colors and thickness. A new test
-  checks this bar by bar. A second new test checks, pixel by pixel, on a
-  standard and on a Retina display, that a bar shorter than a pixel (a
-  slowly changing signal) still shows: an intermediate version of this
-  change lost them on Retina displays, leaving gaps in the line. Measured
-  on this machine, including the step that prepares the picture for the
-  screen: a 32-channel full view went from about 15.4 ms to about 11.4 ms
-  per frame, a click in the channel picker from about 13.4 ms to about
-  8.2 ms, and a single-channel file from about 0.77 ms to about 0.63 ms.
-  (#137)
+  separate drawing object, which was expensive with many channels. Glyde
+  now prepares all of a channel's bars at once, ready for the screen. The
+  picture is exactly the same: same bars, same positions, same colors and
+  thickness, down to every triangle sent to the graphics card, on normal
+  and high-density (Retina) screens alike. A test checks this bar by bar.
+  A second new test checks, pixel by pixel, on a standard and on a Retina
+  display, that a bar shorter than a pixel (a slowly changing signal)
+  still shows: an intermediate version of this change lost them on Retina
+  displays, leaving gaps in the line. Measured on this machine, including
+  the step that prepares the picture for the screen: a 32-channel full view
+  went from about 15.4 ms to about 10.0 ms per frame, a click in the
+  channel picker from about 13.4 ms to about 6.6 ms, panning a large file
+  stored on disk from about 12.5 ms to about 5.3 ms, and a single-channel
+  file from about 0.77 ms to about 0.61 ms. (#137)
 
 - **Files too large for memory now scroll and zoom as fast as small ones.**
   For such a file, Glyde used to have no overview structure (the "pyramid"
