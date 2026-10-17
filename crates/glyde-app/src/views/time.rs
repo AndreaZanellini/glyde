@@ -731,8 +731,15 @@ fn nearest_tick_index(ticks: &[i128], target: i128) -> Option<usize> {
 /// How [`MinMaxBars`] hands its extents to egui.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum BarEncoding {
-    /// One line-segment shape per extent.
+    /// One mesh per channel, tessellated here exactly as egui would
+    /// tessellate [`Self::Strokes`] (same options, pixel density and clip),
+    /// so the frame paints the same triangles without egui handling
+    /// ~2,000 separate shapes per channel (issue #137).
     #[default]
+    Mesh,
+    /// One line-segment shape per extent: the reference the mesh is tested
+    /// against.
+    #[cfg_attr(not(test), allow(dead_code))]
     Strokes,
 }
 
@@ -783,7 +790,7 @@ impl MinMaxBars {
 impl egui_plot::PlotItem for MinMaxBars {
     fn shapes(
         &self,
-        _ui: &egui::Ui,
+        ui: &egui::Ui,
         transform: &egui_plot::PlotTransform,
         shapes: &mut Vec<egui::Shape>,
     ) {
@@ -793,16 +800,36 @@ impl egui_plot::PlotItem for MinMaxBars {
             Self::STROKE_WIDTH
         };
         let stroke = egui::Stroke::new(width, self.color);
-        let BarEncoding::Strokes = self.encoding;
-        shapes.reserve(self.ends.len() / 2);
-        for extent in self.ends.chunks_exact(2) {
-            shapes.push(egui::Shape::line_segment(
-                [
-                    transform.position_from_point(&extent[0]),
-                    transform.position_from_point(&extent[1]),
-                ],
-                stroke,
-            ));
+        let extents = self.ends.chunks_exact(2).map(|extent| {
+            [
+                transform.position_from_point(&extent[0]),
+                transform.position_from_point(&extent[1]),
+            ]
+        });
+        match self.encoding {
+            BarEncoding::Mesh => {
+                // Exactly what `egui::Context::tessellate` would set up for
+                // these shapes: `egui_plot` paints its items clipped to the
+                // plot frame.
+                let ctx = ui.ctx();
+                let mut tessellator = egui::epaint::Tessellator::new(
+                    ctx.pixels_per_point(),
+                    ctx.tessellation_options(|options| *options),
+                    ctx.fonts(|fonts| fonts.font_image_size()),
+                    Vec::new(),
+                );
+                tessellator.set_clip_rect(transform.frame().intersect(ui.clip_rect()));
+                let mut mesh = egui::Mesh::default();
+                for extent in extents {
+                    tessellator.tessellate_line_segment(extent, stroke, &mut mesh);
+                }
+                if !mesh.is_empty() {
+                    shapes.push(egui::Shape::mesh(mesh));
+                }
+            }
+            BarEncoding::Strokes => {
+                shapes.extend(extents.map(|extent| egui::Shape::line_segment(extent, stroke)));
+            }
         }
     }
 
@@ -2220,8 +2247,9 @@ mod render_tests {
         // The same frames twice: with the bars as plain strokes — the
         // reference whose every mark is checked below — and as the app
         // draws them.
-        let frame = |encoding: BarEncoding| {
+        let frame = |encoding: BarEncoding, pixels_per_point: f32| {
             let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(pixels_per_point);
             let mut state = TimeViewState {
                 bar_encoding: encoding,
                 ..TimeViewState::default()
@@ -2233,24 +2261,32 @@ mod render_tests {
             let tessellated = ctx.tessellate(shapes.clone(), ctx.pixels_per_point());
             (state, shapes, tessellated)
         };
-        let (state, shapes, reference) = frame(BarEncoding::Strokes);
-        let (_, _, drawn) = frame(BarEncoding::default());
         // What reaches the screen: the app's frame must tessellate into
         // exactly the triangles the reference strokes do — so the checks
-        // on the strokes below hold for every pixel the app draws.
-        assert_eq!(drawn.len(), reference.len(), "same primitives");
-        for (drawn, reference) in drawn.iter().zip(&reference) {
-            assert_eq!(drawn.clip_rect, reference.clip_rect);
-            match (&drawn.primitive, &reference.primitive) {
-                (
-                    egui::epaint::Primitive::Mesh(drawn),
-                    egui::epaint::Primitive::Mesh(reference),
-                ) => {
-                    assert!(drawn == reference, "the frame must tessellate identically");
+        // on the strokes below hold for every pixel the app draws. On a
+        // standard and a high-density (Retina) display: tessellation snaps
+        // to physical pixels.
+        for pixels_per_point in [1.0, 2.0] {
+            let (_, _, reference) = frame(BarEncoding::Strokes, pixels_per_point);
+            let (_, _, drawn) = frame(BarEncoding::default(), pixels_per_point);
+            assert_eq!(drawn.len(), reference.len(), "same primitives");
+            for (drawn, reference) in drawn.iter().zip(&reference) {
+                assert_eq!(drawn.clip_rect, reference.clip_rect);
+                match (&drawn.primitive, &reference.primitive) {
+                    (
+                        egui::epaint::Primitive::Mesh(drawn),
+                        egui::epaint::Primitive::Mesh(reference),
+                    ) => {
+                        assert!(
+                            drawn == reference,
+                            "the frame must tessellate identically at {pixels_per_point} px/pt"
+                        );
+                    }
+                    _ => panic!("the time view paints meshes only"),
                 }
-                _ => panic!("the time view paints meshes only"),
             }
         }
+        let (state, shapes, _) = frame(BarEncoding::Strokes, 1.0);
 
         let mut transform: Option<[f64; 4]> = None;
         for column in 0..2 {
