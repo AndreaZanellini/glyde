@@ -403,7 +403,12 @@ impl eframe::App for GlydeApp {
                 .resizable(true)
                 .default_height(320.0)
                 .show(ctx, |ui| {
-                    self.psd.show(ui, dataset, self.time_selection.clone())
+                    self.psd.show(
+                        ui,
+                        dataset,
+                        self.time_selection.clone(),
+                        &mut self.time_view.channels,
+                    )
                 })
                 .inner;
             if let Some(PsdRequest::ShowRows(range)) = request {
@@ -1285,7 +1290,12 @@ mod tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                app.psd.show(ui, &dataset, Some(selection.clone()));
+                app.psd.show(
+                    ui,
+                    &dataset,
+                    Some(selection.clone()),
+                    &mut app.time_view.channels,
+                );
             });
         });
         assert!(!output.shapes.is_empty());

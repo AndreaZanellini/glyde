@@ -21,7 +21,10 @@
 //!   one reads every selected sample, so it is the user's call. A PSD that no
 //!   longer matches the view or the settings stays on screen, marked as such.
 //! - One spectrum per numeric series, overlaid on one plot or stacked on
-//!   several, always sharing one synchronized frequency axis.
+//!   several, always sharing one synchronized frequency axis. Which series
+//!   are shown is the same channel picker, and the same choice, as the time
+//!   view's ([`crate::views::channels`], issue #135): every spectrum is
+//!   still computed, a hidden one is just not drawn.
 //! - Log/linear toggles on both axes.
 //! - A "computed on" readout: samples, windows, window, overlap, Δf, sample
 //!   rate, segments averaged, anything excluded, and the memory used against
@@ -35,7 +38,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use egui_plot::{Legend, Line, Plot, PlotPoints};
+use egui_plot::{Line, Plot, PlotPoints};
 use glyde_core::budget::RamBudget;
 use glyde_core::dsp::psd::{
     largest_affordable_segment_len, minimum_peak_bytes, segment_length_fits, FrequencyUnit,
@@ -48,6 +51,7 @@ use glyde_core::ingest::Dataset;
 use glyde_core::series::ViewKind;
 
 use crate::plumbing::psd::{PsdJob, PsdOutcome, Spectrum};
+use crate::views::channels::{self, ChannelVisibility};
 use crate::views::time::series_color;
 
 /// Height of one plot when spectra are stacked.
@@ -148,14 +152,27 @@ impl PsdPanel {
     }
 
     /// Renders the view. `selection` is the rows the time view shows right
-    /// now — what "Compute PSD" would analyze.
+    /// now — what "Compute PSD" would analyze. `channels` is which series
+    /// are drawn, shared with the time view.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         dataset: &Arc<Dataset>,
         selection: Option<Range<usize>>,
+        channels: &mut ChannelVisibility,
     ) -> Option<PsdRequest> {
         let mut request = None;
+        // The same channel list the time view keeps it in sync with, so a
+        // choice made in either view holds in both.
+        channels.sync(
+            dataset
+                .columns
+                .iter()
+                .filter(|series| series.view_kind() == ViewKind::TimeDomain)
+                .map(|series| series.name())
+                .collect::<Vec<_>>()
+                .into_iter(),
+        );
         let columns = numeric_columns(dataset);
         // Checked before anything runs (SPEC §5.1): with this many series,
         // does even the shortest segment length fit the memory cap?
@@ -245,7 +262,7 @@ impl PsdPanel {
                 for line in missing_sample_notes(spectra) {
                     ui.label(line);
                 }
-                self.show_spectra(ui, plan, spectra);
+                self.show_spectra(ui, plan, spectra, channels);
             }
             PsdOutcome::Unavailable(unavailable) => {
                 ui.colored_label(ui.visuals().warn_fg_color, unavailable.to_string());
@@ -381,7 +398,16 @@ impl PsdPanel {
         }
     }
 
-    fn show_spectra(&self, ui: &mut egui::Ui, plan: &PsdPlan, spectra: &[Spectrum]) {
+    /// Draws the spectra of the channels `channels` shows (a spectrum's index
+    /// is its channel's: both enumerate the numeric series in column order),
+    /// with the channel picker over them.
+    fn show_spectra(
+        &self,
+        ui: &mut egui::Ui,
+        plan: &PsdPlan,
+        spectra: &[Spectrum],
+        channels: &mut ChannelVisibility,
+    ) {
         let x_label = frequency_axis_label(plan.frequency_unit, self.log_frequency);
         let y_label = power_axis_label(plan.frequency_unit, self.log_power);
         let log_frequency = self.log_frequency;
@@ -404,35 +430,71 @@ impl PsdPanel {
                 .link_cursor("psd_frequency_axis", [true, false])
         };
 
-        match self.layout {
+        let shown: Vec<(usize, &Spectrum)> = spectra
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| channels.is_visible(index))
+            .collect();
+        let area = match self.layout {
             Layout::Overlay => {
                 build(egui::Id::new("psd_overlay"))
-                    .legend(Legend::default())
                     .show(ui, |plot_ui| {
-                        for (index, spectrum) in spectra.iter().enumerate() {
+                        for &(index, spectrum) in &shown {
                             plot_ui.line(spectrum_line(spectrum, index, log_frequency, log_power));
                         }
-                    });
+                    })
+                    .response
+                    .rect
             }
             Layout::Stacked => {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (index, spectrum) in spectra.iter().enumerate() {
-                        build(egui::Id::new(("psd_stacked", index)))
-                            .height(STACKED_PLOT_HEIGHT)
-                            .legend(Legend::default())
-                            .show(ui, |plot_ui| {
-                                plot_ui.line(spectrum_line(
-                                    spectrum,
-                                    index,
-                                    log_frequency,
-                                    log_power,
-                                ));
-                            });
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .show(ui, |ui| {
+                        if shown.is_empty() {
+                            // Room for the picker, so a channel can be shown
+                            // again from here.
+                            ui.allocate_ui(
+                                egui::vec2(ui.available_width(), STACKED_PLOT_HEIGHT),
+                                |ui| {
+                                    ui.set_min_size(egui::vec2(
+                                        ui.available_width(),
+                                        STACKED_PLOT_HEIGHT,
+                                    ));
+                                    ui.weak("No series shown.");
+                                },
+                            );
+                        }
+                        for &(index, spectrum) in &shown {
+                            // The plot's own name, in place of the one-entry
+                            // legend it used to carry.
+                            series_label(ui, &spectrum.name, series_color(index));
+                            build(egui::Id::new(("psd_stacked", index)))
+                                .height(STACKED_PLOT_HEIGHT)
+                                .show(ui, |plot_ui| {
+                                    plot_ui.line(spectrum_line(
+                                        spectrum,
+                                        index,
+                                        log_frequency,
+                                        log_power,
+                                    ));
+                                });
+                        }
+                    })
+                    .inner_rect
             }
-        }
+        };
+        channels::show(ui, "psd", area, channels, series_color);
     }
+}
+
+/// A stacked plot's title: its series' name after a dot in its color, the
+/// way the channel picker shows it.
+fn series_label(ui: &mut egui::Ui, name: &str, color: egui::Color32) {
+    ui.horizontal(|ui| {
+        let size = ui.text_style_height(&egui::TextStyle::Body);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), size * 0.4, color);
+        ui.label(name);
+    });
 }
 
 /// One spectrum as a plot line, in the same color its series has in the time
@@ -866,7 +928,11 @@ mod render_tests {
                 values: vec![0.0, 1.0].into(),
             },
             time_column_name: "row".to_string(),
-            columns: vec![Series::new("v", SeriesValues::F64(vec![0.0, 1.0]))],
+            // The same two series `ready` has spectra of.
+            columns: vec![
+                Series::new("a", SeriesValues::F64(vec![0.0, 1.0])),
+                Series::new("b", SeriesValues::F64(vec![0.0, 1.0])),
+            ],
         })
     }
 
@@ -882,7 +948,12 @@ mod render_tests {
         let mut request = None;
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                request = panel.show(ui, &dataset, selection.clone());
+                request = panel.show(
+                    ui,
+                    &dataset,
+                    selection.clone(),
+                    &mut ChannelVisibility::default(),
+                );
             });
         });
         (output, request)
@@ -890,6 +961,150 @@ mod render_tests {
 
     fn render(panel: &mut PsdPanel) -> (egui::FullOutput, Option<PsdRequest>) {
         render_with(panel, Some(0..8192))
+    }
+
+    /// Renders `panel` (computed on rows `0..8192`, the same rows shown)
+    /// with `channels` as the channel choice, on `ctx`.
+    fn render_channels(
+        ctx: &egui::Context,
+        panel: &mut PsdPanel,
+        channels: &mut ChannelVisibility,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let dataset = tiny_dataset();
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                panel.show(ui, &dataset, Some(0..8192), channels);
+            });
+        })
+        .shapes
+    }
+
+    /// Every line stroke color in `shapes`, and every text.
+    fn colors_and_texts(
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> (Vec<egui::Color32>, Vec<String>) {
+        fn walk(shape: &egui::Shape, colors: &mut Vec<egui::Color32>, texts: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, colors, texts)),
+                egui::Shape::Path(path) => {
+                    if let egui::epaint::ColorMode::Solid(color) = path.stroke.color {
+                        colors.push(color);
+                    }
+                }
+                egui::Shape::Circle(circle) => colors.push(circle.fill),
+                egui::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                _ => {}
+            }
+        }
+        let (mut colors, mut texts) = (Vec::new(), Vec::new());
+        for clipped in shapes {
+            walk(&clipped.shape, &mut colors, &mut texts);
+        }
+        (colors, texts)
+    }
+
+    // Issue #135: the PSD view shows the same channels as the time view —
+    // one choice, edited in either view — and a hidden channel's spectrum is
+    // not drawn, overlaid or stacked.
+    #[test]
+    fn a_hidden_channel_is_not_drawn_overlaid_or_stacked() {
+        for layout in [Layout::Overlay, Layout::Stacked] {
+            let ctx = egui::Context::default();
+            let mut panel = panel_showing(ready(), layout);
+            let mut channels = ChannelVisibility::default();
+            // A new picker sizes itself on its first frame, unseen.
+            render_channels(&ctx, &mut panel, &mut channels);
+
+            let (colors, texts) =
+                colors_and_texts(&render_channels(&ctx, &mut panel, &mut channels));
+            assert!(colors.contains(&series_color(0)), "{layout:?}: a is drawn");
+            assert!(colors.contains(&series_color(1)), "{layout:?}: b is drawn");
+            assert!(
+                texts.iter().any(|t| t == "2 of 2 shown"),
+                "{layout:?}: picker"
+            );
+
+            channels.toggle(0);
+            let (colors, texts) =
+                colors_and_texts(&render_channels(&ctx, &mut panel, &mut channels));
+            assert!(
+                !colors.contains(&series_color(0)),
+                "{layout:?}: a is hidden"
+            );
+            assert!(
+                colors.contains(&series_color(1)),
+                "{layout:?}: b keeps its color"
+            );
+            assert!(
+                texts.iter().any(|t| t == "1 of 2 shown"),
+                "{layout:?}: picker"
+            );
+            assert_eq!(
+                panel.spectra().map(<[Spectrum]>::len),
+                Some(2),
+                "{layout:?}: hiding never discards a computed spectrum"
+            );
+
+            channels.hide_all();
+            let (_, texts) = colors_and_texts(&render_channels(&ctx, &mut panel, &mut channels));
+            assert!(
+                texts.iter().any(|t| t == "0 of 2 shown"),
+                "{layout:?}: with nothing shown the picker stays reachable"
+            );
+        }
+    }
+
+    // In stacked mode each plot is titled with its series, since it no
+    // longer carries a one-entry legend.
+    #[test]
+    fn stacked_plots_are_titled_with_their_series() {
+        let ctx = egui::Context::default();
+        let mut panel = panel_showing(ready(), Layout::Stacked);
+        let mut channels = ChannelVisibility::default();
+        render_channels(&ctx, &mut panel, &mut channels);
+        channels.toggle(0);
+        let (_, texts) = colors_and_texts(&render_channels(&ctx, &mut panel, &mut channels));
+        // "a" still appears once, as its picker row; "b" twice: its row and
+        // its plot's title.
+        assert_eq!(texts.iter().filter(|t| *t == "a").count(), 1);
+        assert_eq!(texts.iter().filter(|t| *t == "b").count(), 2);
+    }
+
+    // What the app does every frame: the time view and the PSD view render
+    // with the same choice, so hiding a channel in one hides it in the
+    // other.
+    #[test]
+    fn a_channel_hidden_in_the_time_view_is_hidden_in_the_psd_view() {
+        let ctx = egui::Context::default();
+        let dataset = tiny_dataset();
+        let mut time_view = crate::views::time::TimeViewState::default();
+        let mut panel = panel_showing(ready(), Layout::Overlay);
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        let sample_cache = crate::views::time::cache_column_samples(&dataset);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                crate::views::time::show(
+                    ui,
+                    &dataset,
+                    &pyramids,
+                    &ticks,
+                    &sample_cache,
+                    &[],
+                    crate::views::time::CursorLookup::for_time(&dataset.time),
+                    &mut time_view,
+                );
+            });
+        });
+        time_view.channels.toggle(1);
+
+        let (colors, _) =
+            colors_and_texts(&render_channels(&ctx, &mut panel, &mut time_view.channels));
+        assert!(colors.contains(&series_color(0)));
+        assert!(
+            !colors.contains(&series_color(1)),
+            "b was hidden in the time view"
+        );
     }
 
     #[test]
@@ -964,7 +1179,12 @@ mod request_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                panel.show(ui, dataset, Some(selection.clone()));
+                panel.show(
+                    ui,
+                    dataset,
+                    Some(selection.clone()),
+                    &mut ChannelVisibility::default(),
+                );
             });
         });
         format!("{:?}", output.shapes)

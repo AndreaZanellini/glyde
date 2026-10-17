@@ -133,9 +133,11 @@ impl ChannelVisibility {
 /// Draws the picker for `visibility`'s channels inside the top-right corner
 /// of `plot_rect`, colored by `color`, and applies any click to
 /// `visibility`. It floats above the plot (its own layer), so the plot never
-/// pans or zooms from a click, drag or scroll meant for the picker.
+/// pans or zooms from a click, drag or scroll meant for the picker. `view`
+/// tells apart the pickers of different views shown at the same time.
 pub fn show(
     ui: &Ui,
+    view: &str,
     plot_rect: Rect,
     visibility: &mut ChannelVisibility,
     color: impl Fn(usize) -> Color32,
@@ -145,7 +147,7 @@ pub fn show(
     }
     let before = visibility.clone();
     let margin = 8.0;
-    egui::Area::new(ui.id().with("time_view_channel_picker"))
+    egui::Area::new(egui::Id::new(("glyde_channel_picker", view)))
         .order(egui::Order::Middle)
         .pivot(Align2::RIGHT_TOP)
         .fixed_pos(plot_rect.right_top() + egui::vec2(-margin, margin))
@@ -155,7 +157,7 @@ pub fn show(
                 ui.set_width(WIDTH);
                 ui.set_max_width(WIDTH);
                 header(ui, visibility);
-                rows(ui, visibility, color);
+                rows(ui, view, visibility, color);
             });
         });
     if *visibility != before {
@@ -194,7 +196,12 @@ fn header(ui: &mut Ui, visibility: &mut ChannelVisibility) {
 
 /// The channel rows, [`VISIBLE_ROWS`] at a time; only the rows on screen are
 /// laid out.
-fn rows(ui: &mut Ui, visibility: &mut ChannelVisibility, color: impl Fn(usize) -> Color32) {
+fn rows(
+    ui: &mut Ui,
+    view: &str,
+    visibility: &mut ChannelVisibility,
+    color: impl Fn(usize) -> Color32,
+) {
     let font_id = TextStyle::Body.resolve(ui.style());
     let row_height = ui.fonts(|fonts| fonts.row_height(&font_id)) + 2.0;
     let spacing = ui.spacing().item_spacing.y;
@@ -207,7 +214,7 @@ fn rows(ui: &mut Ui, visibility: &mut ChannelVisibility, color: impl Fn(usize) -
             for index in range {
                 let response = row(
                     ui,
-                    index,
+                    row_id(view, index),
                     &visibility.names[index],
                     color(index),
                     visibility.is_visible(index),
@@ -225,16 +232,16 @@ fn rows(ui: &mut Ui, visibility: &mut ChannelVisibility, color: impl Fn(usize) -
     }
 }
 
-/// The id of channel `index`'s row (there is only ever one picker).
-pub(crate) fn row_id(index: usize) -> egui::Id {
-    egui::Id::new(("glyde_channel_picker_row", index))
+/// The id of channel `index`'s row in `view`'s picker.
+pub(crate) fn row_id(view: &str, index: usize) -> egui::Id {
+    egui::Id::new(("glyde_channel_picker_row", view, index))
 }
 
 /// One channel: a dot in its plot color (filled while it is shown) and its
 /// name, the whole row clickable.
 fn row(
     ui: &mut Ui,
-    index: usize,
+    id: egui::Id,
     name: &str,
     color: Color32,
     visible: bool,
@@ -242,7 +249,7 @@ fn row(
 ) -> egui::Response {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
-    let response = ui.interact(rect, row_id(index), Sense::click());
+    let response = ui.interact(rect, id, Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), visible, name)
     });
@@ -384,7 +391,7 @@ mod tests {
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let plot_rect = ui.max_rect();
-                show(ui, plot_rect, visibility, |_| Color32::RED);
+                show(ui, "test", plot_rect, visibility, |_| Color32::RED);
             });
         });
     }
@@ -398,7 +405,7 @@ mod tests {
         modifiers: egui::Modifiers,
     ) {
         let rect = ctx
-            .read_response(row_id(index))
+            .read_response(row_id("test", index))
             .expect("the row must have been laid out")
             .rect;
         let at = rect.center();
@@ -445,7 +452,7 @@ mod tests {
         picker_frame(&ctx, &mut visibility, Vec::new(), egui::Modifiers::NONE);
 
         let laid_out = (0..names.len())
-            .filter(|&index| ctx.read_response(row_id(index)).is_some())
+            .filter(|&index| ctx.read_response(row_id("test", index)).is_some())
             .count();
         assert!(
             (VISIBLE_ROWS..=VISIBLE_ROWS + 1).contains(&laid_out),
