@@ -149,6 +149,10 @@ pub struct TimeViewState {
     background: Option<BackgroundDecimator>,
     /// The background decimation running now, if any.
     pending: Option<PendingDecimation>,
+    /// How aggregated bars are handed to egui; the tests switch it to the
+    /// reference encoding to compare the two.
+    #[cfg(test)]
+    bar_encoding: BarEncoding,
 }
 
 /// One column's decimation and the view it was computed for.
@@ -328,6 +332,10 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         state.ticks_identity = ticks_identity;
     }
     state.collect_background_results(ticks, dataset.columns.len());
+    #[cfg(test)]
+    let bar_encoding = state.bar_encoding;
+    #[cfg(not(test))]
+    let bar_encoding = BarEncoding::default();
     let TimeViewState {
         channels,
         decimated: cache,
@@ -533,7 +541,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 // (SPEC §1.3). All of a channel's extents are one plot item
                 // (issue #137), not one `Line` each.
                 let mut points: Vec<[f64; 2]> = Vec::new();
-                let mut bars = MinMaxBars::new(series.name(), color);
+                let mut bars = MinMaxBars::new(series.name(), color, bar_encoding);
                 for bucket in buckets {
                     if bucket_is_gap(bucket) {
                         continue;
@@ -720,6 +728,14 @@ fn nearest_tick_index(ticks: &[i128], target: i128) -> Option<usize> {
     })
 }
 
+/// How [`MinMaxBars`] hands its extents to egui.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum BarEncoding {
+    /// One line-segment shape per extent.
+    #[default]
+    Strokes,
+}
+
 /// One channel's vertical min/max extents in SPEC §3.1's aggregated regime,
 /// as a single plot item (issue #137). Drawn exactly like the one-`Line`-
 /// per-extent it replaces — a 1.5-point stroke in the channel's color from
@@ -729,6 +745,7 @@ fn nearest_tick_index(ticks: &[i128], target: i128) -> Option<usize> {
 struct MinMaxBars {
     name: String,
     color: egui::Color32,
+    encoding: BarEncoding,
     /// Two per extent, in order: `(x, min)`, `(x, max)`.
     ends: Vec<egui_plot::PlotPoint>,
     bounds: PlotBounds,
@@ -739,10 +756,11 @@ impl MinMaxBars {
     /// The stroke width of an `egui_plot::Line`, which drew these before.
     const STROKE_WIDTH: f32 = 1.5;
 
-    fn new(name: &str, color: egui::Color32) -> Self {
+    fn new(name: &str, color: egui::Color32, encoding: BarEncoding) -> Self {
         Self {
             name: name.to_owned(),
             color,
+            encoding,
             ends: Vec::new(),
             bounds: PlotBounds::NOTHING,
             highlighted: false,
@@ -775,6 +793,7 @@ impl egui_plot::PlotItem for MinMaxBars {
             Self::STROKE_WIDTH
         };
         let stroke = egui::Stroke::new(width, self.color);
+        let BarEncoding::Strokes = self.encoding;
         shapes.reserve(self.ends.len() / 2);
         for extent in self.ends.chunks_exact(2) {
             shapes.push(egui::Shape::line_segment(
@@ -2155,13 +2174,16 @@ mod render_tests {
     }
 
     // Issue #137's lock on SPEC §3.1's aggregated regime, written before
-    // changing how its bars are emitted: whatever carries them, each
-    // channel draws exactly one vertical min/max stroke per non-flat,
-    // non-gap bucket and one dot per flat one, never a stroke from one
-    // pixel column to another, never anything for a gap bucket, in the
-    // channel's color at the same width — and every mark sits exactly where
-    // one affine plot transform puts its bucket, so nothing is moved,
-    // merged, dropped or invented.
+    // changing how its bars are emitted: each channel draws exactly one
+    // vertical min/max stroke per non-flat, non-gap bucket and one dot per
+    // flat one, never a stroke from one pixel column to another, never
+    // anything for a gap bucket, in the channel's color at the same width —
+    // and every mark sits exactly where one affine plot transform puts its
+    // bucket, so nothing is moved, merged, dropped or invented. Checked on
+    // the strokes encoding, where each mark is a shape of its own; the
+    // encoding the app draws with must then tessellate into exactly the
+    // same triangles, vertex for vertex (adapted with the maintainer's
+    // approval when bars became one pre-tessellated mesh per channel).
     #[test]
     fn aggregated_bars_are_exactly_the_buckets() {
         let n = 20_000usize;
@@ -2194,13 +2216,41 @@ mod render_tests {
             Series::new("second", SeriesValues::F64(second)),
         ];
         let fixture = ViewFixture::new(dataset);
-        let ctx = egui::Context::default();
-        let mut state = TimeViewState::default();
         let focus = Some((0.0, (n - 1) as f64));
-        for _ in 0..3 {
-            state_frame(&ctx, &fixture, &mut state, focus);
+        // The same frames twice: with the bars as plain strokes — the
+        // reference whose every mark is checked below — and as the app
+        // draws them.
+        let frame = |encoding: BarEncoding| {
+            let ctx = egui::Context::default();
+            let mut state = TimeViewState {
+                bar_encoding: encoding,
+                ..TimeViewState::default()
+            };
+            for _ in 0..3 {
+                state_frame(&ctx, &fixture, &mut state, focus);
+            }
+            let shapes = state_frame(&ctx, &fixture, &mut state, focus);
+            let tessellated = ctx.tessellate(shapes.clone(), ctx.pixels_per_point());
+            (state, shapes, tessellated)
+        };
+        let (state, shapes, reference) = frame(BarEncoding::Strokes);
+        let (_, _, drawn) = frame(BarEncoding::default());
+        // What reaches the screen: the app's frame must tessellate into
+        // exactly the triangles the reference strokes do — so the checks
+        // on the strokes below hold for every pixel the app draws.
+        assert_eq!(drawn.len(), reference.len(), "same primitives");
+        for (drawn, reference) in drawn.iter().zip(&reference) {
+            assert_eq!(drawn.clip_rect, reference.clip_rect);
+            match (&drawn.primitive, &reference.primitive) {
+                (
+                    egui::epaint::Primitive::Mesh(drawn),
+                    egui::epaint::Primitive::Mesh(reference),
+                ) => {
+                    assert!(drawn == reference, "the frame must tessellate identically");
+                }
+                _ => panic!("the time view paints meshes only"),
+            }
         }
-        let shapes = state_frame(&ctx, &fixture, &mut state, focus);
 
         let mut transform: Option<[f64; 4]> = None;
         for column in 0..2 {
