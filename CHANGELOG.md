@@ -12,6 +12,36 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **A channel picker for files with many channels.** The list of channels
+  in the top-right corner of the time view used to grow past the edge of
+  the plot, so with many channels some could not be reached, and showing a
+  single channel meant clicking every other one off. It is now a small box
+  that shows four channels at a time and scrolls through the rest. It
+  looks and works like before: each channel has a dot in its plot color,
+  filled while the channel is shown, and clicking the row shows or hides
+  it. New: **All** and **None** buttons, a "3 of 32 shown" count, and
+  **Alt+click** (Option+click on a Mac) on a channel to show only that
+  one; Alt+click it again to show them all. Hover a row to see its full
+  name if it is cut off. (#135)
+
+  **Faster with hidden channels, especially on files stored on disk.** A
+  hidden channel now costs nothing to draw. Before, Glyde still computed
+  every hidden channel on every frame and only then left it out. On a file
+  too large for memory this meant reading every hidden channel from disk on
+  every frame, so hiding channels did not help at all. Measured on a 32-channel
+  file stored on disk with one channel shown: about 0.4 ms per frame
+  instead of about 11 ms. With many channels shown, clicking in the picker
+  still redraws all of them; making that faster is a follow-up.
+
+  **Assumptions made (please veto by testing the app):**
+  - The values row under the plot (shown while the mouse is over it) and
+    **Fit to data** now cover only the shown channels. Before, they covered
+    hidden channels too.
+  - Your choice of channels is kept while a file finishes loading. It resets
+    to "all shown" when the list of channels changes: when you open a
+    different file, or after a correction that changes the columns, such as
+    a different delimiter. A new file with exactly the same channel names
+    keeps the choice.
 - **The file's encoding can now be corrected in one click.** When Glyde is
   unsure how a file's text is encoded (the bar then says "encoding: …
   (low confidence)"), a "Correct…" dropdown next to it offers UTF-8,

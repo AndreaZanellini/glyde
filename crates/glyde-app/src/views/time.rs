@@ -40,13 +40,15 @@
 
 use std::sync::Arc;
 
-use egui_plot::{GridMark, Legend, Line, Plot, PlotBounds, PlotPoints, Points};
+use egui_plot::{GridMark, Line, Plot, PlotBounds, PlotPoints, Points};
 use glyde_core::dsp::decimation::{decimate_viewport, Bucket, Pyramid};
 use glyde_core::ingest::{
     progressive_tick_to_value, progressive_value_to_tick, Dataset, Level0Cache, TimeAxis,
 };
 use glyde_core::series::{Series, SeriesValues, ViewKind};
 use glyde_core::time::{format_timestamp, Timestamp};
+
+use crate::views::channels::{self, ChannelVisibility};
 
 /// Renders `dataset`'s numeric columns as a time-domain plot (SPEC §4.1,
 /// §3.1) into `ui`: pan (drag), zoom (scroll wheel and box-select), a "Fit
@@ -79,7 +81,9 @@ use glyde_core::time::{format_timestamp, Timestamp};
 /// the cache holds exactly the converted values, already mapped, so the
 /// reopen that produced it never had to convert them again
 /// (`ingest::derived_caches_for_dataset_cached`). `&[]` for a still-loading
-/// partial dataset, which has no cache of its own yet.
+/// partial dataset, which has no cache of its own yet. `channels`: see
+/// [`show_with_selection`].
+#[allow(clippy::too_many_arguments)]
 pub fn show<P: Pyramid + Sync>(
     ui: &mut egui::Ui,
     dataset: &Dataset,
@@ -88,6 +92,7 @@ pub fn show<P: Pyramid + Sync>(
     sample_cache: &[Option<Vec<f64>>],
     level0_caches: &[Option<Arc<Level0Cache>>],
     cursor: CursorLookup,
+    channels: &mut ChannelVisibility,
 ) {
     show_with_selection(
         ui,
@@ -97,6 +102,7 @@ pub fn show<P: Pyramid + Sync>(
         sample_cache,
         level0_caches,
         cursor,
+        channels,
         None,
     );
 }
@@ -106,6 +112,11 @@ pub fn show<P: Pyramid + Sync>(
 /// `focus` is `Some((x_min, x_max))` in plot seconds, moving the view to
 /// exactly that horizontal span first (e.g. the uniform stretch an
 /// `Irregular` series offers instead of a PSD, SPEC §3.3).
+///
+/// `channels` is which numeric channels are plotted, edited in place by the
+/// channel picker drawn over the plot ([`crate::views::channels`]). A hidden
+/// channel is never decimated, so its per-frame cost is zero; the "Fit to
+/// data" bounds and the cursor readout cover the shown channels only.
 #[allow(clippy::too_many_arguments)]
 pub fn show_with_selection<P: Pyramid + Sync>(
     ui: &mut egui::Ui,
@@ -115,12 +126,29 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     sample_cache: &[Option<Vec<f64>>],
     level0_caches: &[Option<Arc<Level0Cache>>],
     cursor: CursorLookup,
+    channels: &mut ChannelVisibility,
     focus: Option<(f64, f64)>,
 ) -> (i128, i128) {
     let fit_clicked = ui.button("Fit to data").clicked();
 
+    // Every numeric column is a channel; its index here picks its color, so
+    // a channel keeps its color whatever else is hidden. Only the shown ones
+    // are decimated and drawn.
+    let all_channels: Vec<(usize, &Series)> = dataset
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, series)| series.view_kind() == ViewKind::TimeDomain)
+        .collect();
+    channels.sync(all_channels.iter().map(|(_, series)| series.name()));
+    let plotted: Vec<(usize, usize, &Series)> = all_channels
+        .iter()
+        .enumerate()
+        .filter(|&(channel, _)| channels.is_visible(channel))
+        .map(|(channel, &(column_index, series))| (channel, column_index, series))
+        .collect();
+
     let plot = Plot::new("time_domain_view")
-        .legend(Legend::default())
         .allow_zoom(true)
         .allow_scroll(true)
         .allow_drag(true)
@@ -134,7 +162,8 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             // this cost dominating a per-frame unconditional computation —
             // see `x_axis_seconds`'s doc comment).
             let x = x_axis_seconds(&dataset.time);
-            if let Some(bounds) = data_bounds(&x, &dataset.columns) {
+            let shown = plotted.iter().map(|&(_, _, series)| series);
+            if let Some(bounds) = data_bounds(&x, shown) {
                 plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                     [bounds.x_min, bounds.y_min],
                     [bounds.x_max, bounds.y_max],
@@ -181,14 +210,9 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         // (rayon): decimation queries"; issue #114): columns are independent
         // queries, so a multi-channel file costs about one column's query
         // per frame instead of the sum of all of them. Drawing below stays
-        // sequential and in column order.
-        let plotted: Vec<(usize, &Series)> = dataset
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, series)| series.view_kind() == ViewKind::TimeDomain)
-            .collect();
-        let decimate = |&(column_index, series): &(usize, &Series)| {
+        // sequential and in column order. Hidden channels are not in
+        // `plotted` at all, so they cost nothing.
+        let decimate = |&(_, column_index, series): &(usize, usize, &Series)| {
             let cached = sample_cache.get(column_index).and_then(Option::as_ref);
             let level0 = level0_caches
                 .get(column_index)
@@ -211,7 +235,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             plotted.iter().map(decimate).collect()
         };
 
-        for (color_index, (&(_, series), buckets)) in plotted.iter().zip(decimated).enumerate() {
+        for (&(color_index, _, series), buckets) in plotted.iter().zip(decimated) {
             // Issue #55: one color per series, assigned here rather than
             // left to `egui_plot`'s own per-draw-call auto-assignment —
             // `egui_plot` would otherwise hand out a new color to every
@@ -296,13 +320,12 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     });
     let (hovered, visible) = response.inner;
 
+    channels::show(ui, response.response.rect, channels, series_color);
+
     if let Some(index) = hovered {
         ui.horizontal(|ui| {
             ui.label(format_cursor_time(&dataset.time, index));
-            for series in &dataset.columns {
-                if series.view_kind() != ViewKind::TimeDomain {
-                    continue;
-                }
+            for &(_, _, series) in &plotted {
                 if let Some(text) = format_series_value(series.values(), index) {
                     ui.label(format!("{}: {text}", series.name()));
                 }
@@ -669,11 +692,11 @@ struct DataBounds {
     y_max: f64,
 }
 
-fn data_bounds(x: &[f64], columns: &[Series]) -> Option<DataBounds> {
+fn data_bounds<'a>(x: &[f64], columns: impl IntoIterator<Item = &'a Series>) -> Option<DataBounds> {
     let (x_min, x_max) = finite_min_max(x.iter().copied())?;
 
     let y_values = columns
-        .iter()
+        .into_iter()
         .filter(|series| series.view_kind() == ViewKind::TimeDomain)
         .flat_map(|series| {
             (0..series.len()).filter_map(|index| value_as_f64(series.values(), index))
@@ -952,6 +975,7 @@ mod render_tests {
                     &sample_cache,
                     &[],
                     CursorLookup::for_time(&dataset.time),
+                    &mut ChannelVisibility::default(),
                 );
             });
         });
@@ -988,7 +1012,16 @@ mod render_tests {
             };
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show(ui, &dataset, &pyramids, &ticks, &sample_cache, &[], cursor);
+                    show(
+                        ui,
+                        &dataset,
+                        &pyramids,
+                        &ticks,
+                        &sample_cache,
+                        &[],
+                        cursor,
+                        &mut ChannelVisibility::default(),
+                    );
                 });
             })
             .shapes
@@ -1024,7 +1057,16 @@ mod render_tests {
 
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show::<Vec<Vec<Bucket>>>(ui, &dataset, &[], &[], &[], &[], CursorLookup::default());
+                show::<Vec<Vec<Bucket>>>(
+                    ui,
+                    &dataset,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    CursorLookup::default(),
+                    &mut ChannelVisibility::default(),
+                );
             });
         });
 
@@ -1094,6 +1136,7 @@ mod render_tests {
                     &sample_cache,
                     &[],
                     CursorLookup::for_time(&dataset.time),
+                    &mut ChannelVisibility::default(),
                 );
             });
         });
@@ -1160,6 +1203,7 @@ mod render_tests {
                     &sample_cache,
                     &[],
                     CursorLookup::for_time(&dataset.time),
+                    &mut ChannelVisibility::default(),
                 );
             });
         });
@@ -1168,6 +1212,134 @@ mod render_tests {
             !output.shapes.is_empty(),
             "must draw something around a NaN run without panicking"
         );
+    }
+
+    /// A pyramid that records which columns were decimated, so a test can
+    /// see exactly which channels a frame paid for.
+    struct CountingPyramid {
+        column: usize,
+        levels: Vec<Vec<Bucket>>,
+        calls: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl Pyramid for CountingPyramid {
+        fn decimate(
+            &self,
+            samples: &[f64],
+            timestamps: &[i128],
+            range: (i128, i128),
+            pixel_columns: usize,
+        ) -> Vec<Bucket> {
+            self.calls.lock().unwrap().push(self.column);
+            self.levels
+                .decimate(samples, timestamps, range, pixel_columns)
+        }
+    }
+
+    fn three_channel_dataset() -> Dataset {
+        let mut dataset = sample_dataset();
+        dataset.columns = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| Series::new(name, SeriesValues::F64(vec![1.0, 2.0, 1.5])))
+            .collect();
+        dataset
+    }
+
+    /// Every solid color in `shapes`: line strokes and filled dots.
+    fn shape_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn collect(shape: &egui::Shape, colors: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, colors)),
+                egui::Shape::Path(path) => {
+                    if let egui::epaint::ColorMode::Solid(color) = path.stroke.color {
+                        colors.push(color);
+                    }
+                }
+                egui::Shape::LineSegment { stroke, .. } => colors.push(stroke.color),
+                egui::Shape::Circle(circle) => colors.push(circle.fill),
+                _ => {}
+            }
+        }
+        let mut colors = Vec::new();
+        for clipped in shapes {
+            collect(&clipped.shape, &mut colors);
+        }
+        colors
+    }
+
+    // The channel picker exists so a hidden channel costs nothing: it must
+    // never reach decimation (on a spilled file, a read of its on-disk
+    // pyramid every frame), and the shown ones keep the color they had.
+    #[test]
+    fn a_hidden_channel_is_never_decimated_and_colors_stay_put() {
+        let dataset = three_channel_dataset();
+        let levels = glyde_core::ingest::pyramids_for_dataset(&dataset);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pyramids: Vec<Option<CountingPyramid>> = levels
+            .into_iter()
+            .enumerate()
+            .map(|(column, levels)| {
+                Some(CountingPyramid {
+                    column,
+                    levels: levels.expect("numeric column"),
+                    calls: Arc::clone(&calls),
+                })
+            })
+            .collect();
+        let ticks = dataset.time.to_pyramid_ticks();
+        let sample_cache = cache_column_samples(&dataset);
+        let mut channels = ChannelVisibility::default();
+        let ctx = egui::Context::default();
+        let frame = |channels: &mut ChannelVisibility| {
+            calls.lock().unwrap().clear();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &dataset,
+                        &pyramids,
+                        &ticks,
+                        &sample_cache,
+                        &[],
+                        CursorLookup::for_time(&dataset.time),
+                        channels,
+                    );
+                });
+            });
+            let mut decimated = calls.lock().unwrap().clone();
+            decimated.sort_unstable();
+            (decimated, shape_colors(&output.shapes))
+        };
+
+        let (decimated, _) = frame(&mut channels);
+        assert_eq!(decimated, [0, 1, 2], "every channel starts shown");
+
+        channels.toggle(0);
+        let (decimated, colors) = frame(&mut channels);
+        assert_eq!(decimated, [1, 2], "a hidden channel must not be decimated");
+        assert!(!colors.contains(&series_color(0)), "channel 0 is hidden");
+        assert!(
+            colors.contains(&series_color(1)),
+            "channel 1 keeps its color"
+        );
+        assert!(
+            colors.contains(&series_color(2)),
+            "channel 2 keeps its color"
+        );
+
+        channels.hide_all();
+        let (decimated, _) = frame(&mut channels);
+        assert!(decimated.is_empty(), "nothing shown, nothing decimated");
+    }
+
+    #[test]
+    fn fit_to_data_covers_only_the_shown_channels() {
+        let columns = [
+            Series::new("small", SeriesValues::F64(vec![1.0, 2.0])),
+            Series::new("huge", SeriesValues::F64(vec![1000.0, 2000.0])),
+        ];
+        let bounds = data_bounds(&[0.0, 1.0], [&columns[0]]).expect("bounds");
+        assert_eq!((bounds.y_min, bounds.y_max), (1.0, 2.0));
     }
 
     // docs/ROADMAP.md M3 "Zoom all the way in → converges to individual
@@ -1218,6 +1390,7 @@ mod render_tests {
                     &sample_cache,
                     &[],
                     CursorLookup::for_time(&dataset.time),
+                    &mut ChannelVisibility::default(),
                 );
             });
         });
