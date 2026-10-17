@@ -44,10 +44,25 @@ Versioning: [Semantic Versioning](https://semver.org/).
   The gain is larger when the data has to be read from disk again. Panning
   and zooming still recompute every shown channel, as before.
 
+  **The window never freezes while a large file's plot is read from
+  disk.** For a file too large for memory, the plot is now computed in the
+  background instead of inside the screen refresh. Panning, zooming and
+  clicking stay smooth even when the disk is slow. While the new picture is
+  on its way, the plot keeps showing the previous one, at its true
+  positions, with **"Updating…"** in its top-left corner. That note
+  disappears when every channel is up to date. If you pan for a long time,
+  the plot keeps catching up as you go rather than waiting for you to stop.
+  Files that fit in memory are computed as before: that takes well under a
+  millisecond, and doing it in the background would only add a visible
+  delay.
+
   **Assumptions made (please veto by testing the app):**
   - The values row under the plot (shown while the mouse is over it) and
     **Fit to data** now cover only the shown channels. Before, they covered
     hidden channels too.
+  - On a file stored on disk, the plot can briefly show the previous
+    picture (marked "Updating…") instead of making the window wait. Values
+    under the cursor are always read exactly, never from that picture.
   - Your choice of channels is kept while a file finishes loading. It resets
     to "all shown" when the list of channels changes: when you open a
     different file, or after a correction that changes the columns, such as

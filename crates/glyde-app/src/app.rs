@@ -34,8 +34,9 @@ use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache}
 
 use crate::inference_bar::Correction;
 use crate::plumbing::{
-    spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog, CancelFlag, ColumnPyramids,
-    IndexingMessage, PreparedView, TimeIndexPreview, PROGRESS_BOOL_BAND_ROWS,
+    background_decimator, spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog,
+    CancelFlag, ColumnPyramids, IndexingMessage, PreparedView, TimeIndexPreview,
+    PROGRESS_BOOL_BAND_ROWS,
 };
 use crate::views::psd::{selection_rows, PsdPanel, PsdRequest};
 use crate::{inference_bar, views};
@@ -101,14 +102,17 @@ enum Status {
         /// Shared with the background PSD job (`crate::plumbing::psd`),
         /// which reads its raw samples off the UI thread.
         dataset: Arc<Dataset>,
-        pyramids: ColumnPyramids,
+        /// `Arc`, like `prepared` and `level0_caches`, so a spilled file's
+        /// plot can be decimated off the UI thread (issue #135, see
+        /// [`crate::plumbing::background_decimator`]).
+        pyramids: Arc<ColumnPyramids>,
         /// See [`PartialLoad::prepared`]: the same once-per-status-change
         /// derivations, for the completed dataset.
-        prepared: Box<PreparedView>,
+        prepared: Arc<PreparedView>,
         /// See `crate::plumbing::IndexingMessage::Completed`'s doc comment
         /// (issue #92) — `views::time::show` prefers this over `dataset`'s
         /// own column, and over `sample_cache`, whenever an entry is `Some`.
-        level0_caches: Level0Caches,
+        level0_caches: Arc<Level0Caches>,
     },
     Failed {
         path: PathBuf,
@@ -277,6 +281,7 @@ impl GlydeApp {
             // Whatever this message carries replaces the data on screen; a
             // decimation of the old data must never be drawn for the new.
             self.time_view.data_changed();
+            self.time_view.set_background(None);
             if matches!(message, IndexingMessage::Completed { .. }) {
                 self.psd = PsdPanel::default();
                 self.time_selection = None;
@@ -315,14 +320,38 @@ impl GlydeApp {
                     level0_caches,
                     prepared,
                     ..
-                } => Status::Loaded {
-                    path,
-                    report,
-                    dataset: Arc::from(dataset),
-                    pyramids,
-                    prepared,
-                    level0_caches,
-                },
+                } => {
+                    let dataset: Arc<Dataset> = Arc::from(dataset);
+                    let pyramids = Arc::new(pyramids);
+                    let prepared: Arc<PreparedView> = Arc::from(prepared);
+                    let level0_caches = Arc::new(level0_caches);
+                    // Issue #135: a spilled file's decimation reads its
+                    // on-disk pyramid, which can stall on the disk; it runs
+                    // off the UI thread so the plot never waits for it. An
+                    // in-memory file decimates within the frame, as fast and
+                    // a frame sooner.
+                    let background = dataset.is_spilled().then(|| {
+                        tracing::info!(
+                            path = %path.display(),
+                            "file is stored on disk: its plot is decimated off the UI thread"
+                        );
+                        background_decimator(
+                            Arc::clone(&dataset),
+                            Arc::clone(&pyramids),
+                            Arc::clone(&prepared),
+                            Arc::clone(&level0_caches),
+                        )
+                    });
+                    self.time_view.set_background(background);
+                    Status::Loaded {
+                        path,
+                        report,
+                        dataset,
+                        pyramids,
+                        prepared,
+                        level0_caches,
+                    }
+                }
                 IndexingMessage::Failed { path, message, .. } => Status::Failed { path, message },
             };
         }
@@ -913,6 +942,88 @@ mod tests {
             } => assert_eq!(loaded_path, &path),
             _ => panic!("expected a current-generation message to be applied"),
         }
+    }
+
+    /// Issue #135: a completed load stored on disk is decimated off the UI
+    /// thread; an in-memory one, and a still-loading preview, on it — and
+    /// every new message resets the choice to its own data.
+    #[test]
+    fn only_a_completed_spilled_load_decimates_off_the_ui_thread() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("spilled.csv");
+        let mut file = std::fs::File::create(&path).expect("create fixture");
+        writeln!(file, "timestamp,value").expect("write fixture");
+        for i in 0..100 {
+            writeln!(file, "{i},{}", i % 7).expect("write fixture");
+        }
+        drop(file);
+        let spilled = glyde_core::ingest::load_with_budget(
+            &path,
+            glyde_core::budget::RamBudget::from_total_ram_bytes(0),
+            dir.path(),
+        )
+        .expect("spilled fixture must open");
+        assert!(spilled.is_spilled());
+        let pyramids = glyde_core::ingest::disk_pyramids_for_dataset(&spilled, dir.path())
+            .into_iter()
+            .map(|pyramid| pyramid.map(glyde_core::index::disk_pyramid::ColumnPyramid::Disk))
+            .collect();
+        let level0_caches = vec![None; spilled.columns.len()];
+        let prepared = Box::new(PreparedView::new(&spilled, &level0_caches, usize::MAX));
+
+        let mut app = GlydeApp::new();
+        app.generation = 1;
+        let completed = |dataset, pyramids, level0_caches, prepared| IndexingMessage::Completed {
+            generation: 1,
+            path: path.clone(),
+            summary: sample_summary(),
+            report: sample_report(),
+            dataset,
+            pyramids,
+            level0_caches,
+            prepared,
+        };
+
+        app.tx
+            .send(completed(
+                Box::new(spilled),
+                pyramids,
+                level0_caches,
+                prepared,
+            ))
+            .expect("channel send");
+        app.drain_indexing_messages();
+        assert!(
+            app.time_view.decimates_in_background(),
+            "spilled: off the UI thread"
+        );
+
+        app.tx
+            .send(IndexingMessage::Progress {
+                generation: 1,
+                path: path.clone(),
+                dataset: sample_dataset(),
+                pyramids: sample_pyramids(),
+                rows_read: 1,
+                spilled: false,
+                prepared: sample_prepared(),
+                time_index: sample_time_index(),
+            })
+            .expect("channel send");
+        app.drain_indexing_messages();
+        assert!(!app.time_view.decimates_in_background(), "a preview: on it");
+
+        app.tx
+            .send(completed(
+                sample_dataset(),
+                sample_column_pyramids(),
+                sample_level0_caches(),
+                sample_prepared(),
+            ))
+            .expect("channel send");
+        app.drain_indexing_messages();
+        assert!(!app.time_view.decimates_in_background(), "in memory: on it");
     }
 
     // docs/ROADMAP.md M4 "One-click correction of each field → triggers a

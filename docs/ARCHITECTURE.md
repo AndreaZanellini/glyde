@@ -345,7 +345,7 @@ Resolved as follows:
 
 - **UI thread**: render loop, input, state. Never blocks.
 - **Indexer thread**: sniff, infer, build pyramid; emits progress + partial levels. It also prepares every O(rows) render input (ticks, converted samples, boolean bands, cursor lookup) so the UI thread never derives one. On the spilled path a scoped reader thread tokenizes ahead of it in bounded batches (issue #114).
-- **Compute pool** (`rayon`): decimation queries (one per plotted column, in parallel), Welch, and the per-column work of indexing — typing columns, scanning/writing spilled batches, building pyramids and Level-0 caches (issue #114). Columns are independent, so each task owns one column's state; results are combined in column order.
+- **Compute pool** (`rayon`): decimation queries (one per plotted column, in parallel; for a completed spilled load they run as a background job the frame never waits for — it draws the last decimation it has, marked "Updating…", issue #135), Welch, and the per-column work of indexing — typing columns, scanning/writing spilled batches, building pyramids and Level-0 caches (issue #114). Columns are independent, so each task owns one column's state; results are combined in column order.
 - Communication: message channels, immutable snapshots. No shared mutable state across threads without a documented reason.
 
 ## Error philosophy

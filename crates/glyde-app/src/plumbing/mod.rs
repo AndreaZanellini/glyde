@@ -77,6 +77,30 @@ pub type ColumnPyramids = Vec<Option<ColumnPyramid>>;
 /// is not for sharing.
 type Level0Caches = Vec<Option<Arc<Level0Cache>>>;
 
+/// Decimates the time view's columns of a completed load off the UI thread
+/// (issue #135): the same [`views::time::decimate_column`] query the frame
+/// would run, over shared handles to the same data, so it can run on the
+/// `rayon` pool while the frame goes on without it.
+pub fn background_decimator(
+    dataset: Arc<Dataset>,
+    pyramids: Arc<ColumnPyramids>,
+    prepared: Arc<PreparedView>,
+    level0_caches: Arc<Level0Caches>,
+) -> views::time::BackgroundDecimator {
+    views::time::BackgroundDecimator::new(move |column, range, pixel_columns| {
+        views::time::decimate_column(
+            &dataset,
+            &pyramids,
+            &prepared.ticks,
+            &prepared.sample_cache,
+            &level0_caches,
+            column,
+            range,
+            pixel_columns,
+        )
+    })
+}
+
 /// Progress emitted by a background indexing job, polled by the UI thread.
 /// `generation` identifies which open request this message belongs to (see
 /// the module docs) — the receiver must ignore any message whose generation

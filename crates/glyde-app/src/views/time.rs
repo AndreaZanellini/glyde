@@ -126,6 +126,15 @@ pub fn show<P: Pyramid + Sync>(
 /// view is replaced (a new checkpoint of a loading file, a completed load, a
 /// re-index after a correction): a cached decimation of the old data must
 /// never be drawn for the new.
+///
+/// With a [`BackgroundDecimator`] set ([`Self::set_background`]), a channel
+/// whose view changed is decimated off the UI thread instead (issue #135):
+/// the frame never waits for it — on a spilled file, for a read of its
+/// on-disk pyramid — and draws that channel's previous decimation, at its
+/// own true positions, under an "Updating…" note until the new one arrives.
+/// At most one background decimation runs at a time; a view that changes
+/// while it runs is caught up by the next one, so a long pan keeps
+/// updating instead of restarting forever.
 #[derive(Debug, Default)]
 pub struct TimeViewState {
     /// Which channels are plotted, edited by the channel picker.
@@ -136,6 +145,10 @@ pub struct TimeViewState {
     /// backstop to [`Self::data_changed`]: different ticks always mean
     /// different data, so the cache is dropped even if the owner forgot.
     ticks_identity: (usize, usize),
+    /// Where stale channels are decimated when not on the UI thread.
+    background: Option<BackgroundDecimator>,
+    /// The background decimation running now, if any.
+    pending: Option<PendingDecimation>,
 }
 
 /// One column's decimation and the view it was computed for.
@@ -143,14 +156,139 @@ pub struct TimeViewState {
 struct CachedDecimation {
     range: (i128, i128),
     pixel_columns: usize,
+    /// Whether `range` at `pixel_columns` was in SPEC §3.1's raw-samples
+    /// regime — which decides how these buckets are drawn, even on a frame
+    /// whose own view is in the other regime while they are being replaced.
+    converged: bool,
     buckets: Vec<Bucket>,
 }
 
+/// Decimates one column of the data on screen for a view, from any thread:
+/// `(column index, tick range, pixel columns) -> buckets`, the same query
+/// [`decimate_column`] answers on the UI thread. It owns (shares) the data,
+/// so it can outlive the frame that started it.
+#[derive(Clone)]
+pub struct BackgroundDecimator(Arc<DecimateFn>);
+
+/// See [`BackgroundDecimator`].
+type DecimateFn = dyn Fn(usize, (i128, i128), usize) -> Vec<Bucket> + Send + Sync;
+
+impl BackgroundDecimator {
+    pub fn new(
+        decimate: impl Fn(usize, (i128, i128), usize) -> Vec<Bucket> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(decimate))
+    }
+}
+
+impl std::fmt::Debug for BackgroundDecimator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BackgroundDecimator")
+    }
+}
+
+/// A background decimation of some columns for one view. Its results arrive
+/// one column at a time; dropping it cancels the columns not yet started.
+#[derive(Debug)]
+struct PendingDecimation {
+    range: (i128, i128),
+    pixel_columns: usize,
+    results: std::sync::mpsc::Receiver<(usize, Vec<Bucket>)>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for PendingDecimation {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl PendingDecimation {
+    /// Starts decimating `columns` for `range` at `pixel_columns` on the
+    /// `rayon` pool; each finished column repaints `ctx`.
+    fn spawn(
+        decimator: &BackgroundDecimator,
+        columns: Vec<usize>,
+        range: (i128, i128),
+        pixel_columns: usize,
+        ctx: egui::Context,
+    ) -> Self {
+        let (tx, results) = std::sync::mpsc::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job_cancel = Arc::clone(&cancel);
+        let decimator = decimator.clone();
+        rayon::spawn(move || {
+            use rayon::prelude::*;
+            columns.par_iter().for_each_with(tx, |tx, &column| {
+                if job_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let buckets = (decimator.0)(column, range, pixel_columns);
+                if tx.send((column, buckets)).is_ok() {
+                    ctx.request_repaint();
+                }
+            });
+        });
+        Self {
+            range,
+            pixel_columns,
+            results,
+            cancel,
+        }
+    }
+}
+
 impl TimeViewState {
-    /// Drops every cached decimation; the channel choice is kept (it resets
-    /// itself if the channel list changed).
+    /// Drops every cached decimation and cancels a background one still
+    /// running; the channel choice is kept (it resets itself if the channel
+    /// list changed), and so is the [`BackgroundDecimator`] setting.
     pub fn data_changed(&mut self) {
         self.decimated.clear();
+        self.pending = None;
+    }
+
+    /// Decimates stale channels with `background`, off the UI thread, or —
+    /// `None` — on it, within the frame. Must be set for the data on screen
+    /// (call [`Self::data_changed`] first when the data changes).
+    pub fn set_background(&mut self, background: Option<BackgroundDecimator>) {
+        self.pending = None;
+        self.background = background;
+    }
+
+    /// Stores every result the background decimation has produced so far,
+    /// and forgets it once it has finished.
+    fn collect_background_results(&mut self, ticks: &[i128], columns: usize) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        self.decimated.resize_with(columns, || None);
+        let converged = is_converged(ticks, pending.range, pending.pixel_columns);
+        loop {
+            match pending.results.try_recv() {
+                Ok((column, buckets)) => {
+                    if let Some(slot) = self.decimated.get_mut(column) {
+                        *slot = Some(CachedDecimation {
+                            range: pending.range,
+                            pixel_columns: pending.pixel_columns,
+                            converged,
+                            buckets,
+                        });
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.pending = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Whether stale channels are decimated off the UI thread.
+    #[cfg(test)]
+    pub(crate) fn decimates_in_background(&self) -> bool {
+        self.background.is_some()
     }
 
     /// How many columns have a cached decimation.
@@ -189,9 +327,12 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         state.data_changed();
         state.ticks_identity = ticks_identity;
     }
+    state.collect_background_results(ticks, dataset.columns.len());
     let TimeViewState {
         channels,
         decimated: cache,
+        background,
+        pending,
         ..
     } = state;
     let fit_clicked = ui.button("Fit to data").clicked();
@@ -267,7 +408,8 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         // condition `decimate_viewport` itself branches on internally, but
         // needed here too since the branches render differently: connected
         // (SPEC §3.1's raw-samples-plus-markers regime, docs/ROADMAP.md M2)
-        // vs. separate per-column vertical bars ("and nothing else").
+        // vs. separate per-column vertical bars ("and nothing else"). Kept
+        // with each decimation, which is drawn the way it was computed.
         let converged = is_converged(ticks, range, pixel_columns);
 
         // Decimate every plotted column whose cached decimation is not for
@@ -289,40 +431,66 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 })
             })
             .collect();
-        let decimate = |&(_, column_index, series): &(usize, usize, &Series)| {
-            let cached = sample_cache.get(column_index).and_then(Option::as_ref);
-            let level0 = level0_caches
-                .get(column_index)
-                .and_then(Option::as_ref)
-                .map(Arc::as_ref);
-            let samples = column_f64_samples(series.values(), cached, level0);
-            // In memory, or on disk for a spilled file (issue #102); a column
-            // without one decimates its raw samples.
-            match pyramids.get(column_index).and_then(Option::as_ref) {
-                Some(pyramid) => pyramid.decimate(samples, ticks, range, pixel_columns),
-                None => decimate_viewport(&[], samples, ticks, range, pixel_columns),
+        match background {
+            // Off the UI thread (issue #135): this frame draws what is
+            // cached and never waits. A running decimation is left to
+            // finish — the next one catches up with the latest view.
+            Some(decimator) => {
+                if pending.is_none() && !stale.is_empty() {
+                    let columns = stale.iter().map(|&(_, column, _)| column).collect();
+                    *pending = Some(PendingDecimation::spawn(
+                        decimator,
+                        columns,
+                        range,
+                        pixel_columns,
+                        plot_ui.ctx().clone(),
+                    ));
+                }
             }
-        };
-        // A lone column has nothing to run alongside, and the pool hand-off
-        // would only add its own latency to the frame.
-        let fresh: Vec<Vec<Bucket>> = if stale.len() > 1 {
-            use rayon::prelude::*;
-            stale.par_iter().map(decimate).collect()
-        } else {
-            stale.iter().map(decimate).collect()
-        };
-        for (&(_, column_index, _), buckets) in stale.iter().zip(fresh) {
-            cache[column_index] = Some(CachedDecimation {
-                range,
-                pixel_columns,
-                buckets,
-            });
+            None => {
+                let decimate = |&(_, column_index, _): &(usize, usize, &Series)| {
+                    decimate_column(
+                        dataset,
+                        pyramids,
+                        ticks,
+                        sample_cache,
+                        level0_caches,
+                        column_index,
+                        range,
+                        pixel_columns,
+                    )
+                };
+                // A lone column has nothing to run alongside, and the pool
+                // hand-off would only add its own latency to the frame.
+                let fresh: Vec<Vec<Bucket>> = if stale.len() > 1 {
+                    use rayon::prelude::*;
+                    stale.par_iter().map(decimate).collect()
+                } else {
+                    stale.iter().map(decimate).collect()
+                };
+                for (&(_, column_index, _), buckets) in stale.iter().zip(fresh) {
+                    cache[column_index] = Some(CachedDecimation {
+                        range,
+                        pixel_columns,
+                        converged,
+                        buckets,
+                    });
+                }
+            }
         }
+        // Whether any shown channel is drawn from a decimation of another
+        // view (or not drawn yet) — said on the plot, never left silent.
+        let updating = plotted.iter().any(|&(_, column_index, _)| {
+            !cache[column_index].as_ref().is_some_and(|cached| {
+                cached.range == range && cached.pixel_columns == pixel_columns
+            })
+        });
 
         for &(color_index, column_index, series) in &plotted {
-            let buckets: &[Bucket] = cache[column_index]
-                .as_ref()
-                .map_or(&[], |cached| &cached.buckets);
+            let Some(cached) = cache[column_index].as_ref() else {
+                continue;
+            };
+            let buckets: &[Bucket] = &cached.buckets;
             // Issue #55: one color per series, assigned here rather than
             // left to `egui_plot`'s own per-draw-call auto-assignment —
             // `egui_plot` would otherwise hand out a new color to every
@@ -332,7 +500,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             // consistent color.
             let color = series_color(color_index);
 
-            if converged {
+            if cached.converged {
                 // SPEC §3.1's raw-samples regime (docs/ROADMAP.md M2): a
                 // connected line through consecutive raw samples, broken at
                 // each gap bucket (SPEC §1.3), plus point markers on top so
@@ -403,9 +571,25 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         let hovered = plot_ui
             .pointer_coordinate()
             .and_then(|pointer| cursor.nearest(&dataset.time, pointer.x));
-        (hovered, range)
+        (
+            hovered,
+            range,
+            updating.then(|| *plot_ui.transform().frame()),
+        )
     });
-    let (hovered, visible) = response.inner;
+    let (hovered, visible, updating) = response.inner;
+
+    if let Some(frame) = updating {
+        // Painted over the plot rather than laid out under it, so it never
+        // moves the views below it as it comes and goes.
+        ui.painter().text(
+            frame.left_top() + egui::vec2(8.0, 8.0),
+            egui::Align2::LEFT_TOP,
+            "Updating…",
+            egui::TextStyle::Body.resolve(ui.style()),
+            ui.visuals().weak_text_color(),
+        );
+    }
 
     channels::show(ui, response.response.rect, channels, series_color);
 
@@ -536,6 +720,36 @@ fn nearest_tick_index(ticks: &[i128], target: i128) -> Option<usize> {
     } else {
         pos
     })
+}
+
+/// Column `column_index`'s decimation for `range` at `pixel_columns`
+/// (SPEC §3.1): through its pyramid — in memory, or on disk for a spilled
+/// file (issue #102) — or, for a column without one, from its raw samples.
+/// The one query both the UI thread and a [`BackgroundDecimator`] run.
+#[allow(clippy::too_many_arguments)]
+pub fn decimate_column<P: Pyramid>(
+    dataset: &Dataset,
+    pyramids: &[Option<P>],
+    ticks: &[i128],
+    sample_cache: &[Option<Vec<f64>>],
+    level0_caches: &[Option<Arc<Level0Cache>>],
+    column_index: usize,
+    range: (i128, i128),
+    pixel_columns: usize,
+) -> Vec<Bucket> {
+    let Some(series) = dataset.columns.get(column_index) else {
+        return Vec::new();
+    };
+    let cached = sample_cache.get(column_index).and_then(Option::as_ref);
+    let level0 = level0_caches
+        .get(column_index)
+        .and_then(Option::as_ref)
+        .map(Arc::as_ref);
+    let samples = column_f64_samples(series.values(), cached, level0);
+    match pyramids.get(column_index).and_then(Option::as_ref) {
+        Some(pyramid) => pyramid.decimate(samples, ticks, range, pixel_columns),
+        None => decimate_viewport(&[], samples, ticks, range, pixel_columns),
+    }
 }
 
 /// The color for the `index`-th plotted [`ViewKind::TimeDomain`] series
@@ -1495,6 +1709,303 @@ mod render_tests {
             frame(&second_ticks),
             3,
             "new ticks: every shown channel is decimated again"
+        );
+    }
+
+    /// A dataset with its view inputs derived once — like the app, which
+    /// derives them once per load, so the same `ticks` are seen every frame.
+    struct ViewFixture {
+        dataset: Dataset,
+        pyramids: Vec<Option<Vec<Vec<Bucket>>>>,
+        ticks: Vec<i128>,
+        sample_cache: Vec<Option<Vec<f64>>>,
+    }
+
+    impl ViewFixture {
+        fn new(dataset: Dataset) -> Self {
+            Self {
+                pyramids: glyde_core::ingest::pyramids_for_dataset(&dataset),
+                ticks: dataset.time.to_pyramid_ticks().into_owned(),
+                sample_cache: cache_column_samples(&dataset),
+                dataset,
+            }
+        }
+    }
+
+    /// One frame of `fixture`, with `state` and an optional fixed horizontal
+    /// span; returns the frame's shapes.
+    fn state_frame(
+        ctx: &egui::Context,
+        fixture: &ViewFixture,
+        state: &mut TimeViewState,
+        focus: Option<(f64, f64)>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_with_selection(
+                    ui,
+                    &fixture.dataset,
+                    &fixture.pyramids,
+                    &fixture.ticks,
+                    &fixture.sample_cache,
+                    &[],
+                    CursorLookup::for_time(&fixture.dataset.time),
+                    state,
+                    focus,
+                );
+            });
+        })
+        .shapes
+    }
+
+    /// Runs frames until `done(state)` holds, failing after a few seconds.
+    fn frames_until(
+        ctx: &egui::Context,
+        fixture: &ViewFixture,
+        state: &mut TimeViewState,
+        focus: Option<(f64, f64)>,
+        done: impl Fn(&TimeViewState) -> bool,
+    ) {
+        for _ in 0..1000 {
+            state_frame(ctx, fixture, state, focus);
+            if done(state) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the background decimation never landed");
+    }
+
+    /// `dataset`'s own decimation of `column` — what the background must
+    /// reproduce exactly.
+    fn background_for(dataset: &Dataset) -> impl Fn(usize, (i128, i128), usize) -> Vec<Bucket> {
+        let dataset = dataset.clone();
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        let sample_cache = cache_column_samples(&dataset);
+        move |column, range, pixel_columns| {
+            decimate_column(
+                &dataset,
+                &pyramids,
+                &ticks,
+                &sample_cache,
+                &[],
+                column,
+                range,
+                pixel_columns,
+            )
+        }
+    }
+
+    fn has_text(shapes: &[egui::epaint::ClippedShape], text: &str) -> bool {
+        fn find(shape: &egui::Shape, text: &str) -> bool {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().any(|s| find(s, text)),
+                egui::Shape::Text(t) => t.galley.text() == text,
+                _ => false,
+            }
+        }
+        shapes.iter().any(|clipped| find(&clipped.shape, text))
+    }
+
+    fn cached_view(state: &TimeViewState, column: usize) -> Option<((i128, i128), usize)> {
+        state
+            .decimated
+            .get(column)?
+            .as_ref()
+            .map(|c| (c.range, c.pixel_columns))
+    }
+
+    // Issue #135: with a background decimator, the frame never decimates on
+    // the UI thread; it says "Updating…" until the result lands, and the
+    // result is exactly the decimation the UI thread would have computed.
+    #[test]
+    fn a_background_decimation_runs_off_the_ui_thread_and_matches_the_frames_own() {
+        let fixture = ViewFixture::new(three_channel_dataset());
+        let dataset = &fixture.dataset;
+        let ui_thread = std::thread::current().id();
+        let threads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let job_threads = Arc::clone(&threads);
+        let decimate = background_for(dataset);
+        let mut state = TimeViewState::default();
+        state.set_background(Some(BackgroundDecimator::new(
+            move |column, range, pixel_columns| {
+                job_threads
+                    .lock()
+                    .unwrap()
+                    .push(std::thread::current().id());
+                decimate(column, range, pixel_columns)
+            },
+        )));
+        let ctx = egui::Context::default();
+        let focus = Some((0.0, 2.0));
+
+        let shapes = state_frame(&ctx, &fixture, &mut state, focus);
+        assert!(
+            has_text(&shapes, "Updating…"),
+            "nothing decimated yet: said so"
+        );
+
+        frames_until(&ctx, &fixture, &mut state, focus, |state| {
+            state.pending.is_none() && (0..3).all(|c| cached_view(state, c).is_some())
+        });
+        // One more frame at the same view: everything is current.
+        let shapes = state_frame(&ctx, &fixture, &mut state, focus);
+        assert!(!has_text(&shapes, "Updating…"), "every channel is current");
+
+        let threads = threads.lock().unwrap();
+        assert!(!threads.is_empty());
+        assert!(
+            threads.iter().all(|&thread| thread != ui_thread),
+            "a background decimation must never run on the UI thread"
+        );
+
+        let mut sync_state = TimeViewState::default();
+        state_frame(&ctx, &fixture, &mut sync_state, focus);
+        for column in 0..3 {
+            let background = state.decimated[column].as_ref().unwrap();
+            let on_ui_thread = sync_state.decimated[column].as_ref().unwrap();
+            assert_eq!(
+                (background.range, background.pixel_columns),
+                (on_ui_thread.range, on_ui_thread.pixel_columns)
+            );
+            assert_eq!(background.converged, on_ui_thread.converged);
+            assert_eq!(background.buckets, on_ui_thread.buckets);
+        }
+    }
+
+    /// A background decimator that waits until `gate` is opened, and tags
+    /// each result with its call number in `min` so a test can tell old
+    /// results from new.
+    #[allow(clippy::type_complexity)]
+    fn gated_decimator(
+        dataset: &Dataset,
+    ) -> (
+        BackgroundDecimator,
+        Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let decimate = background_for(dataset);
+        let (job_gate, job_calls) = (Arc::clone(&gate), Arc::clone(&calls));
+        let decimator = BackgroundDecimator::new(move |column, range, pixel_columns| {
+            let call = job_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let (open, opened) = &*job_gate;
+            let _open = opened
+                .wait_while(open.lock().unwrap(), |open| !*open)
+                .unwrap();
+            let mut buckets = decimate(column, range, pixel_columns);
+            for bucket in &mut buckets {
+                bucket.min = -(call as f64);
+            }
+            buckets
+        });
+        (decimator, gate, calls)
+    }
+
+    fn open_gate(gate: &(std::sync::Mutex<bool>, std::sync::Condvar)) {
+        *gate
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        gate.1.notify_all();
+    }
+
+    /// Opens the gate when dropped — also when a test fails before opening
+    /// it, so its blocked jobs never starve the shared `rayon` pool every
+    /// other test decimates on.
+    struct GateGuard(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            open_gate(&self.0);
+        }
+    }
+
+    // A decimation of the old data must never be drawn for the new one, even
+    // if it finishes after the data changed.
+    #[test]
+    fn new_data_discards_a_background_decimation_still_running() {
+        let fixture = ViewFixture::new(three_channel_dataset());
+        let dataset = &fixture.dataset;
+        let (decimator, gate, calls) = gated_decimator(dataset);
+        let _release = GateGuard(Arc::clone(&gate));
+        let mut state = TimeViewState::default();
+        state.set_background(Some(decimator));
+        let ctx = egui::Context::default();
+        let focus = Some((0.0, 2.0));
+
+        state_frame(&ctx, &fixture, &mut state, focus);
+        // Wait until the first job is really running, then replace the data.
+        while calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        let first_job_calls = calls.load(std::sync::atomic::Ordering::SeqCst);
+        state.data_changed();
+        open_gate(&gate);
+
+        frames_until(&ctx, &fixture, &mut state, focus, |state| {
+            state.pending.is_none() && (0..3).all(|c| cached_view(state, c).is_some())
+        });
+        for column in 0..3 {
+            let cached = state.decimated[column].as_ref().unwrap();
+            assert!(
+                cached
+                    .buckets
+                    .iter()
+                    .all(|bucket| -bucket.min > first_job_calls as f64),
+                "column {column} holds a result of the job started before the data changed"
+            );
+        }
+    }
+
+    // A pan while a background decimation runs does not start a second one
+    // alongside it; once it finishes, one more catches up with the view the
+    // plot ended on.
+    #[test]
+    fn a_view_change_during_a_background_decimation_is_caught_up_once() {
+        let fixture = ViewFixture::new(three_channel_dataset());
+        let dataset = &fixture.dataset;
+        let (decimator, gate, calls) = gated_decimator(dataset);
+        let _release = GateGuard(Arc::clone(&gate));
+        let mut state = TimeViewState::default();
+        state.set_background(Some(decimator));
+        let ctx = egui::Context::default();
+
+        let first = Some((0.0, 2.0));
+        state_frame(&ctx, &fixture, &mut state, first);
+        let first_view = state.pending.as_ref().map(|p| (p.range, p.pixel_columns));
+        assert!(first_view.is_some(), "a job started for the first view");
+
+        let second = Some((0.5, 1.5));
+        for _ in 0..3 {
+            state_frame(&ctx, &fixture, &mut state, second);
+        }
+        assert_eq!(
+            state.pending.as_ref().map(|p| (p.range, p.pixel_columns)),
+            first_view,
+            "still the first job: no second one alongside it"
+        );
+
+        open_gate(&gate);
+        let mut final_view = None;
+        frames_until(&ctx, &fixture, &mut state, second, |state| {
+            let views: Vec<_> = (0..3).map(|c| cached_view(state, c)).collect();
+            state.pending.is_none()
+                && views
+                    .iter()
+                    .all(|view| view.is_some() && *view != first_view)
+        });
+        for column in 0..3 {
+            let view = cached_view(&state, column);
+            final_view.get_or_insert(view);
+            assert_eq!(Some(view), final_view, "every channel at the same view");
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "one job for the first view, one to catch up: 3 channels each"
         );
     }
 
