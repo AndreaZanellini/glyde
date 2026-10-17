@@ -779,9 +779,12 @@ impl egui_plot::PlotItem for MinMaxBars {
         };
         let stroke = egui::Stroke::new(width, self.color);
         shapes.reserve(self.extents.len());
+        // Two-point paths, exactly what each `egui_plot::Line` drew: never
+        // `Shape::line_segment`, whose tessellation snaps both ends to pixel
+        // centres and so erases a bar shorter than about a pixel.
         for extent in &self.extents {
-            shapes.push(egui::Shape::line_segment(
-                [
+            shapes.push(egui::Shape::line(
+                vec![
                     transform.position_from_point(&extent[0]),
                     transform.position_from_point(&extent[1]),
                 ],

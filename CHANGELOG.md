@@ -670,11 +670,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
   separate drawing object, which was expensive with many channels. They are
   now drawn together, one object per channel. The picture is exactly the
   same: same bars, same positions, same colors and thickness. A new test
-  checks this bar by bar. Measured on this machine, including the step that
-  prepares the picture for the screen: a 32-channel full view went from
-  about 15.4 ms to about 10.9 ms per frame, a click in the channel picker
-  from about 13.4 ms to about 8.2 ms, and a single-channel file from about
-  0.77 ms to about 0.58 ms. Every measured case is 18–46% faster. (#137)
+  checks this bar by bar. A second new test checks, pixel by pixel, on a
+  standard and on a Retina display, that a bar shorter than a pixel (a
+  slowly changing signal) still shows: an intermediate version of this
+  change lost them on Retina displays, leaving gaps in the line. Measured
+  on this machine, including the step that prepares the picture for the
+  screen: a 32-channel full view went from about 15.4 ms to about 11.4 ms
+  per frame, a click in the channel picker from about 13.4 ms to about
+  8.2 ms, and a single-channel file from about 0.77 ms to about 0.63 ms.
+  (#137)
 
 - **Files too large for memory now scroll and zoom as fast as small ones.**
   For such a file, Glyde used to have no overview structure (the "pyramid"
