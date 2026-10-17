@@ -221,7 +221,8 @@ fn spilled_fixture(label: &'static str, sample_count: usize, channels: usize) ->
 }
 
 /// One frame, on a persistent `Context` reused across calls exactly like
-/// `eframe` drives the real app across repaints. `hover` rests the pointer
+/// `eframe` drives the real app across repaints, including the
+/// tessellation of its shapes `eframe` runs before painting them. `hover` rests the pointer
 /// over the middle of the plot, which is what turns on the cursor readout
 /// (SPEC §4.1) — the state the view is in for as long as the user's mouse is
 /// over the plot while panning or zooming (issue #114). `view` is the
@@ -249,7 +250,7 @@ fn render_frame(
         ..Default::default()
     };
     let mut visible = (0, 0);
-    let _ = ctx.run(input, |ctx| {
+    let output = ctx.run(input, |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             visible = views::time::show_with_selection(
                 ui,
@@ -264,6 +265,10 @@ fn render_frame(
             );
         });
     });
+    // What `eframe` does with every frame's shapes before painting them:
+    // part of the frame's cost, and the part that grows with every mark
+    // drawn (issue #137).
+    std::hint::black_box(ctx.tessellate(output.shapes, output.pixels_per_point));
     visible
 }
 
