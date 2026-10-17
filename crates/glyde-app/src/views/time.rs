@@ -18,8 +18,10 @@
 //! dependency comment), a "Fit to data" button, and a cursor readout of the
 //! exact raw value and timestamp at the nearest sample to the pointer.
 //!
-//! Every frame queries [`decimate_viewport`] per numeric column against the
-//! plot's *current* pan/zoom bounds and pixel width (SPEC §3.1: "for each
+//! Every frame draws each shown numeric column's [`decimate_viewport`] query
+//! for the plot's *current* pan/zoom bounds and pixel width — computed that
+//! frame, or reused from an earlier frame that had exactly the same view
+//! ([`TimeViewState`]) — (SPEC §3.1: "for each
 //! pixel column, compute min and max of the raw samples whose timestamps
 //! fall in that column's time range; draw the vertical extent between
 //! them"), using `pyramids` — the same min/max pyramid `glyde_core::ingest`
@@ -81,7 +83,7 @@ use crate::views::channels::{self, ChannelVisibility};
 /// the cache holds exactly the converted values, already mapped, so the
 /// reopen that produced it never had to convert them again
 /// (`ingest::derived_caches_for_dataset_cached`). `&[]` for a still-loading
-/// partial dataset, which has no cache of its own yet. `channels`: see
+/// partial dataset, which has no cache of its own yet. `state`: see
 /// [`show_with_selection`].
 #[allow(clippy::too_many_arguments)]
 pub fn show<P: Pyramid + Sync>(
@@ -92,7 +94,7 @@ pub fn show<P: Pyramid + Sync>(
     sample_cache: &[Option<Vec<f64>>],
     level0_caches: &[Option<Arc<Level0Cache>>],
     cursor: CursorLookup,
-    channels: &mut ChannelVisibility,
+    state: &mut TimeViewState,
 ) {
     show_with_selection(
         ui,
@@ -102,9 +104,60 @@ pub fn show<P: Pyramid + Sync>(
         sample_cache,
         level0_caches,
         cursor,
-        channels,
+        state,
         None,
     );
+}
+
+/// What the time view keeps from one frame to the next: which channels are
+/// shown (the channel picker, [`crate::views::channels`]) and each shown
+/// channel's last decimation.
+///
+/// A channel's decimation is reused as long as the view it was computed for
+/// — the visible tick range and the plot's pixel width — has not changed,
+/// so a frame that does not pan, zoom or resize decimates nothing, and
+/// showing one more channel decimates only that one (issue #135: every
+/// click in the picker used to re-decimate every shown channel, on a
+/// spilled file a read of each one's on-disk pyramid). The reused buckets
+/// are exactly what a fresh query would return: decimation is a pure
+/// function of the data and the view.
+///
+/// The owner must call [`Self::data_changed`] whenever the data behind the
+/// view is replaced (a new checkpoint of a loading file, a completed load, a
+/// re-index after a correction): a cached decimation of the old data must
+/// never be drawn for the new.
+#[derive(Debug, Default)]
+pub struct TimeViewState {
+    /// Which channels are plotted, edited by the channel picker.
+    pub channels: ChannelVisibility,
+    /// `dataset.columns`-parallel; `None` until a column is first shown.
+    decimated: Vec<Option<CachedDecimation>>,
+    /// The `ticks` the cache was filled from (address and length) — a
+    /// backstop to [`Self::data_changed`]: different ticks always mean
+    /// different data, so the cache is dropped even if the owner forgot.
+    ticks_identity: (usize, usize),
+}
+
+/// One column's decimation and the view it was computed for.
+#[derive(Debug)]
+struct CachedDecimation {
+    range: (i128, i128),
+    pixel_columns: usize,
+    buckets: Vec<Bucket>,
+}
+
+impl TimeViewState {
+    /// Drops every cached decimation; the channel choice is kept (it resets
+    /// itself if the channel list changed).
+    pub fn data_changed(&mut self) {
+        self.decimated.clear();
+    }
+
+    /// How many columns have a cached decimation.
+    #[cfg(test)]
+    pub(crate) fn cached_decimations(&self) -> usize {
+        self.decimated.iter().flatten().count()
+    }
 }
 
 /// [`show`], additionally reporting the tick range currently visible — the
@@ -113,10 +166,12 @@ pub fn show<P: Pyramid + Sync>(
 /// exactly that horizontal span first (e.g. the uniform stretch an
 /// `Irregular` series offers instead of a PSD, SPEC §3.3).
 ///
-/// `channels` is which numeric channels are plotted, edited in place by the
-/// channel picker drawn over the plot ([`crate::views::channels`]). A hidden
-/// channel is never decimated, so its per-frame cost is zero; the "Fit to
-/// data" bounds and the cursor readout cover the shown channels only.
+/// `state.channels` is which numeric channels are plotted, edited in place
+/// by the channel picker drawn over the plot ([`crate::views::channels`]). A
+/// hidden channel is never decimated, so its per-frame cost is zero; the
+/// "Fit to data" bounds and the cursor readout cover the shown channels
+/// only. A shown channel is decimated only when the view changed since its
+/// last decimation (see [`TimeViewState`]).
 #[allow(clippy::too_many_arguments)]
 pub fn show_with_selection<P: Pyramid + Sync>(
     ui: &mut egui::Ui,
@@ -126,9 +181,19 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     sample_cache: &[Option<Vec<f64>>],
     level0_caches: &[Option<Arc<Level0Cache>>],
     cursor: CursorLookup,
-    channels: &mut ChannelVisibility,
+    state: &mut TimeViewState,
     focus: Option<(f64, f64)>,
 ) -> (i128, i128) {
+    let ticks_identity = (ticks.as_ptr() as usize, ticks.len());
+    if state.ticks_identity != ticks_identity {
+        state.data_changed();
+        state.ticks_identity = ticks_identity;
+    }
+    let TimeViewState {
+        channels,
+        decimated: cache,
+        ..
+    } = state;
     let fit_clicked = ui.button("Fit to data").clicked();
 
     // Every numeric column is a channel; its index here picks its color, so
@@ -205,13 +270,25 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         // vs. separate per-column vertical bars ("and nothing else").
         let converged = is_converged(ticks, range, pixel_columns);
 
-        // Decimate every plotted column first, in parallel on the `rayon`
-        // compute pool (docs/ARCHITECTURE.md §Threading model: "Compute pool
-        // (rayon): decimation queries"; issue #114): columns are independent
+        // Decimate every plotted column whose cached decimation is not for
+        // this exact view, in parallel on the `rayon` compute pool
+        // (docs/ARCHITECTURE.md §Threading model: "Compute pool (rayon):
+        // decimation queries"; issue #114): columns are independent
         // queries, so a multi-channel file costs about one column's query
         // per frame instead of the sum of all of them. Drawing below stays
         // sequential and in column order. Hidden channels are not in
-        // `plotted` at all, so they cost nothing.
+        // `plotted` at all, so they cost nothing; an unchanged view reuses
+        // every shown channel's decimation (issue #135).
+        cache.resize_with(dataset.columns.len(), || None);
+        let stale: Vec<(usize, usize, &Series)> = plotted
+            .iter()
+            .copied()
+            .filter(|&(_, column_index, _)| {
+                !cache[column_index].as_ref().is_some_and(|cached| {
+                    cached.range == range && cached.pixel_columns == pixel_columns
+                })
+            })
+            .collect();
         let decimate = |&(_, column_index, series): &(usize, usize, &Series)| {
             let cached = sample_cache.get(column_index).and_then(Option::as_ref);
             let level0 = level0_caches
@@ -228,14 +305,24 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         };
         // A lone column has nothing to run alongside, and the pool hand-off
         // would only add its own latency to the frame.
-        let decimated: Vec<Vec<Bucket>> = if plotted.len() > 1 {
+        let fresh: Vec<Vec<Bucket>> = if stale.len() > 1 {
             use rayon::prelude::*;
-            plotted.par_iter().map(decimate).collect()
+            stale.par_iter().map(decimate).collect()
         } else {
-            plotted.iter().map(decimate).collect()
+            stale.iter().map(decimate).collect()
         };
+        for (&(_, column_index, _), buckets) in stale.iter().zip(fresh) {
+            cache[column_index] = Some(CachedDecimation {
+                range,
+                pixel_columns,
+                buckets,
+            });
+        }
 
-        for (&(color_index, _, series), buckets) in plotted.iter().zip(decimated) {
+        for &(color_index, column_index, series) in &plotted {
+            let buckets: &[Bucket] = cache[column_index]
+                .as_ref()
+                .map_or(&[], |cached| &cached.buckets);
             // Issue #55: one color per series, assigned here rather than
             // left to `egui_plot`'s own per-draw-call auto-assignment —
             // `egui_plot` would otherwise hand out a new color to every
@@ -254,7 +341,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 // converged bucket into the point-markers list only, with
                 // no connecting line at all, rendering a small file as
                 // scattered disconnected dots instead of a line plot.
-                let segments = bucket_segments(&dataset.time, &buckets);
+                let segments = bucket_segments(&dataset.time, buckets);
                 for segment in &segments {
                     plot_ui.line(
                         Line::new(PlotPoints::new(segment.clone()))
@@ -277,7 +364,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 // to the next, and never interpolated across a gap bucket
                 // (SPEC §1.3).
                 let mut points: Vec<[f64; 2]> = Vec::new();
-                for bucket in &buckets {
+                for bucket in buckets {
                     if bucket_is_gap(bucket) {
                         continue;
                     }
@@ -975,7 +1062,7 @@ mod render_tests {
                     &sample_cache,
                     &[],
                     CursorLookup::for_time(&dataset.time),
-                    &mut ChannelVisibility::default(),
+                    &mut TimeViewState::default(),
                 );
             });
         });
@@ -1020,7 +1107,7 @@ mod render_tests {
                         &sample_cache,
                         &[],
                         cursor,
-                        &mut ChannelVisibility::default(),
+                        &mut TimeViewState::default(),
                     );
                 });
             })
@@ -1065,7 +1152,7 @@ mod render_tests {
                     &[],
                     &[],
                     CursorLookup::default(),
-                    &mut ChannelVisibility::default(),
+                    &mut TimeViewState::default(),
                 );
             });
         });
@@ -1136,7 +1223,7 @@ mod render_tests {
                     &sample_cache,
                     &[],
                     CursorLookup::for_time(&dataset.time),
-                    &mut ChannelVisibility::default(),
+                    &mut TimeViewState::default(),
                 );
             });
         });
@@ -1203,7 +1290,7 @@ mod render_tests {
                     &sample_cache,
                     &[],
                     CursorLookup::for_time(&dataset.time),
-                    &mut ChannelVisibility::default(),
+                    &mut TimeViewState::default(),
                 );
             });
         });
@@ -1234,6 +1321,30 @@ mod render_tests {
             self.levels
                 .decimate(samples, timestamps, range, pixel_columns)
         }
+    }
+
+    /// `dataset`'s pyramids, each recording into the returned list the
+    /// column it decimated.
+    #[allow(clippy::type_complexity)]
+    fn counting_pyramids(
+        dataset: &Dataset,
+    ) -> (
+        Vec<Option<CountingPyramid>>,
+        Arc<std::sync::Mutex<Vec<usize>>>,
+    ) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(dataset)
+            .into_iter()
+            .enumerate()
+            .map(|(column, levels)| {
+                Some(CountingPyramid {
+                    column,
+                    levels: levels.expect("numeric column"),
+                    calls: Arc::clone(&calls),
+                })
+            })
+            .collect();
+        (pyramids, calls)
     }
 
     fn three_channel_dataset() -> Dataset {
@@ -1269,28 +1380,18 @@ mod render_tests {
 
     // The channel picker exists so a hidden channel costs nothing: it must
     // never reach decimation (on a spilled file, a read of its on-disk
-    // pyramid every frame), and the shown ones keep the color they had.
+    // pyramid every frame), and the shown ones keep the color they had. And
+    // a frame whose view did not change decimates nothing at all: a click
+    // in the picker costs only the channel it turned on (issue #135).
     #[test]
-    fn a_hidden_channel_is_never_decimated_and_colors_stay_put() {
+    fn only_shown_channels_with_a_changed_view_are_decimated() {
         let dataset = three_channel_dataset();
-        let levels = glyde_core::ingest::pyramids_for_dataset(&dataset);
-        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let pyramids: Vec<Option<CountingPyramid>> = levels
-            .into_iter()
-            .enumerate()
-            .map(|(column, levels)| {
-                Some(CountingPyramid {
-                    column,
-                    levels: levels.expect("numeric column"),
-                    calls: Arc::clone(&calls),
-                })
-            })
-            .collect();
+        let (pyramids, calls) = counting_pyramids(&dataset);
         let ticks = dataset.time.to_pyramid_ticks();
         let sample_cache = cache_column_samples(&dataset);
-        let mut channels = ChannelVisibility::default();
+        let mut state = TimeViewState::default();
         let ctx = egui::Context::default();
-        let frame = |channels: &mut ChannelVisibility| {
+        let frame = |state: &mut TimeViewState| {
             calls.lock().unwrap().clear();
             let output = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -1302,7 +1403,7 @@ mod render_tests {
                         &sample_cache,
                         &[],
                         CursorLookup::for_time(&dataset.time),
-                        channels,
+                        state,
                     );
                 });
             });
@@ -1311,12 +1412,22 @@ mod render_tests {
             (decimated, shape_colors(&output.shapes))
         };
 
-        let (decimated, _) = frame(&mut channels);
+        // `egui_plot` settles its bounds over the first frames; from then
+        // on the view is unchanged.
+        let (decimated, _) = frame(&mut state);
         assert_eq!(decimated, [0, 1, 2], "every channel starts shown");
+        frame(&mut state);
+        frame(&mut state);
+        let (decimated, colors) = frame(&mut state);
+        assert!(decimated.is_empty(), "an unchanged view decimates nothing");
+        assert!(
+            colors.contains(&series_color(0)),
+            "a reused decimation is drawn"
+        );
 
-        channels.toggle(0);
-        let (decimated, colors) = frame(&mut channels);
-        assert_eq!(decimated, [1, 2], "a hidden channel must not be decimated");
+        state.channels.toggle(0);
+        let (decimated, colors) = frame(&mut state);
+        assert!(decimated.is_empty(), "hiding a channel decimates nothing");
         assert!(!colors.contains(&series_color(0)), "channel 0 is hidden");
         assert!(
             colors.contains(&series_color(1)),
@@ -1327,9 +1438,64 @@ mod render_tests {
             "channel 2 keeps its color"
         );
 
-        channels.hide_all();
-        let (decimated, _) = frame(&mut channels);
+        state.data_changed();
+        let (decimated, _) = frame(&mut state);
+        assert_eq!(
+            decimated,
+            [1, 2],
+            "new data: only shown channels are decimated"
+        );
+
+        state.channels.toggle(0);
+        let (decimated, colors) = frame(&mut state);
+        assert_eq!(decimated, [0], "showing a channel decimates only that one");
+        assert!(colors.contains(&series_color(0)));
+
+        state.channels.hide_all();
+        let (decimated, _) = frame(&mut state);
         assert!(decimated.is_empty(), "nothing shown, nothing decimated");
+    }
+
+    // The cache's backstop: different `ticks` are different data, so a
+    // decimation of the old ones is never drawn even if the owner did not
+    // call `data_changed`.
+    #[test]
+    fn new_ticks_drop_every_cached_decimation() {
+        let dataset = three_channel_dataset();
+        let (pyramids, calls) = counting_pyramids(&dataset);
+        let first_ticks = dataset.time.to_pyramid_ticks().into_owned();
+        let second_ticks = first_ticks.clone();
+        let sample_cache = cache_column_samples(&dataset);
+        let mut state = TimeViewState::default();
+        let ctx = egui::Context::default();
+        let mut frame = |ticks: &[i128]| {
+            calls.lock().unwrap().clear();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &dataset,
+                        &pyramids,
+                        ticks,
+                        &sample_cache,
+                        &[],
+                        CursorLookup::for_time(&dataset.time),
+                        &mut state,
+                    );
+                });
+            });
+            calls.lock().unwrap().len()
+        };
+        // Let `egui_plot` settle its bounds, so only the ticks change below.
+        for _ in 0..3 {
+            frame(&first_ticks);
+        }
+        assert_eq!(frame(&first_ticks), 0, "same ticks, same view: all reused");
+        assert_eq!(
+            frame(&second_ticks),
+            3,
+            "new ticks: every shown channel is decimated again"
+        );
     }
 
     #[test]
@@ -1390,7 +1556,7 @@ mod render_tests {
                     &sample_cache,
                     &[],
                     CursorLookup::for_time(&dataset.time),
-                    &mut ChannelVisibility::default(),
+                    &mut TimeViewState::default(),
                 );
             });
         });

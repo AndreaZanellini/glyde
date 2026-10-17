@@ -30,8 +30,19 @@ Versioning: [Semantic Versioning](https://semver.org/).
   too large for memory this meant reading every hidden channel from disk on
   every frame, so hiding channels did not help at all. Measured on a 32-channel
   file stored on disk with one channel shown: about 0.4 ms per frame
-  instead of about 11 ms. With many channels shown, clicking in the picker
-  still redraws all of them; making that faster is a follow-up.
+  instead of about 11 ms.
+
+  **Clicks in the picker no longer recompute every channel.** While you
+  are not panning or zooming, Glyde now remembers what it computed for each
+  channel and reuses it. Showing a channel again computes only that channel,
+  and hiding one computes nothing. Before, every click recomputed every shown
+  channel, which on a large file meant reading each one from disk again.
+  What you see is exactly the same; Glyde just does not redo the same work.
+  Measured with 32 channels shown, on a file whose data the computer already
+  had in memory: a click went from about 11 ms to about 8 ms. Most of what
+  remains is drawing the 32 channels, which is tracked separately (#137).
+  The gain is larger when the data has to be read from disk again. Panning
+  and zooming still recompute every shown channel, as before.
 
   **Assumptions made (please veto by testing the app):**
   - The values row under the plot (shown while the mouse is over it) and

@@ -148,10 +148,12 @@ pub struct GlydeApp {
     /// A horizontal span, in plot seconds, the time view should move to on
     /// its next frame (the PSD view's "analyze the largest uniform stretch").
     time_focus: Option<(f64, f64)>,
-    /// Which channels the time view plots (its channel picker). Kept across
-    /// frames and across the preview-to-completed switch of one file; it
-    /// resets itself to every channel shown when the channel list changes.
-    channels: views::channels::ChannelVisibility,
+    /// The time view's state across frames: which channels it plots (its
+    /// channel picker) — kept across the preview-to-completed switch of one
+    /// file, reset by itself to every channel shown when the channel list
+    /// changes — and each shown channel's last decimation, dropped whenever
+    /// new data arrives (see [`Self::drain_indexing_messages`]).
+    time_view: views::time::TimeViewState,
 }
 
 impl Default for GlydeApp {
@@ -167,7 +169,7 @@ impl Default for GlydeApp {
             psd: PsdPanel::default(),
             time_selection: None,
             time_focus: None,
-            channels: Default::default(),
+            time_view: Default::default(),
         }
     }
 }
@@ -272,6 +274,9 @@ impl GlydeApp {
                 );
                 continue;
             }
+            // Whatever this message carries replaces the data on screen; a
+            // decimation of the old data must never be drawn for the new.
+            self.time_view.data_changed();
             if matches!(message, IndexingMessage::Completed { .. }) {
                 self.psd = PsdPanel::default();
                 self.time_selection = None;
@@ -431,7 +436,7 @@ impl eframe::App for GlydeApp {
                             // always has, same as a `None` entry would.
                             &[],
                             partial.prepared.cursor,
-                            &mut self.channels,
+                            &mut self.time_view,
                         );
                         let ticks = &partial.prepared.ticks;
                         views::state_timeline::show(
@@ -481,7 +486,7 @@ impl eframe::App for GlydeApp {
                     &prepared.sample_cache,
                     level0_caches,
                     prepared.cursor,
-                    &mut self.channels,
+                    &mut self.time_view,
                     self.time_focus.take(),
                 );
                 self.time_selection = Some(selection_rows(
@@ -735,6 +740,50 @@ mod tests {
             }
             _ => panic!("expected a Loading status with a partial dataset attached"),
         }
+    }
+
+    /// Issue #135: a decimation cached for the data on screen must never be
+    /// drawn for the data a new message brings, while the user's channel
+    /// choice (same channel list) survives it.
+    #[test]
+    fn new_data_drops_cached_decimations_and_keeps_the_channel_choice() {
+        let mut app = GlydeApp::new();
+        app.generation = 1;
+        let dataset = sample_dataset();
+        let prepared = sample_prepared();
+        let _ = egui::Context::default().run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                views::time::show(
+                    ui,
+                    &dataset,
+                    &sample_pyramids(),
+                    &prepared.ticks,
+                    &prepared.sample_cache,
+                    &[],
+                    prepared.cursor,
+                    &mut app.time_view,
+                );
+            });
+        });
+        assert_eq!(app.time_view.cached_decimations(), 1);
+        app.time_view.channels.toggle(0);
+
+        app.tx
+            .send(IndexingMessage::Progress {
+                generation: 1,
+                path: PathBuf::from("a.csv"),
+                dataset: sample_dataset(),
+                pyramids: sample_pyramids(),
+                rows_read: 1,
+                spilled: false,
+                prepared: sample_prepared(),
+                time_index: sample_time_index(),
+            })
+            .expect("channel send");
+        app.drain_indexing_messages();
+
+        assert_eq!(app.time_view.cached_decimations(), 0);
+        assert!(!app.time_view.channels.is_visible(0));
     }
 
     /// Issue #87: the storage decision has to survive the trip from the
