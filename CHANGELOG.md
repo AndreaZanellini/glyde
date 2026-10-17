@@ -24,6 +24,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
   one; Alt+click it again to show them all. Hover a row to see its full
   name if it is cut off. (#135)
 
+  **The PSD view uses the same picker, and the same choice.** The PSD
+  view's list of series, which had the same problems, is now the same box
+  in the same corner. Hiding a channel in either view hides it in both, so
+  "show only this channel" is one click for the whole window. In **Stacked**
+  mode, a hidden channel's plot is removed, and each remaining plot shows
+  its channel's name and color above it, where its one-line legend used to
+  be. Hiding a series never throws away its computed spectrum: show it again
+  and it is back without pressing "Compute PSD".
+
   **Faster with hidden channels, especially on files stored on disk.** A
   hidden channel now costs nothing to draw. Before, Glyde still computed
   every hidden channel on every frame and only then left it out. On a file
@@ -63,6 +72,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   - On a file stored on disk, the plot can briefly show the previous
     picture (marked "Updating…") instead of making the window wait. Values
     under the cursor are always read exactly, never from that picture.
+  - The time view and the PSD view share one choice of channels; they
+    cannot show different channels. "Compute PSD" still computes every
+    series, shown or not, as before.
   - Your choice of channels is kept while a file finishes loading. It resets
     to "all shown" when the list of channels changes: when you open a
     different file, or after a correction that changes the columns, such as

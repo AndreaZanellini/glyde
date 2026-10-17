@@ -591,7 +591,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         );
     }
 
-    channels::show(ui, response.response.rect, channels, series_color);
+    channels::show(ui, "time", response.response.rect, channels, series_color);
 
     if let Some(index) = hovered {
         ui.horizontal(|ui| {
