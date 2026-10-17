@@ -48,9 +48,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   channel, which on a large file meant reading each one from disk again.
   What you see is exactly the same; Glyde just does not redo the same work.
   Measured with 32 channels shown, on a file whose data the computer already
-  had in memory: a click went from about 11 ms to about 8 ms. Most of what
-  remains is drawing the 32 channels, which is tracked separately (#137).
-  The gain is larger when the data has to be read from disk again. Panning
+  had in memory: a click went from about 11 ms to about 8 ms; drawing the
+  32 channels, the larger part of what remained, got faster too (see
+  "Plots draw faster" below, #137). The gain is larger when the data has to be read from disk again. Panning
   and zooming still recompute every shown channel, as before.
 
   **The window never freezes while a large file's plot is read from
@@ -664,6 +664,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `blocking-decision` issue rather than decided here.
 
 ### Changed
+- **Plots draw faster, especially with many channels.** When a time
+  view shows more data than it has pixels, each channel is drawn as one
+  thin vertical bar per pixel column. Each of those bars used to be a
+  separate drawing object, which was expensive with many channels. They are
+  now drawn together, one object per channel. The picture is exactly the
+  same: same bars, same positions, same colors and thickness. A new test
+  checks this bar by bar. Measured on this machine, including the step that
+  prepares the picture for the screen: a 32-channel full view went from
+  about 15.4 ms to about 10.9 ms per frame, a click in the channel picker
+  from about 13.4 ms to about 8.2 ms, and a single-channel file from about
+  0.77 ms to about 0.58 ms. Every measured case is 18–46% faster. (#137)
+
 - **Files too large for memory now scroll and zoom as fast as small ones.**
   For such a file, Glyde used to have no overview structure (the "pyramid"
   of min/max summaries) to draw from, because it would have cost too much

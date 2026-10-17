@@ -530,8 +530,10 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 // SPEC §3.1's aggregated regime: one vertical extent per
                 // pixel column — never a line connecting one pixel column
                 // to the next, and never interpolated across a gap bucket
-                // (SPEC §1.3).
+                // (SPEC §1.3). All of a channel's extents are one plot item
+                // (issue #137), not one `Line` each.
                 let mut points: Vec<[f64; 2]> = Vec::new();
+                let mut bars = MinMaxBars::new(series.name(), color);
                 for bucket in buckets {
                     if bucket_is_gap(bucket) {
                         continue;
@@ -541,15 +543,11 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                     if bucket.min == bucket.max {
                         points.push([bucket_x, bucket.min]);
                     } else {
-                        plot_ui.line(
-                            Line::new(PlotPoints::new(vec![
-                                [bucket_x, bucket.min],
-                                [bucket_x, bucket.max],
-                            ]))
-                            .name(series.name())
-                            .color(color),
-                        );
+                        bars.push(bucket_x, bucket.min, bucket.max);
                     }
+                }
+                if !bars.is_empty() {
+                    plot_ui.add(bars);
                 }
                 if !points.is_empty() {
                     plot_ui.points(
@@ -720,6 +718,108 @@ fn nearest_tick_index(ticks: &[i128], target: i128) -> Option<usize> {
     } else {
         pos
     })
+}
+
+/// One channel's vertical min/max extents in SPEC §3.1's aggregated regime,
+/// as a single plot item (issue #137). Drawn exactly like the one-`Line`-
+/// per-extent it replaces — a 1.5-point stroke in the channel's color from
+/// each extent's min to its max, hoverable at either end — without
+/// `egui_plot`'s per-item cost (a boxed item, a name, bounds and a point
+/// buffer each) paid ~2,000 times per channel per frame.
+struct MinMaxBars {
+    name: String,
+    color: egui::Color32,
+    /// Two per extent, in order: `(x, min)`, `(x, max)`.
+    ends: Vec<egui_plot::PlotPoint>,
+    bounds: PlotBounds,
+    highlighted: bool,
+}
+
+impl MinMaxBars {
+    /// The stroke width of an `egui_plot::Line`, which drew these before.
+    const STROKE_WIDTH: f32 = 1.5;
+
+    fn new(name: &str, color: egui::Color32) -> Self {
+        Self {
+            name: name.to_owned(),
+            color,
+            ends: Vec::new(),
+            bounds: PlotBounds::NOTHING,
+            highlighted: false,
+        }
+    }
+
+    fn push(&mut self, x: f64, min: f64, max: f64) {
+        for y in [min, max] {
+            let end = egui_plot::PlotPoint::new(x, y);
+            self.bounds.extend_with(&end);
+            self.ends.push(end);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+}
+
+impl egui_plot::PlotItem for MinMaxBars {
+    fn shapes(
+        &self,
+        _ui: &egui::Ui,
+        transform: &egui_plot::PlotTransform,
+        shapes: &mut Vec<egui::Shape>,
+    ) {
+        let width = if self.highlighted {
+            Self::STROKE_WIDTH * 2.0
+        } else {
+            Self::STROKE_WIDTH
+        };
+        let stroke = egui::Stroke::new(width, self.color);
+        shapes.reserve(self.ends.len() / 2);
+        for extent in self.ends.chunks_exact(2) {
+            shapes.push(egui::Shape::line_segment(
+                [
+                    transform.position_from_point(&extent[0]),
+                    transform.position_from_point(&extent[1]),
+                ],
+                stroke,
+            ));
+        }
+    }
+
+    fn initialize(&mut self, _x_range: std::ops::RangeInclusive<f64>) {}
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn color(&self) -> egui::Color32 {
+        self.color
+    }
+
+    fn highlight(&mut self) {
+        self.highlighted = true;
+    }
+
+    fn highlighted(&self) -> bool {
+        self.highlighted
+    }
+
+    fn allow_hover(&self) -> bool {
+        true
+    }
+
+    fn geometry(&self) -> egui_plot::PlotGeometry<'_> {
+        egui_plot::PlotGeometry::Points(&self.ends)
+    }
+
+    fn bounds(&self) -> PlotBounds {
+        self.bounds
+    }
+
+    fn id(&self) -> Option<egui::Id> {
+        None
+    }
 }
 
 /// Column `column_index`'s decimation for `range` at `pixel_columns`
