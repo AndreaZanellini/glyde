@@ -53,7 +53,15 @@
 //! ([`MULTI_CHANNELS`]), rendered twice: every channel shown, and only one
 //! shown through the channel picker (`views::channels`). A hidden channel
 //! must cost nothing — the picker's reason to exist on a spilled file — so
-//! the one-shown variant is the gate for that.
+//! the one-shown variant is the gate for that. A last case times a **click
+//! in the picker** with every channel shown and the view unchanged: the
+//! other channels' decimations are reused (issue #135), so it decimates one
+//! channel, not all of them (drawing them all remains, issue #137).
+//!
+//! The view keeps each shown channel's decimation while the view does not
+//! change (`views::time::TimeViewState`), so every frame meant to time a
+//! decimation first drops that cache — otherwise a repeated full-view frame
+//! would time a cache hit, not the worst case this bench gates.
 //!
 //! Per issue #61 decision 2 (mirrored from `glyde-core`'s benches), only the
 //! absolute SPEC §5 ceiling is build-blocking here; the >15% regression
@@ -66,6 +74,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use egui::{Pos2, Rect, Vec2};
 use glyde_app::views;
 use glyde_app::views::channels::ChannelVisibility;
+use glyde_app::views::time::TimeViewState;
 use glyde_core::index::disk_pyramid::ColumnPyramid;
 use glyde_core::ingest::{pyramids_for_dataset, Dataset, TimeAxis};
 use glyde_core::series::{Series, SeriesValues};
@@ -210,12 +219,13 @@ fn spilled_fixture(label: &'static str, sample_count: usize, channels: usize) ->
 /// over the middle of the plot, which is what turns on the cursor readout
 /// (SPEC §4.1) — the state the view is in for as long as the user's mouse is
 /// over the plot while panning or zooming (issue #114). `view` is the
-/// horizontal span shown, in plot seconds. Returns the tick range the frame
-/// actually decimated.
+/// horizontal span shown, in plot seconds. `state` is reused as is: a
+/// channel whose cached decimation matches `view` is not decimated again.
+/// Returns the tick range the frame actually decimated.
 fn render_frame(
     ctx: &egui::Context,
     fixture: &Fixture,
-    channels: &mut ChannelVisibility,
+    state: &mut TimeViewState,
     hover: bool,
     view: (f64, f64),
 ) -> (i128, i128) {
@@ -243,7 +253,7 @@ fn render_frame(
                 &fixture.sample_cache,
                 &[],
                 fixture.cursor,
-                channels,
+                state,
                 Some(view),
             );
         });
@@ -272,20 +282,22 @@ fn pan_view(fixture: &Fixture, step: usize) -> (f64, f64) {
     (start, start + span * 0.1)
 }
 
-/// Asserts SPEC §5's ceiling on one steady-state frame of `view`, after a
-/// warm-up frame, and that the frame really showed the samples it claims.
+/// Asserts SPEC §5's ceiling on one steady-state frame of `view` that
+/// decimates every shown channel (no cached decimation), after a warm-up
+/// frame, and that the frame really showed the samples it claims.
 fn assert_frame_budget(
     ctx: &egui::Context,
     fixture: &Fixture,
-    channels: &mut ChannelVisibility,
+    state: &mut TimeViewState,
     hover: bool,
     view: (f64, f64),
     what: &str,
     min_visible_ticks: i128,
 ) {
-    render_frame(ctx, fixture, channels, hover, view);
+    render_frame(ctx, fixture, state, hover, view);
+    state.data_changed();
     let start = Instant::now();
-    let (first, last) = render_frame(ctx, fixture, channels, hover, view);
+    let (first, last) = render_frame(ctx, fixture, state, hover, view);
     let elapsed = start.elapsed();
     assert!(
         last - first >= min_visible_ticks,
@@ -315,7 +327,8 @@ fn bench_one_fixture(
     } else {
         format!("{}, {shown}", fixture.label)
     };
-    let mut channels = channels;
+    let mut state = TimeViewState::default();
+    state.channels = channels;
     let full = full_view(fixture);
     let span_ticks = fixture.ticks.last().expect("non-empty") - fixture.ticks[0];
     for hover in [false, true] {
@@ -326,7 +339,7 @@ fn bench_one_fixture(
         assert_frame_budget(
             &ctx,
             fixture,
-            &mut channels,
+            &mut state,
             hover,
             full,
             &format!("full view, {mode}"),
@@ -336,7 +349,7 @@ fn bench_one_fixture(
         assert_frame_budget(
             &ctx,
             fixture,
-            &mut channels,
+            &mut state,
             hover,
             pan_view(fixture, 37),
             &format!("pan, {mode}"),
@@ -348,10 +361,11 @@ fn bench_one_fixture(
             &format!("time_view_render/{label}/full view{suffix}"),
             |b| {
                 b.iter(|| {
+                    state.data_changed();
                     render_frame(
                         std::hint::black_box(&ctx),
                         std::hint::black_box(fixture),
-                        &mut channels,
+                        &mut state,
                         hover,
                         full,
                     )
@@ -365,13 +379,59 @@ fn bench_one_fixture(
                 render_frame(
                     std::hint::black_box(&ctx),
                     std::hint::black_box(fixture),
-                    &mut channels,
+                    &mut state,
                     hover,
                     pan_view(fixture, step),
                 )
             })
         });
     }
+}
+
+/// A click in the picker that shows one more channel, with every other
+/// channel shown and the view unchanged: only that channel is decimated.
+/// Each iteration toggles it, so iterations alternate hiding it (nothing to
+/// decimate) and showing it again (one decimation) — the cost of a click.
+fn bench_picker_click(c: &mut Criterion, fixture: &Fixture) {
+    let ctx = egui::Context::default();
+    let full = full_view(fixture);
+    let mut state = TimeViewState::default();
+    // Settle: every channel decimated for this view once.
+    for _ in 0..3 {
+        render_frame(&ctx, fixture, &mut state, false, full);
+    }
+    assert_eq!(state.channels.visible_count(), MULTI_CHANNELS);
+
+    state.channels.toggle(0);
+    render_frame(&ctx, fixture, &mut state, false, full);
+    state.channels.toggle(0);
+    let start = Instant::now();
+    render_frame(&ctx, fixture, &mut state, false, full);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed <= FRAME_TIME_CEILING,
+        "a picker click with all {MULTI_CHANNELS} channels shown took {elapsed:?}, \
+         exceeding the {FRAME_TIME_CEILING:?} build-blocking ceiling"
+    );
+
+    c.bench_function(
+        &format!(
+            "time_view_render/{}, all {MULTI_CHANNELS} shown/picker click",
+            fixture.label
+        ),
+        |b| {
+            b.iter(|| {
+                state.channels.toggle(0);
+                render_frame(
+                    std::hint::black_box(&ctx),
+                    std::hint::black_box(fixture),
+                    &mut state,
+                    false,
+                    full,
+                )
+            })
+        },
+    );
 }
 
 fn bench_time_view_render(c: &mut Criterion) {
@@ -396,6 +456,7 @@ fn bench_time_view_render(c: &mut Criterion) {
     one_shown.solo(0);
     assert_eq!(one_shown.visible_count(), 1);
     bench_one_fixture(c, &many, one_shown, &format!("1 of {MULTI_CHANNELS} shown"));
+    bench_picker_click(c, &many);
 }
 
 criterion_group!(benches, bench_time_view_render);
