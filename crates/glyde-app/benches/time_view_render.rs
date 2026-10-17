@@ -58,6 +58,11 @@
 //! other channels' decimations are reused (issue #135), so it decimates one
 //! channel, not all of them (drawing them all remains, issue #137).
 //!
+//! The completed spilled load in the app decimates **off the UI thread**
+//! (issue #135): a "background" case pans the many-channel fixture that
+//! way and gates the UI frame alone — which then never includes a
+//! decimation, only drawing whatever has been decimated so far.
+//!
 //! The view keeps each shown channel's decimation while the view does not
 //! change (`views::time::TimeViewState`), so every frame meant to time a
 //! decimation first drops that cache — otherwise a repeated full-view frame
@@ -68,6 +73,7 @@
 //! comparison is a manual check on the SPEC §5 reference machine using
 //! criterion's own local baseline comparison.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -434,6 +440,58 @@ fn bench_picker_click(c: &mut Criterion, fixture: &Fixture) {
     );
 }
 
+/// Panning `fixture` with every channel shown and its decimation off the UI
+/// thread, as the app does for a completed spilled load: the UI frame never
+/// waits for a decimation, so this times drawing alone.
+fn bench_background_pan(c: &mut Criterion, fixture: &Fixture) {
+    let shared = Arc::new((
+        fixture.dataset.clone(),
+        fixture.pyramids.clone(),
+        fixture.ticks.clone(),
+        fixture.sample_cache.clone(),
+    ));
+    let mut state = TimeViewState::default();
+    state.set_background(Some(views::time::BackgroundDecimator::new(
+        move |column, range, pixel_columns| {
+            let (dataset, pyramids, ticks, sample_cache) = &*shared;
+            views::time::decimate_column(
+                dataset,
+                pyramids,
+                ticks,
+                sample_cache,
+                &[],
+                column,
+                range,
+                pixel_columns,
+            )
+        },
+    )));
+    let ctx = egui::Context::default();
+    let mut step = 0;
+    let mut frame = |state: &mut TimeViewState| {
+        step += 1;
+        render_frame(&ctx, fixture, state, false, pan_view(fixture, step))
+    };
+    for _ in 0..10 {
+        frame(&mut state);
+    }
+    let start = Instant::now();
+    frame(&mut state);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed <= FRAME_TIME_CEILING,
+        "a background-decimated pan frame took {elapsed:?}, exceeding the \
+         {FRAME_TIME_CEILING:?} build-blocking ceiling"
+    );
+    c.bench_function(
+        &format!(
+            "time_view_render/{}, all {MULTI_CHANNELS} shown/pan, background",
+            fixture.label
+        ),
+        |b| b.iter(|| frame(std::hint::black_box(&mut state))),
+    );
+}
+
 fn bench_time_view_render(c: &mut Criterion) {
     let all = ChannelVisibility::default;
     bench_one_fixture(c, &f64_fixture(SAMPLE_COUNT), all(), "");
@@ -457,6 +515,7 @@ fn bench_time_view_render(c: &mut Criterion) {
     assert_eq!(one_shown.visible_count(), 1);
     bench_one_fixture(c, &many, one_shown, &format!("1 of {MULTI_CHANNELS} shown"));
     bench_picker_click(c, &many);
+    bench_background_pan(c, &many);
 }
 
 criterion_group!(benches, bench_time_view_render);
