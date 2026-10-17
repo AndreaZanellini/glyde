@@ -2009,6 +2009,178 @@ mod render_tests {
         );
     }
 
+    /// Every data mark `shapes` draws in `color`: two-point strokes (as
+    /// `(top, bottom, width)`, whatever shape kind carries them) and filled
+    /// dots (as `(center, radius)`).
+    #[allow(clippy::type_complexity)]
+    fn marks_in(
+        shapes: &[egui::epaint::ClippedShape],
+        color: egui::Color32,
+    ) -> (Vec<(egui::Pos2, egui::Pos2, f32)>, Vec<(egui::Pos2, f32)>) {
+        fn walk(
+            shape: &egui::Shape,
+            color: egui::Color32,
+            strokes: &mut Vec<(egui::Pos2, egui::Pos2, f32)>,
+            dots: &mut Vec<(egui::Pos2, f32)>,
+        ) {
+            let mut stroke = |a: egui::Pos2, b: egui::Pos2, width: f32| {
+                let (top, bottom) = if a.y <= b.y { (a, b) } else { (b, a) };
+                strokes.push((top, bottom, width));
+            };
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|s| walk(s, color, strokes, dots))
+                }
+                egui::Shape::Path(path)
+                    if path.stroke.color == egui::epaint::ColorMode::Solid(color) =>
+                {
+                    assert_eq!(path.points.len(), 2, "a bar is one two-point stroke");
+                    stroke(path.points[0], path.points[1], path.stroke.width);
+                }
+                egui::Shape::LineSegment { points, stroke: s } if s.color == color => {
+                    stroke(points[0], points[1], s.width);
+                }
+                egui::Shape::Mesh(_) => panic!("bars must stay strokes"),
+                egui::Shape::Circle(circle) if circle.fill == color => {
+                    dots.push((circle.center, circle.radius));
+                }
+                _ => {}
+            }
+        }
+        let (mut strokes, mut dots) = (Vec::new(), Vec::new());
+        for clipped in shapes {
+            walk(&clipped.shape, color, &mut strokes, &mut dots);
+        }
+        (strokes, dots)
+    }
+
+    // Issue #137's lock on SPEC §3.1's aggregated regime, written before
+    // changing how its bars are emitted: whatever carries them, each
+    // channel draws exactly one vertical min/max stroke per non-flat,
+    // non-gap bucket and one dot per flat one, never a stroke from one
+    // pixel column to another, never anything for a gap bucket, in the
+    // channel's color at the same width — and every mark sits exactly where
+    // one affine plot transform puts its bucket, so nothing is moved,
+    // merged, dropped or invented.
+    #[test]
+    fn aggregated_bars_are_exactly_the_buckets() {
+        let n = 20_000usize;
+        let wave = |i: usize, phase: f64| (i as f64 * 0.01 + phase).sin();
+        let mut first: Vec<f64> = (0..n).map(|i| wave(i, 0.0)).collect();
+        first[7_000] = 25.0; // a one-sample spike
+        for value in &mut first[12_000..12_600] {
+            *value = f64::NAN; // a gap
+        }
+        // A flat stretch: buckets whose min equals their max.
+        let second: Vec<f64> = (0..n)
+            .map(|i| {
+                if (4_000..9_000).contains(&i) {
+                    3.0
+                } else {
+                    wave(i, 1.0)
+                }
+            })
+            .collect();
+        let mut dataset = sample_dataset();
+        dataset.time = TimeAxis::Absolute {
+            timestamps: (0..n as i128)
+                .map(|i| Timestamp::new(i, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        dataset.columns = vec![
+            Series::new("first", SeriesValues::F64(first)),
+            Series::new("second", SeriesValues::F64(second)),
+        ];
+        let fixture = ViewFixture::new(dataset);
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        let focus = Some((0.0, (n - 1) as f64));
+        for _ in 0..3 {
+            state_frame(&ctx, &fixture, &mut state, focus);
+        }
+        let shapes = state_frame(&ctx, &fixture, &mut state, focus);
+
+        let mut transform: Option<[f64; 4]> = None;
+        for column in 0..2 {
+            let cached = state.decimated[column].as_ref().expect("decimated");
+            assert!(!cached.converged, "this view must be aggregated");
+            let (strokes, dots) = marks_in(&shapes, series_color(column));
+            let mut bars = Vec::new();
+            let mut flats = Vec::new();
+            for bucket in &cached.buckets {
+                if bucket_is_gap(bucket) {
+                    continue;
+                }
+                let x = tick_to_seconds(
+                    &fixture.dataset.time,
+                    (bucket.first_ts + bucket.last_ts) / 2,
+                );
+                if bucket.min == bucket.max {
+                    flats.push((x, bucket.min));
+                } else {
+                    bars.push((x, bucket.min, bucket.max));
+                }
+            }
+            assert!(bars.len() > 100, "a meaningful fixture");
+            assert_eq!(
+                !flats.is_empty(),
+                column == 1,
+                "only `second` has a flat stretch"
+            );
+            assert_eq!(
+                strokes.len(),
+                bars.len(),
+                "column {column}: one stroke per bar"
+            );
+            assert_eq!(
+                dots.len(),
+                flats.len(),
+                "column {column}: one dot per flat bucket"
+            );
+
+            // Screen = (x * sx + ox, y * sy + oy): solved from the two
+            // outermost bars (x) and the tallest one (y), then every mark
+            // must match it.
+            let mut strokes = strokes;
+            strokes.sort_by(|a, b| a.0.x.total_cmp(&b.0.x));
+            let [sx, ox, sy, oy] = *transform.get_or_insert_with(|| {
+                let (a, b) = (bars[0], bars[bars.len() - 1]);
+                let (sa, sb) = (strokes[0], strokes[strokes.len() - 1]);
+                let sx = (sb.0.x - sa.0.x) as f64 / (b.0 - a.0);
+                let tallest = (0..bars.len())
+                    .max_by(|&i, &j| (bars[i].2 - bars[i].1).total_cmp(&(bars[j].2 - bars[j].1)))
+                    .expect("bars");
+                let (t, st) = (bars[tallest], strokes[tallest]);
+                let sy = (st.0.y - st.1.y) as f64 / (t.2 - t.1);
+                [sx, sa.0.x as f64 - a.0 * sx, sy, st.0.y as f64 - t.2 * sy]
+            });
+            let close = |screen: f32, expected: f64| (screen as f64 - expected).abs() < 0.05;
+            for (&(top, bottom, width), &(x, min, max)) in strokes.iter().zip(&bars) {
+                assert_eq!(width, 1.5);
+                assert_eq!(top.x, bottom.x, "a bar never leans into the next column");
+                assert!(close(top.x, x * sx + ox), "bar at x = {x} misplaced");
+                assert!(
+                    close(top.y, max * sy + oy),
+                    "bar at x = {x}: top {} is not its max {max} ({})",
+                    top.y,
+                    max * sy + oy
+                );
+                assert!(
+                    close(bottom.y, min * sy + oy),
+                    "bar at x = {x}: bottom is not its min"
+                );
+            }
+            let mut dots = dots;
+            dots.sort_by(|a, b| a.0.x.total_cmp(&b.0.x));
+            for (&(center, radius), &(x, value)) in dots.iter().zip(&flats) {
+                assert_eq!(radius, 2.0);
+                assert!(close(center.x, x * sx + ox) && close(center.y, value * sy + oy));
+            }
+        }
+    }
+
     #[test]
     fn fit_to_data_covers_only_the_shown_channels() {
         let columns = [
