@@ -101,6 +101,27 @@ pub fn background_decimator(
     })
 }
 
+/// Rebuilds a completed load's dense state-timeline lanes for a zoomed-in
+/// window off the UI thread (SPEC §4.3's collapse rule: a "multiple states"
+/// glyph expands on zoom), over shared handles to the same data.
+pub fn lane_refiner(
+    dataset: Arc<Dataset>,
+    prepared: Arc<PreparedView>,
+) -> views::state_timeline::LaneRefiner {
+    views::state_timeline::LaneRefiner::new(move |column, kind, window, cells, cancel| {
+        views::state_timeline::refine_lane(
+            &dataset,
+            &prepared.ticks,
+            prepared.cursor.is_sorted(),
+            column,
+            kind,
+            window,
+            cells,
+            cancel,
+        )
+    })
+}
+
 /// Progress emitted by a background indexing job, polled by the UI thread.
 /// `generation` identifies which open request this message belongs to (see
 /// the module docs) — the receiver must ignore any message whose generation

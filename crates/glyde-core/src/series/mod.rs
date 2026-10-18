@@ -21,6 +21,7 @@
 
 mod anomaly;
 mod categorical;
+mod collapse;
 mod dtype;
 mod markers;
 mod samples;
@@ -31,6 +32,7 @@ pub use categorical::{
     state_label_id, string_state_bands, StateBand, StateBandBuilder, StateCell, StateLane,
     MAX_EXACT_STATE_BANDS, MAX_OVERVIEW_LABELS, STATE_OVERVIEW_CELLS,
 };
+pub use collapse::{collapse_runs, ColumnGrid, BOOL_OFF_ID, BOOL_ON_ID};
 pub use dtype::{Dtype, SeriesValues, SpilledValues, ViewKind};
 pub use markers::{
     is_marker_column, Marker, MarkerBuilder, MarkerLane, MARKER_OVERVIEW_CELLS, MAX_EXACT_MARKERS,

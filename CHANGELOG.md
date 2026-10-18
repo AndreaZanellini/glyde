@@ -12,6 +12,36 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Nothing in the state timeline can hide any more, and you can zoom into it
+  (milestone M6, collapse rule).** The on/off, text-state and event lanes
+  under the plot used to be fixed pictures of the whole file. When many
+  short states fell into the same spot on screen, the last one drawn
+  covered the others, so a brief state could look like it never happened.
+  Now each lane is drawn one screen column at a time. A column that holds
+  two or more different states, or two or more events, is drawn in
+  **orange**. Hover it and the tooltip says so, e.g. "several states here —
+  zoom in to see them" or "5 events here — zoom in to separate them".
+  **Hold Ctrl (⌘ on a Mac) and scroll over a lane, or pinch on a trackpad,
+  to zoom; drag to pan**: all the lanes move together,
+  and the orange columns split into their individual states and events as
+  you zoom in. **Double-click** a lane to see the whole file again. On a
+  very dense column (thousands of changes), zooming in rebuilds that lane
+  for what is on screen in the background, so the exact states appear a
+  moment after you stop zooming. To try it: open a file with a flag that
+  flips thousands of times, check that the lane is orange where it flips
+  fast, then zoom into the orange part until it splits into blue and gray
+  bands. Assumptions you can veto:
+  - The lanes zoom with each other but **not yet with the time plot above
+    them**. Lining them up with the plot is the next M6 item.
+  - A "column" is one screen point wide (on a Retina display, two physical
+    pixels).
+  - The right-most column also covers the very last instant on screen. If
+    a state changes exactly there, that column is orange even though the
+    change is only at its edge.
+  - When a lane is drawn from its whole-file summary, an event is placed
+    at the middle of its summary cell, which can be up to half a cell off.
+    This only happens while a zoomed-in rebuild is still running.
+
 - **A channel picker for files with many channels.** The list of channels
   in the top-right corner of the time view used to grow past the edge of
   the plot, so with many channels some could not be reached, and showing a

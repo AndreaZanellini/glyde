@@ -1131,7 +1131,7 @@ pub fn tick_to_seconds(time: &TimeAxis, tick: i128) -> f64 {
 /// current viewport bounds from `egui_plot`) back to a pyramid tick, for
 /// querying [`decimate_viewport`] with a range in the same tick units
 /// `glyde_core::ingest::TimeAxis::to_pyramid_ticks` produces.
-fn seconds_to_tick(time: &TimeAxis, seconds: f64) -> i128 {
+pub(crate) fn seconds_to_tick(time: &TimeAxis, seconds: f64) -> i128 {
     match absolute_ticks_per_second(time) {
         Some(ticks_per_second) => (seconds * ticks_per_second as f64).round() as i128,
         None => progressive_value_to_tick(seconds),
