@@ -12,6 +12,25 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Glyde now recognizes `.parquet` files (milestone M7, first step — not
+  yet openable in the app window).** Under the hood, Glyde can now read a
+  Parquet file's layout and its timestamp column, and report what it found
+  the same way it does for a CSV: which column is the time axis, how many
+  rows, whether sampling is uniform, and how many gaps there are. Every
+  number type (8- to 64-bit integers, 32/64-bit floats, true/false, text)
+  keeps its exact width; nothing is converted. **You cannot yet see a
+  Parquet plot** — drawing one is the later M7 items. What you can check
+  today is that the automated corpus test for the "clean Parquet, timestamp
+  column" file now passes. Assumptions you can veto:
+  - The time axis is the **first timestamp column** in the file, wherever
+    it sits. A Parquet file with no timestamp column gets a generated
+    row-number axis, as a CSV without a time column does.
+  - A column containing **empty (null) values, or dictionary-encoded text,
+    is refused with a clear error** instead of being filled in or guessed
+    at. Handling them properly is the next M7 item.
+  - A file whose only column is the timestamp is refused ("no data series
+    to plot"), exactly like a one-column CSV.
+
 - **Nothing in the state timeline can hide any more, and you can zoom into it
   (milestone M6, collapse rule).** The on/off, text-state and event lanes
   under the plot used to be fixed pictures of the whole file. When many

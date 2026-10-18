@@ -55,6 +55,12 @@ pub enum GlydeError {
     #[error("single-column file: only the time index is present, no data series to plot")]
     SingleColumnFile,
 
+    /// A Parquet file could not be read, or holds something Glyde does not
+    /// handle yet (SPEC §1.1, docs/ROADMAP.md M7). Always loud: nothing in a
+    /// Parquet file is dropped, filled, or guessed at silently (Golden Rule 2).
+    #[error("could not read Parquet file {path}: {reason}")]
+    Parquet { path: PathBuf, reason: String },
+
     /// `input` did not parse as a valid timestamp under `format` (SPEC §2.1).
     #[error("invalid timestamp {input:?} for format {format:?}: {reason}")]
     InvalidTimestamp {

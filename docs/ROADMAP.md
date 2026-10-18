@@ -191,7 +191,7 @@ them, so CI stays green while honoring "written first."
 
 ## M7 — Parquet
 
-- [ ] Parquet reader behind the `Reader` trait: `arrow`/`parquet` row-group access, dtype mapping → SPEC §1.1, §1.4, ARCH §Parquet · proven by: corpus 53
+- [x] Parquet reader behind the `Reader` trait: `arrow`/`parquet` row-group access, dtype mapping → SPEC §1.1, §1.4, ARCH §Parquet · proven by: corpus 53 · `ingest::ParquetReader` is registered; `ingest::inspect` routes `.parquet` to `parquet::inspect` (time column only, projected; same `summarize_ticks` as CSV) and corpus 53 is asserted in the open→compare gate; `map_dtype`/`read_column` keep every native width (unit-tested round trip). **Residual**: `open_dataset`/the app window do not load Parquet yet (needs the `Dataset` path; folded into the "timestamp columns flow through the same time-index path" item below); nulls and dictionary strings are rejected with `GlydeError::Parquet` until the next item
 - [ ] Parquet nulls → gaps; dictionary-encoded strings → categorical → SPEC §1.3, §1.4 · proven by: corpus 54, 56
 - [ ] Partitioned / multi-file directory support → SPEC §1.1 · proven by: corpus 55
 - [ ] Row-group min/max column statistics populate upper pyramid levels with no scan → ARCH §Index, ARCH §why-Parquet · proven by: stats→pyramid unit test + index-build (Parquet 1 GB) bench ≤ budget

@@ -251,6 +251,9 @@ fn timestamp_format_label(format: TimestampFormat) -> &'static str {
 /// `glyde-app`'s indexer does) should call [`open_dataset`] instead, which
 /// produces both from a single parse (issue #58).
 pub fn inspect(path: &Path) -> Result<OpenSummary> {
+    if super::Reader::recognizes(&super::ParquetReader, path) {
+        return super::parquet::inspect(path);
+    }
     let (outcome, time_column_text) = open_path_capturing_column(path, 0)?;
 
     let time_column_name = outcome.column_names.first().cloned().unwrap_or_default();

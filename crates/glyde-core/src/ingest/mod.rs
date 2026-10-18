@@ -28,6 +28,7 @@ mod csv;
 mod dataset;
 mod dataset_cache;
 mod infer;
+mod parquet;
 mod report;
 mod spill_sort;
 
@@ -50,6 +51,7 @@ pub use infer::{
     Confidence, DecimalSeparator, DecimalSeparatorInference, Delimiter, DelimiterInference,
     DtypeInference, EncodingInference, EncodingSource, HeaderInference, HEAD_SAMPLE_BYTES,
 };
+pub use parquet::{map_dtype, read_column, timestamp_unit, ParquetReader};
 pub use report::{
     inspect, open_dataset, open_dataset_progressive, open_dataset_progressive_cancellable,
     open_dataset_progressive_in, open_dataset_progressive_with_overrides, open_dataset_with_budget,
@@ -187,7 +189,7 @@ impl Registry {
     /// for v1.
     pub fn default_registry() -> Self {
         Self {
-            readers: vec![Box::new(CsvReader)],
+            readers: vec![Box::new(CsvReader), Box::new(ParquetReader)],
         }
     }
 
