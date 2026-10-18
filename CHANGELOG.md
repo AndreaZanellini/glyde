@@ -12,6 +12,32 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Parquet columns with missing values, and categorical (dictionary)
+  columns, now open (milestone M7, second item).** Until now the
+  inference bar listed them as "not loaded". A missing value in a number
+  column is now a **gap in the line**, exactly like an empty cell in a
+  CSV: never filled in, and flagged as a missing-data run. A categorical
+  text column (Parquet's dictionary encoding, common for state or mode
+  columns) shows in the state timeline as labeled bands, like any text
+  column. To try it: open
+  `testdata/corpus/case-54-parquet-with-nulls.parquet` (two gaps in
+  `value`) and `case-56-parquet-dictionary-strings.parquet` (an
+  idle → running → fault lane). Assumptions you can veto:
+  - **Whole-number columns with missing values are shown as decimals**,
+    so the gaps can be drawn (a whole-number type has no "missing"
+    value). Every value present is unchanged. This only happens when
+    every value converts exactly. If a column holds integers too large
+    for that (beyond about 9 million billion), it stays "not loaded" with
+    that reason, rather than being rounded.
+  - A missing value in a text column is an **empty label**, and a
+    true/false column with missing values is shown as the text "true",
+    "false" or empty. Both are what a CSV with blank cells gives you.
+  - A timestamp column with a missing timestamp cannot be the time axis.
+    The file is plotted against row numbers instead, and the inference bar
+    says why ("\"t\" has no timestamp on row N…"), flagged
+    low-confidence.
+  - A categorical column whose categories are numbers rather than text is
+    still listed as "not loaded".
 - **Parquet files open (milestone M7, first item).** Dropping or picking a
   `.parquet` file no longer fails with "unrecognized format". Glyde reads
   the file's own schema, so nothing about the layout is guessed: the
