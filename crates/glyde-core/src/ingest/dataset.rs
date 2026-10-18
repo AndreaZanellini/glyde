@@ -1329,6 +1329,12 @@ impl TimeCandidateScan {
     /// [`Self::observe`] for a value that is already a number — a typed
     /// column (a Parquet integer or float column, docs/ROADMAP.md M7) has no
     /// text to parse.
+    ///
+    /// Forced inline: [`Self::observe`] runs once per row of every CSV open,
+    /// and splitting it into this second function without the attribute cost
+    /// ~10% of `benches/index_build.rs` (measured on PR #156, in both bench
+    /// orders; with it the bench matches `main`).
+    #[inline(always)]
     pub(crate) fn observe_value(&mut self, value: f64) {
         let row = self.rows;
         self.rows += 1;
