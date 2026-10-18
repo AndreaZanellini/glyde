@@ -468,21 +468,25 @@ impl eframe::App for GlydeApp {
                             pending_correction =
                                 Some((path.clone(), Correction::TimeColumn(picked)));
                         }
-                        views::time::show(
-                            ui,
-                            &partial.dataset,
-                            &partial.pyramids,
-                            &partial.prepared.ticks,
-                            &partial.prepared.sample_cache,
-                            // A still-growing checkpoint has no level0 cache
-                            // of its own (issue #92's doc comment on
-                            // `IndexingMessage::Completed`) — it renders
-                            // straight from the in-memory dataset like it
-                            // always has, same as a `None` entry would.
-                            &[],
-                            partial.prepared.cursor,
-                            &mut self.time_view,
-                        );
+                        views::state_timeline::plot_above_lanes(ui, &self.state_timeline, |ui| {
+                            views::time::show(
+                                ui,
+                                &partial.dataset,
+                                &partial.pyramids,
+                                &partial.prepared.ticks,
+                                &partial.prepared.sample_cache,
+                                // A still-growing checkpoint has no
+                                // level0 cache of its own (issue #92's
+                                // doc comment on
+                                // `IndexingMessage::Completed`) — it
+                                // renders straight from the in-memory
+                                // dataset like it always has, same as a
+                                // `None` entry would.
+                                &[],
+                                partial.prepared.cursor,
+                                &mut self.time_view,
+                            )
+                        });
                         let ticks = &partial.prepared.ticks;
                         views::state_timeline::show(
                             ui,
@@ -491,6 +495,7 @@ impl eframe::App for GlydeApp {
                             &partial.prepared.bool_bands,
                             &partial.prepared.state_lanes,
                             &partial.prepared.marker_lanes,
+                            self.time_view.shared_axis(),
                             &mut self.state_timeline,
                         );
                     }
@@ -524,17 +529,22 @@ impl eframe::App for GlydeApp {
                 // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1"; SPEC
                 // §3.1 decimation via `pyramids` (docs/ROADMAP.md M3, issue #80).
                 // Its visible interval is the PSD view's selection (SPEC §4.2).
-                let visible = views::time::show_with_selection(
-                    ui,
-                    dataset,
-                    pyramids,
-                    &prepared.ticks,
-                    &prepared.sample_cache,
-                    level0_caches,
-                    prepared.cursor,
-                    &mut self.time_view,
-                    self.time_focus.take(),
-                );
+                // Stacked above the state lanes, which share its time axis
+                // (SPEC §4.1, §4.3).
+                let visible =
+                    views::state_timeline::plot_above_lanes(ui, &self.state_timeline, |ui| {
+                        views::time::show_with_selection(
+                            ui,
+                            dataset,
+                            pyramids,
+                            &prepared.ticks,
+                            &prepared.sample_cache,
+                            level0_caches,
+                            prepared.cursor,
+                            &mut self.time_view,
+                            self.time_focus.take(),
+                        )
+                    });
                 self.time_selection = Some(selection_rows(
                     &prepared.ticks,
                     prepared.cursor.is_sorted(),
@@ -542,9 +552,8 @@ impl eframe::App for GlydeApp {
                 ));
                 // SPEC §4.3 / docs/ROADMAP.md M6 "Boolean series → on/off
                 // horizontal bands", "String/categorical → labeled state
-                // bands", "Markers" and the collapse rule (sharing this
-                // view's axis with the plot above is a still-open M6 item,
-                // not yet built).
+                // bands", "Markers", the collapse rule and time alignment:
+                // laid out over the plot's frame, on its time axis.
                 views::state_timeline::show(
                     ui,
                     dataset,
@@ -552,6 +561,7 @@ impl eframe::App for GlydeApp {
                     &prepared.bool_bands,
                     &prepared.state_lanes,
                     &prepared.marker_lanes,
+                    self.time_view.shared_axis(),
                     &mut self.state_timeline,
                 );
             }

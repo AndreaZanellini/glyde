@@ -38,15 +38,19 @@
 //! [`glyde_core::series::ColumnGrid`] — a column touched by two or more
 //! states, or two or more events, is drawn as an orange "multiple" block or
 //! tick whose tooltip says so, never as whichever state happened to be drawn
-//! last. The lanes zoom and pan horizontally, together; zooming in spreads
-//! the same states over more columns until each shows on its own. A lane
+//! last. Zooming in spreads the same states over more columns until each
+//! shows on its own. A lane
 //! too dense to keep every run is a bounded overview, so when one of its
 //! cells is wider than a screen column it is rebuilt for the visible window
 //! off the UI thread ([`LaneRefiner`]) and redrawn when ready.
 //!
-//! Deliberately out of scope here — the remaining M6 roadmap item: sharing
-//! [`super::time`]'s pannable axis. The lanes zoom with each other, not yet
-//! with the time-domain plot above them.
+//! Time alignment (SPEC §4.1, §4.3: one synchronized time axis): the lanes
+//! are stacked under [`super::time`]'s plot ([`plot_above_lanes`]) and share
+//! its x axis through [`super::time::TIME_AXIS_LINK_GROUP`] — panning,
+//! zooming, a fit or a jump in the plot or in any lane moves all of them —
+//! and each lane is laid out over exactly the plot's frame
+//! ([`super::time::SharedAxis`]), so a band sits under the samples of its
+//! time.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -59,7 +63,10 @@ use glyde_core::series::{
     MarkerLane, SeriesValues, SpilledValues, StateBandBuilder, StateCell, StateLane, BOOL_ON_ID,
 };
 
-use super::time::{format_x_axis_tick, seconds_to_tick, tick_to_seconds};
+use super::time::{
+    axis_bounds, format_x_axis_tick, seconds_to_tick, tick_to_seconds, SharedAxis,
+    TIME_AXIS_LINK_GROUP,
+};
 
 /// Height, in points, of one lane.
 const LANE_HEIGHT: f32 = 36.0;
@@ -75,14 +82,15 @@ const OFF_COLOR: egui::Color32 = egui::Color32::from_gray(60);
 /// The "multiple states / events in this column" glyph (SPEC §4.3).
 const MIXED_COLOR: egui::Color32 = egui::Color32::from_rgb(205, 130, 45);
 
-/// Every lane zooms and pans horizontally with every other.
-const LANE_LINK_GROUP: &str = "state_timeline_lanes";
+/// The most of the window the lanes take from the plot above them; more
+/// lanes than fit scroll.
+const MAX_LANES_SHARE: f32 = 0.5;
 
 /// The legend under which the lanes are drawn: what the "multiple" glyph
 /// means and how to expand it.
 const COLLAPSE_LEGEND: &str = "Orange: several states or events share one screen column — \
      zoom in to see each one (Ctrl/⌘ + scroll or pinch to zoom, drag to pan). \
-     Double-click a lane to show the whole file.";
+     The lanes move with the plot above. Double-click to show the whole file.";
 
 /// The most cells a lane is rebuilt with for a zoomed-in window.
 const MAX_REFINE_CELLS: usize = 1 << 15;
@@ -222,6 +230,9 @@ impl LaneSlot {
 pub struct StateTimelineState {
     slots: HashMap<(usize, LaneKind), LaneSlot>,
     refiner: Option<LaneRefiner>,
+    /// How tall the lanes were last frame, in points; `None` before they
+    /// were first drawn.
+    height: Option<f32>,
 }
 
 impl StateTimelineState {
@@ -237,6 +248,15 @@ impl StateTimelineState {
     pub fn set_refiner(&mut self, refiner: Option<LaneRefiner>) {
         self.slots.clear();
         self.refiner = refiner;
+    }
+
+    /// How tall the time plot above the lanes is, out of `available`
+    /// points: what the lanes do not take — as tall as last frame, at most
+    /// [`MAX_LANES_SHARE`] of it — less `readout_row` for the plot's cursor
+    /// readout.
+    pub fn time_plot_height(&self, available: f32, readout_row: f32) -> f32 {
+        let lanes = self.height.unwrap_or(0.0).min(available * MAX_LANES_SHARE);
+        (available - lanes - readout_row).max(0.0)
     }
 
     /// How many lanes currently draw a rebuilt view.
@@ -345,6 +365,20 @@ fn spawn_refinement(
     }
 }
 
+/// Lays out `plot` — the time view — in `ui` above the state lanes drawn
+/// next with [`show`], leaving them the room they took last frame
+/// ([`StateTimelineState::time_plot_height`]): stacked, so both are on
+/// screen.
+pub fn plot_above_lanes<R>(
+    ui: &mut egui::Ui,
+    lanes: &StateTimelineState,
+    plot: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let height = lanes.time_plot_height(ui.available_height(), ui.spacing().interact_size.y);
+    ui.allocate_ui(egui::vec2(ui.available_width(), height), plot)
+        .inner
+}
+
 /// Renders `dataset`'s state lanes (SPEC §4.3) into `ui`, one
 /// [`egui_plot::Plot`] per lane. `bool_bands`, `state_lanes` and
 /// `marker_lanes` are `dataset.columns`-parallel (see [`cache_bool_bands`],
@@ -354,6 +388,13 @@ fn spawn_refinement(
 /// and computed by the caller once per status change — the same
 /// once-not-per-frame discipline [`super::time::show`] follows for the
 /// identical reason (see its own doc comment).
+///
+/// `shared` is the time plot's axis this frame
+/// ([`super::time::TimeViewState::shared_axis`]): the lanes fit to its span
+/// and are laid out over its frame. `None` (no plot) fits them to their own
+/// span, full width. Lanes that do not fit the room left under the plot
+/// scroll.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
     dataset: &Dataset,
@@ -361,6 +402,7 @@ pub fn show(
     bool_bands: &[Option<BoolLane>],
     state_lanes: &[Option<StateLane>],
     marker_lanes: &[Option<MarkerColumn>],
+    shared: Option<SharedAxis>,
     state: &mut StateTimelineState,
 ) {
     let time = &dataset.time;
@@ -372,9 +414,49 @@ pub fn show(
         .chain(marker_lanes.iter().flatten().map(|m| m.lane.tick_bounds()))
         .next();
     let Some((min_tick, max_tick)) = bounds else {
+        state.height = Some(0.0);
         return;
     };
-    let axis = axis_bounds(min_tick, max_tick, time);
+    let axis = shared.map_or_else(|| axis_bounds(min_tick, max_tick, time), |s| s.fit);
+    let output = egui::ScrollArea::vertical()
+        .id_salt("state_timeline_lanes")
+        .auto_shrink([false, true])
+        .max_height(ui.available_height())
+        .show(ui, |ui| {
+            show_lanes(
+                ui,
+                dataset,
+                ticks,
+                bool_bands,
+                state_lanes,
+                marker_lanes,
+                axis,
+                shared,
+                state,
+            );
+        });
+    let height = output.content_size.y;
+    if state.height.is_none_or(|last| (last - height).abs() > 0.5) {
+        // The plot above takes its room from this: lay it out again.
+        state.height = Some(height);
+        ui.ctx().request_repaint();
+    }
+}
+
+/// The legend and every lane, inside [`show`]'s scroll area.
+#[allow(clippy::too_many_arguments)]
+fn show_lanes(
+    ui: &mut egui::Ui,
+    dataset: &Dataset,
+    ticks: &[i128],
+    bool_bands: &[Option<BoolLane>],
+    state_lanes: &[Option<StateLane>],
+    marker_lanes: &[Option<MarkerColumn>],
+    axis: (f64, f64),
+    shared: Option<SharedAxis>,
+    state: &mut StateTimelineState,
+) {
+    let time = &dataset.time;
     ui.weak(COLLAPSE_LEGEND);
 
     for (index, series) in dataset.columns.iter().enumerate() {
@@ -404,7 +486,25 @@ pub fn show(
             }
             (None, None, None) => continue,
         };
-        show_lane(ui, index, lane, ticks, time, axis, state);
+        match shared {
+            // Over exactly the plot's frame: the same x, the same pixel.
+            Some(shared) => {
+                ui.horizontal(|ui| {
+                    ui.add_space((shared.left - ui.cursor().left()).max(0.0));
+                    show_lane(
+                        ui,
+                        index,
+                        lane,
+                        ticks,
+                        time,
+                        axis,
+                        Some(shared.width),
+                        state,
+                    );
+                });
+            }
+            None => show_lane(ui, index, lane, ticks, time, axis, None, state),
+        }
     }
 }
 
@@ -478,8 +578,10 @@ fn lane_labels(lane: LaneRef<'_>) -> Labels<'_> {
     }
 }
 
-/// Draws one lane as a horizontally zoomable plot linked to every other
-/// lane, collapsing it onto this frame's screen columns.
+/// Draws one lane as a horizontally zoomable plot sharing the time plot's
+/// x axis, `width` points wide (the available width when `None`),
+/// collapsing it onto this frame's screen columns.
+#[allow(clippy::too_many_arguments)]
 fn show_lane(
     ui: &mut egui::Ui,
     index: usize,
@@ -487,6 +589,7 @@ fn show_lane(
     ticks: &[i128],
     time: &TimeAxis,
     axis: (f64, f64),
+    width: Option<f32>,
     state: &mut StateTimelineState,
 ) {
     let kind = match base {
@@ -499,18 +602,22 @@ fn show_lane(
         LaneKind::Bool | LaneKind::State => format!("state_timeline_{index}"),
     };
     let mut hover = None;
-    let response = Plot::new(id)
-        .height(LANE_HEIGHT)
+    let mut plot = Plot::new(id).height(LANE_HEIGHT);
+    if let Some(width) = width {
+        plot = plot.width(width);
+    }
+    let response = plot
         .show_axes([true, false])
         .show_grid([false, false])
         .allow_zoom([true, false])
         .allow_scroll([true, false])
         .allow_drag([true, false])
         .allow_boxed_zoom(false)
-        .link_axis(LANE_LINK_GROUP, [true, false])
-        // What the first frame and a double-click fit: the whole file, the
-        // lane's fixed unit height. Never set per frame, which would undo
-        // the zoom another linked lane applied this frame.
+        .link_axis(TIME_AXIS_LINK_GROUP, [true, false])
+        // What the first frame and a double-click fit: the whole file — the
+        // span the time plot fits too — and the lane's fixed unit height.
+        // Never set per frame, which would undo the zoom the plot or
+        // another lane applied this frame.
         .include_x(axis.0)
         .include_x(axis.1)
         .include_y(0.0)
@@ -524,17 +631,6 @@ fn show_lane(
                 let bounds = plot_ui.plot_bounds();
                 (bounds.min()[0], bounds.max()[0])
             };
-            // A lane drawn before the one being zoomed learns the new range
-            // from the link group a frame later: draw that frame too.
-            let memory = egui::Id::new((LANE_LINK_GROUP, "last_x_range", index));
-            let changed = plot_ui.ctx().data_mut(|data| {
-                let previous = data.get_temp::<(f64, f64)>(memory);
-                data.insert_temp(memory, x_range);
-                previous != Some(x_range)
-            });
-            if changed {
-                plot_ui.ctx().request_repaint();
-            }
             let columns = plot_ui.transform().frame().width().round().max(1.0) as usize;
             let view = ViewColumns::new(time, x_range, columns);
             let ctx = plot_ui.ctx().clone();
@@ -575,10 +671,41 @@ fn show_lane(
                 .pointer_coordinate()
                 .and_then(|point| view.column_at(point.x));
             hover = column.and_then(|column| hover_text(kind, &drawn, &view.grid, column));
+            x_range
         });
+    // The columns were laid out for the range this lane had before this
+    // frame's pan or zoom — its own, or the plot's or another lane's,
+    // linked in after drawing: draw the next frame for the range now shown,
+    // once it is off by a visible amount (half a screen column), never for
+    // float rounding, which would redraw forever.
+    let bounds = response.transform.bounds();
+    let shown = (bounds.min()[0], bounds.max()[0]);
+    if is_visibly_different(response.inner, shown, response.transform.frame().width()) {
+        ui.ctx().request_repaint();
+    }
+    #[cfg(test)]
+    {
+        let frame = response.transform.frame();
+        let view = LaneView {
+            x_range: shown,
+            left: frame.left(),
+            width: frame.width(),
+            top: response.response.rect.top(),
+            bottom: response.response.rect.bottom(),
+        };
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(lane_view_id(index), view));
+    }
     if let (Some(text), true) = (hover, response.response.hovered()) {
         response.response.on_hover_text(text);
     }
+}
+
+/// Whether x range `drawn` would put anything half a screen column or more
+/// away from where x range `shown` puts it, over a `width`-point frame.
+fn is_visibly_different(drawn: (f64, f64), shown: (f64, f64), width: f32) -> bool {
+    let half_column = (shown.1 - shown.0).abs() / f64::from(width.max(1.0)) / 2.0;
+    (drawn.0 - shown.0).abs() >= half_column || (drawn.1 - shown.1).abs() >= half_column
 }
 
 /// Fills each run of equal columns, `Mixed` ones in the "multiple" color.
@@ -719,20 +846,25 @@ fn fill_rect(plot_ui: &mut egui_plot::PlotUi, x0: f64, x1: f64, color: egui::Col
     );
 }
 
-/// The full-file x-axis bounds (in plot seconds, [`tick_to_seconds`]'s
-/// coordinate space) a lane fits on its first frame and on a double-click.
-/// A single-sample file (SPEC §1.4: a valid input) has a zero-width range;
-/// it is padded symmetrically so the plot still has a nonzero span to fit,
-/// the same degenerate case `views::time::pad_if_degenerate` handles for
-/// the time-domain view.
-fn axis_bounds(min_tick: i128, max_tick: i128, time: &TimeAxis) -> (f64, f64) {
-    let min = tick_to_seconds(time, min_tick);
-    let max = tick_to_seconds(time, max_tick);
-    if (max - min).abs() > f64::EPSILON {
-        (min, max)
-    } else {
-        (min - 1.0, max + 1.0)
-    }
+/// Where lane `index` was drawn on the last frame, for the tests.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LaneView {
+    x_range: (f64, f64),
+    left: f32,
+    width: f32,
+    top: f32,
+    bottom: f32,
+}
+
+#[cfg(test)]
+fn lane_view_id(index: usize) -> egui::Id {
+    egui::Id::new(("lane_view", index))
+}
+
+#[cfg(test)]
+fn lane_view(ctx: &egui::Context, index: usize) -> Option<LaneView> {
+    ctx.data(|data| data.get_temp(lane_view_id(index)))
 }
 
 /// Rebuilds column `column`'s `kind` lane over the tick window `window`
@@ -1101,6 +1233,117 @@ mod render_tests {
         }
     }
 
+    /// One frame of the time plot stacked above `dataset`'s lanes, laid
+    /// out the way the app does it, in an 800 x 600 window.
+    fn stacked_frame(
+        ctx: &egui::Context,
+        dataset: &Dataset,
+        time_state: &mut super::super::time::TimeViewState,
+        lanes_state: &mut StateTimelineState,
+        focus: Option<(f64, f64)>,
+    ) {
+        let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(dataset);
+        let samples = super::super::time::cache_column_samples(dataset);
+        let bools = cache_bool_bands(dataset, &ticks);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                plot_above_lanes(ui, lanes_state, |ui| {
+                    super::super::time::show_with_selection(
+                        ui,
+                        dataset,
+                        &pyramids,
+                        &ticks,
+                        &samples,
+                        &[],
+                        super::super::time::CursorLookup::for_time(&dataset.time),
+                        time_state,
+                        focus,
+                    )
+                });
+                show(
+                    ui,
+                    dataset,
+                    &ticks,
+                    &bools,
+                    &[],
+                    &[],
+                    time_state.shared_axis(),
+                    lanes_state,
+                );
+            });
+        });
+    }
+
+    fn assert_close(actual: (f64, f64), expected: (f64, f64)) {
+        assert!(
+            (actual.0 - expected.0).abs() < 1e-9 && (actual.1 - expected.1).abs() < 1e-9,
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    // SPEC §4.1/§4.3: one synchronized time axis. A lane shows exactly the
+    // span the plot above it shows — the whole file at first, the zoomed
+    // window after a jump — over exactly the same screen columns.
+    #[test]
+    fn lanes_share_the_time_plots_axis_and_frame() {
+        let dataset = sample_dataset();
+        let ctx = egui::Context::default();
+        let mut time_state = super::super::time::TimeViewState::default();
+        let mut lanes_state = StateTimelineState::default();
+        for _ in 0..3 {
+            stacked_frame(&ctx, &dataset, &mut time_state, &mut lanes_state, None);
+        }
+
+        let shared = time_state.shared_axis().expect("the plot shares its axis");
+        assert_close(shared.fit, (0.0, 3.0));
+        assert_close(shared.x_range, shared.fit);
+        let lane = lane_view(&ctx, 0).expect("the bool lane is drawn");
+        assert_close(lane.x_range, shared.x_range);
+        assert_eq!((lane.left, lane.width), (shared.left, shared.width));
+
+        stacked_frame(
+            &ctx,
+            &dataset,
+            &mut time_state,
+            &mut lanes_state,
+            Some((1.0, 2.0)),
+        );
+        for _ in 0..2 {
+            stacked_frame(&ctx, &dataset, &mut time_state, &mut lanes_state, None);
+        }
+
+        let shared = time_state.shared_axis().expect("the plot shares its axis");
+        assert_close(shared.x_range, (1.0, 2.0));
+        let lane = lane_view(&ctx, 0).expect("the bool lane is drawn");
+        assert_close(lane.x_range, (1.0, 2.0));
+        assert_eq!((lane.left, lane.width), (shared.left, shared.width));
+    }
+
+    // Stacked means visible: the plot leaves the lanes the room they took
+    // on the frame before, so they are on screen under it.
+    #[test]
+    fn the_lanes_stay_inside_the_window_under_the_plot() {
+        let dataset = sample_dataset();
+        let ctx = egui::Context::default();
+        let mut time_state = super::super::time::TimeViewState::default();
+        let mut lanes_state = StateTimelineState::default();
+        for _ in 0..3 {
+            stacked_frame(&ctx, &dataset, &mut time_state, &mut lanes_state, None);
+        }
+
+        let lane = lane_view(&ctx, 0).expect("the bool lane is drawn");
+        assert!(lane.bottom <= 600.0, "lane ends at {}", lane.bottom);
+        assert!(lane.top > 300.0, "the plot keeps most of the window");
+    }
+
     #[test]
     fn frequent_state_changes_render_a_bounded_number_of_shapes() {
         let len = glyde_core::series::MAX_EXACT_BOOL_BANDS * 3;
@@ -1131,6 +1374,7 @@ mod render_tests {
                     &lanes,
                     &[],
                     &[],
+                    None,
                     &mut StateTimelineState::default(),
                 );
             });
@@ -1166,6 +1410,7 @@ mod render_tests {
                     &bool_bands,
                     &[],
                     &[],
+                    None,
                     &mut StateTimelineState::default(),
                 );
             });
@@ -1207,6 +1452,7 @@ mod render_tests {
                     &[],
                     &lanes,
                     &[],
+                    None,
                     &mut StateTimelineState::default(),
                 );
             });
@@ -1348,6 +1594,7 @@ mod render_tests {
                     &[],
                     &state,
                     &markers,
+                    None,
                     &mut StateTimelineState::default(),
                 );
             });
@@ -1431,6 +1678,7 @@ mod render_tests {
                     &bool_bands,
                     &[],
                     &[],
+                    None,
                     &mut StateTimelineState::default(),
                 );
             });
@@ -1466,6 +1714,7 @@ mod render_tests {
                     &bool_bands,
                     &[],
                     &[],
+                    None,
                     &mut StateTimelineState::default(),
                 );
             });
@@ -1514,6 +1763,45 @@ mod tests {
             })
         );
         assert_eq!(bands[1], None);
+    }
+
+    #[test]
+    fn a_lane_redraws_only_for_a_visible_range_change() {
+        // 1000 seconds over 1000 points: a column is a second.
+        let shown = (0.0, 1000.0);
+
+        assert!(!is_visibly_different((0.0, 1000.0), shown, 1000.0));
+        assert!(!is_visibly_different((1e-7, 1000.0 - 1e-7), shown, 1000.0));
+        assert!(is_visibly_different((0.5, 1000.0), shown, 1000.0));
+        assert!(is_visibly_different((0.0, 990.0), shown, 1000.0));
+    }
+
+    #[test]
+    fn the_plot_takes_the_window_less_the_lanes_and_a_readout_row() {
+        let state = StateTimelineState {
+            height: Some(120.0),
+            ..StateTimelineState::default()
+        };
+
+        assert_eq!(state.time_plot_height(600.0, 20.0), 460.0);
+    }
+
+    #[test]
+    fn lanes_never_take_more_than_half_the_window() {
+        let state = StateTimelineState {
+            height: Some(2000.0),
+            ..StateTimelineState::default()
+        };
+
+        assert_eq!(state.time_plot_height(600.0, 20.0), 280.0);
+    }
+
+    #[test]
+    fn before_the_lanes_were_measured_the_plot_keeps_the_window() {
+        let state = StateTimelineState::default();
+
+        assert_eq!(state.time_plot_height(600.0, 20.0), 580.0);
+        assert_eq!(state.time_plot_height(10.0, 20.0), 0.0);
     }
 
     #[test]

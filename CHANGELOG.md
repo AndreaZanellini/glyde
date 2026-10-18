@@ -12,6 +12,30 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **The state lanes now line up with the plot above them and move with it
+  (milestone M6, time alignment — the last M6 item).** The plot and the
+  on/off, text-state and event lanes now share one time axis. Pan, zoom,
+  box-zoom, "Fit to data", double-click or jumping to an anomaly in the
+  plot moves every lane with it, and zooming or panning a lane moves the
+  plot. Each lane is drawn exactly as wide as the plot's drawing area and
+  starts where it starts, so a band sits right under the samples of the
+  same moment. The lanes are also stacked so you can always see them: the
+  plot now leaves room for them at the bottom of the window. Before, a
+  file with numbers *and* flags could push the lanes off the bottom edge.
+  To try it: open a file with a numeric column and a flag column, zoom
+  into the plot, and check that the flag lane shows the same span and its
+  changes line up with the plot below the same timestamps. Assumptions
+  you can veto:
+  - The lanes take at most **half the window**. When there are more lanes
+    than fit, they scroll (scroll vertically over them; scrolling
+    sideways or dragging still pans).
+  - A fit (opening a file, double-click, "Fit to data") now shows the
+    data **edge to edge**, with no blank margin left and right of the
+    first and last sample, so the plot and the lanes fit to exactly the
+    same span. The plot used to leave a 5% margin on each side after a
+    double-click or on opening.
+  - The plot keeps a strip one row tall under it for the cursor readout,
+    so the lanes no longer jump when you hover the plot.
 - **Nothing in the state timeline can hide any more, and you can zoom into it
   (milestone M6, collapse rule).** The on/off, text-state and event lanes
   under the plot used to be fixed pictures of the whole file. When many
@@ -31,8 +55,8 @@ Versioning: [Semantic Versioning](https://semver.org/).
   flips thousands of times, check that the lane is orange where it flips
   fast, then zoom into the orange part until it splits into blue and gray
   bands. Assumptions you can veto:
-  - The lanes zoom with each other but **not yet with the time plot above
-    them**. Lining them up with the plot is the next M6 item.
+  - The lanes zoom with each other — and, since the time-alignment entry
+    above, with the plot too.
   - A "column" is one screen point wide (on a Retina display, two physical
     pixels).
   - The right-most column also covers the very last instant on screen. If
