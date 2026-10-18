@@ -37,8 +37,9 @@
 //! this module needing its own `samples < pixels` check.
 //!
 //! Non-numeric columns (`bool`/`string`, SPEC §1.4) are not drawn here —
-//! they route to the state timeline (SPEC §4.3, docs/ROADMAP.md M6), not
-//! yet built.
+//! they route to the state timeline (SPEC §4.3, docs/ROADMAP.md M6,
+//! [`super::state_timeline`]), whose lanes share this plot's x axis through
+//! [`TIME_AXIS_LINK_GROUP`] and align to its frame ([`SharedAxis`]).
 
 use std::sync::Arc;
 
@@ -149,10 +150,35 @@ pub struct TimeViewState {
     background: Option<BackgroundDecimator>,
     /// The background decimation running now, if any.
     pending: Option<PendingDecimation>,
+    /// The whole-file x range ([`fit_range`]), once computed: once per
+    /// data ([`Self::data_changed`] drops it), never per frame.
+    fit: Option<Option<(f64, f64)>>,
+    /// Where this frame's plot put its x axis, for the lanes below it.
+    shared_axis: Option<SharedAxis>,
     /// How aggregated bars are handed to egui; the tests switch it to the
     /// reference encoding to compare the two.
     #[cfg(test)]
     bar_encoding: BarEncoding,
+}
+
+/// The `egui_plot` link group through which the time plot and every state
+/// lane share one x axis (SPEC §4.1: "sharing a single, synchronized time
+/// axis"; §4.3: "time-aligned with §4.1"): panning, zooming, a fit or a
+/// jump in any of them moves all of them.
+pub(crate) const TIME_AXIS_LINK_GROUP: &str = "time_axis";
+
+/// The time plot's x axis as drawn this frame — what the state lanes below
+/// it line up with, so a band sits exactly under the samples of its time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SharedAxis {
+    /// What a fit shows: the whole file, in plot seconds ([`fit_range`]).
+    pub fit: (f64, f64),
+    /// The x range the plot shows this frame, in plot seconds.
+    pub x_range: (f64, f64),
+    /// The plot frame's left edge, in screen points.
+    pub left: f32,
+    /// The plot frame's width, in screen points.
+    pub width: f32,
 }
 
 /// One column's decimation and the view it was computed for.
@@ -250,6 +276,13 @@ impl TimeViewState {
     pub fn data_changed(&mut self) {
         self.decimated.clear();
         self.pending = None;
+        self.fit = None;
+    }
+
+    /// Where the last frame's plot put its x axis; `None` before the first
+    /// frame or when the file has no samples.
+    pub fn shared_axis(&self) -> Option<SharedAxis> {
+        self.shared_axis
     }
 
     /// Decimates stale channels with `background`, off the UI thread, or —
@@ -332,6 +365,9 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         state.ticks_identity = ticks_identity;
     }
     state.collect_background_results(ticks, dataset.columns.len());
+    let fit = *state
+        .fit
+        .get_or_insert_with(|| fit_range(ticks, cursor.is_sorted(), &dataset.time));
     #[cfg(test)]
     let bar_encoding = state.bar_encoding;
     #[cfg(not(test))]
@@ -341,6 +377,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         decimated: cache,
         background,
         pending,
+        shared_axis,
         ..
     } = state;
     let fit_clicked = ui.button("Fit to data").clicked();
@@ -362,12 +399,20 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         .map(|(channel, &(column_index, series))| (channel, column_index, series))
         .collect();
 
-    let plot = Plot::new("time_domain_view")
+    let mut plot = Plot::new("time_domain_view")
         .allow_zoom(true)
         .allow_scroll(true)
         .allow_drag(true)
         .allow_boxed_zoom(true)
+        .link_axis(TIME_AXIS_LINK_GROUP, [true, false])
+        // No horizontal margin: a fit (first frame, double-click) shows
+        // exactly `fit`, the span every linked lane fits to as well, so a
+        // fit never leaves the plot and the lanes on different spans.
+        .set_margin_fraction(egui::vec2(0.0, 0.05))
         .x_axis_formatter(|mark, _range| format_x_axis_tick(ticks, mark, &dataset.time));
+    if let Some((x_min, x_max)) = fit {
+        plot = plot.include_x(x_min).include_x(x_max);
+    }
 
     let response = plot.show(ui, |plot_ui| {
         if fit_clicked {
@@ -378,9 +423,11 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             let x = x_axis_seconds(&dataset.time);
             let shown = plotted.iter().map(|&(_, _, series)| series);
             if let Some(bounds) = data_bounds(&x, shown) {
+                // The span the lanes fit to as well.
+                let (x_min, x_max) = fit.unwrap_or((bounds.x_min, bounds.x_max));
                 plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                    [bounds.x_min, bounds.y_min],
-                    [bounds.x_max, bounds.y_max],
+                    [x_min, bounds.y_min],
+                    [x_max, bounds.y_max],
                 ));
             }
         }
@@ -584,6 +631,14 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         )
     });
     let (hovered, visible, updating) = response.inner;
+    let frame = response.transform.frame();
+    let bounds = response.transform.bounds();
+    *shared_axis = fit.map(|fit| SharedAxis {
+        fit,
+        x_range: (bounds.min()[0], bounds.max()[0]),
+        left: frame.left(),
+        width: frame.width(),
+    });
 
     if let Some(frame) = updating {
         // Painted over the plot rather than laid out under it, so it never
@@ -610,6 +665,32 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         });
     }
     visible
+}
+
+/// What a fit shows of an axis whose pyramid ticks are `ticks`: its
+/// earliest to its latest sample in plot seconds ([`tick_to_seconds`]) —
+/// the first and last tick when `sorted`, a scan otherwise — padded by a
+/// second either side when that is a single instant. `None` with no
+/// samples.
+pub(crate) fn fit_range(ticks: &[i128], sorted: bool, time: &TimeAxis) -> Option<(f64, f64)> {
+    let (min, max) = if sorted {
+        (*ticks.first()?, *ticks.last()?)
+    } else {
+        (*ticks.iter().min()?, *ticks.iter().max()?)
+    };
+    Some(axis_bounds(min, max, time))
+}
+
+/// `min_tick..max_tick` in plot seconds, padded by a second either side
+/// when that is a single instant (a zero-width axis cannot be drawn).
+pub(crate) fn axis_bounds(min_tick: i128, max_tick: i128, time: &TimeAxis) -> (f64, f64) {
+    let min = tick_to_seconds(time, min_tick);
+    let max = tick_to_seconds(time, max_tick);
+    if (max - min).abs() > f64::EPSILON {
+        (min, max)
+    } else {
+        (min - 1.0, max + 1.0)
+    }
 }
 
 /// `time`'s samples as plain `f64` x-coordinates for `egui_plot`, which only
@@ -1985,6 +2066,14 @@ mod render_tests {
         let job_threads = Arc::clone(&threads);
         let decimate = background_for(dataset);
         let mut state = TimeViewState::default();
+        let ctx = egui::Context::default();
+        let focus = Some((0.0, 2.0));
+        // The plot's axes settle their size over the first frames, which
+        // changes the view: let them, then start from nothing decimated.
+        for _ in 0..3 {
+            state_frame(&ctx, &fixture, &mut state, focus);
+        }
+        state.data_changed();
         state.set_background(Some(BackgroundDecimator::new(
             move |column, range, pixel_columns| {
                 job_threads
@@ -1994,8 +2083,6 @@ mod render_tests {
                 decimate(column, range, pixel_columns)
             },
         )));
-        let ctx = egui::Context::default();
-        let focus = Some((0.0, 2.0));
 
         let shapes = state_frame(&ctx, &fixture, &mut state, focus);
         assert!(
@@ -2810,6 +2897,41 @@ mod tests {
     // draw — with nothing drawn, `egui_plot`'s own auto-bounds had nothing
     // to expand around, so it stayed `NOTHING` forever. `query_range` must
     // fall back to the dataset's own full tick range in exactly this case.
+    fn nanos_axis() -> TimeAxis {
+        TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Nanoseconds)].into(),
+            format: TimestampFormat::EpochNanos,
+        }
+    }
+
+    #[test]
+    fn fit_range_spans_the_first_to_last_tick_of_a_time_ordered_axis() {
+        let ticks = [0, 1_000_000_000, 3_000_000_000];
+
+        assert_eq!(fit_range(&ticks, true, &nanos_axis()), Some((0.0, 3.0)));
+    }
+
+    #[test]
+    fn fit_range_spans_the_earliest_to_latest_tick_of_an_unordered_axis() {
+        let ticks = [2_000_000_000, 0, 3_000_000_000, 1_000_000_000];
+
+        assert_eq!(fit_range(&ticks, false, &nanos_axis()), Some((0.0, 3.0)));
+    }
+
+    #[test]
+    fn fit_range_pads_a_single_sample_axis() {
+        assert_eq!(
+            fit_range(&[5_000_000_000], true, &nanos_axis()),
+            Some((4.0, 6.0))
+        );
+    }
+
+    #[test]
+    fn fit_range_of_an_empty_axis_is_none() {
+        assert_eq!(fit_range(&[], true, &nanos_axis()), None);
+        assert_eq!(fit_range(&[], false, &nanos_axis()), None);
+    }
+
     #[test]
     fn query_range_falls_back_to_the_full_tick_range_when_plot_bounds_is_invalid() {
         let time = TimeAxis::Absolute {
