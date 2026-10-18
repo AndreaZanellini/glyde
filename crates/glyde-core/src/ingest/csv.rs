@@ -50,6 +50,18 @@ impl super::Reader for CsvReader {
                     || ext.eq_ignore_ascii_case("txt")
             })
     }
+
+    fn inspect(&self, path: &Path) -> crate::Result<super::OpenSummary> {
+        super::report::inspect_csv(path)
+    }
+
+    fn open_dataset(
+        &self,
+        path: &Path,
+        request: super::OpenRequest<'_>,
+    ) -> crate::Result<(super::OpenSummary, super::InferenceReport, super::Dataset)> {
+        super::report::open_csv_dataset(path, request)
+    }
 }
 
 /// One column's captured raw text across every kept row: every field is

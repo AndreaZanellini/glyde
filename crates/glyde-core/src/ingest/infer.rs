@@ -971,7 +971,11 @@ impl ColumnInference {
 /// because a `Bool`/`String` column has no NaN concept at all and an `I64`
 /// one cannot produce a NaN. `log` is off for a progressive snapshot, whose
 /// runs are logged once the column is final.
-fn series_with_anomalies(name: impl Into<String>, values: SeriesValues, log: bool) -> Series {
+pub(crate) fn series_with_anomalies(
+    name: impl Into<String>,
+    values: SeriesValues,
+    log: bool,
+) -> Series {
     let anomalies = match values.as_f64_slice() {
         Some(samples) => {
             let nan_runs = detect_nan_runs(samples);

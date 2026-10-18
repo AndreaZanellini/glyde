@@ -51,4 +51,5 @@ InferenceReport {
         "value",
         "pressure",
     ],
+    unloaded_columns: [],
 }

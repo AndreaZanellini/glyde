@@ -671,6 +671,7 @@ mod tests {
                 name: "timestamp".to_string(),
             },
             column_names: vec!["timestamp".to_string(), "value".to_string()],
+            unloaded_columns: Vec::new(),
         })
     }
 

@@ -51,4 +51,5 @@ InferenceReport {
         "temperature [°C]",
         "acceleration [µm/s²]",
     ],
+    unloaded_columns: [],
 }

@@ -561,15 +561,6 @@ pub(crate) fn load_with_outcome(
     )
 }
 
-/// [`load_with_outcome`] against an explicit budget and spill directory.
-pub(crate) fn load_with_outcome_with_budget(
-    path: &Path,
-    budget: RamBudget,
-    cache_dir: &Path,
-) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
-    load_with_outcome_using(path, budget, Some(cache_dir), IngestOverrides::default())
-}
-
 /// [`load_with_outcome`] with [`IngestOverrides`] applied — `ingest::report::
 /// open_dataset_with_overrides` uses this the same way `open_dataset` uses
 /// [`load_with_outcome`].
@@ -590,7 +581,7 @@ pub(crate) fn load_with_outcome_with_overrides(
 /// resolvable cache directory at all. Not an error on its own: a file that
 /// fits the budget never needs it (docs/ARCHITECTURE.md §The index: "the
 /// cache is an optimization, never a requirement to open a file").
-fn os_spill_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn os_spill_dir() -> Option<std::path::PathBuf> {
     match level0::os_cache_dir() {
         Ok(dir) => Some(dir),
         Err(err) => {
@@ -707,7 +698,7 @@ fn choose_storage_with_disk(
     Ok(Storage::Spill(Box::new(sniff)))
 }
 
-fn load_with_outcome_using(
+pub(crate) fn load_with_outcome_using(
     path: &Path,
     budget: RamBudget,
     cache_dir: Option<&Path>,
@@ -1122,7 +1113,7 @@ impl TimeAxisBuilder {
     }
 }
 
-fn assemble_dataset(
+pub(crate) fn assemble_dataset(
     time: TimeAxis,
     time_column_name: String,
     columns: Vec<Series>,
@@ -1236,7 +1227,11 @@ pub enum GeneratedIndexReason {
 /// CLAUDE.md "every ingestion decision is logged": the time index is the
 /// first one the plot depends on, and generating one the file does not
 /// contain is the loudest decision ingestion can take on the user's behalf.
-fn log_time_index_decision(time_column_name: &str, inference: &TimeIndexInference, rows: usize) {
+pub(crate) fn log_time_index_decision(
+    time_column_name: &str,
+    inference: &TimeIndexInference,
+    rows: usize,
+) {
     match &inference.generated {
         None => info!(
             time_column = %time_column_name,
@@ -1322,12 +1317,21 @@ pub(crate) struct TimeCandidateScan {
 
 impl TimeCandidateScan {
     pub(crate) fn observe(&mut self, field: &str) {
+        match parse_progressive_value(field) {
+            Ok(value) => self.observe_value(value),
+            Err(_) => {
+                self.rows += 1;
+                self.non_numeric += 1;
+            }
+        }
+    }
+
+    /// [`Self::observe`] for a value that is already a number — a typed
+    /// column (a Parquet integer or float column, docs/ROADMAP.md M7) has no
+    /// text to parse.
+    pub(crate) fn observe_value(&mut self, value: f64) {
         let row = self.rows;
         self.rows += 1;
-        let Ok(value) = parse_progressive_value(field) else {
-            self.non_numeric += 1;
-            return;
-        };
         if let Some(previous) = self.previous {
             // Incomparable (a NaN on either side) counts as a drop too.
             match value.partial_cmp(&previous) {
@@ -1390,7 +1394,7 @@ impl TimeCandidateScan {
 /// #94): row 0, 1, 2, … of the rows kept after SPEC §1.3's skipping, as a
 /// progressive numeric axis, so a file without a usable time column still
 /// opens, still plots, and still keeps its rows in source order.
-fn row_ordinal_axis(row_count: usize) -> TimeAxis {
+pub(crate) fn row_ordinal_axis(row_count: usize) -> TimeAxis {
     TimeAxis::Progressive {
         values: ProgressiveValues::Memory((0..row_count).map(|row| row as f64).collect()),
     }
@@ -2303,29 +2307,6 @@ pub(crate) fn load_with_outcome_progressive(
         &NEVER_CANCELLED,
         on_checkpoint,
     )
-}
-
-/// [`load_with_outcome_progressive`] with [`IngestOverrides`] applied
-/// (docs/ROADMAP.md M4) — `ingest::report::open_dataset_progressive_with_overrides`
-/// uses this the same way `open_dataset_progressive` uses
-/// [`load_with_outcome_progressive`].
-pub(crate) fn load_with_outcome_progressive_with_overrides(
-    path: &Path,
-    overrides: IngestOverrides,
-    on_checkpoint: impl FnMut(Checkpoint),
-) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
-    load_with_outcome_progressive_using(path, overrides, &NEVER_CANCELLED, on_checkpoint)
-}
-
-/// [`load_with_outcome_progressive_with_overrides`] that stops with
-/// [`GlydeError::Cancelled`] once `cancelled` is raised (issue #119).
-pub(crate) fn load_with_outcome_progressive_cancellable(
-    path: &Path,
-    overrides: IngestOverrides,
-    cancelled: &AtomicBool,
-    on_checkpoint: impl FnMut(Checkpoint),
-) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
-    load_with_outcome_progressive_using(path, overrides, cancelled, on_checkpoint)
 }
 
 fn load_with_outcome_progressive_using(
