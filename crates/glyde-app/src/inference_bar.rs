@@ -155,6 +155,9 @@ pub fn show(
     // make — a regression from the plain label this replaces, which was
     // always visible regardless of the bar's collapsed state.
     skipped_rows_detail(ui, report);
+    // Same reasoning: a column the file has but the plot does not must be
+    // visible without expanding anything (Golden Rule 2).
+    unloaded_columns_detail(ui, report);
     // A sibling of the header for the same reason as the skipped-rows line:
     // plotting against an index the file does not contain must be stated
     // where it cannot be collapsed away (Golden Rule 2).
@@ -340,6 +343,33 @@ fn skipped_rows_detail(ui: &mut egui::Ui, report: &InferenceReport) {
             ));
         }
     });
+}
+
+/// Columns the file has but the dataset does not (e.g. a Parquet `DECIMAL`
+/// column, issue #153), each with why — collapsed like the skipped rows,
+/// and likewise absent for a file that loaded every column.
+fn unloaded_columns_detail(ui: &mut egui::Ui, report: &InferenceReport) {
+    let Some(heading) = unloaded_columns_heading(report.unloaded_columns.len()) else {
+        return;
+    };
+    egui::CollapsingHeader::new(heading)
+        .id_salt("inference-bar-unloaded-columns")
+        .default_open(false)
+        .show(ui, |ui| {
+            for column in &report.unloaded_columns {
+                ui.label(format!("\"{}\": {}", column.name, column.reason));
+            }
+        });
+}
+
+/// [`unloaded_columns_detail`]'s heading, `None` when every column loaded.
+fn unloaded_columns_heading(count: usize) -> Option<String> {
+    (count > 0).then(|| {
+        format!(
+            "{count} column{} not loaded — view details",
+            if count == 1 { "" } else { "s" }
+        )
+    })
 }
 
 /// SPEC §2.1's timezone label: `"timezone: +02:00 (honored)"` when the
@@ -631,7 +661,9 @@ fn field_text(name: &str, value: &str, confidence: Confidence) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glyde_core::ingest::{InferredField, SamplingClass, SkipReason, SkippedRowDetail};
+    use glyde_core::ingest::{
+        InferredField, SamplingClass, SkipReason, SkippedRowDetail, UnloadedColumn,
+    };
 
     fn sample_report(timestamp_format_confidence: Confidence) -> InferenceReport {
         InferenceReport {
@@ -667,6 +699,7 @@ mod tests {
                 name: "timestamp".to_string(),
             },
             column_names: vec!["timestamp".to_string(), "value".to_string()],
+            unloaded_columns: Vec::new(),
         }
     }
 
@@ -1018,6 +1051,38 @@ mod tests {
     // SPEC §1.3 "surfaced in the inference bar ('142 rows skipped — view
     // details')": a clean file (the common case) must render nothing extra
     // for skipped rows at all.
+    #[test]
+    fn unloaded_columns_are_announced_outside_the_collapsed_bar() {
+        let clean = rendered_texts(&sample_report(Confidence::High));
+        assert!(!clean.contains("not loaded"), "{clean}");
+
+        let mut report = sample_report(Confidence::High);
+        report.unloaded_columns = vec![
+            UnloadedColumn {
+                name: "price".to_string(),
+                reason: "its type (Decimal128(10, 2)) is not one Glyde can plot".to_string(),
+            },
+            UnloadedColumn {
+                name: "day".to_string(),
+                reason: "its type (Date32) is not one Glyde can plot".to_string(),
+            },
+        ];
+        let texts = rendered_texts(&report);
+        assert!(
+            texts.contains("2 columns not loaded — view details"),
+            "{texts}"
+        );
+    }
+
+    #[test]
+    fn unloaded_columns_heading_counts_in_plain_language() {
+        assert_eq!(unloaded_columns_heading(0), None);
+        assert_eq!(
+            unloaded_columns_heading(1).as_deref(),
+            Some("1 column not loaded — view details")
+        );
+    }
+
     #[test]
     fn skipped_rows_detail_renders_nothing_for_a_clean_file() {
         let clean = sample_report(Confidence::High);

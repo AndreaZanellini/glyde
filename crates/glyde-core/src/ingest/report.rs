@@ -45,6 +45,7 @@ use super::dataset::{
     TimeCandidateScan, TimeIndexInference,
 };
 use super::infer::Confidence;
+use super::{IngestOverrides, Reader, Registry};
 use crate::time::{
     detect_monotonicity, detect_monotonicity_from, infer_timestamp_format, parse_timestamp,
     summarize_ticks, TimestampFormat,
@@ -188,6 +189,116 @@ pub struct InferenceReport {
     /// Every column of the file, in header order — the time-column
     /// correction's choices (SPEC §1.2).
     pub column_names: Vec<String>,
+    /// Columns of the file that are not in the dataset because v1 cannot
+    /// hold their type (e.g. a Parquet `DECIMAL` or nested column): never
+    /// dropped silently (Golden Rule 2), always listed here with why.
+    /// Always empty for delimited text, where every column is typed.
+    pub unloaded_columns: Vec<UnloadedColumn>,
+}
+
+/// A column the reader found but did not load (see
+/// [`InferenceReport::unloaded_columns`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnloadedColumn {
+    pub name: String,
+    /// Plain-language reason, shown as is in the inference bar.
+    pub reason: String,
+}
+
+/// What a [`Reader`] settled about a file's layout, independent of its
+/// format: the half of [`OpenSummary`]/[`InferenceReport`] the [`Dataset`]
+/// itself cannot answer. Every reader hands one of these to
+/// [`build_summary_and_report`], so the time-axis statistics, confidences
+/// and labels are derived by one implementation for every format
+/// (docs/ARCHITECTURE.md Hard rule 4). A format without a concept (a
+/// Parquet file has no delimiter) reports `None` at full confidence: there
+/// is nothing to have guessed.
+pub(crate) struct SourceFacts {
+    pub(crate) column_names: Vec<String>,
+    pub(crate) row_count: u64,
+    pub(crate) skipped_row_count: u64,
+    pub(crate) skipped_row_details: Vec<SkippedRowDetail>,
+    pub(crate) encoding: InferredField<String>,
+    pub(crate) delimiter: InferredField<Option<String>>,
+    pub(crate) decimal_separator: InferredField<Option<String>>,
+    /// Whether the column names themselves are a guess (see
+    /// [`CsvParseOutcome::header_ambiguous`]).
+    pub(crate) header_ambiguous: bool,
+    pub(crate) unloaded_columns: Vec<UnloadedColumn>,
+}
+
+impl From<CsvParseOutcome> for SourceFacts {
+    fn from(outcome: CsvParseOutcome) -> Self {
+        Self {
+            column_names: outcome.column_names,
+            row_count: outcome.row_count,
+            skipped_row_count: outcome.skipped_row_count,
+            skipped_row_details: outcome.skipped_row_details,
+            encoding: InferredField {
+                value: outcome.encoding_label,
+                confidence: outcome.encoding_confidence,
+            },
+            delimiter: InferredField {
+                value: Some(outcome.delimiter.as_str().to_string()),
+                confidence: outcome.delimiter_confidence,
+            },
+            decimal_separator: InferredField {
+                value: Some(outcome.decimal_separator.as_str().to_string()),
+                confidence: outcome.decimal_separator_confidence,
+            },
+            header_ambiguous: outcome.header_ambiguous,
+            unloaded_columns: Vec::new(),
+        }
+    }
+}
+
+/// How an open should run: the parameters every `open_dataset*` entry point
+/// below fixes differently, handed to the [`Reader`] that claims the path.
+pub struct OpenRequest<'a> {
+    pub overrides: IngestOverrides,
+    pub budget: crate::budget::RamBudget,
+    /// Where a file too large for `budget` may spill, and where reusable
+    /// caches live. `None`: no cache directory, so such a file is refused.
+    pub cache_dir: Option<&'a Path>,
+    pub cancelled: &'a std::sync::atomic::AtomicBool,
+    /// `Some` for a progressive open, called at each checkpoint (see
+    /// [`open_dataset_progressive`]); a reader that has nothing renderable
+    /// before it finishes may never call it.
+    pub on_checkpoint: Option<&'a mut dyn FnMut(Checkpoint)>,
+}
+
+impl OpenRequest<'_> {
+    /// Raised when the caller moved on (issue #119).
+    pub(crate) fn ensure_not_cancelled(&self) -> Result<()> {
+        dataset::ensure_not_cancelled(self.cancelled)
+    }
+}
+
+/// The reader that opens `path`: the registered one that claims it, or the
+/// delimited-text reader for any other extension — which is what every path
+/// opened as before readers were routed (a `.dat` or `.log` is very often
+/// delimited text). `glyde-app` refuses unrecognized formats itself, through
+/// [`super::open`], before getting here.
+fn with_reader<T>(path: &Path, open: impl FnOnce(&dyn Reader) -> T) -> T {
+    let registry = Registry::default_registry();
+    open(registry.find(path).unwrap_or(&super::CsvReader))
+}
+
+/// The system's RAM budget and OS cache directory: what every entry point
+/// below uses unless it names its own.
+fn system_request<'a>(
+    overrides: IngestOverrides,
+    cache_dir: Option<&'a Path>,
+    cancelled: &'a std::sync::atomic::AtomicBool,
+    on_checkpoint: Option<&'a mut dyn FnMut(Checkpoint)>,
+) -> OpenRequest<'a> {
+    OpenRequest {
+        overrides,
+        budget: crate::budget::RamBudget::from_system(),
+        cache_dir,
+        cancelled,
+        on_checkpoint,
+    }
 }
 
 /// Where a dataset's time index came from (see [`InferenceReport::time_index`]).
@@ -237,6 +348,7 @@ fn timestamp_format_label(format: TimestampFormat) -> &'static str {
         TimestampFormat::EpochNanos => "epoch_ns",
         TimestampFormat::LabViewEpoch => "labview_epoch",
         TimestampFormat::ExcelSerial => "excel_serial",
+        TimestampFormat::ParquetTimestamp => "parquet_timestamp",
     }
 }
 
@@ -251,6 +363,12 @@ fn timestamp_format_label(format: TimestampFormat) -> &'static str {
 /// `glyde-app`'s indexer does) should call [`open_dataset`] instead, which
 /// produces both from a single parse (issue #58).
 pub fn inspect(path: &Path) -> Result<OpenSummary> {
+    with_reader(path, |reader| reader.inspect(path))
+}
+
+/// [`inspect`] for a delimited-text file: the [`super::CsvReader`]'s own
+/// summary, from one pass that captures column 0 alone.
+pub(crate) fn inspect_csv(path: &Path) -> Result<OpenSummary> {
     let (outcome, time_column_text) = open_path_capturing_column(path, 0)?;
 
     let time_column_name = outcome.column_names.first().cloned().unwrap_or_default();
@@ -349,8 +467,14 @@ pub fn inspect(path: &Path) -> Result<OpenSummary> {
 /// detection, and monotonicity checks `inspect` runs, so the two summaries
 /// agree by construction rather than by re-derivation.
 pub fn open_dataset(path: &Path) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    let (outcome, dataset, time_index) = dataset::load_with_outcome(path)?;
-    build_summary_and_report(outcome, dataset, time_index)
+    let cache_dir = dataset::os_spill_dir();
+    let request = system_request(
+        IngestOverrides::default(),
+        cache_dir.as_deref(),
+        &super::csv::NEVER_CANCELLED,
+        None,
+    );
+    with_reader(path, |reader| reader.open_dataset(path, request))
 }
 
 /// [`open_dataset`] against an explicit RAM budget and spill directory, so a
@@ -362,9 +486,14 @@ pub fn open_dataset_with_budget(
     budget: crate::budget::RamBudget,
     cache_dir: &Path,
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    let (outcome, dataset, time_index) =
-        dataset::load_with_outcome_with_budget(path, budget, cache_dir)?;
-    build_summary_and_report(outcome, dataset, time_index)
+    let request = OpenRequest {
+        overrides: IngestOverrides::default(),
+        budget,
+        cache_dir: Some(cache_dir),
+        cancelled: &super::csv::NEVER_CANCELLED,
+        on_checkpoint: None,
+    };
+    with_reader(path, |reader| reader.open_dataset(path, request))
 }
 
 /// [`open_dataset`], additionally invoking `on_checkpoint` with a
@@ -381,11 +510,16 @@ pub fn open_dataset_with_budget(
 /// §1.2's inference bar is driven by the completed open, not a moving target.
 pub fn open_dataset_progressive(
     path: &Path,
-    on_checkpoint: impl FnMut(Checkpoint),
+    mut on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    let (outcome, dataset, time_index) =
-        dataset::load_with_outcome_progressive(path, on_checkpoint)?;
-    build_summary_and_report(outcome, dataset, time_index)
+    let cache_dir = dataset::os_spill_dir();
+    let request = system_request(
+        IngestOverrides::default(),
+        cache_dir.as_deref(),
+        &super::csv::NEVER_CANCELLED,
+        Some(&mut on_checkpoint),
+    );
+    with_reader(path, |reader| reader.open_dataset(path, request))
 }
 
 /// [`open_dataset`] with [`super::IngestOverrides`] applied (docs/ROADMAP.md
@@ -398,9 +532,14 @@ pub fn open_dataset_with_overrides(
     path: &Path,
     overrides: super::IngestOverrides,
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    let (outcome, dataset, time_index) =
-        dataset::load_with_outcome_with_overrides(path, overrides)?;
-    build_summary_and_report(outcome, dataset, time_index)
+    let cache_dir = dataset::os_spill_dir();
+    let request = system_request(
+        overrides,
+        cache_dir.as_deref(),
+        &super::csv::NEVER_CANCELLED,
+        None,
+    );
+    with_reader(path, |reader| reader.open_dataset(path, request))
 }
 
 /// [`open_dataset_progressive`] with [`super::IngestOverrides`] applied — the
@@ -409,11 +548,16 @@ pub fn open_dataset_with_overrides(
 pub fn open_dataset_progressive_with_overrides(
     path: &Path,
     overrides: super::IngestOverrides,
-    on_checkpoint: impl FnMut(Checkpoint),
+    mut on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    let (outcome, dataset, time_index) =
-        dataset::load_with_outcome_progressive_with_overrides(path, overrides, on_checkpoint)?;
-    build_summary_and_report(outcome, dataset, time_index)
+    let cache_dir = dataset::os_spill_dir();
+    let request = system_request(
+        overrides,
+        cache_dir.as_deref(),
+        &super::csv::NEVER_CANCELLED,
+        Some(&mut on_checkpoint),
+    );
+    with_reader(path, |reader| reader.open_dataset(path, request))
 }
 
 /// [`open_dataset_progressive_with_overrides`] that stops early with
@@ -426,16 +570,16 @@ pub fn open_dataset_progressive_cancellable(
     path: &Path,
     overrides: super::IngestOverrides,
     cancelled: &std::sync::atomic::AtomicBool,
-    on_checkpoint: impl FnMut(Checkpoint),
+    mut on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    let (outcome, dataset, time_index) = dataset::load_with_outcome_progressive_cancellable(
-        path,
+    let cache_dir = dataset::os_spill_dir();
+    let request = system_request(
         overrides,
+        cache_dir.as_deref(),
         cancelled,
-        on_checkpoint,
-    )?;
-    dataset::ensure_not_cancelled(cancelled)?;
-    build_summary_and_report(outcome, dataset, time_index)
+        Some(&mut on_checkpoint),
+    );
+    with_reader(path, |reader| reader.open_dataset(path, request))
 }
 
 /// [`open_dataset_progressive_cancellable`] against an explicit RAM budget
@@ -448,25 +592,52 @@ pub fn open_dataset_progressive_in(
     budget: crate::budget::RamBudget,
     cache_dir: &Path,
     cancelled: &std::sync::atomic::AtomicBool,
-    on_checkpoint: impl FnMut(Checkpoint),
+    mut on_checkpoint: impl FnMut(Checkpoint),
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    let (outcome, dataset, time_index) = dataset::load_with_outcome_progressive_in(
-        path,
+    let request = OpenRequest {
         overrides,
         budget,
-        Some(cache_dir),
+        cache_dir: Some(cache_dir),
         cancelled,
-        on_checkpoint,
-    )?;
-    dataset::ensure_not_cancelled(cancelled)?;
-    build_summary_and_report(outcome, dataset, time_index)
+        on_checkpoint: Some(&mut on_checkpoint),
+    };
+    with_reader(path, |reader| reader.open_dataset(path, request))
+}
+
+/// The [`super::CsvReader`]'s open: the in-memory or spilled parse (and,
+/// for a progressive request, its checkpoints), then the one summary
+/// builder. Each `open_dataset*` entry point used to call its own
+/// `dataset::load_with_outcome*` variant; they differed only in the fields
+/// [`OpenRequest`] now carries.
+pub(crate) fn open_csv_dataset(
+    path: &Path,
+    request: OpenRequest<'_>,
+) -> Result<(OpenSummary, InferenceReport, Dataset)> {
+    let (outcome, dataset, time_index) = match request.on_checkpoint {
+        Some(on_checkpoint) => dataset::load_with_outcome_progressive_in(
+            path,
+            request.overrides,
+            request.budget,
+            request.cache_dir,
+            request.cancelled,
+            on_checkpoint,
+        )?,
+        None => dataset::load_with_outcome_using(
+            path,
+            request.budget,
+            request.cache_dir,
+            request.overrides,
+        )?,
+    };
+    dataset::ensure_not_cancelled(request.cancelled)?;
+    build_summary_and_report(outcome.into(), dataset, time_index)
 }
 
 /// The summary/report-building half of [`open_dataset`], shared with
 /// [`open_dataset_progressive`] so the two never independently (and
 /// possibly divergently) derive the same fields from a parsed [`Dataset`].
-fn build_summary_and_report(
-    outcome: CsvParseOutcome,
+pub(crate) fn build_summary_and_report(
+    source: SourceFacts,
     dataset: Dataset,
     time_index: TimeIndexInference,
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
@@ -519,13 +690,13 @@ fn build_summary_and_report(
     };
 
     let summary = OpenSummary {
-        encoding: outcome.encoding_label.clone(),
-        delimiter: Some(outcome.delimiter.as_str().to_string()),
-        decimal_separator: Some(outcome.decimal_separator.as_str().to_string()),
+        encoding: source.encoding.value.clone(),
+        delimiter: source.delimiter.value.clone(),
+        decimal_separator: source.decimal_separator.value.clone(),
         time_column: time_column.clone(),
         timestamp_format: timestamp_format.clone(),
-        row_count: outcome.row_count,
-        skipped_row_count: outcome.skipped_row_count,
+        row_count: source.row_count,
+        skipped_row_count: source.skipped_row_count,
         sampling_class,
         gap_count,
         non_monotonic_count,
@@ -548,7 +719,7 @@ fn build_summary_and_report(
         .generated
         .as_ref()
         .is_some_and(|reason| *reason != GeneratedIndexReason::Requested);
-    let time_column_confidence = if outcome.header_ambiguous || generated_on_users_behalf {
+    let time_column_confidence = if source.header_ambiguous || generated_on_users_behalf {
         Confidence::Low
     } else {
         Confidence::High
@@ -563,21 +734,12 @@ fn build_summary_and_report(
         (_, Some(GeneratedIndexReason::Unreadable { .. })) => Confidence::Low,
         _ => Confidence::High,
     };
-    let time_index_source = time_index.source(&outcome.column_names);
+    let time_index_source = time_index.source(&source.column_names);
 
     let report = InferenceReport {
-        encoding: InferredField {
-            value: outcome.encoding_label,
-            confidence: outcome.encoding_confidence,
-        },
-        delimiter: InferredField {
-            value: Some(outcome.delimiter.as_str().to_string()),
-            confidence: outcome.delimiter_confidence,
-        },
-        decimal_separator: InferredField {
-            value: Some(outcome.decimal_separator.as_str().to_string()),
-            confidence: outcome.decimal_separator_confidence,
-        },
+        encoding: source.encoding,
+        delimiter: source.delimiter,
+        decimal_separator: source.decimal_separator,
         time_column: InferredField {
             value: time_column,
             confidence: time_column_confidence,
@@ -586,15 +748,16 @@ fn build_summary_and_report(
             value: timestamp_format,
             confidence: timestamp_format_confidence,
         },
-        sample_count: outcome.row_count,
+        sample_count: source.row_count,
         sampling_class,
-        skipped_row_count: outcome.skipped_row_count,
-        skipped_row_details: outcome.skipped_row_details,
+        skipped_row_count: source.skipped_row_count,
+        skipped_row_details: source.skipped_row_details,
         non_monotonic_count,
         duplicate_timestamp_count,
         timezone,
         time_index: time_index_source,
-        column_names: outcome.column_names,
+        column_names: source.column_names,
+        unloaded_columns: source.unloaded_columns,
     };
 
     Ok((summary, report, dataset))
@@ -602,7 +765,8 @@ fn build_summary_and_report(
 
 /// SPEC §2.1's timezone summary for an absolute-timestamp axis: `Honored`
 /// with the first parsed row's UTC offset for
-/// [`TimestampFormat::Iso8601WithOffset`], `UtcImplicit` for counters with a
+/// [`TimestampFormat::Iso8601WithOffset`] and a timezone-aware
+/// [`TimestampFormat::ParquetTimestamp`] column, `UtcImplicit` for counters with a
 /// defined UTC epoch, and `NaiveLocal` for dates without an offset (including
 /// Excel serial dates, which specify a calendar origin but no timezone).
 fn timezone_label(
@@ -615,7 +779,7 @@ fn timezone_label(
         | TimestampFormat::EpochMicros
         | TimestampFormat::EpochNanos
         | TimestampFormat::LabViewEpoch => return TimezoneLabel::UtcImplicit,
-        TimestampFormat::Iso8601WithOffset => {}
+        TimestampFormat::Iso8601WithOffset | TimestampFormat::ParquetTimestamp => {}
         TimestampFormat::Iso8601Naive
         | TimestampFormat::DateTimeSpace
         | TimestampFormat::DayFirst

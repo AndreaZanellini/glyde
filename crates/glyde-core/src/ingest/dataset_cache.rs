@@ -228,7 +228,7 @@ const DELIMITERS: [Delimiter; 5] = [
     Delimiter::Whitespace,
 ];
 
-const FORMATS: [(TimestampFormat, &str); 11] = [
+const FORMATS: [(TimestampFormat, &str); 12] = [
     (TimestampFormat::Iso8601WithOffset, "iso8601-offset"),
     (TimestampFormat::Iso8601Naive, "iso8601-naive"),
     (TimestampFormat::DateTimeSpace, "datetime-space"),
@@ -240,6 +240,7 @@ const FORMATS: [(TimestampFormat, &str); 11] = [
     (TimestampFormat::EpochNanos, "epoch-ns"),
     (TimestampFormat::LabViewEpoch, "labview"),
     (TimestampFormat::ExcelSerial, "excel"),
+    (TimestampFormat::ParquetTimestamp, "parquet"),
 ];
 
 const UNITS: [TimeUnit; 5] = [

@@ -32,6 +32,12 @@ pub enum GlydeError {
         source: std::io::Error,
     },
 
+    /// The file claims to be Parquet (by its extension) but its footer or
+    /// pages could not be decoded — truncated, corrupt, or written with a
+    /// codec this build does not include (docs/ROADMAP.md M7).
+    #[error("could not read {path} as Parquet: {reason}")]
+    InvalidParquet { path: PathBuf, reason: String },
+
     /// No registered [`crate::ingest::Reader`] recognizes this path's format
     /// (docs/SPEC.md §1.1 lists the v1-frozen set: `.csv`, `.tsv`, `.txt`,
     /// `.parquet`).

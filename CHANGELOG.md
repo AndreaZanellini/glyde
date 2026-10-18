@@ -12,6 +12,45 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Parquet files open (milestone M7, first item).** Dropping or picking a
+  `.parquet` file no longer fails with "unrecognized format". Glyde reads
+  the file's own schema, so nothing about the layout is guessed: the
+  inference bar shows encoding "n/a" and no delimiter or decimal
+  separator. Every number column keeps its exact type (an `int64` stays an
+  `int64`, a `float` stays a `float`). True/false columns and text columns
+  go to the state timeline, as they do for CSV. A Parquet timestamp column
+  becomes the time axis, shown as `timestamp format: parquet_timestamp`,
+  with its timezone honored (a `UTC` column reads `timezone: +00:00
+  (honored)`, and a column in a named zone such as `Europe/Rome` keeps the
+  right offset on each side of a daylight-saving change). PSD and the
+  state timeline work on it like on a CSV. To try it: open
+  `testdata/corpus/case-53-clean-parquet-timestamp.parquet`, then one of
+  your own Parquet files. Limits for now, each tracked:
+  - **Columns with missing values, and dictionary-encoded text columns,
+    are not loaded yet.** The next M7 item adds them. Until then the
+    inference bar says "N columns not loaded — view details" and lists
+    each one with the reason, and so do columns of types Glyde cannot plot
+    (decimals, dates, binary, nested data). No column is dropped without
+    saying so.
+  - **A Parquet file too large for Glyde's memory budget is refused** with
+    the sizes, instead of being cached on disk the way a large CSV is
+    (issue #155).
+  - The plot appears when the whole file has been read: there is no
+    growing preview while a Parquet file loads yet.
+  - A second timestamp column is listed as "not loaded": pick it as the
+    time column to plot against it.
+
+  Assumptions you can veto:
+  - The time axis is the **first timestamp column, wherever it sits**, not
+    necessarily the first column. A typed timestamp leaves no doubt about
+    what it is.
+  - If the file has no timestamp column, the CSV rule applies to its first
+    column: numbers that never go backwards and do advance become the
+    axis. Anything else is plotted against a generated row index, flagged
+    low-confidence. Epoch numbers (e.g. an `int64` of milliseconds) are
+    not yet read as dates; that is a later M7 item.
+  - A timestamp whose timezone name Glyde does not recognize is shown in
+    UTC (the stored instant is still exact), with a warning in the log.
 - **The state lanes now line up with the plot above them and move with it
   (milestone M6, time alignment — the last M6 item).** The plot and the
   on/off, text-state and event lanes now share one time axis. Pan, zoom,

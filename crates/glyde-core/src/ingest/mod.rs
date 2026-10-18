@@ -28,6 +28,7 @@ mod csv;
 mod dataset;
 mod dataset_cache;
 mod infer;
+mod parquet;
 mod report;
 mod spill_sort;
 
@@ -50,11 +51,12 @@ pub use infer::{
     Confidence, DecimalSeparator, DecimalSeparatorInference, Delimiter, DelimiterInference,
     DtypeInference, EncodingInference, EncodingSource, HeaderInference, HEAD_SAMPLE_BYTES,
 };
+pub use parquet::ParquetReader;
 pub use report::{
     inspect, open_dataset, open_dataset_progressive, open_dataset_progressive_cancellable,
     open_dataset_progressive_in, open_dataset_progressive_with_overrides, open_dataset_with_budget,
-    open_dataset_with_overrides, InferenceReport, InferredField, OpenSummary, SamplingClass,
-    TimeIndexSource, TimezoneLabel,
+    open_dataset_with_overrides, InferenceReport, InferredField, OpenRequest, OpenSummary,
+    SamplingClass, TimeIndexSource, TimezoneLabel, UnloadedColumn,
 };
 
 use crate::time::TimestampFormat;
@@ -168,6 +170,8 @@ fn overrides_signature(overrides: IngestOverrides) -> u64 {
 /// A single ingested source format (ARCH hard rule 5): adding a format means
 /// adding one `ingest/<format>.rs` implementing this trait plus one registry
 /// entry in [`Registry::default_registry`] — nothing else changes.
+/// [`inspect`] and every `open_dataset*` entry point dispatch to the reader
+/// that claims the path.
 pub trait Reader: Send + Sync {
     /// Human-readable format name, used in logs and the inference bar.
     fn format_name(&self) -> &'static str;
@@ -175,6 +179,18 @@ pub trait Reader: Send + Sync {
     /// Cheap recognition test: does this reader claim `path`? Extension-based
     /// for now; content sniffing lands with each reader's own parse logic.
     fn recognizes(&self, path: &Path) -> bool;
+
+    /// The torture-corpus summary of an automatic open of `path`
+    /// (docs/QUALITY.md §1), see [`inspect`].
+    fn inspect(&self, path: &Path) -> Result<OpenSummary>;
+
+    /// Opens `path` as `request` asks: its summary, its inference report,
+    /// and the materialized [`Dataset`].
+    fn open_dataset(
+        &self,
+        path: &Path,
+        request: OpenRequest<'_>,
+    ) -> Result<(OpenSummary, InferenceReport, Dataset)>;
 }
 
 /// Every reader `glyde-core` knows about, tried in registration order.
@@ -187,7 +203,7 @@ impl Registry {
     /// for v1.
     pub fn default_registry() -> Self {
         Self {
-            readers: vec![Box::new(CsvReader)],
+            readers: vec![Box::new(CsvReader), Box::new(ParquetReader)],
         }
     }
 
@@ -238,6 +254,18 @@ mod tests {
             .expect("a .csv path must be claimed by a registered reader");
 
         assert_eq!(reader.format_name(), "csv");
+    }
+
+    #[test]
+    fn default_registry_recognizes_a_parquet_path_as_the_parquet_reader() {
+        let registry = Registry::default_registry();
+
+        for name in ["readings.parquet", "READINGS.PARQUET"] {
+            let reader = registry
+                .find(Path::new(name))
+                .expect("a .parquet path must be claimed by a registered reader");
+            assert_eq!(reader.format_name(), "parquet", "{name}");
+        }
     }
 
     #[test]

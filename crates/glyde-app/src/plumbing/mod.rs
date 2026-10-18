@@ -361,10 +361,10 @@ fn run_index_job(
     });
     tracing::info!(path = %path.display(), "opening file");
 
-    // Check format recognition first so an unsupported extension (e.g. a
-    // `.parquet` file — not landed until M7) reports a clear "unrecognized
-    // format" error instead of failing deep inside the CSV-specific parser
-    // with a confusing message (Golden Rule 2: never guess silently).
+    // Check format recognition first so an unsupported extension (e.g. an
+    // `.xlsx`) reports a clear "unrecognized format" error instead of failing
+    // deep inside a reader with a confusing message (Golden Rule 2: never
+    // guess silently).
     if let Err(err) = glyde_core::ingest::open(&path) {
         tracing::error!(path = %path.display(), error = %err, "failed to open file");
         let _ = tx.send(IndexingMessage::Failed {
@@ -592,6 +592,53 @@ mod tests {
                     "an in-memory dataset's completed level0 cache must be built for every \
                      numeric column (issue #92)"
                 );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// docs/ROADMAP.md M7 (issue #153): a Parquet file opens through the
+    /// same indexer as a CSV — no longer refused as an unrecognized format —
+    /// with its typed timestamp column as the time axis and the same derived
+    /// plot inputs (pyramid, Level-0 cache) built for its numeric column.
+    #[test]
+    fn spawn_index_job_opens_a_parquet_file_with_its_timestamp_axis() {
+        let path = corpus_path("case-53-clean-parquet-timestamp.parquet");
+        let (tx, rx) = mpsc::channel();
+
+        spawn_index_job(3, path.clone(), CancelFlag::default(), tx);
+
+        let completed = rx
+            .iter()
+            .find(|message| {
+                matches!(
+                    message,
+                    IndexingMessage::Completed { .. } | IndexingMessage::Failed { .. }
+                )
+            })
+            .expect("the job must finish");
+        match completed {
+            IndexingMessage::Completed {
+                summary,
+                report,
+                dataset,
+                pyramids,
+                level0_caches,
+                ..
+            } => {
+                assert_eq!(summary.row_count, 6);
+                assert_eq!(
+                    summary.timestamp_format.as_deref(),
+                    Some("parquet_timestamp")
+                );
+                assert_eq!(report.encoding.value, "n/a");
+                assert!(matches!(
+                    dataset.time,
+                    glyde_core::ingest::TimeAxis::Absolute { .. }
+                ));
+                assert_eq!(dataset.columns.len(), 1);
+                assert!(pyramids[0].is_some());
+                assert!(level0_caches[0].is_some());
             }
             other => panic!("expected Completed, got {other:?}"),
         }

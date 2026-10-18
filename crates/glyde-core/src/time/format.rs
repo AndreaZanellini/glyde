@@ -130,6 +130,12 @@ pub enum TimestampFormat {
     /// Excel serial date: days since 1899-12-30, fractional part is the time
     /// of day.
     ExcelSerial,
+    /// A typed Parquet `TIMESTAMP` column (docs/ROADMAP.md M7): no text to
+    /// infer, the unit (s/ms/µs/ns) and the timezone come from the file's
+    /// own schema. A timezone-aware column carries each row's UTC offset
+    /// and redisplays as ISO 8601 with that offset; a column without one is
+    /// naive local time and redisplays as naive ISO 8601 (SPEC §2.1).
+    ParquetTimestamp,
 }
 
 /// Parses `input` as `format`, producing a [`Timestamp`] in that format's
@@ -147,6 +153,13 @@ pub fn parse_timestamp(input: &str, format: TimestampFormat) -> crate::Result<Ti
         TimestampFormat::EpochNanos => parse_epoch_integer(input, TimeUnit::Nanoseconds, format),
         TimestampFormat::LabViewEpoch => parse_labview_epoch(input),
         TimestampFormat::ExcelSerial => parse_excel_serial(input),
+        // Parquet timestamps are typed integers read from the file's schema,
+        // never text, so there is nothing to parse them from.
+        TimestampFormat::ParquetTimestamp => Err(crate::GlydeError::InvalidTimestamp {
+            input: input.to_string(),
+            format,
+            reason: "Parquet timestamps are typed values, not text".to_string(),
+        }),
     }
 }
 
@@ -167,6 +180,10 @@ pub fn format_timestamp(timestamp: &Timestamp, format: TimestampFormat) -> Strin
         TimestampFormat::EpochNanos => format_epoch(timestamp, TimeUnit::Nanoseconds),
         TimestampFormat::LabViewEpoch => format_labview_epoch(timestamp),
         TimestampFormat::ExcelSerial => format_excel_serial(timestamp),
+        TimestampFormat::ParquetTimestamp => match timestamp.offset_seconds {
+            Some(_) => format_iso8601_with_offset(timestamp),
+            None => format_iso8601_naive(timestamp),
+        },
     }
 }
 
@@ -655,9 +672,14 @@ fn nanos_since_epoch<Tz: chrono::TimeZone>(
 /// `timestamp`'s ticks, for formatting. `timestamp.ticks` is always
 /// nanoseconds since the epoch for the two ISO formats that call this (both
 /// producers above only ever construct [`TimeUnit::Nanoseconds`] timestamps).
+/// The UTC instant of `timestamp`, in any unit up to nanoseconds (a
+/// textual format parses into nanoseconds; a Parquet timestamp keeps its
+/// file's own unit). Picosecond timestamps never reach this: their callers
+/// route them to the sub-nanosecond formatters first.
 fn utc_datetime_from_ticks(timestamp: &Timestamp) -> chrono::DateTime<chrono::Utc> {
-    let secs = timestamp.ticks.div_euclid(1_000_000_000);
-    let nanos = timestamp.ticks.rem_euclid(1_000_000_000);
+    let per_second = timestamp.unit.ticks_per_second();
+    let secs = timestamp.ticks.div_euclid(per_second);
+    let nanos = timestamp.ticks.rem_euclid(per_second) * (1_000_000_000 / per_second);
     chrono::DateTime::from_timestamp(
         i64::try_from(secs).expect("nanosecond-range instant fits in an i64 second count"),
         u32::try_from(nanos).expect("nanos-of-second remainder is always in 0..1_000_000_000"),

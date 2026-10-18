@@ -24,10 +24,10 @@
 //! future PR can flip it off if a not-yet-implemented format needs to land
 //! ahead of satisfying every one of its cases.
 //!
-//! Parquet (corpus cases 53-56, docs/ROADMAP.md M7) have no reader
-//! registered yet — `inspect` cannot open them at all today — so they are
-//! not part of "so far" and are explicitly skipped here, not asserted, until
-//! M7 lands a Parquet `Reader`.
+//! Parquet corpus case 53 is opened by the Parquet `Reader` (docs/ROADMAP.md
+//! M7, issue #153). Cases 54-56 need the later M7 items (nulls, partitioned
+//! directories, dictionary strings) and are explicitly skipped here, not
+//! asserted, until those land.
 //!
 //! Case 21 previously disagreed with `time::classify_sampling`'s robust-CV
 //! statistic (issue #48): its `.expected.json` said `"uniform"`, predating
@@ -44,10 +44,9 @@ mod support;
 use glyde_core::ingest::inspect;
 use support::{compare, corpus_dir, discover_cases, load_expected, ExpectedOutcome};
 
-/// docs/ROADMAP.md M7, not yet started: no `Reader` claims `.parquet`, and
-/// case 55 is a directory `inspect` cannot even memory-map as a file.
+/// docs/ROADMAP.md M7's later items: nulls → gaps (54), partitioned
+/// directories (55), dictionary-encoded strings → categorical (56).
 const NOT_YET_IMPLEMENTED: &[&str] = &[
-    "case-53-clean-parquet-timestamp",
     "case-54-parquet-with-nulls",
     "case-55-partitioned-parquet-directory",
     "case-56-parquet-dictionary-strings",
