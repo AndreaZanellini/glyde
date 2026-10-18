@@ -33,8 +33,8 @@ pub struct BoolBand {
     pub value: bool,
 }
 
-/// The fixed-size overview used when a series changes state too often to
-/// retain and draw every run. Each nonzero cell records every state seen in
+/// The size of the whole-file overview used when a series changes state too
+/// often to retain and draw every run. Each nonzero cell records every state seen in
 /// that part of the time axis; `3` means both states occurred and must be
 /// drawn as a visible multiple-states glyph, not silently dropped.
 pub const BOOL_OVERVIEW_CELLS: usize = 2048;
@@ -70,6 +70,7 @@ impl BoolLane {
 struct Overview {
     min_tick: i128,
     max_tick: i128,
+    cells: usize,
     off_diff: Vec<i64>,
     on_diff: Vec<i64>,
 }
@@ -83,9 +84,16 @@ impl Overview {
         let offset = tick.saturating_sub(self.min_tick) as f64;
         // Cell `k` holds `[k, k + 1) / N` of the axis (the last one also
         // holds `max_tick`) — the same split `glyde-app` draws.
-        ((offset / span) * BOOL_OVERVIEW_CELLS as f64)
+        ((offset / span) * self.cells as f64)
             .floor()
-            .clamp(0.0, (BOOL_OVERVIEW_CELLS - 1) as f64) as usize
+            .clamp(0.0, (self.cells - 1) as f64) as usize
+    }
+
+    /// Whether `band` touches the window at all; a run wholly before or
+    /// after it is not part of this view.
+    fn touches(&self, band: &BoolBand) -> bool {
+        band.start_tick.max(band.end_tick) >= self.min_tick
+            && band.start_tick.min(band.end_tick) <= self.max_tick
     }
 
     fn record(&mut self, band: BoolBand) {
@@ -106,8 +114,8 @@ impl Overview {
     fn finish(self) -> Vec<u8> {
         let mut off = 0;
         let mut on = 0;
-        let mut cells = Vec::with_capacity(BOOL_OVERVIEW_CELLS);
-        for index in 0..BOOL_OVERVIEW_CELLS {
+        let mut cells = Vec::with_capacity(self.cells);
+        for index in 0..self.cells {
             off += self.off_diff[index];
             on += self.on_diff[index];
             cells.push(u8::from(off > 0) | (u8::from(on > 0) << 1));
@@ -150,12 +158,23 @@ impl BoolBandBuilder {
     /// exact runs while they fit, then switches to a 2048-cell overview.
     /// Every on/off occurrence remains visible through a mixed-state cell.
     pub fn for_view(min_tick: i128, max_tick: i128) -> Self {
+        Self::for_window(min_tick, max_tick, BOOL_OVERVIEW_CELLS)
+    }
+
+    /// [`Self::for_view`] over just the window `[min_tick, max_tick]` of the
+    /// axis, with a `cells`-cell overview (SPEC §4.3: a zoomed-in view
+    /// rebuilds a dense lane for what is on screen, so its runs reappear).
+    /// Every sample is still pushed, in file order; runs that do not touch
+    /// the window are dropped, and one that only partly does is kept whole.
+    pub fn for_window(min_tick: i128, max_tick: i128, cells: usize) -> Self {
+        let cells = cells.max(1);
         Self {
             overview: Some(Overview {
                 min_tick,
                 max_tick,
-                off_diff: vec![0; BOOL_OVERVIEW_CELLS + 1],
-                on_diff: vec![0; BOOL_OVERVIEW_CELLS + 1],
+                cells,
+                off_diff: vec![0; cells + 1],
+                on_diff: vec![0; cells + 1],
             }),
             ..Self::default()
         }
@@ -163,6 +182,9 @@ impl BoolBandBuilder {
 
     fn emit(&mut self, band: BoolBand) {
         if let Some(overview) = &mut self.overview {
+            if !overview.touches(&band) {
+                return;
+            }
             overview.record(band);
             if !self.summarized {
                 self.bands.push(band);

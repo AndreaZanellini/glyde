@@ -34,8 +34,8 @@ use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache}
 
 use crate::inference_bar::Correction;
 use crate::plumbing::{
-    background_decimator, spawn_index_job, spawn_index_job_with_overrides, spawn_open_dialog,
-    CancelFlag, ColumnPyramids, IndexingMessage, PreparedView, TimeIndexPreview,
+    background_decimator, lane_refiner, spawn_index_job, spawn_index_job_with_overrides,
+    spawn_open_dialog, CancelFlag, ColumnPyramids, IndexingMessage, PreparedView, TimeIndexPreview,
     PROGRESS_BOOL_BAND_ROWS,
 };
 use crate::views::psd::{selection_rows, PsdPanel, PsdRequest};
@@ -158,6 +158,9 @@ pub struct GlydeApp {
     /// changes — and each shown channel's last decimation, dropped whenever
     /// new data arrives (see [`Self::drain_indexing_messages`]).
     time_view: views::time::TimeViewState,
+    /// The state timeline's lanes rebuilt for a zoomed-in window (SPEC
+    /// §4.3's collapse rule), dropped whenever new data arrives.
+    state_timeline: views::state_timeline::StateTimelineState,
 }
 
 impl Default for GlydeApp {
@@ -174,6 +177,7 @@ impl Default for GlydeApp {
             time_selection: None,
             time_focus: None,
             time_view: Default::default(),
+            state_timeline: Default::default(),
         }
     }
 }
@@ -282,6 +286,7 @@ impl GlydeApp {
             // decimation of the old data must never be drawn for the new.
             self.time_view.data_changed();
             self.time_view.set_background(None);
+            self.state_timeline.set_refiner(None);
             if matches!(message, IndexingMessage::Completed { .. }) {
                 self.psd = PsdPanel::default();
                 self.time_selection = None;
@@ -343,6 +348,12 @@ impl GlydeApp {
                         )
                     });
                     self.time_view.set_background(background);
+                    // SPEC §4.3: a dense state lane zoomed into is rebuilt
+                    // for the visible window, always off the UI thread.
+                    self.state_timeline.set_refiner(Some(lane_refiner(
+                        Arc::clone(&dataset),
+                        Arc::clone(&prepared),
+                    )));
                     Status::Loaded {
                         path,
                         report,
@@ -480,6 +491,7 @@ impl eframe::App for GlydeApp {
                             &partial.prepared.bool_bands,
                             &partial.prepared.state_lanes,
                             &partial.prepared.marker_lanes,
+                            &mut self.state_timeline,
                         );
                     }
                     None => {
@@ -530,8 +542,9 @@ impl eframe::App for GlydeApp {
                 ));
                 // SPEC §4.3 / docs/ROADMAP.md M6 "Boolean series → on/off
                 // horizontal bands", "String/categorical → labeled state
-                // bands" and "Markers" (sharing this view's axis with the
-                // plot above is a still-open M6 item, not yet built).
+                // bands", "Markers" and the collapse rule (sharing this
+                // view's axis with the plot above is a still-open M6 item,
+                // not yet built).
                 views::state_timeline::show(
                     ui,
                     dataset,
@@ -539,6 +552,7 @@ impl eframe::App for GlydeApp {
                     &prepared.bool_bands,
                     &prepared.state_lanes,
                     &prepared.marker_lanes,
+                    &mut self.state_timeline,
                 );
             }
             Status::Failed { path, message } => {

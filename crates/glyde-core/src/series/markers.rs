@@ -27,7 +27,8 @@
 /// A denser marker column falls back to a fixed-size per-cell count, so
 /// memory stays bounded however many events a file holds.
 pub const MAX_EXACT_MARKERS: usize = 4096;
-/// Number of cells in the bounded overview of a very dense marker column.
+/// Number of cells in the bounded whole-file overview of a very dense marker
+/// column.
 pub const MARKER_OVERVIEW_CELLS: usize = 2048;
 
 /// One event: the tick of its sample and the verbatim cell text.
@@ -88,11 +89,18 @@ pub struct MarkerBuilder {
 
 impl MarkerBuilder {
     pub fn for_view(min_tick: i128, max_tick: i128) -> Self {
+        Self::for_window(min_tick, max_tick, MARKER_OVERVIEW_CELLS)
+    }
+
+    /// [`Self::for_view`] over just the window `[min_tick, max_tick]`, with a
+    /// `cells`-cell overview: events outside the window are skipped, so a
+    /// zoomed-in view can recover the individual markers of a dense column.
+    pub fn for_window(min_tick: i128, max_tick: i128, cells: usize) -> Self {
         Self {
             min_tick,
             max_tick,
             markers: Vec::new(),
-            counts: vec![0; MARKER_OVERVIEW_CELLS],
+            counts: vec![0; cells.max(1)],
             summarized: false,
         }
     }
@@ -105,14 +113,15 @@ impl MarkerBuilder {
         let offset = tick.saturating_sub(self.min_tick) as f64;
         // Cell `k` holds `[k, k + 1) / N` of the axis (the last one also
         // holds `max_tick`); `glyde-app` draws each tick at its cell's center.
-        ((offset / span) * MARKER_OVERVIEW_CELLS as f64)
+        let cells = self.counts.len();
+        ((offset / span) * cells as f64)
             .floor()
-            .clamp(0.0, (MARKER_OVERVIEW_CELLS - 1) as f64) as usize
+            .clamp(0.0, (cells - 1) as f64) as usize
     }
 
     /// Feeds one cell. An empty cell is not an event and is ignored.
     pub fn push(&mut self, text: &str, tick: i128) {
-        if text.is_empty() {
+        if text.is_empty() || tick < self.min_tick || tick > self.max_tick {
             return;
         }
         let cell = self.cell(tick);

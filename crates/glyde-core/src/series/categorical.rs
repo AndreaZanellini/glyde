@@ -94,6 +94,7 @@ pub fn state_label_id(label: &str) -> u32 {
 struct Overview {
     min_tick: i128,
     max_tick: i128,
+    cells: usize,
     count: Vec<i64>,
     sum: Vec<i128>,
     sumsq: Vec<i128>,
@@ -109,9 +110,14 @@ impl Overview {
         let offset = tick.saturating_sub(self.min_tick) as f64;
         // Cell `k` holds `[k, k + 1) / N` of the axis (the last one also
         // holds `max_tick`) — the same split `glyde-app` draws and hovers.
-        ((offset / span) * STATE_OVERVIEW_CELLS as f64)
+        ((offset / span) * self.cells as f64)
             .floor()
-            .clamp(0.0, (STATE_OVERVIEW_CELLS - 1) as f64) as usize
+            .clamp(0.0, (self.cells - 1) as f64) as usize
+    }
+
+    /// Whether a run over `start_tick..end_tick` touches the window at all.
+    fn touches(&self, start_tick: i128, end_tick: i128) -> bool {
+        start_tick.max(end_tick) >= self.min_tick && start_tick.min(end_tick) <= self.max_tick
     }
 
     fn record(&mut self, start_tick: i128, end_tick: i128, label: &str) {
@@ -132,8 +138,8 @@ impl Overview {
 
     fn finish(self) -> (Vec<StateCell>, BTreeMap<u32, String>) {
         let (mut count, mut sum, mut sumsq) = (0i64, 0i128, 0i128);
-        let mut cells = Vec::with_capacity(STATE_OVERVIEW_CELLS);
-        for index in 0..STATE_OVERVIEW_CELLS {
+        let mut cells = Vec::with_capacity(self.cells);
+        for index in 0..self.cells {
             count += self.count[index];
             sum += self.sum[index];
             sumsq += self.sumsq[index];
@@ -173,13 +179,21 @@ impl StateBandBuilder {
     /// Bounded-memory form for a whole-file, fixed-axis view: retains exact
     /// runs while they fit, then switches to the fixed-size overview.
     pub fn for_view(min_tick: i128, max_tick: i128) -> Self {
+        Self::for_window(min_tick, max_tick, STATE_OVERVIEW_CELLS)
+    }
+
+    /// [`Self::for_view`] over just the window `[min_tick, max_tick]`, with a
+    /// `cells`-cell overview (see [`super::BoolBandBuilder::for_window`]).
+    pub fn for_window(min_tick: i128, max_tick: i128, cells: usize) -> Self {
+        let cells = cells.max(1);
         Self {
             overview: Some(Overview {
                 min_tick,
                 max_tick,
-                count: vec![0; STATE_OVERVIEW_CELLS + 1],
-                sum: vec![0; STATE_OVERVIEW_CELLS + 1],
-                sumsq: vec![0; STATE_OVERVIEW_CELLS + 1],
+                cells,
+                count: vec![0; cells + 1],
+                sum: vec![0; cells + 1],
+                sumsq: vec![0; cells + 1],
                 labels: BTreeMap::new(),
             }),
             ..Self::default()
@@ -188,6 +202,9 @@ impl StateBandBuilder {
 
     fn emit(&mut self, band: StateBand) {
         if let Some(overview) = &mut self.overview {
+            if !overview.touches(band.start_tick, band.end_tick) {
+                return;
+            }
             overview.record(band.start_tick, band.end_tick, &band.label);
             if !self.summarized {
                 self.bands.push(band);
