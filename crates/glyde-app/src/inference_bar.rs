@@ -297,6 +297,9 @@ fn generated_index_text(source: &TimeIndexSource, rows: Option<u64>) -> Option<S
                  it is plotted as a signal."
             ),
         },
+        GeneratedIndexReason::MissingTimestamps { column, row } => {
+            format!("\"{column}\" has no timestamp on row {row}, so it cannot be used as time.")
+        }
         GeneratedIndexReason::Unreadable { column } => format!(
             "\"{column}\" is neither timestamps in a supported format nor numbers, so it is \
              plotted as a series, not used as time."
@@ -1179,6 +1182,16 @@ mod tests {
         });
         let unreadable = generated_index_notice(&report).expect("announced");
         assert!(unreadable.contains("\"stamp\" is neither"), "{unreadable}");
+
+        report.time_index = TimeIndexSource::Generated(GeneratedIndexReason::MissingTimestamps {
+            column: "t".to_string(),
+            row: 4,
+        });
+        let missing = generated_index_notice(&report).expect("announced");
+        assert!(
+            missing.contains("\"t\" has no timestamp on row 4"),
+            "{missing}"
+        );
     }
 
     // Nothing to announce when the index is a real column, or when the user

@@ -178,6 +178,7 @@ enum GeneratedMeta {
     Constant { column: String },
     MostlyRepeated { column: String, changes: u64 },
     Unreadable { column: String },
+    MissingTimestamps { column: String, row: u64 },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -351,6 +352,9 @@ fn write(
                     }
                     GeneratedIndexReason::Unreadable { column } => {
                         GeneratedMeta::Unreadable { column }
+                    }
+                    GeneratedIndexReason::MissingTimestamps { column, row } => {
+                        GeneratedMeta::MissingTimestamps { column, row }
                     }
                 }),
         },
@@ -633,6 +637,9 @@ fn read(inner: impl Read, file_len: u64) -> Result<Parsed> {
                 GeneratedIndexReason::MostlyRepeated { column, changes }
             }
             GeneratedMeta::Unreadable { column } => GeneratedIndexReason::Unreadable { column },
+            GeneratedMeta::MissingTimestamps { column, row } => {
+                GeneratedIndexReason::MissingTimestamps { column, row }
+            }
         }),
     };
     let dataset = Dataset {

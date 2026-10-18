@@ -148,10 +148,14 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
         .iter()
         .map(|field| SourceColumn {
             name: field.name().clone(),
+            nullable: field.is_nullable(),
+            dictionary: matches!(field.data_type(), DataType::Dictionary(..)),
             state: match ColumnValues::for_type(field.data_type()) {
                 Ok(values) => ColumnState::Loading(values),
                 Err(reason) => ColumnState::Unloaded(reason),
             },
+            validity: None,
+            rows: 0,
         })
         .collect();
     let loaded: Vec<usize> = columns
@@ -204,6 +208,9 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
         }
     }
     request.ensure_not_cancelled()?;
+    for column in &mut columns {
+        column.settle_missing();
+    }
 
     let (dataset, time_index) = build_dataset(&mut columns, row_count, request.overrides)?;
     let unloaded_columns = columns
@@ -260,10 +267,21 @@ fn log_ignored_overrides(overrides: IngestOverrides) {
     }
 }
 
+/// Bytes per row budgeted for the text of a dictionary-encoded column's
+/// labels. Its uncompressed size in the footer is the dictionary plus the
+/// keys, far smaller than the decoded column, where every row holds its own
+/// copy of its label. The footer cannot say how long the labels are, so a
+/// state name's typical length is budgeted, with room to spare.
+const DICTIONARY_LABEL_BYTES: u64 = 32;
+
 /// What materializing every loadable column costs, from the footer: each
 /// fixed-width column at its element width, a string column at its
-/// uncompressed bytes plus one `String` per row, and the time axis at one
-/// [`Timestamp`] per row whichever column becomes it.
+/// uncompressed bytes plus one `String` per row (a dictionary column at
+/// [`DICTIONARY_LABEL_BYTES`] per row on top), one validity byte per row for
+/// a column that may hold nulls, and the time axis at one [`Timestamp`] per
+/// row whichever column becomes it. A column whose nulls promote it to `f64`
+/// (see [`SourceColumn::settle_missing`]) briefly holds both widths, so its
+/// `f64` copy is budgeted too.
 fn estimated_bytes(columns: &[SourceColumn], metadata: &ParquetMetaData, rows: u64) -> u64 {
     let schema = metadata.file_metadata().schema_descr();
     let mut text_bytes = vec![0u64; columns.len()];
@@ -279,12 +297,21 @@ fn estimated_bytes(columns: &[SourceColumn], metadata: &ParquetMetaData, rows: u
     columns
         .iter()
         .zip(text_bytes)
-        .map(|(column, text)| match &column.state {
-            ColumnState::Loading(ColumnValues::String(_)) => {
-                text + rows * std::mem::size_of::<String>() as u64
-            }
-            ColumnState::Loading(values) => rows * values.element_bytes(),
-            _ => 0,
+        .map(|(column, text)| {
+            let ColumnState::Loading(values) = &column.state else {
+                return 0;
+            };
+            let values_bytes = match values {
+                ColumnValues::String(_) if column.dictionary => {
+                    text + rows * (std::mem::size_of::<String>() as u64 + DICTIONARY_LABEL_BYTES)
+                }
+                ColumnValues::String(_) => text + rows * std::mem::size_of::<String>() as u64,
+                values if column.nullable && values.is_numeric() => {
+                    rows * (values.element_bytes() + 8)
+                }
+                values => rows * values.element_bytes(),
+            };
+            values_bytes + if column.nullable { rows } else { 0 }
         })
         .fold(axis, u64::saturating_add)
 }
@@ -292,7 +319,16 @@ fn estimated_bytes(columns: &[SourceColumn], metadata: &ParquetMetaData, rows: u
 /// One top-level column of the file's schema, in schema order.
 struct SourceColumn {
     name: String,
+    /// Whether the schema allows nulls in it (sizes the budget estimate).
+    nullable: bool,
+    /// Whether its values are dictionary-encoded (sizes the budget estimate).
+    dictionary: bool,
     state: ColumnState,
+    /// `false` at every row that is null, created at the first null seen —
+    /// `None` for a column without any (the common case costs nothing).
+    validity: Option<Vec<bool>>,
+    /// Rows appended so far.
+    rows: usize,
 }
 
 enum ColumnState {
@@ -310,17 +346,101 @@ impl SourceColumn {
         let ColumnState::Loading(values) = &mut self.state else {
             return;
         };
-        if array.null_count() > 0 {
-            // Golden Rule 1: the value buffer under a null is not a sample.
-            // Loading the column anyway would invent one per null.
-            self.state = ColumnState::Unloaded(format!(
-                "it has missing values ({} in one batch of {} rows), which Glyde cannot show yet",
-                array.null_count(),
-                array.len()
-            ));
-            return;
+        // Logical nulls: a dictionary column is null where its key is, and
+        // where the label its key points at is.
+        match array.logical_nulls().filter(|nulls| nulls.null_count() > 0) {
+            Some(nulls) => {
+                let rows = self.rows;
+                let validity = self.validity.get_or_insert_with(|| vec![true; rows]);
+                validity.extend(nulls.iter());
+            }
+            None => {
+                if let Some(validity) = &mut self.validity {
+                    validity.resize(self.rows + array.len(), true);
+                }
+            }
         }
+        self.rows += array.len();
+        // The value buffer under a null holds whatever the writer left there;
+        // `settle_missing` overwrites it before anything reads it (Golden
+        // Rule 1: it is not a sample).
         values.append(array);
+    }
+
+    /// The first row with no value, if any.
+    fn first_missing_row(&self) -> Option<usize> {
+        self.validity.as_ref()?.iter().position(|valid| !valid)
+    }
+
+    /// Turns every null into SPEC §1.3's gap, in the column's own dtype when
+    /// it has one (docs/ROADMAP.md M7, issue #157):
+    ///
+    /// - `float`/`double`: NaN, which the series flags as a NaN run.
+    /// - Integers: no integer is a gap, so the column becomes `f64` with NaN
+    ///   gaps — only when every value converts exactly (SPEC §1.4: never
+    ///   upcast with precision loss). An `int64`/`uint64` beyond ±2⁵³ is not
+    ///   loaded instead, with the reason.
+    /// - Text: an empty label, which is what a blank cell is in a CSV text
+    ///   column (and what the state timeline already shows for one).
+    /// - Booleans: text `true`/`false`/empty, which is what a CSV boolean
+    ///   column with blank cells becomes.
+    /// - Timestamps: left as they are; a timestamp column with nulls cannot
+    ///   be the time axis ([`build_dataset`] reports it), and is not a series.
+    fn settle_missing(&mut self) {
+        let Some(validity) = self.validity.take() else {
+            return;
+        };
+        let missing = validity.iter().filter(|valid| !**valid).count();
+        let ColumnState::Loading(values) = &mut self.state else {
+            return;
+        };
+        let promoted = match values {
+            ColumnValues::F32(v) => {
+                mark_missing(v, &validity, f32::NAN);
+                None
+            }
+            ColumnValues::F64(v) => {
+                mark_missing(v, &validity, f64::NAN);
+                None
+            }
+            ColumnValues::String(v) => {
+                mark_missing(v, &validity, String::new());
+                None
+            }
+            ColumnValues::Bool(v) => Some(Ok(ColumnValues::String(
+                v.iter()
+                    .zip(&validity)
+                    .map(|(&value, &valid)| match (valid, value) {
+                        (false, _) => String::new(),
+                        (true, true) => "true".to_string(),
+                        (true, false) => "false".to_string(),
+                    })
+                    .collect(),
+            ))),
+            ColumnValues::Timestamp { .. } => {
+                self.validity = Some(validity);
+                return;
+            }
+            numeric => Some(exact_f64_with_gaps(numeric, &validity).map(ColumnValues::F64)),
+        };
+        match promoted {
+            None => info!(
+                column = %self.name,
+                missing,
+                "Parquet nulls kept as gaps in the column's own dtype (SPEC §1.3)"
+            ),
+            Some(Ok(values)) => {
+                info!(
+                    column = %self.name,
+                    missing,
+                    to = if matches!(values, ColumnValues::F64(_)) { "f64 with NaN gaps" } else { "text" },
+                    "Parquet column with nulls converted so its gaps can be shown (SPEC §1.3); \
+                     every present value is unchanged"
+                );
+                self.state = ColumnState::Loading(values);
+            }
+            Some(Err(reason)) => self.state = ColumnState::Unloaded(reason),
+        }
     }
 
     /// The typed values, moving them out of this column.
@@ -387,10 +507,12 @@ impl ColumnValues {
                 zone: Zone::from_arrow(timezone.as_deref()),
                 ticks: Vec::new(),
             },
-            DataType::Dictionary(..) => {
-                return Err(
-                    "its values are dictionary-encoded, which Glyde cannot read yet".to_string(),
-                )
+            // A categorical column (SPEC §1.4): decoded to one label per row,
+            // the same string series a CSV text column is.
+            DataType::Dictionary(_, labels)
+                if matches!(labels.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+            {
+                ColumnValues::String(Vec::new())
             }
             other => return Err(format!("its type ({other}) is not one Glyde can plot")),
         })
@@ -410,7 +532,8 @@ impl ColumnValues {
     }
 
     /// Appends one batch's array, which has this column's type (the reader
-    /// decodes every batch against the one footer schema) and no nulls.
+    /// decodes every batch against the one footer schema). What lands at a
+    /// null row is a placeholder until [`SourceColumn::settle_missing`].
     fn append(&mut self, array: &ArrayRef) {
         match self {
             ColumnValues::Bool(values) => values.extend(array.as_boolean().values().iter()),
@@ -429,6 +552,7 @@ impl ColumnValues {
                 values.extend(array.as_primitive::<Float64Type>().values())
             }
             ColumnValues::String(values) => match array.data_type() {
+                DataType::Dictionary(..) => append_dictionary_labels(values, array),
                 DataType::LargeUtf8 => values.extend(
                     array
                         .as_string::<i64>()
@@ -482,6 +606,79 @@ impl ColumnValues {
             ColumnValues::Timestamp { .. } => return None,
         })
     }
+}
+
+/// Overwrites every null row's placeholder with `gap`.
+fn mark_missing<T: Clone>(values: &mut [T], validity: &[bool], gap: T) {
+    for (value, &valid) in values.iter_mut().zip(validity) {
+        if !valid {
+            *value = gap.clone();
+        }
+    }
+}
+
+/// The largest integer magnitude every smaller one of which an `f64` holds
+/// exactly (2⁵³).
+const MAX_EXACT_F64_INTEGER: u64 = 1 << 53;
+
+/// An integer column with nulls as `f64` with NaN gaps, or why it cannot be:
+/// a present value beyond ±2⁵³ would be rounded, and SPEC §1.4 forbids an
+/// upcast that loses precision.
+fn exact_f64_with_gaps(
+    values: &ColumnValues,
+    validity: &[bool],
+) -> std::result::Result<Vec<f64>, String> {
+    let exact = |magnitude: u64| magnitude <= MAX_EXACT_F64_INTEGER;
+    let fits = match values {
+        ColumnValues::I64(v) => v
+            .iter()
+            .zip(validity)
+            .all(|(n, &valid)| !valid || exact(n.unsigned_abs())),
+        ColumnValues::U64(v) => v
+            .iter()
+            .zip(validity)
+            .all(|(&n, &valid)| !valid || exact(n)),
+        _ => true,
+    };
+    if !fits {
+        return Err(
+            "it has missing values, and its integers are too large to show as decimals exactly \
+             (beyond ±2^53), so Glyde cannot mark the gaps without changing a value"
+                .to_string(),
+        );
+    }
+    let mut converted = values.to_f64();
+    mark_missing(&mut converted, validity, f64::NAN);
+    Ok(converted)
+}
+
+/// Decodes a dictionary-encoded UTF-8 batch to one label per row: the
+/// categorical column as the plain text column the rest of Glyde reads.
+fn append_dictionary_labels(values: &mut Vec<String>, array: &ArrayRef) {
+    let dictionary = array.as_any_dictionary();
+    let labels = dictionary.values();
+    let label = |key: usize| -> String {
+        if key >= labels.len() || labels.is_null(key) {
+            return String::new();
+        }
+        match labels.data_type() {
+            DataType::LargeUtf8 => labels.as_string::<i64>().value(key).to_string(),
+            _ => labels.as_string::<i32>().value(key).to_string(),
+        }
+    };
+    values.extend(
+        dictionary
+            .normalized_keys()
+            .into_iter()
+            .enumerate()
+            .map(|(row, key)| {
+                if array.is_null(row) {
+                    String::new()
+                } else {
+                    label(key)
+                }
+            }),
+    );
 }
 
 /// A timestamp column's timezone (SPEC §2.1: "if the source carries one,
@@ -637,6 +834,15 @@ fn build_dataset(
     if let Some(index) = candidate {
         let name = columns[index].name.clone();
         match &columns[index].state {
+            ColumnState::Loading(ColumnValues::Timestamp { .. })
+                if columns[index].first_missing_row().is_some() =>
+            {
+                let row = columns[index].first_missing_row().unwrap_or_default() as u64;
+                columns[index].state = ColumnState::Unloaded(format!(
+                    "it has no timestamp on row {row}, so it cannot place rows in time"
+                ));
+                generated = Some(GeneratedIndexReason::MissingTimestamps { column: name, row });
+            }
             ColumnState::Loading(ColumnValues::Timestamp { .. }) => {
                 if let Some(ColumnValues::Timestamp { unit, zone, ticks }) = columns[index].take() {
                     match absolute_axis(unit, zone, ticks) {
@@ -931,8 +1137,10 @@ mod tests {
     #[test]
     fn columns_glyde_cannot_hold_are_listed_with_a_reason_never_dropped_silently() {
         let dir = tempfile::tempdir().unwrap();
-        let dictionary: DictionaryArray<arrow::datatypes::Int32Type> =
-            vec!["idle", "idle", "run"].into_iter().collect();
+        let numeric_dictionary: DictionaryArray<arrow::datatypes::Int8Type> = DictionaryArray::new(
+            arrow::array::Int8Array::from(vec![0, 1, 0]),
+            Arc::new(Int32Array::from(vec![7, 9])),
+        );
         let path = write(
             &dir,
             vec![
@@ -947,11 +1155,7 @@ mod tests {
                     ),
                 ),
                 ("day", Arc::new(Date32Array::from(vec![1, 2, 3]))),
-                (
-                    "gappy",
-                    Arc::new(Float64Array::from(vec![Some(1.0), None, Some(3.0)])),
-                ),
-                ("state", Arc::new(dictionary)),
+                ("codes", Arc::new(numeric_dictionary)),
             ],
         );
 
@@ -964,15 +1168,194 @@ mod tests {
             .iter()
             .map(|c| (c.name.as_str(), c.reason.as_str()))
             .collect();
-        assert_eq!(unloaded.len(), 4, "{unloaded:?}");
+        assert_eq!(unloaded.len(), 3, "{unloaded:?}");
         assert!(unloaded[0].0 == "price" && unloaded[0].1.contains("Decimal128(10, 2)"));
         assert!(unloaded[1].0 == "day" && unloaded[1].1.contains("Date32"));
-        assert!(unloaded[2].0 == "gappy" && unloaded[2].1.contains("missing values"));
-        assert!(unloaded[3].0 == "state" && unloaded[3].1.contains("dictionary"));
+        assert!(unloaded[2].0 == "codes" && unloaded[2].1.contains("Dictionary(Int8, Int32)"));
+        assert_eq!(report.column_names, ["t", "value", "price", "day", "codes"]);
+    }
+
+    fn series<'a>(dataset: &'a Dataset, name: &str) -> &'a crate::series::Series {
+        dataset
+            .columns
+            .iter()
+            .find(|series| series.name() == name)
+            .unwrap_or_else(|| panic!("{name} must be loaded"))
+    }
+
+    /// SPEC §1.3: a null is a gap — NaN in the series, flagged as a NaN run,
+    /// never filled with whatever the value buffer held under it.
+    #[test]
+    fn corpus_54_float_nulls_become_flagged_nan_gaps() {
+        let (summary, report, dataset) =
+            open_default(&corpus_path("case-54-parquet-with-nulls.parquet"));
+
+        assert_eq!(summary.row_count, 6);
+        assert!(report.unloaded_columns.is_empty());
+        let value = series(&dataset, "value");
+        let SeriesValues::F64(samples) = value.values() else {
+            panic!("a double column stays f64, got {:?}", value.dtype());
+        };
+        let shown: Vec<Option<f64>> = samples
+            .iter()
+            .map(|v| (!v.is_nan()).then_some(*v))
+            .collect();
         assert_eq!(
-            report.column_names,
-            ["t", "value", "price", "day", "gappy", "state"]
+            shown,
+            [Some(10.0), Some(10.1), None, Some(10.3), None, Some(10.5)]
         );
+        assert_eq!(value.anomalies().nan_runs, [2..3, 4..5]);
+    }
+
+    #[test]
+    fn corpus_56_dictionary_strings_become_a_categorical_series() {
+        let (summary, report, dataset) =
+            open_default(&corpus_path("case-56-parquet-dictionary-strings.parquet"));
+
+        assert_eq!(summary.row_count, 6);
+        assert!(report.unloaded_columns.is_empty());
+        let state = series(&dataset, "state");
+        assert_eq!(
+            state.values(),
+            &SeriesValues::String(
+                ["idle", "idle", "running", "running", "running", "fault"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+        assert_eq!(state.view_kind(), crate::series::ViewKind::StateTimeline);
+    }
+
+    #[test]
+    fn nulls_in_every_other_supported_type_follow_the_csv_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let labels: DictionaryArray<arrow::datatypes::Int32Type> =
+            vec![Some("on"), None, Some("off")].into_iter().collect();
+        let path = write(
+            &dir,
+            vec![
+                ("t", seconds(3)),
+                (
+                    "f32",
+                    Arc::new(Float32Array::from(vec![Some(1.5), None, Some(3.0)])),
+                ),
+                (
+                    "i32",
+                    Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
+                ),
+                (
+                    "u64",
+                    Arc::new(UInt64Array::from(vec![Some(1 << 53), None, Some(0)])),
+                ),
+                (
+                    "big",
+                    Arc::new(Int64Array::from(vec![Some((1 << 53) + 1), None, Some(0)])),
+                ),
+                (
+                    "flag",
+                    Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+                ),
+                (
+                    "text",
+                    Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+                ),
+                ("labels", Arc::new(labels)),
+            ],
+        );
+
+        let (_summary, report, dataset) = open_default(&path);
+
+        let gaps = |name: &str| -> Vec<Option<f64>> {
+            let values = series(&dataset, name).values();
+            assert_eq!(values.dtype(), Dtype::F64, "{name} is promoted to f64");
+            values
+                .to_f64_vec()
+                .unwrap()
+                .into_iter()
+                .map(|v| (!v.is_nan()).then_some(v))
+                .collect()
+        };
+        let SeriesValues::F32(f32s) = series(&dataset, "f32").values() else {
+            panic!("a float column stays f32");
+        };
+        assert!(f32s[0] == 1.5 && f32s[1].is_nan() && f32s[2] == 3.0);
+        assert_eq!(series(&dataset, "f32").anomalies().nan_runs, vec![(1..2)]);
+        assert_eq!(gaps("i32"), [Some(1.0), None, Some(3.0)]);
+        assert_eq!(gaps("u64"), [Some((1u64 << 53) as f64), None, Some(0.0)]);
+        assert_eq!(series(&dataset, "i32").anomalies().nan_runs, vec![(1..2)]);
+        let text = |values: [&str; 3]| SeriesValues::String(values.map(String::from).to_vec());
+        assert_eq!(
+            series(&dataset, "flag").values(),
+            &text(["true", "", "false"])
+        );
+        assert_eq!(series(&dataset, "text").values(), &text(["a", "", "c"]));
+        assert_eq!(
+            series(&dataset, "labels").values(),
+            &text(["on", "", "off"])
+        );
+
+        assert_eq!(report.unloaded_columns.len(), 1);
+        assert_eq!(report.unloaded_columns[0].name, "big");
+        assert!(
+            report.unloaded_columns[0].reason.contains("exactly"),
+            "{}",
+            report.unloaded_columns[0].reason
+        );
+    }
+
+    #[test]
+    fn a_large_utf8_dictionary_decodes_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let labels = DictionaryArray::<arrow::datatypes::Int16Type>::new(
+            arrow::array::Int16Array::from(vec![1, 0, 1]),
+            Arc::new(LargeStringArray::from(vec!["low", "high"])),
+        );
+        let path = write(
+            &dir,
+            vec![
+                ("t", seconds(3)),
+                ("labels", Arc::new(labels)),
+                ("value", Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]))),
+            ],
+        );
+
+        let (_summary, _report, dataset) = open_default(&path);
+
+        assert_eq!(
+            series(&dataset, "labels").values(),
+            &SeriesValues::String(vec!["high".into(), "low".into(), "high".into()])
+        );
+    }
+
+    #[test]
+    fn a_timestamp_column_with_missing_values_cannot_be_the_time_axis() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            vec![
+                (
+                    "t",
+                    Arc::new(
+                        TimestampMicrosecondArray::from(vec![Some(START_US), None, Some(START_US)])
+                            .with_timezone("UTC"),
+                    ) as ArrayRef,
+                ),
+                ("value", Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]))),
+            ],
+        );
+
+        let (_summary, report, dataset) = open_default(&path);
+
+        assert_eq!(
+            report.time_index,
+            TimeIndexSource::Generated(GeneratedIndexReason::MissingTimestamps {
+                column: "t".to_string(),
+                row: 1
+            })
+        );
+        assert!(report.has_low_confidence_field());
+        assert_eq!(dataset.columns.len(), 1);
+        assert_eq!(report.unloaded_columns[0].name, "t");
     }
 
     #[test]

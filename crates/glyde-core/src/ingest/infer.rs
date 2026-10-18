@@ -967,7 +967,8 @@ impl ColumnInference {
 }
 
 /// Wraps `values` in a [`Series`] with SPEC §1.3's NaN runs flagged, never
-/// filled. Only a float column can carry them; `to_f64_vec` is not used here
+/// filled. Only a float column (`f64`, or `f32` from Parquet) can carry them;
+/// `to_f64_vec` is not used here
 /// because a `Bool`/`String` column has no NaN concept at all and an `I64`
 /// one cannot produce a NaN. `log` is off for a progressive snapshot, whose
 /// runs are logged once the column is final.
@@ -976,7 +977,14 @@ pub(crate) fn series_with_anomalies(
     values: SeriesValues,
     log: bool,
 ) -> Series {
-    let anomalies = match values.as_f64_slice() {
+    // An `f32` column (a Parquet `FLOAT`, issue #157) carries NaN gaps too.
+    let widened = match &values {
+        SeriesValues::F32(samples) => {
+            Some(samples.iter().map(|&v| f64::from(v)).collect::<Vec<_>>())
+        }
+        _ => None,
+    };
+    let anomalies = match widened.as_deref().or(values.as_f64_slice()) {
         Some(samples) => {
             let nan_runs = detect_nan_runs(samples);
             if log && !nan_runs.is_empty() {

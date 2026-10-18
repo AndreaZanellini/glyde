@@ -1222,6 +1222,10 @@ pub enum GeneratedIndexReason {
     /// The candidate column is neither timestamps in a supported format nor
     /// numbers (issue #94).
     Unreadable { column: String },
+    /// The candidate is a typed timestamp column (Parquet, issue #157) but
+    /// row `row` (0-based) has no timestamp: a time axis cannot place a row
+    /// it has no time for, and inventing one would be a guess.
+    MissingTimestamps { column: String, row: u64 },
 }
 
 /// CLAUDE.md "every ingestion decision is logged": the time index is the
@@ -1265,6 +1269,14 @@ pub(crate) fn log_time_index_decision(
             "no time column detected: the first column holds a single value throughout, so it is \
              plotted as a signal against a generated row index (SPEC §2.1), reported \
              low-confidence in the inference bar"
+        ),
+        Some(GeneratedIndexReason::MissingTimestamps { column, row }) => warn!(
+            candidate = %column,
+            first_missing_at_row = row,
+            rows,
+            "the timestamp column has rows without a timestamp, so it cannot be the time axis; \
+             the file is plotted against a generated row index instead (SPEC §1.3 \"never abort \
+             the load\"), reported low-confidence in the inference bar"
         ),
         Some(GeneratedIndexReason::Unreadable { column }) => warn!(
             candidate = %column,
