@@ -99,6 +99,12 @@ pub struct CacheKey {
     /// `IngestOverrides` itself so this module — the lower-level indexing
     /// primitive — never has to depend on `crate::ingest`'s types.
     overrides_signature: u64,
+    /// For a directory source (a partitioned Parquet dataset, issue #159), a
+    /// fingerprint of every file inside it — relative path, size and mtime —
+    /// `0` for a plain file. A directory's own size and mtime do not change
+    /// when a file deep inside it is rewritten, so without this a changed
+    /// partition would serve a stale cache.
+    contents_signature: u64,
 }
 
 impl CacheKey {
@@ -111,20 +117,20 @@ impl CacheKey {
         };
         let metadata = std::fs::metadata(source_path).map_err(to_io_error)?;
         let modified = metadata.modified().map_err(to_io_error)?;
-        let source_mtime_unix_nanos = match modified.duration_since(std::time::UNIX_EPOCH) {
-            Ok(since_epoch) => since_epoch.as_nanos() as i128,
-            // A modification time before the Unix epoch is unusual but not
-            // invalid (SPEC §2.1's "never guess silently" spirit applies to
-            // our own cache keys too: represent it exactly, don't clamp it).
-            Err(before_epoch) => -(before_epoch.duration().as_nanos() as i128),
+
+        let contents_signature = if metadata.is_dir() {
+            directory_signature(source_path).map_err(to_io_error)?
+        } else {
+            0
         };
 
         Ok(Self {
             source_path: source_path.to_path_buf(),
             source_size: metadata.len(),
-            source_mtime_unix_nanos,
+            source_mtime_unix_nanos: unix_nanos(modified),
             column: None,
             overrides_signature: 0,
+            contents_signature,
         })
     }
 
@@ -182,6 +188,46 @@ impl CacheKey {
     fn values_path(&self, cache_dir: &Path) -> PathBuf {
         cache_dir.join(format!("{}.val.glyc0", self.cache_stem()))
     }
+}
+
+/// `time` as nanoseconds since the Unix epoch. A modification time before
+/// the epoch is unusual but not invalid (SPEC §2.1's "never guess silently"
+/// spirit applies to our own cache keys too: represent it exactly, don't
+/// clamp it).
+fn unix_nanos(time: std::time::SystemTime) -> i128 {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(since_epoch) => since_epoch.as_nanos() as i128,
+        Err(before_epoch) => -(before_epoch.duration().as_nanos() as i128),
+    }
+}
+
+/// A fingerprint of every file under `dir`, at any depth: each one's path
+/// relative to `dir`, size and mtime, in path order. Every file counts, not
+/// only the ones a reader loads — a stricter key only costs a rebuild.
+/// Symlinked directories are not followed, so a link cycle cannot loop.
+fn directory_signature(dir: &Path) -> std::io::Result<u64> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in std::fs::read_dir(&current)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                pending.push(entry.path());
+            } else {
+                let metadata = std::fs::metadata(entry.path())?;
+                let relative = entry.path().strip_prefix(dir).map(Path::to_path_buf);
+                files.push((
+                    relative.unwrap_or_else(|_| entry.path()),
+                    metadata.len(),
+                    unix_nanos(metadata.modified()?),
+                ));
+            }
+        }
+    }
+    files.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    files.hash(&mut hasher);
+    Ok(hasher.finish())
 }
 
 /// A memory-mapped Level-0 cache: the raw `timestamps`/`samples` of one
@@ -803,6 +849,31 @@ mod tests {
 
         let result = try_open(dir.path(), &key).expect("a missing cache must not be an error");
         assert!(result.is_none());
+    }
+
+    /// A directory source (a partitioned Parquet dataset, issue #159): its
+    /// own size and mtime do not change when a file deep inside it is
+    /// rewritten, so the key must see every file, or a stale pyramid would be
+    /// served for changed data.
+    #[test]
+    fn a_directory_key_changes_when_any_file_inside_it_changes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nested = dir.path().join("date=1");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("part-0.parquet");
+        std::fs::write(&file, b"first version").unwrap();
+        let before = CacheKey::for_path(dir.path()).expect("key a directory");
+        assert_eq!(before, CacheKey::for_path(dir.path()).unwrap(), "stable");
+
+        // Same length, same directory listing: only the content (and mtime)
+        // changes — the case the directory's own metadata cannot see.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&file, b"other version").unwrap();
+        assert_ne!(before, CacheKey::for_path(dir.path()).unwrap());
+
+        let renamed = CacheKey::for_path(dir.path()).unwrap();
+        std::fs::rename(&file, nested.join("part-1.parquet")).unwrap();
+        assert_ne!(renamed, CacheKey::for_path(dir.path()).unwrap());
     }
 
     #[test]

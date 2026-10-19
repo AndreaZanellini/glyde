@@ -26,10 +26,8 @@
 //!   widened. A column of any other type (decimal, date, binary, nested, a
 //!   16-bit float, …) is **not loaded**: it is logged at `warn` and listed in
 //!   [`InferenceReport::unloaded_columns`], so the inference bar says so
-//!   (Golden Rule 2). Until the M7 "nulls → gaps" and "dictionary strings →
-//!   categorical" items land, a column holding nulls or dictionary-encoded
-//!   values is not loaded either, for the same reason: reading the value
-//!   buffer under a null would invent a sample.
+//!   (Golden Rule 2). Nulls become gaps and dictionary-encoded strings a
+//!   categorical series (see [`SourceColumn::settle_missing`]).
 //! - **The time index** is the first typed `TIMESTAMP` column — its type
 //!   says what it is, so there is no format to guess (reported as
 //!   `parquet_timestamp`). Its unit (s/ms/µs/ns) is kept as the tick unit and
@@ -48,6 +46,16 @@
 //! and a file that does not fit is refused with the numbers. There is no
 //! spilled path for Parquet yet, and no progress checkpoint: the plot
 //! appears when the read completes.
+//!
+//! **Partitioned directories** (issue #159). A directory holding `.parquet`
+//! files at any depth is one dataset: its files are read in path order and
+//! concatenated, and every Hive `key=value/` directory above a file becomes
+//! a text column, after the file's own, so a partition key is never dropped
+//! silently. Entries named `_*` or `.*` (`_SUCCESS`, `_temporary/`, `.crc`)
+//! are not data and are skipped, as Spark and Hive do. Every footer is read
+//! before any page: the files must agree on their columns, types and
+//! partition keys (a file that differs refuses the open, naming it — no
+//! guessed merge), and the affordability check covers all of them.
 
 use super::dataset::{
     assemble_dataset, log_time_index_decision, os_spill_dir, row_ordinal_axis, Dataset,
@@ -65,18 +73,21 @@ use crate::time::{TimeUnit, Timestamp, TimestampFormat};
 use crate::{GlydeError, Result};
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes::{
-    DataType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+    DataType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, Schema,
     TimeUnit as ArrowTimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
     TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
 use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::ParquetMetaData;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-/// Recognizes `.parquet` files (SPEC §1.1).
+/// Recognizes `.parquet` files and partitioned Parquet directories (SPEC
+/// §1.1).
 pub struct ParquetReader;
 
 impl Reader for ParquetReader {
@@ -84,10 +95,13 @@ impl Reader for ParquetReader {
         "parquet"
     }
 
+    /// A `.parquet` file, or a directory holding at least one at any depth
+    /// (a partitioned dataset, issue #159).
     fn recognizes(&self, path: &Path) -> bool {
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
+        if path.is_dir() {
+            return list_directory(path).is_ok_and(|listing| !listing.parquet_files.is_empty());
+        }
+        has_parquet_extension(path)
     }
 
     /// The summary of an automatic open. Unlike delimited text there is no
@@ -133,16 +147,18 @@ fn invalid(path: &Path, reason: impl ToString) -> GlydeError {
 
 fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, InferenceReport, Dataset)> {
     log_ignored_overrides(request.overrides);
-    let file = File::open(path).map_err(|source| GlydeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| invalid(path, e))?;
-    let schema = builder.schema().clone();
-    let metadata = builder.metadata().clone();
-    let declared_rows = u64::try_from(metadata.file_metadata().num_rows()).unwrap_or(0);
+    let sources = source_files(path)?;
+    let schema = sources[0].metadata.schema().clone();
+    let partition_keys: Vec<String> = sources[0]
+        .partition
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect();
+    check_sources_agree(path, &sources)?;
+    let declared_rows: u64 = sources.iter().map(SourceFile::declared_rows).sum();
 
-    // Decide every column's fate from the footer alone.
+    // Decide every column's fate from the footers alone. Partition keys
+    // follow the file's own columns, as text.
     let mut columns: Vec<SourceColumn> = schema
         .fields()
         .iter()
@@ -157,8 +173,17 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
             validity: None,
             rows: 0,
         })
+        .chain(partition_keys.iter().map(|key| SourceColumn {
+            name: key.clone(),
+            nullable: false,
+            dictionary: false,
+            state: ColumnState::Loading(ColumnValues::String(Vec::new())),
+            validity: None,
+            rows: 0,
+        }))
         .collect();
-    let loaded: Vec<usize> = columns
+    let file_columns = schema.fields().len();
+    let loaded: Vec<usize> = columns[..file_columns]
         .iter()
         .enumerate()
         .filter(|(_, column)| matches!(column.state, ColumnState::Loading(_)))
@@ -166,15 +191,30 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
         .collect();
     info!(
         path = %path.display(),
+        files = sources.len(),
         rows = declared_rows,
-        row_groups = metadata.num_row_groups(),
-        columns = columns.len(),
+        row_groups = sources.iter().map(|s| s.metadata.metadata().num_row_groups()).sum::<usize>(),
+        columns = file_columns,
         loadable_columns = loaded.len(),
+        partition_keys = ?partition_keys,
         "Parquet schema read from the footer"
     );
 
-    // SPEC §5.1: affordability before acting, from the footer's exact sizes.
-    let estimated_bytes = estimated_bytes(&columns, &metadata, declared_rows);
+    // SPEC §5.1: affordability before acting, from every footer's exact
+    // sizes, before a single page of any file is read.
+    let estimated_bytes = sources
+        .iter()
+        .map(|source| {
+            let rows = source.declared_rows();
+            let labels: u64 = source
+                .partition
+                .iter()
+                .map(|(_, value)| std::mem::size_of::<String>() as u64 + value.len() as u64)
+                .sum();
+            estimated_bytes(&columns[..file_columns], source.metadata.metadata(), rows)
+                .saturating_add(rows.saturating_mul(labels))
+        })
+        .fold(0, u64::saturating_add);
     if !request.budget.affords(estimated_bytes) {
         warn!(
             estimated_bytes,
@@ -192,19 +232,31 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
         "opening the Parquet file in memory: its typed columns fit the RAM budget (SPEC §5.1)"
     );
 
-    let projection = ProjectionMask::roots(builder.parquet_schema(), loaded.iter().copied());
-    let batches = builder
-        .with_projection(projection)
-        .with_batch_size(BATCH_ROWS)
-        .build()
-        .map_err(|e| invalid(path, e))?;
     let mut row_count = 0u64;
-    for batch in batches {
+    for source in &sources {
         request.ensure_not_cancelled()?;
-        let batch = batch.map_err(|e| invalid(path, e))?;
-        row_count += batch.num_rows() as u64;
-        for (array, &index) in batch.columns().iter().zip(&loaded) {
-            columns[index].append(array);
+        let file = File::open(&source.path).map_err(|source_error| GlydeError::Io {
+            path: source.path.clone(),
+            source: source_error,
+        })?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(file, source.metadata.clone());
+        let projection = ProjectionMask::roots(builder.parquet_schema(), loaded.iter().copied());
+        let batches = builder
+            .with_projection(projection)
+            .with_batch_size(BATCH_ROWS)
+            .build()
+            .map_err(|e| invalid(&source.path, e))?;
+        for batch in batches {
+            request.ensure_not_cancelled()?;
+            let batch = batch.map_err(|e| invalid(&source.path, e))?;
+            row_count += batch.num_rows() as u64;
+            for (array, &index) in batch.columns().iter().zip(&loaded) {
+                columns[index].append(array);
+            }
+            for (column, (_, value)) in columns[file_columns..].iter_mut().zip(&source.partition) {
+                column.append_label(value, batch.num_rows());
+            }
         }
     }
     request.ensure_not_cancelled()?;
@@ -231,7 +283,12 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
         })
         .collect::<Vec<_>>();
     let facts = SourceFacts {
-        column_names: schema.fields().iter().map(|f| f.name().clone()).collect(),
+        column_names: schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .chain(partition_keys)
+            .collect(),
         row_count,
         skipped_row_count: 0,
         skipped_row_details: Vec::new(),
@@ -242,6 +299,281 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
         unloaded_columns,
     };
     build_summary_and_report(facts, dataset, time_index)
+}
+
+/// One Parquet file of the source: the file itself, or one file of a
+/// partitioned directory.
+struct SourceFile {
+    path: PathBuf,
+    /// Its Hive partition keys and values (`date=2026-01-01/` gives
+    /// `("date", "2026-01-01")`), outermost first. Empty for a single file.
+    partition: Vec<(String, String)>,
+    /// Its footer, read once and reused for the read itself.
+    metadata: ArrowReaderMetadata,
+}
+
+impl SourceFile {
+    fn declared_rows(&self) -> u64 {
+        u64::try_from(self.metadata.metadata().file_metadata().num_rows()).unwrap_or(0)
+    }
+}
+
+/// Whether a directory entry is one Spark and Hive leave out of a dataset:
+/// `_SUCCESS`, `_metadata`, `_temporary/`, `.crc` checksums, hidden files.
+fn is_ignored_entry(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with('_') || name.starts_with('.')
+}
+
+fn has_parquet_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
+}
+
+/// What a walk of a dataset directory found.
+#[derive(Default)]
+struct DirectoryListing {
+    /// Every `.parquet` file, in path order.
+    parquet_files: Vec<PathBuf>,
+    /// Entries skipped by [`is_ignored_entry`] (a skipped directory counts
+    /// once).
+    ignored: usize,
+    /// Files that are not Parquet (a stray CSV, a README).
+    not_parquet: usize,
+}
+
+/// Walks `dir` at any depth. Symlinked directories are not followed, so a
+/// link cycle cannot loop.
+fn list_directory(dir: &Path) -> std::io::Result<DirectoryListing> {
+    let mut listing = DirectoryListing::default();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in std::fs::read_dir(&current)? {
+            let entry = entry?;
+            if is_ignored_entry(&entry.file_name()) {
+                listing.ignored += 1;
+            } else if entry.file_type()?.is_dir() {
+                pending.push(entry.path());
+            } else if has_parquet_extension(&entry.path()) {
+                listing.parquet_files.push(entry.path());
+            } else {
+                listing.not_parquet += 1;
+            }
+        }
+    }
+    // Path order, so `date=…` partitions arrive in date order.
+    listing.parquet_files.sort();
+    Ok(listing)
+}
+
+/// The Parquet files `path` stands for, each with its footer: `path` itself,
+/// or every Parquet file of a dataset directory (docs/SPEC.md §1.1,
+/// issue #159).
+fn source_files(path: &Path) -> Result<Vec<SourceFile>> {
+    let io_error = |source| GlydeError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let files = if path.is_dir() {
+        let listing = list_directory(path).map_err(io_error)?;
+        info!(
+            path = %path.display(),
+            parquet_files = listing.parquet_files.len(),
+            ignored_entries = listing.ignored,
+            "opening a Parquet dataset directory as one dataset, its files in path order; \
+             entries named `_*` or `.*` are not data and are ignored, as Spark and Hive do"
+        );
+        if listing.not_parquet > 0 {
+            warn!(
+                path = %path.display(),
+                files = listing.not_parquet,
+                "files without a .parquet extension in the dataset directory are not read"
+            );
+        }
+        if listing.parquet_files.is_empty() {
+            return Err(invalid(path, "the folder holds no Parquet files"));
+        }
+        listing
+            .parquet_files
+            .into_iter()
+            .map(|file| {
+                let partition = hive_partition(path, &file);
+                (file, partition)
+            })
+            .collect()
+    } else {
+        vec![(path.to_path_buf(), Vec::new())]
+    };
+    files
+        .into_iter()
+        .map(|(file_path, partition)| {
+            let file = File::open(&file_path).map_err(|source| GlydeError::Io {
+                path: file_path.clone(),
+                source,
+            })?;
+            let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
+                .map_err(|e| invalid(&file_path, e))?;
+            Ok(SourceFile {
+                path: file_path,
+                partition,
+                metadata,
+            })
+        })
+        .collect()
+}
+
+/// The value Hive writes for a null partition value.
+const HIVE_NULL_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
+
+/// The `key=value` directories between `root` and `file`, outermost first.
+/// Values are percent-decoded as Hive escapes them (`10%3A00` is `10:00`),
+/// and Hive's null partition becomes an empty label, as a null text value
+/// does.
+fn hive_partition(root: &Path, file: &Path) -> Vec<(String, String)> {
+    let Some(parent) = file.parent() else {
+        return Vec::new();
+    };
+    let Ok(relative) = parent.strip_prefix(root) else {
+        return Vec::new();
+    };
+    relative
+        .components()
+        .filter_map(|component| {
+            let component = component.as_os_str().to_str()?;
+            let (key, value) = component.split_once('=')?;
+            if key.is_empty() {
+                return None;
+            }
+            let value = if value == HIVE_NULL_PARTITION {
+                String::new()
+            } else {
+                percent_decode(value)
+            };
+            Some((percent_decode(key), value))
+        })
+        .collect()
+}
+
+/// `text` with every `%XX` escape decoded, or `text` unchanged when the
+/// escapes do not decode to UTF-8 (the directory name is then the truest
+/// label there is).
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escape = (bytes[i] == b'%')
+            .then(|| text.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escape {
+            Some(byte) => {
+                decoded.push(byte);
+                i += 3;
+            }
+            None => {
+                decoded.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| text.to_string())
+}
+
+/// SPEC §1.1's directory is one dataset only when every file agrees: the
+/// same columns of the same types, and the same partition keys. A file that
+/// differs refuses the open, naming it — there is no guessed merge.
+fn check_sources_agree(root: &Path, sources: &[SourceFile]) -> Result<()> {
+    let Some((first, rest)) = sources.split_first() else {
+        return Ok(());
+    };
+    let name = |source: &SourceFile| {
+        source
+            .path
+            .strip_prefix(root)
+            .unwrap_or(&source.path)
+            .display()
+            .to_string()
+    };
+    let keys = |source: &SourceFile| -> Vec<String> {
+        source
+            .partition
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect()
+    };
+    let schema = first.metadata.schema();
+    for key in keys(first) {
+        if schema.field_with_name(&key).is_ok() {
+            return Err(invalid(
+                root,
+                format!(
+                    "its partition key `{key}` is also a column of `{}`, so Glyde cannot tell \
+                     which one the dataset means",
+                    name(first)
+                ),
+            ));
+        }
+    }
+    for source in rest {
+        if keys(source) != keys(first) {
+            return Err(invalid(
+                root,
+                format!(
+                    "`{}` has the partition keys [{}], but `{}` has [{}]; every file of a \
+                     partitioned folder must have the same ones",
+                    name(source),
+                    keys(source).join(", "),
+                    name(first),
+                    keys(first).join(", ")
+                ),
+            ));
+        }
+        if let Some(difference) = schema_difference(source.metadata.schema(), schema) {
+            return Err(invalid(
+                root,
+                format!(
+                    "`{}` has a different schema from `{}` ({difference}); every file of the \
+                     folder must have the same columns of the same types",
+                    name(source),
+                    name(first)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// How `schema` differs from `reference` in column names or types, if it
+/// does. Nullability is not compared: whether a writer allowed nulls does not
+/// change a value.
+fn schema_difference(schema: &Schema, reference: &Schema) -> Option<String> {
+    let describe =
+        |field: &arrow::datatypes::Field| format!("`{}` ({})", field.name(), field.data_type());
+    if schema.fields().len() != reference.fields().len() {
+        return Some(format!(
+            "{} columns instead of {}",
+            schema.fields().len(),
+            reference.fields().len()
+        ));
+    }
+    schema
+        .fields()
+        .iter()
+        .zip(reference.fields())
+        .enumerate()
+        .find(|(_, (field, other))| {
+            field.name() != other.name() || field.data_type() != other.data_type()
+        })
+        .map(|(index, (field, other))| {
+            format!(
+                "column {} is {} instead of {}",
+                index + 1,
+                describe(field),
+                describe(other)
+            )
+        })
 }
 
 /// A field Parquet's own schema settles: there was nothing to guess.
@@ -365,6 +697,15 @@ impl SourceColumn {
         // `settle_missing` overwrites it before anything reads it (Golden
         // Rule 1: it is not a sample).
         values.append(array);
+    }
+
+    /// Appends `rows` copies of a partition key's value: every row of one
+    /// file of a partitioned directory has its directory's value.
+    fn append_label(&mut self, label: &str, rows: usize) {
+        if let ColumnState::Loading(ColumnValues::String(values)) = &mut self.state {
+            values.extend(std::iter::repeat_n(label, rows).map(str::to_string));
+            self.rows += rows;
+        }
     }
 
     /// The first row with no value, if any.
@@ -957,7 +1298,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
-    use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -980,8 +1320,20 @@ mod tests {
         columns: Vec<(&str, ArrayRef)>,
         properties: Option<WriterProperties>,
     ) -> PathBuf {
-        let batch = RecordBatch::try_from_iter(columns).expect("valid test batch");
         let path = dir.path().join("test.parquet");
+        write_at(&path, columns, properties);
+        path
+    }
+
+    /// Writes one Parquet file at `path`, creating its directories.
+    fn write_at(
+        path: &Path,
+        columns: Vec<(&str, ArrayRef)>,
+        properties: Option<WriterProperties>,
+    ) -> PathBuf {
+        let batch = RecordBatch::try_from_iter(columns).expect("valid test batch");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create test dirs");
+        let path = path.to_path_buf();
         let file = File::create(&path).expect("create test file");
         let mut writer =
             ArrowWriter::try_new(file, batch.schema(), properties).expect("parquet writer");
@@ -1819,6 +2171,237 @@ mod tests {
         let err = open_with(&path, IngestOverrides::default()).unwrap_err();
 
         assert!(matches!(err, GlydeError::SingleColumnFile));
+    }
+
+    fn values(count: i64, first: f64) -> ArrayRef {
+        Arc::new(Float64Array::from(
+            (0..count).map(|i| first + i as f64).collect::<Vec<_>>(),
+        ))
+    }
+
+    #[test]
+    fn corpus_55_partitions_open_as_one_dataset_in_partition_order() {
+        let path = corpus_path("case-55-partitioned-parquet-directory");
+        assert!(ParquetReader.recognizes(&path));
+
+        let (summary, report, dataset) = open_default(&path);
+
+        assert_eq!(summary.row_count, 6);
+        assert_eq!(summary.sampling_class, SamplingClass::SegmentedUniform);
+        assert_eq!(summary.gap_count, 1);
+        assert_eq!(report.column_names, ["timestamp", "value", "date"]);
+        assert_eq!(
+            series(&dataset, "value").values(),
+            &SeriesValues::F64(vec![1.0, 1.1, 1.2, 2.0, 2.1, 2.2])
+        );
+        assert_eq!(
+            series(&dataset, "date").values(),
+            &SeriesValues::String(
+                [
+                    "2026-01-01",
+                    "2026-01-01",
+                    "2026-01-01",
+                    "2026-01-03",
+                    "2026-01-03",
+                    "2026-01-03"
+                ]
+                .map(String::from)
+                .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn a_directory_is_claimed_only_when_it_holds_parquet_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!ParquetReader.recognizes(dir.path()), "an empty directory");
+        std::fs::write(dir.path().join("readings.csv"), "t,v\n").unwrap();
+        assert!(!ParquetReader.recognizes(dir.path()), "only a CSV inside");
+        write_at(
+            &dir.path().join("deep/x=1/part-0.parquet"),
+            vec![("t", seconds(2)), ("v", values(2, 0.0))],
+            None,
+        );
+        assert!(
+            ParquetReader.recognizes(dir.path()),
+            "a nested Parquet file"
+        );
+    }
+
+    #[test]
+    fn files_of_a_directory_are_concatenated_in_path_order_and_markers_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        // Written out of order on purpose: path order, not creation order.
+        write_at(
+            &dir.path().join("part-1.parquet"),
+            vec![("t", seconds(2)), ("v", values(2, 10.0))],
+            None,
+        );
+        write_at(
+            &dir.path().join("part-0.parquet"),
+            vec![("t", seconds(2)), ("v", values(2, 0.0))],
+            None,
+        );
+        std::fs::write(dir.path().join("_SUCCESS"), b"").unwrap();
+        std::fs::write(dir.path().join(".part-0.parquet.crc"), b"junk").unwrap();
+        write_at(
+            &dir.path().join("_temporary/part-9.parquet"),
+            vec![("t", seconds(1)), ("v", values(1, 99.0))],
+            None,
+        );
+
+        let (summary, report, dataset) = open_default(dir.path());
+
+        assert_eq!(
+            series(&dataset, "v").values(),
+            &SeriesValues::F64(vec![0.0, 1.0, 10.0, 11.0])
+        );
+        assert_eq!(report.column_names, ["t", "v"], "no partition keys here");
+        // Both files restart at the same instant: reported, never reordered.
+        assert_eq!(summary.non_monotonic_count, 1);
+    }
+
+    #[test]
+    fn nested_hive_partitions_become_one_text_column_per_key() {
+        let dir = tempfile::tempdir().unwrap();
+        for (site, day) in [("north", "1"), ("south", "2")] {
+            write_at(
+                &dir.path()
+                    .join(format!("site={site}/day={day}/part-0.parquet")),
+                vec![("t", seconds(1)), ("v", values(1, 0.0))],
+                None,
+            );
+        }
+
+        let (_summary, report, dataset) = open_default(dir.path());
+
+        assert_eq!(report.column_names, ["t", "v", "site", "day"]);
+        let text = |v: [&str; 2]| SeriesValues::String(v.map(String::from).to_vec());
+        assert_eq!(series(&dataset, "site").values(), &text(["north", "south"]));
+        assert_eq!(series(&dataset, "day").values(), &text(["1", "2"]));
+    }
+
+    #[test]
+    fn a_file_with_a_different_schema_refuses_the_open_and_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_at(
+            &dir.path().join("a.parquet"),
+            vec![("t", seconds(1)), ("v", values(1, 0.0))],
+            None,
+        );
+        write_at(
+            &dir.path().join("b.parquet"),
+            vec![("t", seconds(1)), ("pressure", values(1, 0.0))],
+            None,
+        );
+
+        let err = open_with(dir.path(), IngestOverrides::default()).unwrap_err();
+
+        match err {
+            GlydeError::InvalidParquet { reason, .. } => {
+                assert!(reason.contains("b.parquet"), "{reason}");
+                assert!(reason.contains("a.parquet"), "{reason}");
+            }
+            other => panic!("expected InvalidParquet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn files_with_different_partition_keys_refuse_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        write_at(
+            &dir.path().join("date=1/part-0.parquet"),
+            vec![("t", seconds(1)), ("v", values(1, 0.0))],
+            None,
+        );
+        write_at(
+            &dir.path().join("loose.parquet"),
+            vec![("t", seconds(1)), ("v", values(1, 0.0))],
+            None,
+        );
+
+        let err = open_with(dir.path(), IngestOverrides::default()).unwrap_err();
+
+        assert!(
+            matches!(&err, GlydeError::InvalidParquet { reason, .. } if reason.contains("partition")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_budget_check_covers_every_file_of_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for part in 0..4 {
+            write_at(
+                &dir.path().join(format!("part-{part}.parquet")),
+                vec![("t", seconds(1_000)), ("v", values(1_000, 0.0))],
+                None,
+            );
+        }
+        let one_file = open(
+            &dir.path().join("part-0.parquet"),
+            OpenRequest {
+                overrides: IngestOverrides::default(),
+                budget: RamBudget::from_total_ram_bytes(16 << 30),
+                cache_dir: None,
+                cancelled: &AtomicBool::new(false),
+                on_checkpoint: None,
+            },
+        );
+        assert!(one_file.is_ok());
+
+        // A budget one file fits but four files do not.
+        let err = open(
+            dir.path(),
+            OpenRequest {
+                overrides: IngestOverrides::default(),
+                budget: RamBudget::from_total_ram_bytes(4 * 50_000),
+                cache_dir: None,
+                cancelled: &AtomicBool::new(false),
+                on_checkpoint: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, GlydeError::BudgetExceeded { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn hive_values_are_percent_decoded_and_the_null_partition_is_an_empty_label() {
+        let dir = tempfile::tempdir().unwrap();
+        for at in ["10%3A00", "__HIVE_DEFAULT_PARTITION__"] {
+            write_at(
+                &dir.path().join(format!("at={at}/part-0.parquet")),
+                vec![("t", seconds(1)), ("v", values(1, 0.0))],
+                None,
+            );
+        }
+
+        let (_summary, _report, dataset) = open_default(dir.path());
+
+        // `_` sorts after digits: the null partition comes second.
+        assert_eq!(
+            series(&dataset, "at").values(),
+            &SeriesValues::String(vec!["10:00".to_string(), String::new()])
+        );
+        assert_eq!(percent_decode("a%2Fb%"), "a/b%", "a stray % is kept");
+        assert_eq!(percent_decode("%FF"), "%FF", "not UTF-8: left as written");
+    }
+
+    #[test]
+    fn a_partition_key_that_is_also_a_column_refuses_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        write_at(
+            &dir.path().join("v=1/part-0.parquet"),
+            vec![("t", seconds(1)), ("v", values(1, 0.0))],
+            None,
+        );
+
+        let err = open_with(dir.path(), IngestOverrides::default()).unwrap_err();
+
+        assert!(
+            matches!(&err, GlydeError::InvalidParquet { reason, .. } if reason.contains("`v`")),
+            "{err:?}"
+        );
     }
 
     #[test]

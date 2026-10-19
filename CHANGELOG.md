@@ -25,6 +25,40 @@ Versioning: [Semantic Versioning](https://semver.org/).
   previous commit instead of letting both run.
 
 ### Added
+- **A folder of Parquet files now opens as one dataset (milestone M7,
+  third item).** Tools like Spark, Hive, pandas and DuckDB often save a
+  dataset as a folder of Parquet files split by day or site, such as
+  `date=2026-01-01/part-0.parquet`. Choose **File → Open folder…**, or
+  drag the folder onto the window, and every file is read in name order,
+  so `date=…` folders arrive in date order. The folder-name values
+  (`date`, `site`, …) become text columns of the dataset, so you can see
+  which file each row came from. Nothing is dropped silently. To try it,
+  open the folder `testdata/corpus/case-55-partitioned-parquet-directory`:
+  you get 6 rows over two days, with one gap and a `date` column.
+  - The RAM check covers **all** the files before any data is read, so a
+    folder that does not fit is refused up front, with the numbers.
+  - Reopening a folder after you rewrite one of its files rebuilds the
+    plot. A cached plot is never shown for files that changed.
+  - Assumptions you can veto:
+    - **Every file must have the same columns, of the same types, and the
+      same folder keys.** If one differs, the open is refused with a
+      message that names the file. Glyde does not try to merge them.
+    - **Spark/Hive bookkeeping is ignored**: anything whose name starts
+      with `_` or `.` (`_SUCCESS`, `_temporary/`, `.crc` checksums).
+      Other files in the folder that are not Parquet (a stray CSV, a
+      README) are skipped too. Both counts go in the log.
+    - **Files are read in name order, and rows are never reordered.**
+      If that order is not time order (for example `hour=10` sorts
+      before `hour=9`), the out-of-order warning appears and **[Sort]**
+      fixes it, as for any file.
+    - **Folder values are decoded as Hive writes them**: `10%3A00` reads
+      as `10:00`, and Hive's "no value" folder
+      (`__HIVE_DEFAULT_PARTITION__`) becomes an empty label.
+    - **A folder key that is also a column name inside the files** (for
+      example a `date=` folder over files that already have a `date`
+      column) refuses the open, because Glyde cannot tell which one you
+      mean.
+
 - **Parquet columns with missing values, and categorical (dictionary)
   columns, now open (milestone M7, second item).** Until now the
   inference bar listed them as "not loaded". A missing value in a number
