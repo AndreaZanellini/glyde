@@ -94,10 +94,15 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-# Benchmarks must measure release-grade code (docs/QUALITY.md §3).
+# Benchmarks must measure release-grade code (docs/QUALITY.md §3), so this
+# inherits `release` unchanged: same fat LTO, same codegen as the shipped
+# binary. No debuginfo: it does not change the generated code, but under fat
+# LTO it made every bench binary's link ~7x slower (an incremental glyde-core
+# bench build went from ~100 s to ~770 s locally, and to 37 min on the CI
+# macOS runner once Parquet/arrow joined the link). To profile a bench
+# locally, opt in with `CARGO_PROFILE_BENCH_DEBUG=true cargo bench ...`.
 [profile.bench]
 inherits = "release"
-debug = true
 strip = false
 
 # Tests over multi-GB fixtures are unusably slow in a debug build; optimize

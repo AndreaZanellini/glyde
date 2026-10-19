@@ -23,6 +23,13 @@ defaults:
   run:
     shell: bash
 
+# A new push to a PR branch makes the run for the previous push worthless, so
+# cancel it instead of letting it hold a macOS runner for the whole bench job.
+# Pushes to main are never cancelled: every merge commit gets a full run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint:
     name: Format & Clippy (${{ matrix.os }})
@@ -131,7 +138,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      # rust-cache keys on Cargo.lock and only saves on a cache *miss*. When a
+      # step that builds new dependencies is added (the glyde-app bench, which
+      # pulls in the whole GUI tree) the old cache keeps matching and is never
+      # refreshed, so those ~255 crates were rebuilt from scratch on every run.
+      # Keying on this workflow file makes any change to the job's steps
+      # produce a fresh cache.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('.github/workflows/ci.yml') }}
       - name: Report free disk before fixture generation
         run: df -h .
       # Large fixtures are generated, never committed. See docs/QUALITY.md §3.
