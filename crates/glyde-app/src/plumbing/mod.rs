@@ -321,10 +321,27 @@ pub fn spawn_index_job_with_overrides(
 /// Not unit-tested: `rfd`'s native dialog has no headless backend, so this
 /// can only be exercised manually (docs/ROADMAP.md M2's proof for this item).
 pub fn spawn_open_dialog(generation: u64, cancel: CancelFlag, tx: Sender<IndexingMessage>) {
+    spawn_dialog(generation, cancel, tx, |dialog| dialog.pick_file());
+}
+
+/// [`spawn_open_dialog`] picking a folder instead: a partitioned Parquet
+/// dataset opens as one dataset (docs/SPEC.md §1.1, issue #159). The opened
+/// folder goes through the same indexer as a file; that path is tested with
+/// corpus case 55, the dialog itself only manually.
+pub fn spawn_open_folder_dialog(generation: u64, cancel: CancelFlag, tx: Sender<IndexingMessage>) {
+    spawn_dialog(generation, cancel, tx, |dialog| dialog.pick_folder());
+}
+
+fn spawn_dialog(
+    generation: u64,
+    cancel: CancelFlag,
+    tx: Sender<IndexingMessage>,
+    pick: impl FnOnce(rfd::FileDialog) -> Option<PathBuf> + Send + 'static,
+) {
     thread::Builder::new()
         .name("glyde-file-dialog".to_string())
         .spawn(move || {
-            if let Some(path) = rfd::FileDialog::new().pick_file() {
+            if let Some(path) = pick(rfd::FileDialog::new()) {
                 run_index_job(generation, path, IngestOverrides::default(), &cancel, &tx);
             }
         })
@@ -639,6 +656,36 @@ mod tests {
                 assert_eq!(dataset.columns.len(), 1);
                 assert!(pyramids[0].is_some());
                 assert!(level0_caches[0].is_some());
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// docs/ROADMAP.md M7 (issue #159): a partitioned Parquet folder, what
+    /// File → Open folder… and a folder drop hand the indexer, opens as one
+    /// dataset with its partition key as a text column.
+    #[test]
+    fn spawn_index_job_opens_a_partitioned_parquet_folder_as_one_dataset() {
+        let path = corpus_path("case-55-partitioned-parquet-directory");
+        let (tx, rx) = mpsc::channel();
+
+        spawn_index_job(4, path, CancelFlag::default(), tx);
+
+        let completed = rx
+            .iter()
+            .find(|message| {
+                matches!(
+                    message,
+                    IndexingMessage::Completed { .. } | IndexingMessage::Failed { .. }
+                )
+            })
+            .expect("the job must finish");
+        match completed {
+            IndexingMessage::Completed {
+                summary, report, ..
+            } => {
+                assert_eq!(summary.row_count, 6);
+                assert_eq!(report.column_names, ["timestamp", "value", "date"]);
             }
             other => panic!("expected Completed, got {other:?}"),
         }

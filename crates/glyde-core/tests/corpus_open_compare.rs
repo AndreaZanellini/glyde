@@ -24,10 +24,9 @@
 //! future PR can flip it off if a not-yet-implemented format needs to land
 //! ahead of satisfying every one of its cases.
 //!
-//! Parquet corpus cases 53, 54 and 56 are opened by the Parquet `Reader`
-//! (docs/ROADMAP.md M7, issues #153, #157). Case 55, a partitioned
-//! directory, needs a later M7 item and is explicitly skipped here, not
-//! asserted, until it lands.
+//! Parquet corpus cases 53-56 are opened by the Parquet `Reader`
+//! (docs/ROADMAP.md M7, issues #153, #157, #159), case 55 being a
+//! partitioned directory. Every corpus case is now asserted.
 //!
 //! Case 21 previously disagreed with `time::classify_sampling`'s robust-CV
 //! statistic (issue #48): its `.expected.json` said `"uniform"`, predating
@@ -44,8 +43,8 @@ mod support;
 use glyde_core::ingest::inspect;
 use support::{compare, corpus_dir, discover_cases, load_expected, ExpectedOutcome};
 
-/// docs/ROADMAP.md M7's partitioned-directory item (55).
-const NOT_YET_IMPLEMENTED: &[&str] = &["case-55-partitioned-parquet-directory"];
+/// Cases a future format may need to land ahead of satisfying: none today.
+const NOT_YET_IMPLEMENTED: &[&str] = &[];
 
 #[test]
 fn every_implemented_corpus_case_opens_and_matches_its_expected_json() {

@@ -35,8 +35,8 @@ use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache}
 use crate::inference_bar::Correction;
 use crate::plumbing::{
     background_decimator, lane_refiner, spawn_index_job, spawn_index_job_with_overrides,
-    spawn_open_dialog, CancelFlag, ColumnPyramids, IndexingMessage, PreparedView, TimeIndexPreview,
-    PROGRESS_BOOL_BAND_ROWS,
+    spawn_open_dialog, spawn_open_folder_dialog, CancelFlag, ColumnPyramids, IndexingMessage,
+    PreparedView, TimeIndexPreview, PROGRESS_BOOL_BAND_ROWS,
 };
 use crate::views::psd::{selection_rows, PsdPanel, PsdRequest};
 use crate::{inference_bar, views};
@@ -375,7 +375,9 @@ impl eframe::App for GlydeApp {
 
         // SPEC §6 drag-and-drop. Native builds only populate `path` (the web
         // target isn't part of v1 — docs/ARCHITECTURE.md §Workspace layout);
-        // only the most recent drop matters (single file at a time).
+        // only the most recent drop matters (single file at a time). A
+        // dropped folder is a partitioned Parquet dataset (issue #159), which
+        // the Parquet reader claims like a file.
         let dropped_path = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -393,6 +395,11 @@ impl eframe::App for GlydeApp {
                         ui.close_menu();
                         let cancel = self.next_generation();
                         spawn_open_dialog(self.generation, cancel, self.tx.clone());
+                    }
+                    if ui.button("Open folder…").clicked() {
+                        ui.close_menu();
+                        let cancel = self.next_generation();
+                        spawn_open_folder_dialog(self.generation, cancel, self.tx.clone());
                     }
                 });
             });

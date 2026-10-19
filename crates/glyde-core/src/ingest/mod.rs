@@ -269,6 +269,15 @@ mod tests {
     }
 
     #[test]
+    fn default_registry_claims_a_partitioned_directory_for_the_parquet_reader() {
+        let registry = Registry::default_registry();
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/corpus/case-55-partitioned-parquet-directory");
+        let reader = registry.find(&dir).expect("a directory of Parquet files");
+        assert_eq!(reader.format_name(), "parquet");
+    }
+
+    #[test]
     fn default_registry_has_no_reader_for_an_unknown_extension() {
         let registry = Registry::default_registry();
 
