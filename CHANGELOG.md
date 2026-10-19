@@ -11,6 +11,19 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **CI is much faster: the performance job drops from ~80–90 minutes back
+  to an estimated ~15–20.** Nothing about what is measured or enforced
+  changed: the same benchmarks run against the same budgets, on code built
+  exactly like the binary you ship. Two causes were fixed:
+  (1) the benchmark build carried debugging information, which does not
+  change the code but made the final optimization step ~7x slower — once
+  Parquet support added a large library to it, that step alone took 37
+  minutes; (2) the job's build cache had gone stale and was rebuilding the
+  whole GUI library tree from scratch on every run. Also, pushing a new
+  commit to a pull request now cancels the still-running CI for the
+  previous commit instead of letting both run.
+
 ### Added
 - **Parquet columns with missing values, and categorical (dictionary)
   columns, now open (milestone M7, second item).** Until now the
