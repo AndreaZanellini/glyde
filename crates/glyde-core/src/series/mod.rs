@@ -28,6 +28,8 @@ mod samples;
 mod state;
 
 pub use anomaly::{detect_nan_runs, Anomalies, NanRunScan};
+
+use crate::index::row_groups::RowGroupStats;
 pub use categorical::{
     state_label_id, string_state_bands, StateBand, StateBandBuilder, StateCell, StateLane,
     MAX_EXACT_STATE_BANDS, MAX_OVERVIEW_LABELS, STATE_OVERVIEW_CELLS,
@@ -94,6 +96,11 @@ pub struct Series {
     name: String,
     values: SeriesValues,
     anomalies: Anomalies,
+    /// The source's exact per-row-group min/max, when its reader has them
+    /// (a Parquet integer column, issue #162): what lets the pyramid's upper
+    /// levels skip aggregation. Dropped by [`Self::reorder`], since it
+    /// describes the source's row order.
+    row_group_stats: Option<RowGroupStats>,
 }
 
 impl Series {
@@ -103,6 +110,7 @@ impl Series {
             name: name.into(),
             values,
             anomalies: Anomalies::default(),
+            row_group_stats: None,
         }
     }
 
@@ -117,7 +125,19 @@ impl Series {
             name: name.into(),
             values,
             anomalies,
+            row_group_stats: None,
         }
+    }
+
+    /// This series with its source's row-group statistics attached (see the
+    /// field's doc).
+    pub fn with_row_group_stats(mut self, stats: RowGroupStats) -> Self {
+        self.row_group_stats = Some(stats);
+        self
+    }
+
+    pub fn row_group_stats(&self) -> Option<&RowGroupStats> {
+        self.row_group_stats.as_ref()
     }
 
     /// The column name, taken verbatim from the source header (SPEC §4.1:
@@ -170,6 +190,7 @@ impl Series {
     /// by anything yet (docs/ROADMAP.md M8).
     pub(crate) fn reorder(&mut self, order: &[usize]) {
         self.values.reorder(order);
+        self.row_group_stats = None;
         if let Some(samples) = self.values.as_f64_slice() {
             self.anomalies.nan_runs = detect_nan_runs(samples);
         }
@@ -179,6 +200,25 @@ impl Series {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Row-group statistics describe the source's row order (issue #162):
+    /// once [Sort] reorders the rows they no longer match, so they go.
+    #[test]
+    fn reordering_drops_the_row_group_statistics() {
+        use crate::index::row_groups::RowGroupBounds;
+        let bounds = |min, max| RowGroupBounds {
+            rows: 1,
+            min: Some(min),
+            max: Some(max),
+        };
+        let mut series = Series::new("count", SeriesValues::I32(vec![2, 1]))
+            .with_row_group_stats(RowGroupStats::new(vec![bounds(2.0, 2.0), bounds(1.0, 1.0)]));
+        assert!(series.row_group_stats().is_some());
+
+        series.reorder(&[1, 0]);
+
+        assert!(series.row_group_stats().is_none());
+    }
 
     #[test]
     fn a_new_series_has_no_anomalies() {

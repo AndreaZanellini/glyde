@@ -38,9 +38,12 @@
 //!   against a generated row index, reported low-confidence. A column the
 //!   user picks in the inference bar is taken as given, exactly as for CSV.
 //!
-//! **Row-group access.** Only the columns that will be loaded are decoded
-//! (a projection on the footer schema), and the file is read row group by
-//! row group in bounded record batches, cancellable between batches. What
+//! **Row-group access.** Only the columns that will be loaded are decoded,
+//! each by its own reader projected onto it alone, in parallel on the
+//! `rayon` pool, row group by row group in bounded record batches,
+//! cancellable between batches. An integer column also keeps its row
+//! groups' exact min/max, from which `index::row_groups` builds the
+//! pyramid's upper levels where that is exact (issue #162). What
 //! the typed columns will cost is known exactly from the footer before a
 //! single page is decoded, so SPEC §5.1's affordability check runs first
 //! and a file that does not fit is refused with the numbers. There is no
@@ -68,15 +71,17 @@ use super::report::{
     SourceFacts, UnloadedColumn,
 };
 use super::{IngestOverrides, Reader, TimeColumnChoice};
+use crate::index::row_groups::{RowGroupBounds, RowGroupStats};
 use crate::series::SeriesValues;
 use crate::time::{TimeUnit, Timestamp, TimestampFormat};
 use crate::{GlydeError, Result};
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes::{
-    DataType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, Schema,
+    DataType, Field, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, Schema,
     TimeUnit as ArrowTimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
     TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
+use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -172,6 +177,7 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
             },
             validity: None,
             rows: 0,
+            row_group_stats: None,
         })
         .chain(partition_keys.iter().map(|key| SourceColumn {
             name: key.clone(),
@@ -180,6 +186,7 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
             state: ColumnState::Loading(ColumnValues::String(Vec::new())),
             validity: None,
             rows: 0,
+            row_group_stats: None,
         }))
         .collect();
     let file_columns = schema.fields().len();
@@ -232,36 +239,45 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
         "opening the Parquet file in memory: its typed columns fit the RAM budget (SPEC §5.1)"
     );
 
+    // The footers give the exact row count: reserve it once, rather than
+    // letting each column's buffer double (and copy) its way there.
+    let reserve_rows = usize::try_from(declared_rows).unwrap_or(0);
+    for &index in &loaded {
+        if let ColumnState::Loading(values) = &mut columns[index].state {
+            values.reserve(reserve_rows);
+        }
+    }
+    // Each column is decoded by its own reader, projected onto it alone, on
+    // the `rayon` pool: decoding is CPU-bound, and the columns of a row group
+    // are independent chunks of the file. Every column still reads the
+    // sources in order, so its rows arrive in file order.
     let mut row_count = 0u64;
     for source in &sources {
         request.ensure_not_cancelled()?;
-        let file = File::open(&source.path).map_err(|source_error| GlydeError::Io {
-            path: source.path.clone(),
-            source: source_error,
-        })?;
-        let builder =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(file, source.metadata.clone());
-        let projection = ProjectionMask::roots(builder.parquet_schema(), loaded.iter().copied());
-        let batches = builder
-            .with_projection(projection)
-            .with_batch_size(BATCH_ROWS)
-            .build()
-            .map_err(|e| invalid(&source.path, e))?;
-        for batch in batches {
-            request.ensure_not_cancelled()?;
-            let batch = batch.map_err(|e| invalid(&source.path, e))?;
-            row_count += batch.num_rows() as u64;
-            for (array, &index) in batch.columns().iter().zip(&loaded) {
-                columns[index].append(array);
-            }
-            for (column, (_, value)) in columns[file_columns..].iter_mut().zip(&source.partition) {
-                column.append_label(value, batch.num_rows());
-            }
+        let cancelled = request.cancelled;
+        let mut targets: Vec<(usize, &mut SourceColumn)> = columns[..file_columns]
+            .iter_mut()
+            .enumerate()
+            .filter(|(index, _)| loaded.contains(index))
+            .collect();
+        use rayon::prelude::*;
+        targets
+            .par_iter_mut()
+            .try_for_each(|(index, column)| read_column(source, *index, column, cancelled))?;
+        let rows = usize::try_from(source.declared_rows()).unwrap_or(usize::MAX);
+        for (column, (_, value)) in columns[file_columns..].iter_mut().zip(&source.partition) {
+            column.append_label(value, rows);
         }
+        row_count += source.declared_rows();
     }
     request.ensure_not_cancelled()?;
     for column in &mut columns {
         column.settle_missing();
+    }
+    for (column, field) in columns.iter_mut().zip(schema.fields()) {
+        if matches!(column.state, ColumnState::Loading(_)) {
+            column.row_group_stats = row_group_stats(&sources, field);
+        }
     }
 
     let (dataset, time_index) = build_dataset(&mut columns, row_count, request.overrides)?;
@@ -299,6 +315,45 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
         unloaded_columns,
     };
     build_summary_and_report(facts, dataset, time_index)
+}
+
+/// Appends every row of the file's column `index` (a root of its schema) to
+/// `column`, in bounded record batches, checking `cancelled` between them.
+fn read_column(
+    source: &SourceFile,
+    index: usize,
+    column: &mut SourceColumn,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let file = File::open(&source.path).map_err(|error| GlydeError::Io {
+        path: source.path.clone(),
+        source: error,
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, source.metadata.clone());
+    let projection = ProjectionMask::roots(builder.parquet_schema(), [index]);
+    let batches = builder
+        .with_projection(projection)
+        .with_batch_size(BATCH_ROWS)
+        .build()
+        .map_err(|e| invalid(&source.path, e))?;
+    let rows_before = column.rows;
+    for batch in batches {
+        super::dataset::ensure_not_cancelled(cancelled)?;
+        let batch = batch.map_err(|e| invalid(&source.path, e))?;
+        column.append(batch.column(0));
+    }
+    let read = (column.rows - rows_before) as u64;
+    if read != source.declared_rows() {
+        return Err(invalid(
+            &source.path,
+            format!(
+                "its footer declares {} rows, but its column `{}` holds {read}",
+                source.declared_rows(),
+                column.name
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// One Parquet file of the source: the file itself, or one file of a
@@ -421,6 +476,143 @@ fn source_files(path: &Path) -> Result<Vec<SourceFile>> {
             })
         })
         .collect()
+}
+
+/// The exact per-row-group min/max of `field` across every source file, in
+/// row order, for the pyramid (issue #162, `index::row_groups`), or `None`
+/// (logged) when they cannot be trusted to equal a scan:
+///
+/// - Only integer columns: Parquet's float statistics leave NaN out without
+///   counting it, and a bucket's `nan_count` must be exact.
+/// - Statistics in the deprecated pre-2017 fields are not used: they were
+///   written with signed ordering, wrong for unsigned columns.
+/// - Statistics a writer marked inexact (truncated) are not used.
+///
+/// A row group with no statistics at all keeps `None` bounds; the pyramid
+/// accepts that only for a group with no values.
+fn row_group_stats(sources: &[SourceFile], field: &Field) -> Option<RowGroupStats> {
+    let integer = matches!(
+        field.data_type(),
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    );
+    if !integer {
+        if matches!(field.data_type(), DataType::Float32 | DataType::Float64) {
+            info!(
+                column = %field.name(),
+                "float column: its Parquet row-group statistics do not count NaN, so its \
+                 pyramid is aggregated in full"
+            );
+        }
+        return None;
+    }
+    let mut groups = Vec::new();
+    for source in sources {
+        match file_row_group_bounds(source, field) {
+            Ok(bounds) => groups.extend(bounds),
+            Err(reason) => {
+                info!(
+                    column = %field.name(),
+                    file = %source.path.display(),
+                    reason,
+                    "Parquet row-group statistics not used for this column's pyramid"
+                );
+                return None;
+            }
+        }
+    }
+    if groups
+        .iter()
+        .all(|group| group.min.is_none() && group.max.is_none())
+    {
+        info!(
+            column = %field.name(),
+            "this Parquet column has no row-group statistics; its pyramid is aggregated in full"
+        );
+        return None;
+    }
+    Some(RowGroupStats::new(groups))
+}
+
+/// One file's row-group bounds for `field`, or why they cannot be used.
+fn file_row_group_bounds(
+    source: &SourceFile,
+    field: &Field,
+) -> std::result::Result<Vec<RowGroupBounds>, &'static str> {
+    let metadata = source.metadata.metadata();
+    let converter = StatisticsConverter::try_new(
+        field.name(),
+        source.metadata.schema(),
+        source.metadata.parquet_schema(),
+    )
+    .map_err(|_| "the column's statistics could not be located")?;
+    let leaf = converter
+        .parquet_column_index()
+        .ok_or("the column has no Parquet leaf to read statistics from")?;
+    for row_group in metadata.row_groups() {
+        if let Some(statistics) = row_group.column(leaf).statistics() {
+            if statistics.is_min_max_deprecated() {
+                return Err("its statistics use the deprecated pre-2017 fields");
+            }
+            if !statistics.min_is_exact() || !statistics.max_is_exact() {
+                return Err("its statistics are marked inexact");
+            }
+        }
+    }
+    let unreadable = "its statistics could not be decoded";
+    let mins = converter
+        .row_group_mins(metadata.row_groups())
+        .map_err(|_| unreadable)?;
+    let maxes = converter
+        .row_group_maxes(metadata.row_groups())
+        .map_err(|_| unreadable)?;
+    let (mins, maxes) = (integers_as_f64(&mins), integers_as_f64(&maxes));
+    let (Some(mins), Some(maxes)) = (mins, maxes) else {
+        return Err(unreadable);
+    };
+    Ok(metadata
+        .row_groups()
+        .iter()
+        .zip(mins.into_iter().zip(maxes))
+        .map(|(row_group, (min, max))| RowGroupBounds {
+            rows: usize::try_from(row_group.num_rows()).unwrap_or(0),
+            min,
+            max,
+        })
+        .collect())
+}
+
+/// An integer statistics array as the `f64` the pyramid holds, converted
+/// exactly as the column's samples are (`as f64`, monotonic, so the min of
+/// the converted values is the converted min).
+fn integers_as_f64(array: &ArrayRef) -> Option<Vec<Option<f64>>> {
+    fn convert<T: arrow::datatypes::ArrowPrimitiveType>(
+        array: &ArrayRef,
+        to_f64: impl Fn(T::Native) -> f64,
+    ) -> Vec<Option<f64>> {
+        array
+            .as_primitive::<T>()
+            .iter()
+            .map(|v| v.map(&to_f64))
+            .collect()
+    }
+    Some(match array.data_type() {
+        DataType::Int8 => convert::<Int8Type>(array, f64::from),
+        DataType::Int16 => convert::<Int16Type>(array, f64::from),
+        DataType::Int32 => convert::<Int32Type>(array, f64::from),
+        DataType::Int64 => convert::<Int64Type>(array, |n| n as f64),
+        DataType::UInt8 => convert::<UInt8Type>(array, f64::from),
+        DataType::UInt16 => convert::<UInt16Type>(array, f64::from),
+        DataType::UInt32 => convert::<UInt32Type>(array, f64::from),
+        DataType::UInt64 => convert::<UInt64Type>(array, |n| n as f64),
+        _ => return None,
+    })
 }
 
 /// The value Hive writes for a null partition value.
@@ -661,6 +853,9 @@ struct SourceColumn {
     validity: Option<Vec<bool>>,
     /// Rows appended so far.
     rows: usize,
+    /// Its exact row-group min/max, for the pyramid (issue #162): an integer
+    /// column's only.
+    row_group_stats: Option<RowGroupStats>,
 }
 
 enum ColumnState {
@@ -857,6 +1052,26 @@ impl ColumnValues {
             }
             other => return Err(format!("its type ({other}) is not one Glyde can plot")),
         })
+    }
+
+    /// Makes room for `rows` more rows (the budget check already covered
+    /// them).
+    fn reserve(&mut self, rows: usize) {
+        match self {
+            ColumnValues::Bool(v) => v.reserve(rows),
+            ColumnValues::I8(v) => v.reserve(rows),
+            ColumnValues::I16(v) => v.reserve(rows),
+            ColumnValues::I32(v) => v.reserve(rows),
+            ColumnValues::I64(v) => v.reserve(rows),
+            ColumnValues::U8(v) => v.reserve(rows),
+            ColumnValues::U16(v) => v.reserve(rows),
+            ColumnValues::U32(v) => v.reserve(rows),
+            ColumnValues::U64(v) => v.reserve(rows),
+            ColumnValues::F32(v) => v.reserve(rows),
+            ColumnValues::F64(v) => v.reserve(rows),
+            ColumnValues::String(v) => v.reserve(rows),
+            ColumnValues::Timestamp { ticks, .. } => ticks.reserve(rows),
+        }
     }
 
     /// Bytes one row of this column costs in memory (a string column's text
@@ -1114,18 +1329,39 @@ fn absolute_axis(
     ticks: Vec<i64>,
 ) -> std::result::Result<TimeAxis, String> {
     let per_second = unit.ticks_per_second() as i64;
-    let mut timestamps = Vec::with_capacity(ticks.len());
-    for (row, tick) in ticks.into_iter().enumerate() {
-        if chrono::DateTime::from_timestamp(tick.div_euclid(per_second), 0).is_none() {
-            return Err(format!(
-                "its timestamp on row {row} is outside the dates Glyde can display"
-            ));
-        }
-        timestamps.push(match zone.offset_seconds(tick, unit) {
-            Some(offset) => Timestamp::with_offset(i128::from(tick), unit, offset),
-            None => Timestamp::new(i128::from(tick), unit),
-        });
+    let displayable =
+        |tick: i64| chrono::DateTime::from_timestamp(tick.div_euclid(per_second), 0).is_some();
+    // The displayable instants are one contiguous range, so checking the
+    // extremes checks every row; the row is only looked for to name it.
+    let (min, max) = ticks.iter().fold((i64::MAX, i64::MIN), |(min, max), &t| {
+        (min.min(t), max.max(t))
+    });
+    if !ticks.is_empty() && !(displayable(min) && displayable(max)) {
+        let row = ticks
+            .iter()
+            .position(|&tick| !displayable(tick))
+            .unwrap_or_default();
+        return Err(format!(
+            "its timestamp on row {row} is outside the dates Glyde can display"
+        ));
     }
+    let timestamps = match zone {
+        Zone::Naive => ticks
+            .into_iter()
+            .map(|tick| Timestamp::new(i128::from(tick), unit))
+            .collect(),
+        Zone::Fixed(offset) => ticks
+            .into_iter()
+            .map(|tick| Timestamp::with_offset(i128::from(tick), unit, offset))
+            .collect(),
+        Zone::Named(_) => ticks
+            .into_iter()
+            .map(|tick| match zone.offset_seconds(tick, unit) {
+                Some(offset) => Timestamp::with_offset(i128::from(tick), unit, offset),
+                None => Timestamp::new(i128::from(tick), unit),
+            })
+            .collect(),
+    };
     Ok(TimeAxis::Absolute {
         timestamps: Timestamps::Memory(timestamps),
         format: TimestampFormat::ParquetTimestamp,
@@ -1217,7 +1453,7 @@ fn build_dataset(
     let time_column = if generated.is_none() { candidate } else { None };
     let time = time.unwrap_or_else(|| row_ordinal_axis(row_count as usize));
 
-    let mut series = Vec::new();
+    let mut pending = Vec::new();
     for column in columns.iter_mut() {
         if is_timestamp(column) {
             column.state = ColumnState::Unloaded(
@@ -1227,9 +1463,22 @@ fn build_dataset(
             continue;
         }
         if let Some(values) = column.take().and_then(ColumnValues::into_series_values) {
-            series.push(series_with_anomalies(column.name.clone(), values, true));
+            pending.push((column.name.clone(), values, column.row_group_stats.take()));
         }
     }
+    // Each series' anomaly scan is independent: on the `rayon` pool, in
+    // column order.
+    use rayon::prelude::*;
+    let series: Vec<_> = pending
+        .into_par_iter()
+        .map(|(name, values, stats)| {
+            let built = series_with_anomalies(name, values, true);
+            match stats {
+                Some(stats) => built.with_row_group_stats(stats),
+                None => built,
+            }
+        })
+        .collect();
     if series.is_empty() {
         return Err(GlydeError::SingleColumnFile);
     }
@@ -2402,6 +2651,116 @@ mod tests {
             matches!(&err, GlydeError::InvalidParquet { reason, .. } if reason.contains("`v`")),
             "{err:?}"
         );
+    }
+
+    fn small_row_groups(rows: usize) -> WriterProperties {
+        WriterProperties::builder()
+            .set_max_row_group_size(rows)
+            .build()
+    }
+
+    /// Issue #162: an integer column carries its row groups' exact min/max,
+    /// and the pyramid built with them is the pyramid a scan builds.
+    #[test]
+    fn integer_columns_carry_their_row_group_statistics_into_the_pyramid() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = 64 * 20 + 5;
+        let counts: ArrayRef = Arc::new(Int64Array::from(
+            (0..rows as i64)
+                .map(|i| (i % 7 != 3).then_some((i * 7919) % 1013 - 500))
+                .collect::<Vec<_>>(),
+        ));
+        let path = write_with(
+            &dir,
+            vec![
+                ("t", seconds(rows as i64)),
+                ("count", counts),
+                ("level", values(rows as i64, 0.5)),
+            ],
+            Some(small_row_groups(64)),
+        );
+
+        let (_summary, _report, dataset) = open_default(&path);
+
+        let count = series(&dataset, "count");
+        let stats = count.row_group_stats().expect("an integer column has them");
+        assert_eq!(stats.groups().len(), 21);
+        assert_eq!(stats.groups()[0].rows, 64);
+        assert_eq!(stats.groups()[20].rows, 5);
+        assert!(
+            series(&dataset, "level").row_group_stats().is_none(),
+            "float statistics do not count NaN, so a float column has none"
+        );
+
+        let ticks = dataset.time.to_pyramid_ticks();
+        let samples = count.values().to_f64_vec().unwrap();
+        let (_, first_level) = crate::index::row_groups::build_pyramid_with_row_groups(
+            &samples,
+            &ticks,
+            &count.anomalies().nan_runs,
+            stats,
+        );
+        assert_eq!(first_level, Ok(1), "64-row groups line up with level 1");
+        let pyramids = crate::ingest::pyramids_for_dataset(&dataset);
+        let index = dataset
+            .columns
+            .iter()
+            .position(|c| c.name() == "count")
+            .unwrap();
+        assert_eq!(
+            pyramids[index].as_ref().unwrap(),
+            &crate::dsp::decimation::build_pyramid(&samples, &ticks)
+        );
+    }
+
+    #[test]
+    fn row_group_statistics_of_a_directory_run_across_its_files_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for (part, first) in [(0, 0), (1, 100)] {
+            let counts: ArrayRef =
+                Arc::new(Int32Array::from((first..first + 128).collect::<Vec<i32>>()));
+            write_at(
+                &dir.path().join(format!("part-{part}.parquet")),
+                vec![("t", seconds(128)), ("count", counts)],
+                Some(small_row_groups(64)),
+            );
+        }
+
+        let (_summary, _report, dataset) = open_default(dir.path());
+
+        let groups = series(&dataset, "count")
+            .row_group_stats()
+            .unwrap()
+            .groups();
+        let bounds: Vec<_> = groups.iter().map(|g| (g.rows, g.min, g.max)).collect();
+        assert_eq!(
+            bounds,
+            [
+                (64, Some(0.0), Some(63.0)),
+                (64, Some(64.0), Some(127.0)),
+                (64, Some(100.0), Some(163.0)),
+                (64, Some(164.0), Some(227.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_written_without_statistics_has_none_to_carry() {
+        let dir = tempfile::tempdir().unwrap();
+        let counts: ArrayRef = Arc::new(Int32Array::from((0..128).collect::<Vec<i32>>()));
+        let properties = WriterProperties::builder()
+            .set_max_row_group_size(64)
+            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+            .build();
+        let path = write_with(
+            &dir,
+            vec![("t", seconds(128)), ("count", counts)],
+            Some(properties),
+        );
+
+        let (_summary, _report, dataset) = open_default(&path);
+
+        assert!(series(&dataset, "count").row_group_stats().is_none());
     }
 
     #[test]

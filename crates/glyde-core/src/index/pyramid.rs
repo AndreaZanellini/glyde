@@ -124,6 +124,22 @@ where
     Ok(pyramid)
 }
 
+/// [`build_or_open`], with `build` producing the pyramid on a miss: what
+/// lets a caller hand in a builder that takes some levels from row-group
+/// statistics (issue #162) while keeping the same cache.
+pub fn build_or_open_with(
+    cache_dir: &Path,
+    key: &CacheKey,
+    build: impl FnOnce() -> Vec<Vec<Bucket>>,
+) -> Result<Vec<Vec<Bucket>>> {
+    if let Some(pyramid) = try_open(cache_dir, key)? {
+        return Ok(pyramid);
+    }
+    let pyramid = build();
+    write_cache(cache_dir, key, &pyramid)?;
+    Ok(pyramid)
+}
+
 /// Builds a new pyramid from `samples`/`timestamps` via [`build_pyramid`],
 /// writes it to the cache, and returns it.
 pub fn build(

@@ -16,10 +16,11 @@
 //! docs/QUALITY.md §3): CSV full index build must be ≤30s per 10GB, i.e.
 //! ≤3s for the 1GB fixture benched here.
 //!
-//! Only CSV is covered — Parquet ingestion (QUALITY §3's other benched
-//! path) has no reader registered yet (`ingest::Registry::default_registry`
-//! lists only `CsvReader`), so a Parquet bench would have nothing to
-//! measure; add one when a Parquet `Reader` lands.
+//! Parquet (docs/ROADMAP.md M7, issue #162): SPEC §5's "≤10s per 10GB" is
+//! ≤1s for the 1GB fixture benched here. It covers what an open does before
+//! the plot can be drawn: the read *and* every column's pyramid, half of
+//! them integer columns whose upper levels come from the row-group
+//! statistics (`index::row_groups`).
 //!
 //! Per issue #61 decision 2: this gate enforces the absolute SPEC §5
 //! ceiling only (with a margin over the linear budget for CI-runner noise,
@@ -51,6 +52,23 @@ mod support;
 /// that measurement rather than guessed; tighten it once real CI timing is
 /// observed.
 const CSV_1GB_CEILING: Duration = Duration::from_secs(45);
+
+/// SPEC §5: "Full index build, Parquet: ≤10s per 10GB" is ≤1s for 1GB on
+/// the reference machine. Like the CSV ceiling above, this build-blocking
+/// gate carries a margin for shared CI hardware and catches real
+/// regressions (a return to single-threaded decoding would roughly double
+/// it). It is **not** proof of the SPEC number: on a MacBook Air M1 (the
+/// reference machine, but swapping under other load) this bench measured
+/// ~1.5–2 s, so the reference budget is not met yet. That gap is tracked in
+/// issue #163.
+const PARQUET_1GB_CEILING: Duration = Duration::from_secs(10);
+
+/// pyarrow's default row-group size (2^20 rows): it lines up with pyramid
+/// level 6 (8^7 = 2^21 rows), so the statistics path is exercised.
+const PARQUET_ROW_GROUP_ROWS: usize = 1 << 20;
+/// Four `f64` and four `i64` columns: the floats are always aggregated, the
+/// integers take their upper levels from the statistics.
+const PARQUET_COLUMNS: (usize, usize) = (4, 4);
 
 const FIXTURE_BYTES: u64 = 1024 * 1024 * 1024;
 const FIXTURE_COLUMNS: usize = 8;
@@ -87,5 +105,45 @@ fn bench_index_build(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_index_build);
+fn bench_parquet_index_build(c: &mut Criterion) {
+    let fixture = support::fixture_dir().join("bench_index_build_1gb.parquet");
+    support::ensure_parquet_fixture(
+        &fixture,
+        FIXTURE_BYTES,
+        PARQUET_COLUMNS,
+        PARQUET_ROW_GROUP_ROWS,
+        FIXTURE_SEED,
+    )
+    .expect("failed to generate the Parquet index_build bench fixture");
+
+    let build = |path: &std::path::Path| {
+        let (_summary, _report, dataset) =
+            ingest::open_dataset(path).expect("index build must succeed on its own bench fixture");
+        let pyramids = ingest::pyramids_for_dataset(&dataset);
+        assert!(
+            pyramids.iter().all(Option::is_some),
+            "every column is numeric"
+        );
+        (dataset, pyramids)
+    };
+
+    let start = Instant::now();
+    drop(build(&fixture));
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed <= PARQUET_1GB_CEILING,
+        "index build on a 1 GB Parquet file took {elapsed:?}, exceeding the \
+         {PARQUET_1GB_CEILING:?} build-blocking ceiling (SPEC §5: full index build, Parquet, \
+         ≤10s per 10GB)"
+    );
+
+    let mut group = c.benchmark_group("index_build");
+    group.sample_size(10);
+    group.bench_function("parquet_1gb", |b| {
+        b.iter(|| build(std::hint::black_box(&fixture)))
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_index_build, bench_parquet_index_build);
 criterion_main!(benches);

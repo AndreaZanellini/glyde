@@ -54,6 +54,7 @@ use crate::budget::RamBudget;
 use crate::dsp::decimation::{build_pyramid, build_pyramid_streaming, extend_pyramid, Bucket};
 use crate::index::level0::{self, CacheKey, Level0Cache};
 use crate::index::pyramid;
+use crate::index::row_groups;
 use crate::index::spill::{SpillSet, SpillStringsWriter, SpillVec, SpillVecWriter};
 use crate::series::{Anomalies, Dtype, NanRunScan, Series, SeriesValues, SpilledValues};
 use crate::time::{
@@ -2741,13 +2742,13 @@ pub fn pyramids_for_dataset(dataset: &Dataset) -> Vec<Option<Vec<Vec<Bucket>>>> 
         .columns
         .par_iter()
         .map(|series| match series.values().as_f64_slice() {
-            // Already `f64`: hand `build_pyramid` the samples themselves
-            // rather than a freshly allocated copy of them.
-            Some(samples) => Some(build_pyramid(samples, &ticks)),
+            // Already `f64`: hand the builder the samples themselves rather
+            // than a freshly allocated copy of them.
+            Some(samples) => Some(column_pyramid(series, samples, &ticks)),
             None => series
                 .values()
                 .to_f64_vec()
-                .map(|samples| build_pyramid(&samples, &ticks)),
+                .map(|samples| column_pyramid(series, &samples, &ticks)),
         })
         .collect()
 }
@@ -3074,7 +3075,7 @@ fn derived_caches_for_column(
             path,
             cache_dir,
             column_key,
-            index,
+            (index, series),
             level0.samples(),
             level0.timestamps(),
         );
@@ -3099,7 +3100,7 @@ fn derived_caches_for_column(
                 path,
                 cache_dir,
                 column_key,
-                index,
+                (index, series),
                 level0.samples(),
                 level0.timestamps(),
             );
@@ -3113,8 +3114,14 @@ fn derived_caches_for_column(
                 "level 0 cache could not be written for this column; the raw-sample view will \
                  read from the in-memory dataset instead (issue #92)"
             );
-            let pyramid =
-                build_or_open_pyramid(path, cache_dir, column_key, index, &samples, ticks);
+            let pyramid = build_or_open_pyramid(
+                path,
+                cache_dir,
+                column_key,
+                (index, series),
+                &samples,
+                ticks,
+            );
             (Some(pyramid), None)
         }
     }
@@ -3127,11 +3134,13 @@ fn build_or_open_pyramid(
     path: &Path,
     cache_dir: &Path,
     column_key: &CacheKey,
-    index: usize,
+    (index, series): (usize, &Series),
     samples: &[f64],
     ticks: &[i128],
 ) -> Vec<Vec<Bucket>> {
-    match pyramid::build_or_open(cache_dir, column_key, samples, ticks) {
+    match pyramid::build_or_open_with(cache_dir, column_key, || {
+        column_pyramid(series, samples, ticks)
+    }) {
         Ok(levels) => levels,
         Err(err) => {
             warn!(
@@ -3141,9 +3150,41 @@ fn build_or_open_pyramid(
                 "pyramid cache read/write failed for this column; falling back to an uncached \
                  build (issue #81)"
             );
-            build_pyramid(samples, ticks)
+            column_pyramid(series, samples, ticks)
         }
     }
+}
+
+/// `series`' in-memory pyramid over `samples` (its values as `f64`): taken
+/// partly from its source's row-group statistics when it has them and they
+/// line up exactly (issue #162, [`row_groups`]), aggregated in full
+/// otherwise. The same pyramid either way; the decision is logged.
+fn column_pyramid(series: &Series, samples: &[f64], ticks: &[i128]) -> Vec<Vec<Bucket>> {
+    let Some(stats) = series.row_group_stats() else {
+        return build_pyramid(samples, ticks);
+    };
+    let (pyramid, first_level) = row_groups::build_pyramid_with_row_groups(
+        samples,
+        ticks,
+        &series.anomalies().nan_runs,
+        stats,
+    );
+    match first_level {
+        Ok(level) => info!(
+            column = series.name(),
+            row_groups = stats.groups().len(),
+            from_level = level,
+            levels = pyramid.len(),
+            "pyramid levels from this one up taken from the Parquet row-group statistics, \
+             with no aggregation (exact: each bucket is whole row groups)"
+        ),
+        Err(reason) => info!(
+            column = series.name(),
+            reason = %reason,
+            "Parquet row-group statistics not used for this column's pyramid; aggregated in full"
+        ),
+    }
+    pyramid
 }
 
 #[cfg(test)]

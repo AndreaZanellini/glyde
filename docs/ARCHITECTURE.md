@@ -29,7 +29,7 @@ New dependencies require a one-line justification in the PR. Prefer the above. `
 
 Considered and rejected. A DataFrame engine is built to load and transform tables in memory; Glyde does the opposite — it never materializes the dataset, it streams once to build an index and thereafter reads only what a viewport needs. Its inference (joint delimiter/decimal resolution, encoding recovery, metadata preambles, ragged-row salvage) is the product's differentiator and must be ours, so a DataFrame library's own inference would go unused. What would remain is raw parse speed, which `csv` over memory-mapped chunks with `rayon` already delivers — without the dependency tree, the compile times, or the pressure on the 50 MB binary budget.
 
-The Parquet path benefits doubly: row groups carry **column min/max statistics** in their metadata, which populate the upper levels of the index pyramid with no scan at all.
+The Parquet path benefits doubly: row groups carry **column min/max statistics** in their metadata, which populate the upper levels of the index pyramid with no scan at all — **where that is exact** (issue #162, `glyde_core::index::row_groups`). The levels whose buckets are unions of whole row groups (equal-sized groups, bucket size a multiple of the group size) are taken from the statistics, and the levels below them are still scanned. Only integer columns qualify: Parquet's float statistics leave NaN out without counting it, and a bucket's `nan_count` must be exact (#164). `nan_count` comes from the series' own NaN runs, and `first_ts`/`last_ts` from the time axis at the bucket's edges, never from the footer.
 
 ## Workspace layout
 
