@@ -20,6 +20,7 @@
 pub mod disk_pyramid;
 pub mod level0;
 pub mod pyramid;
+pub mod row_groups;
 pub mod spill;
 
 pub use level0::{CacheKey, Level0Cache, Level0CacheWriter};

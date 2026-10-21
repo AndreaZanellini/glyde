@@ -25,6 +25,32 @@ Versioning: [Semantic Versioning](https://semver.org/).
   previous commit instead of letting both run.
 
 ### Added
+- **Parquet files open faster, and whole-number columns use the file's
+  own summaries for the zoomed-out view (milestone M7, fourth item).**
+  - **Faster opening:** a Parquet file's columns are now read in
+    parallel. On the reference MacBook Air M1, reading a 1 GB file went
+    from about 1.0 s to about 0.5 s, and the whole open, plot included,
+    from about 2.0 s to about 1.5 s.
+  - **The file's own summaries:** Parquet stores a min/max for every
+    block of rows. For whole-number columns, Glyde now uses them for the
+    most zoomed-out levels of the plot instead of recomputing them. This
+    only happens when the result is guaranteed to be identical, and the
+    plot looks exactly the same.
+  - **Not met yet:** the target for opening Parquet is 1 s per GB on the
+    M1, and it measured about 1.5–2 s. That machine was busy and swapping
+    during the measurement, so the real number may be better. The gap is
+    tracked in issue #163. CI now times a 1 GB Parquet open on every
+    change, so it can only get faster from here.
+  - Decided by you on #162, listed here so you can check:
+    - **Decimal (float) columns do not use the summaries.** Parquet's
+      float summaries skip missing (NaN) values without counting them,
+      and Glyde must know exactly where missing data is (issue #164).
+    - The summaries are not used when the file's blocks of rows are not
+      all the same size (Spark, DuckDB and partitioned folders usually
+      are not), after **[Sort]**, or when a summary is missing or written
+      in an old format. In those cases the plot is computed as before,
+      and the log says why.
+
 - **A folder of Parquet files now opens as one dataset (milestone M7,
   third item).** Tools like Spark, Hive, pandas and DuckDB often save a
   dataset as a folder of Parquet files split by day or site, such as

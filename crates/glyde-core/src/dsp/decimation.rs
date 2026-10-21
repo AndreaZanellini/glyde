@@ -275,7 +275,7 @@ impl Level0Stream {
 }
 
 /// [`Level0Builder`] over one whole slice — the in-memory case.
-fn bucket_level_from_samples(samples: &[f64], timestamps: &[i128]) -> Vec<Bucket> {
+pub(crate) fn bucket_level_from_samples(samples: &[f64], timestamps: &[i128]) -> Vec<Bucket> {
     let mut builder = Level0Builder::for_sample_count(samples.len());
     builder.push_chunk(samples, timestamps);
     builder.finish()
@@ -284,7 +284,7 @@ fn bucket_level_from_samples(samples: &[f64], timestamps: &[i128]) -> Vec<Bucket
 /// Aggregates one pyramid level into the next, exactly — min-of-mins,
 /// max-of-maxes over groups of [`PYRAMID_FACTOR`] children (SPEC §3.1: "never
 /// from resampled or averaged data").
-fn bucket_level_from_buckets(children: &[Bucket]) -> Vec<Bucket> {
+pub(crate) fn bucket_level_from_buckets(children: &[Bucket]) -> Vec<Bucket> {
     children
         .chunks(PYRAMID_FACTOR)
         .map(|group| {

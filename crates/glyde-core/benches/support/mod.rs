@@ -129,6 +129,88 @@ pub fn ensure_csv_fixture(
     writer.flush()
 }
 
+/// Writes a deterministic Parquet fixture at `path`, if it does not already
+/// exist: a UTC microsecond timestamp column, `float_columns` `f64` columns
+/// and `integer_columns` `i64` columns, every one non-nullable,
+/// uncompressed, in row groups of `row_group_rows` rows, until the data
+/// reaches `target_bytes` (8 bytes per value). Written to a temporary name and
+/// renamed, so an interrupted run never leaves a short fixture to be reused.
+pub fn ensure_parquet_fixture(
+    path: &Path,
+    target_bytes: u64,
+    (float_columns, integer_columns): (usize, usize),
+    row_group_rows: usize,
+    seed: u64,
+) -> std::io::Result<()> {
+    use arrow::array::{ArrayRef, Float64Array, Int64Array, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::sync::Arc;
+
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let to_io = |e: parquet::errors::ParquetError| std::io::Error::other(e);
+
+    let mut fields = vec![Field::new(
+        "timestamp",
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    )];
+    fields
+        .extend((0..float_columns).map(|i| Field::new(format!("ch{i}"), DataType::Float64, false)));
+    fields
+        .extend((0..integer_columns).map(|i| Field::new(format!("n{i}"), DataType::Int64, false)));
+    let schema = Arc::new(Schema::new(fields));
+
+    let bytes_per_row = 8 * (1 + float_columns + integer_columns) as u64;
+    let rows = target_bytes / bytes_per_row;
+    let properties = WriterProperties::builder()
+        .set_max_row_group_size(row_group_rows)
+        .build();
+    let tmp = path.with_extension("parquet.tmp");
+    let mut writer = ArrowWriter::try_new(File::create(&tmp)?, schema.clone(), Some(properties))
+        .map_err(to_io)?;
+
+    const BATCH: u64 = 1 << 16;
+    let epoch_start_us: i64 = 1_700_000_000_000_000;
+    let mut rng = Xorshift64::new(seed);
+    let mut row = 0u64;
+    while row < rows {
+        let n = BATCH.min(rows - row);
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(
+            TimestampMicrosecondArray::from(
+                (row..row + n)
+                    .map(|r| epoch_start_us + r as i64 * 1_000)
+                    .collect::<Vec<_>>(),
+            )
+            .with_timezone("UTC"),
+        )];
+        for _ in 0..float_columns {
+            columns.push(Arc::new(Float64Array::from(
+                (0..n).map(|_| rng.next_f64() * 1000.0).collect::<Vec<_>>(),
+            )));
+        }
+        for _ in 0..integer_columns {
+            columns.push(Arc::new(Int64Array::from(
+                (0..n)
+                    .map(|_| (rng.next_f64() * 1e6) as i64)
+                    .collect::<Vec<_>>(),
+            )));
+        }
+        let batch = RecordBatch::try_new(schema.clone(), columns).map_err(std::io::Error::other)?;
+        writer.write(&batch).map_err(to_io)?;
+        row += n;
+    }
+    writer.close().map_err(to_io)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// Formats milliseconds since the Unix epoch as `YYYY-MM-DDTHH:MM:SS.sssZ`.
 /// Small, self-contained civil-calendar conversion (Howard Hinnant's
 /// `civil_from_days`) so this bench-only helper does not need a timezone
