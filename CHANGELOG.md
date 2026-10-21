@@ -25,6 +25,30 @@ Versioning: [Semantic Versioning](https://semver.org/).
   previous commit instead of letting both run.
 
 ### Added
+- **Parquet time columns stored as plain numbers or text now become a real
+  time axis, exactly as in a CSV (milestone M7, last item).** Many tools
+  write the time as a plain number (seconds, milliseconds, microseconds or
+  nanoseconds since 1970, a LabVIEW timestamp, an Excel date) or as date
+  text, instead of Parquet's own timestamp type. Before, such a file was
+  plotted against those raw numbers; now the plot shows dates and times,
+  in UTC for epoch numbers. Glyde decides this with the same rules it uses
+  for CSV, so the same values give the same answer in either format:
+  - a number column that runs backwards or never advances is still treated
+    as a signal and plotted against the row number, as before;
+  - a whole-second value that could also be a LabVIEW timestamp is shown
+    as "low confidence" in the inference bar, as in CSV;
+  - a timestamp-format correction now applies to such a column (before,
+    Parquet ignored it). It still does not apply to a column of Parquet's
+    own timestamp type, whose type already says what it is.
+  - **Assumption to veto:** a decimal number column with whole values (for
+    example `1772352000.0`) is read like the same whole numbers. In a CSV,
+    the text `.0` counts as a hint that the value is a LabVIEW timestamp.
+    A Parquet decimal column has no text to carry that hint, so Glyde
+    doesn't use it. If the corrected format can't read the column, Glyde
+    plots against the row number and says why, instead of refusing to open
+    the file.
+  - Try it: open `testdata/corpus/case-61-parquet-epoch-milliseconds.parquet`
+    and the axis shows 2026-03-01 08:00:00 onwards.
 - **Parquet files open faster, and whole-number columns use the file's
   own summaries for the zoomed-out view (milestone M7, fourth item).**
   - **Faster opening:** a Parquet file's columns are now read in

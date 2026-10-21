@@ -1293,7 +1293,7 @@ pub(crate) fn log_time_index_decision(
 /// SPEC §2.1's progressive numeric index: a plain number with no
 /// absolute-time meaning. A field that is not even that is not a time index
 /// value at all — see [`TimeCandidateScan`].
-fn parse_progressive_value(field: &str) -> Result<f64> {
+pub(crate) fn parse_progressive_value(field: &str) -> Result<f64> {
     field
         .trim()
         .parse::<f64>()
