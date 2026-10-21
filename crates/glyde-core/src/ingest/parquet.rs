@@ -1608,6 +1608,10 @@ fn time_axis_from_text(
         ));
     };
 
+    // The `f64` copy only ever becomes a progressive axis: free it before
+    // the timestamps are built, so the open never holds both (PR #167
+    // review).
+    drop(as_f64);
     let mut timestamps = Vec::with_capacity(values.len());
     let mut first_failure = None;
     values.for_each_field(|field| {
