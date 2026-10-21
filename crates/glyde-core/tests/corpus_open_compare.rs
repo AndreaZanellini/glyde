@@ -24,8 +24,8 @@
 //! future PR can flip it off if a not-yet-implemented format needs to land
 //! ahead of satisfying every one of its cases.
 //!
-//! Parquet corpus cases 53-56 are opened by the Parquet `Reader`
-//! (docs/ROADMAP.md M7, issues #153, #157, #159), case 55 being a
+//! Parquet corpus cases 53-56 and 61 are opened by the Parquet `Reader`
+//! (docs/ROADMAP.md M7, issues #153, #157, #159, #166), case 55 being a
 //! partitioned directory. Every corpus case is now asserted.
 //!
 //! Case 21 previously disagreed with `time::classify_sampling`'s robust-CV

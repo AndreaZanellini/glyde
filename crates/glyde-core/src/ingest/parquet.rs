@@ -33,10 +33,16 @@
 //!   `parquet_timestamp`). Its unit (s/ms/µs/ns) is kept as the tick unit and
 //!   its timezone is honored per row (SPEC §2.1); a column without one is
 //!   naive local time. A file with no timestamp column falls back to SPEC
-//!   §2.1's rule for column 0: a numeric column that never runs backwards
-//!   and does advance is a progressive index, anything else is plotted
-//!   against a generated row index, reported low-confidence. A column the
-//!   user picks in the inference bar is taken as given, exactly as for CSV.
+//!   §2.1's rule for column 0, and a column of numbers or text (column 0,
+//!   or one the user picks) goes through **the same time-index path as a
+//!   CSV column holding the same values** (issue #166): its values are read
+//!   as text by the same timestamp-format scan, so epoch s/ms/µs/ns, LabVIEW
+//!   and Excel serial numbers and date/time strings become absolute time,
+//!   and the user's timestamp-format correction applies to it. A numeric
+//!   column that never runs backwards and does advance but matches no
+//!   format is a progressive index; anything else is plotted against a
+//!   generated row index, reported low-confidence. A column the user picks
+//!   in the inference bar is taken as given, exactly as for CSV.
 //!
 //! **Row-group access.** Only the columns that will be loaded are decoded,
 //! each by its own reader projected onto it alone, in parallel on the
@@ -61,9 +67,9 @@
 //! guessed merge), and the affordability check covers all of them.
 
 use super::dataset::{
-    assemble_dataset, log_time_index_decision, os_spill_dir, row_ordinal_axis, Dataset,
-    GeneratedIndexReason, ProgressiveValues, TimeAxis, TimeCandidateScan, TimeIndexInference,
-    Timestamps,
+    assemble_dataset, log_time_index_decision, os_spill_dir, parse_progressive_value,
+    row_ordinal_axis, Dataset, GeneratedIndexReason, ProgressiveValues, TimeAxis,
+    TimeCandidateScan, TimeIndexInference, Timestamps,
 };
 use super::infer::{series_with_anomalies, Confidence};
 use super::report::{
@@ -73,7 +79,10 @@ use super::report::{
 use super::{IngestOverrides, Reader, TimeColumnChoice};
 use crate::index::row_groups::{RowGroupBounds, RowGroupStats};
 use crate::series::SeriesValues;
-use crate::time::{TimeUnit, Timestamp, TimestampFormat};
+use crate::time::{
+    parse_timestamp, TimeUnit, Timestamp, TimestampFormat, TimestampFormatInference,
+    TimestampFormatScan,
+};
 use crate::{GlydeError, Result};
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes::{
@@ -777,16 +786,17 @@ fn settled<T>(value: T) -> InferredField<T> {
 }
 
 /// The text-format corrections have no meaning for a typed file; say so
-/// rather than dropping them without a trace.
+/// rather than dropping them without a trace. (A timestamp-format
+/// correction does apply, to a time column of numbers or text: see
+/// [`time_axis_from_text`].)
 fn log_ignored_overrides(overrides: IngestOverrides) {
     if overrides.delimiter.is_some()
         || overrides.decimal_separator.is_some()
         || overrides.encoding.is_some()
-        || overrides.timestamp_format.is_some()
     {
         info!(
-            "delimiter, decimal separator, encoding and timestamp format corrections do not \
-             apply to a Parquet file; ignored"
+            "delimiter, decimal separator and encoding corrections do not apply to a Parquet \
+             file; ignored"
         );
     }
 }
@@ -1319,6 +1329,15 @@ fn parse_fixed_offset(timezone: &str) -> Option<i32> {
     (hours < 24 && minutes < 60).then_some(sign * (hours * 3600 + minutes * 60))
 }
 
+/// Whether `ticks` of `unit` since the Unix epoch is an instant `chrono` can
+/// display (within about ±262,000 years).
+fn displayable(ticks: i128, unit: TimeUnit) -> bool {
+    i64::try_from(ticks.div_euclid(unit.ticks_per_second()))
+        .ok()
+        .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+        .is_some()
+}
+
 /// The time axis from a timestamp column's ticks, or why it cannot be one:
 /// an instant outside the calendar range `chrono` can display (beyond about
 /// ±262,000 years) is not a time Glyde can place on an axis, and every
@@ -1328,9 +1347,7 @@ fn absolute_axis(
     zone: Zone,
     ticks: Vec<i64>,
 ) -> std::result::Result<TimeAxis, String> {
-    let per_second = unit.ticks_per_second() as i64;
-    let displayable =
-        |tick: i64| chrono::DateTime::from_timestamp(tick.div_euclid(per_second), 0).is_some();
+    let displayable = |tick: i64| displayable(i128::from(tick), unit);
     // The displayable instants are one contiguous range, so checking the
     // extremes checks every row; the row is only looked for to name it.
     let (min, max) = ticks.iter().fold((i64::MAX, i64::MIN), |(min, max), &t| {
@@ -1404,6 +1421,7 @@ fn build_dataset(
     };
 
     let mut time = None;
+    let mut timestamp_format_ambiguous = false;
     let mut generated = match candidate {
         None => Some(GeneratedIndexReason::Requested),
         Some(_) => None,
@@ -1421,6 +1439,13 @@ fn build_dataset(
                 generated = Some(GeneratedIndexReason::MissingTimestamps { column: name, row });
             }
             ColumnState::Loading(ColumnValues::Timestamp { .. }) => {
+                if overrides.timestamp_format.is_some() {
+                    info!(
+                        time_column = %name,
+                        "the timestamp format correction does not apply to a typed Parquet \
+                         timestamp column, whose type settles its format; ignored"
+                    );
+                }
                 if let Some(ColumnValues::Timestamp { unit, zone, ticks }) = columns[index].take() {
                     match absolute_axis(unit, zone, ticks) {
                         Ok(axis) => time = Some(axis),
@@ -1431,20 +1456,19 @@ fn build_dataset(
                     }
                 }
             }
-            ColumnState::Loading(values) if values.is_numeric() => {
-                let mut scan = TimeCandidateScan::default();
-                let as_f64 = values.to_f64();
-                for &value in &as_f64 {
-                    scan.observe_value(value);
-                }
-                match scan.verdict(false, check_monotonic, &name) {
-                    None => {
+            ColumnState::Loading(values) if values.is_numeric() || values.is_text() => {
+                match time_axis_from_text(
+                    values,
+                    &name,
+                    overrides.timestamp_format,
+                    check_monotonic,
+                ) {
+                    Ok((axis, ambiguous)) => {
                         columns[index].take();
-                        time = Some(TimeAxis::Progressive {
-                            values: ProgressiveValues::Memory(as_f64),
-                        });
+                        time = Some(axis);
+                        timestamp_format_ambiguous = ambiguous;
                     }
-                    Some(reason) => generated = Some(reason),
+                    Err(reason) => generated = Some(reason),
                 }
             }
             _ => generated = Some(GeneratedIndexReason::Unreadable { column: name }),
@@ -1488,7 +1512,7 @@ fn build_dataset(
         None => super::GENERATED_TIME_COLUMN_NAME.to_string(),
     };
     let inference = TimeIndexInference {
-        timestamp_format_ambiguous: false,
+        timestamp_format_ambiguous,
         time_column,
         generated,
     };
@@ -1499,7 +1523,191 @@ fn build_dataset(
     ))
 }
 
+/// SPEC §2.1's decision for a time column of numbers or text, made exactly
+/// as the CSV path (`dataset::TimeAxisBuilder`) makes it for a column
+/// holding the same values as text (issue #166): the same
+/// [`TimestampFormatScan`] (or the user's format correction) chooses the
+/// format, the same [`TimeCandidateScan`] verdict decides whether the
+/// column is a time index at all, and [`parse_timestamp`] reads each value.
+/// A test opens every case both ways and asserts the same decision.
+///
+/// A number is read as the text [`ColumnValues::for_each_field`] gives it,
+/// its shortest exact decimal form: a whole-valued float reads as the
+/// integer it equals. CSV text can carry a `.0` that the scan takes as
+/// evidence of a LabVIEW timestamp; a typed float carries no such text, so
+/// an `INT64` and a `DOUBLE` column of the same values reach the same
+/// decision.
+///
+/// Returns the axis and whether its format is SPEC §2.1's low-confidence
+/// pick, or why the column is not a time index. A format correction the
+/// column cannot be read in falls back to the row index with the reason
+/// rather than failing the open (SPEC §1.3 "never abort the load").
+fn time_axis_from_text(
+    values: &ColumnValues,
+    column: &str,
+    format_override: Option<TimestampFormat>,
+    check_monotonic: bool,
+) -> std::result::Result<(TimeAxis, bool), GeneratedIndexReason> {
+    let unreadable = || GeneratedIndexReason::Unreadable {
+        column: column.to_string(),
+    };
+    let mut candidate = TimeCandidateScan::default();
+    let mut scan = TimestampFormatScan::default();
+    // A number's own value is the exact one; parsing its text back would
+    // only round-trip it.
+    let as_f64 = values.is_numeric().then(|| values.to_f64());
+    if let Some(numbers) = &as_f64 {
+        for &value in numbers {
+            candidate.observe_value(value);
+        }
+    }
+    if format_override.is_none() || as_f64.is_none() {
+        values.for_each_field(|field| {
+            if format_override.is_none() {
+                scan.observe(field);
+            }
+            if as_f64.is_none() {
+                candidate.observe(field);
+            }
+        });
+    }
+    let inference = match format_override {
+        Some(format) => Some(TimestampFormatInference {
+            format,
+            ambiguous: false,
+        }),
+        None => scan.finish(),
+    };
+    if let Some(reason) = candidate.verdict(inference.is_some(), check_monotonic, column) {
+        return Err(reason);
+    }
+
+    let Some(inference) = inference else {
+        // Every value is a number (the verdict saw to that) and none is a
+        // timestamp: SPEC §2.1's progressive index.
+        let progressive = match as_f64 {
+            Some(numbers) => numbers,
+            None => {
+                let mut numbers = Vec::new();
+                let mut failed = false;
+                values.for_each_field(|field| match parse_progressive_value(field) {
+                    Ok(value) => numbers.push(value),
+                    Err(_) => failed = true,
+                });
+                if failed {
+                    return Err(unreadable());
+                }
+                numbers
+            }
+        };
+        return Ok((
+            TimeAxis::Progressive {
+                values: ProgressiveValues::Memory(progressive),
+            },
+            false,
+        ));
+    };
+
+    let mut timestamps = Vec::with_capacity(values.len());
+    let mut first_failure = None;
+    values.for_each_field(|field| {
+        if first_failure.is_some() {
+            return;
+        }
+        match parse_timestamp(field, inference.format) {
+            Ok(timestamp) if displayable(timestamp.ticks, timestamp.unit) => {
+                timestamps.push(timestamp)
+            }
+            _ => first_failure = Some((timestamps.len(), field.to_string())),
+        }
+    });
+    if let Some((row, field)) = first_failure {
+        warn!(
+            time_column = %column,
+            format = ?inference.format,
+            row,
+            field = %field,
+            "the time column cannot be read in this timestamp format (a value fails to parse \
+             or is outside the dates Glyde can display); plotting against a generated row \
+             index instead (SPEC §1.3 \"never abort the load\")"
+        );
+        return Err(unreadable());
+    }
+    info!(
+        time_column = %column,
+        format = ?inference.format,
+        corrected = format_override.is_some(),
+        low_confidence = inference.ambiguous,
+        "time column of numbers or text read as absolute time, as the same values in a CSV \
+         (SPEC §2.1)"
+    );
+    Ok((
+        TimeAxis::Absolute {
+            timestamps: Timestamps::Memory(timestamps),
+            format: inference.format,
+        },
+        inference.ambiguous,
+    ))
+}
+
 impl ColumnValues {
+    /// Whether this is a text column, which SPEC §2.1 reads for a
+    /// timestamp format as it would a CSV column's text.
+    fn is_text(&self) -> bool {
+        matches!(self, ColumnValues::String(_))
+    }
+
+    /// The number of rows.
+    fn len(&self) -> usize {
+        match self {
+            ColumnValues::Bool(v) => v.len(),
+            ColumnValues::I8(v) => v.len(),
+            ColumnValues::I16(v) => v.len(),
+            ColumnValues::I32(v) => v.len(),
+            ColumnValues::I64(v) => v.len(),
+            ColumnValues::U8(v) => v.len(),
+            ColumnValues::U16(v) => v.len(),
+            ColumnValues::U32(v) => v.len(),
+            ColumnValues::U64(v) => v.len(),
+            ColumnValues::F32(v) => v.len(),
+            ColumnValues::F64(v) => v.len(),
+            ColumnValues::String(v) => v.len(),
+            ColumnValues::Timestamp { ticks, .. } => ticks.len(),
+        }
+    }
+
+    /// Hands `f` each row's value as the text a CSV column would hold: a
+    /// string as is, a number in its shortest exact decimal form (Rust's
+    /// `Display`, never an exponent). One buffer is reused for every row, so
+    /// the column is never held a second time as text. Booleans and
+    /// timestamps are never asked (see [`time_axis_from_text`]'s caller).
+    fn for_each_field(&self, mut f: impl FnMut(&str)) {
+        fn render<T: std::fmt::Display>(values: &[T], f: &mut impl FnMut(&str)) {
+            use std::fmt::Write;
+            let mut buffer = String::new();
+            for value in values {
+                buffer.clear();
+                // Writing to a `String` cannot fail.
+                let _ = write!(buffer, "{value}");
+                f(&buffer);
+            }
+        }
+        match self {
+            ColumnValues::I8(v) => render(v, &mut f),
+            ColumnValues::I16(v) => render(v, &mut f),
+            ColumnValues::I32(v) => render(v, &mut f),
+            ColumnValues::I64(v) => render(v, &mut f),
+            ColumnValues::U8(v) => render(v, &mut f),
+            ColumnValues::U16(v) => render(v, &mut f),
+            ColumnValues::U32(v) => render(v, &mut f),
+            ColumnValues::U64(v) => render(v, &mut f),
+            ColumnValues::F32(v) => render(v, &mut f),
+            ColumnValues::F64(v) => render(v, &mut f),
+            ColumnValues::String(v) => v.iter().for_each(|text| f(text)),
+            ColumnValues::Bool(_) | ColumnValues::Timestamp { .. } => {}
+        }
+    }
+
     /// Whether this is a number column, the only kind SPEC §2.1 lets stand
     /// in as a progressive time index.
     fn is_numeric(&self) -> bool {
@@ -2132,6 +2340,344 @@ mod tests {
         assert_eq!(dataset.time_column_name, "depth");
         assert_eq!(summary.non_monotonic_count, 1);
         assert_eq!(report.unloaded_columns[0].name, "t");
+    }
+
+    /// 2026-03-01T08:00:00Z in whole seconds, corpus case 53's first row.
+    const START_S: i64 = START_US / SECOND_US;
+    /// The same instant as LabVIEW seconds (since 1904-01-01T00:00:00Z).
+    const START_LABVIEW_S: i64 = START_S + 2_082_844_800;
+
+    /// Opens the CSV `t,value` file holding `fields` as its time column, the
+    /// text a Parquet value of the same column reads as.
+    fn open_csv_twin(
+        dir: &tempfile::TempDir,
+        fields: &[String],
+        overrides: IngestOverrides,
+    ) -> (OpenSummary, InferenceReport, Dataset) {
+        let mut text = String::from("t,value\n");
+        for (row, field) in fields.iter().enumerate() {
+            text.push_str(&format!("{field},{row}.5\n"));
+        }
+        let path = dir.path().join("twin.csv");
+        std::fs::write(&path, text).expect("write CSV twin");
+        crate::ingest::open_dataset_with_overrides(&path, overrides).expect("CSV twin opens")
+    }
+
+    /// The SPEC §2.1 decision a time column reached: everything the
+    /// inference bar and the plot take from it.
+    fn time_decision(
+        summary: &OpenSummary,
+        report: &InferenceReport,
+        dataset: &Dataset,
+    ) -> impl std::fmt::Debug + PartialEq {
+        (
+            report.time_index.clone(),
+            report.timestamp_format.value.clone(),
+            report.timestamp_format.confidence,
+            report.timezone.clone(),
+            summary.sampling_class,
+            dataset.time.clone(),
+        )
+    }
+
+    /// Asserts that a Parquet file whose time column is `column` reaches
+    /// exactly the time-index decision a CSV holding the same values as
+    /// text does (docs/ROADMAP.md M7, issue #166).
+    fn assert_same_time_index_as_csv(column: ArrayRef, overrides: IngestOverrides) {
+        let rows = column.len();
+        let fields: Vec<String> = (0..rows)
+            .map(|row| arrow::util::display::array_value_to_string(&column, row).unwrap())
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            vec![
+                ("t", column),
+                (
+                    "value",
+                    Arc::new(Float64Array::from(
+                        (0..rows).map(|row| row as f64 + 0.5).collect::<Vec<_>>(),
+                    )),
+                ),
+            ],
+        );
+
+        let (summary, report, dataset) = open_with(&path, overrides).expect("Parquet opens");
+        let (csv_summary, csv_report, csv_dataset) = open_csv_twin(&dir, &fields, overrides);
+
+        assert_eq!(
+            time_decision(&summary, &report, &dataset),
+            time_decision(&csv_summary, &csv_report, &csv_dataset),
+            "Parquet and CSV disagree on the time column {fields:?}"
+        );
+    }
+
+    #[test]
+    fn number_time_columns_reach_the_same_time_index_as_the_same_values_in_a_csv() {
+        let int64 = |values: Vec<i64>| -> ArrayRef { Arc::new(Int64Array::from(values)) };
+        let float64 = |values: Vec<f64>| -> ArrayRef { Arc::new(Float64Array::from(values)) };
+        let steps = |start: i64, step: i64| (0..6).map(|i| start + i * step).collect::<Vec<_>>();
+        let columns: Vec<(&str, ArrayRef)> = vec![
+            ("epoch seconds", int64(steps(START_S, 1))),
+            ("epoch milliseconds", int64(steps(START_S * 1_000, 1_000))),
+            ("epoch microseconds", int64(steps(START_US, SECOND_US))),
+            (
+                "epoch nanoseconds",
+                int64(steps(START_US * 1_000, SECOND_US * 1_000)),
+            ),
+            (
+                "unsigned epoch seconds",
+                Arc::new(UInt32Array::from(
+                    (0..6).map(|i| START_S as u32 + i).collect::<Vec<_>>(),
+                )),
+            ),
+            (
+                "float epoch seconds with a fraction",
+                float64((0..6).map(|i| START_S as f64 + 0.25 + i as f64).collect()),
+            ),
+            (
+                "whole epoch seconds also in the LabVIEW window (ambiguous)",
+                int64(steps(START_LABVIEW_S, 1)),
+            ),
+            (
+                "Excel serial days",
+                float64((0..6).map(|i| 46_082.5 + f64::from(i) * 0.25).collect()),
+            ),
+            ("a small progressive index", int64(steps(0, 1))),
+            (
+                "epoch milliseconds that drop",
+                int64(vec![
+                    START_S * 1_000,
+                    START_S * 1_000 + 1_000,
+                    START_S * 1_000 - 5_000,
+                    START_S * 1_000 + 2_000,
+                ]),
+            ),
+            ("epoch seconds stuck on one value", int64(vec![START_S; 4])),
+        ];
+        for (case, column) in columns {
+            eprintln!("case: {case}");
+            assert_same_time_index_as_csv(column, IngestOverrides::default());
+        }
+    }
+
+    #[test]
+    fn text_time_columns_reach_the_same_time_index_as_the_same_text_in_a_csv() {
+        let text = |values: &[&str]| -> ArrayRef { Arc::new(StringArray::from(values.to_vec())) };
+        let columns: Vec<(&str, ArrayRef)> = vec![
+            (
+                "ISO 8601 with an offset",
+                text(&[
+                    "2026-03-01T08:00:00+01:00",
+                    "2026-03-01T08:00:01+01:00",
+                    "2026-03-01T08:00:02+01:00",
+                ]),
+            ),
+            (
+                "date and time with a space",
+                text(&[
+                    "2026-03-01 08:00:00",
+                    "2026-03-01 08:00:01",
+                    "2026-03-01 08:00:02",
+                ]),
+            ),
+            (
+                "day/month ambiguous in every row",
+                text(&[
+                    "01/02/2026 08:00:00",
+                    "01/02/2026 08:00:01",
+                    "01/02/2026 08:00:02",
+                ]),
+            ),
+            (
+                "dates out of order stay a time index",
+                text(&[
+                    "2026-03-01T08:00:02",
+                    "2026-03-01T08:00:00",
+                    "2026-03-01T08:00:01",
+                ]),
+            ),
+            (
+                "epoch seconds written as text",
+                text(&["1772352000", "1772352001", "1772352002"]),
+            ),
+            ("text that is no time", text(&["a", "b", "c"])),
+        ];
+        for (case, column) in columns {
+            eprintln!("case: {case}");
+            assert_same_time_index_as_csv(column, IngestOverrides::default());
+        }
+    }
+
+    #[test]
+    fn a_timestamp_format_correction_applies_to_a_number_time_column_as_for_a_csv() {
+        let ambiguous: ArrayRef = Arc::new(Int64Array::from(
+            (0..4).map(|i| START_LABVIEW_S + i).collect::<Vec<_>>(),
+        ));
+        let corrected = IngestOverrides {
+            timestamp_format: Some(TimestampFormat::LabViewEpoch),
+            ..IngestOverrides::default()
+        };
+        assert_same_time_index_as_csv(ambiguous.clone(), corrected);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(&dir, vec![("t", ambiguous), ("value", values(4, 0.0))]);
+        let (_summary, report, dataset) = open_with(&path, corrected).unwrap();
+        assert_eq!(
+            report.timestamp_format.value.as_deref(),
+            Some("labview_epoch")
+        );
+        assert_eq!(report.timestamp_format.confidence, Confidence::High);
+        match &dataset.time {
+            TimeAxis::Absolute { timestamps, format } => {
+                assert_eq!(*format, TimestampFormat::LabViewEpoch);
+                let first = timestamps.iter().next().unwrap();
+                assert_eq!(
+                    first.ticks * 1_000_000 / first.unit.ticks_per_second(),
+                    i128::from(START_US)
+                );
+            }
+            other => panic!("expected an absolute axis, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_epoch_milliseconds_first_column_is_absolute_time_in_utc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            vec![
+                (
+                    "time_ms",
+                    Arc::new(Int64Array::from(
+                        (0..4)
+                            .map(|i| START_S * 1_000 + i * 500)
+                            .collect::<Vec<_>>(),
+                    )),
+                ),
+                ("value", values(4, 0.0)),
+            ],
+        );
+
+        let (summary, report, dataset) = open_default(&path);
+
+        assert_eq!(dataset.time_column_name, "time_ms");
+        assert_eq!(summary.timestamp_format.as_deref(), Some("epoch_ms"));
+        assert_eq!(summary.sampling_class, SamplingClass::Uniform);
+        assert_eq!(report.timezone, Some(TimezoneLabel::UtcImplicit));
+        assert!(!report.has_low_confidence_field());
+        let TimeAxis::Absolute { timestamps, .. } = &dataset.time else {
+            panic!("expected an absolute axis, got {:?}", dataset.time);
+        };
+        let ticks: Vec<i128> = timestamps.iter().map(|t| t.ticks).collect();
+        let first = i128::from(START_S * 1_000);
+        assert_eq!(ticks, [first, first + 500, first + 1_000, first + 1_500]);
+        // The column is the axis, not also a series.
+        assert_eq!(dataset.columns.len(), 1);
+    }
+
+    #[test]
+    fn a_whole_valued_float_time_column_reads_as_the_same_integers_would() {
+        let open_column = |column: ArrayRef| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write(&dir, vec![("t", column), ("value", values(3, 0.0))]);
+            let (summary, report, dataset) = open_default(&path);
+            (
+                summary.timestamp_format,
+                report.timestamp_format.confidence,
+                dataset.time,
+            )
+        };
+        for start in [START_S, START_LABVIEW_S] {
+            let integers = (0..3).map(|i| start + i).collect::<Vec<_>>();
+            let floats = integers.iter().map(|&n| n as f64).collect::<Vec<_>>();
+            assert_eq!(
+                open_column(Arc::new(Float64Array::from(floats))),
+                open_column(Arc::new(Int64Array::from(integers))),
+            );
+        }
+    }
+
+    #[test]
+    fn a_picked_epoch_column_becomes_the_absolute_time_axis() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            vec![
+                ("value", values(3, 0.0)),
+                (
+                    "epoch",
+                    Arc::new(Int64Array::from(
+                        (0..3).map(|i| START_S + i).collect::<Vec<_>>(),
+                    )),
+                ),
+            ],
+        );
+
+        let (summary, _report, dataset) = open_with(
+            &path,
+            IngestOverrides {
+                time_column: Some(TimeColumnChoice::Column(1)),
+                ..IngestOverrides::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(dataset.time_column_name, "epoch");
+        assert_eq!(summary.timestamp_format.as_deref(), Some("epoch_s"));
+    }
+
+    #[test]
+    fn a_timestamp_format_correction_does_not_apply_to_a_typed_timestamp_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(&dir, vec![("t", seconds(3)), ("value", values(3, 0.0))]);
+
+        let (summary, _report, dataset) = open_with(
+            &path,
+            IngestOverrides {
+                timestamp_format: Some(TimestampFormat::EpochSeconds),
+                ..IngestOverrides::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary.timestamp_format.as_deref(),
+            Some("parquet_timestamp")
+        );
+        assert_eq!(timestamps(&dataset).len(), 3);
+    }
+
+    #[test]
+    fn a_timestamp_format_correction_the_column_cannot_be_read_in_falls_back_to_the_row_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            vec![
+                (
+                    "label",
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                ),
+                ("value", values(3, 0.0)),
+            ],
+        );
+
+        let (_summary, report, dataset) = open_with(
+            &path,
+            IngestOverrides {
+                timestamp_format: Some(TimestampFormat::Iso8601Naive),
+                ..IngestOverrides::default()
+            },
+        )
+        .expect("an unreadable correction never aborts the open");
+
+        assert_eq!(
+            report.time_index,
+            TimeIndexSource::Generated(GeneratedIndexReason::Unreadable {
+                column: "label".to_string()
+            })
+        );
+        assert_eq!(dataset.columns.len(), 2);
     }
 
     #[test]
