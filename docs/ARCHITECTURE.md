@@ -29,7 +29,7 @@ New dependencies require a one-line justification in the PR. Prefer the above. `
 
 Considered and rejected. A DataFrame engine is built to load and transform tables in memory; Glyde does the opposite — it never materializes the dataset, it streams once to build an index and thereafter reads only what a viewport needs. Its inference (joint delimiter/decimal resolution, encoding recovery, metadata preambles, ragged-row salvage) is the product's differentiator and must be ours, so a DataFrame library's own inference would go unused. What would remain is raw parse speed, which `csv` over memory-mapped chunks with `rayon` already delivers — without the dependency tree, the compile times, or the pressure on the 50 MB binary budget.
 
-The Parquet path benefits doubly: row groups carry **column min/max statistics** in their metadata, which populate the upper levels of the index pyramid with no scan at all — **where that is exact** (issue #162, `glyde_core::index::row_groups`). The levels whose buckets are unions of whole row groups (equal-sized groups, bucket size a multiple of the group size) are taken from the statistics, and the levels below them are still scanned. Only integer columns qualify: Parquet's float statistics leave NaN out without counting it, and a bucket's `nan_count` must be exact (#164). `nan_count` comes from the series' own NaN runs, and `first_ts`/`last_ts` from the time axis at the bucket's edges, never from the footer.
+The Parquet path benefits doubly: row groups carry **column min/max statistics** in their metadata, which populate the upper levels of the index pyramid with no scan at all — **where that is exact** (issue #162, `glyde_core::index::row_groups`). The levels whose buckets are unions of whole row groups (equal-sized groups, bucket size a multiple of the group size) are taken from the statistics, and the levels below them are still scanned. Only integer columns qualify: Parquet's float statistics leave NaN out without counting it, and a bucket's `nan_count` must be exact (#164). `nan_count` comes from the series' own NaN runs, and `first_ts`/`last_ts` from the time axis at the bucket's edges, never from the footer. Likewise `first_value`/`last_value` (issue #147) are read from the series' raw samples at the bucket's edges, since the footer statistics do not carry them.
 
 ## Workspace layout
 
@@ -136,8 +136,9 @@ item's job, built to this principle.
 The multi-resolution min/max pyramid is the heart of the performance contract.
 
 - Level 0 = raw samples (in file, memory-mapped, never fully loaded).
-- Level *k* stores `(min, max, first_ts, last_ts, nan_count)` per bucket; bucket size grows geometrically (factor 8 recommended, documented in code).
-- Level *k+1* is derived from level *k* — **exactly**, min-of-mins and max-of-maxes. Never from resampled or averaged data.
+- Level *k* stores `(min, max, first_ts, last_ts, first_value, last_value, nan_count)` per bucket (`first_value`/`last_value`: the values of the bucket's first and last raw sample, NaN included, so the view can connect consecutive columns — SPEC §3.1, issue #147); bucket size grows geometrically (factor 8 recommended, documented in code).
+- Level *k+1* is derived from level *k* — **exactly**, min-of-mins and max-of-maxes, first child's `first_value`, last child's `last_value`. Never from resampled or averaged data.
+- Adding fields to `Bucket` changes the on-disk pyramid layout: the pyramid cache format version is bumped with it, so a cache written by an older build is rebuilt, never misread.
 - Built progressively during background indexing; the plot improves as levels complete.
 - Bounded by the RAM budget; spills to a cache file in the OS app-data dir, keyed by file path + size + mtime, so reopening a known file is instant.
 - The pyramid serves **rendering only**. DSP never reads it.

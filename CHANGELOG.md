@@ -12,6 +12,20 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- **Decision recorded (issue #147): the zoomed-out time plot will draw a
+  continuous trace instead of a dashed one.** This entry only updates the
+  documents. The app does not change yet; the next pull request
+  implements it. At zoom levels where each screen column holds only a few
+  samples, a steep signal currently looks dashed, with holes that look
+  like missing data although nothing is missing. The new rule, the one
+  digital oscilloscopes use ("peak detect + vectors"): every column still
+  shows its full min-to-max range, so no peak can disappear, and a short
+  line now joins each column's last sample to the next column's first
+  sample. That is exactly the line drawn between those two samples when
+  you zoom all the way in. Nothing is invented, and a missing value (NaN)
+  still breaks the trace, as before. Cost to expect in the next PR: the
+  zoom index grows by about a quarter, and indexes cached by older
+  versions are rebuilt once on first open.
 - **CI is much faster: the performance job drops from ~80–90 minutes back
   to an estimated ~15–20.** Nothing about what is measured or enforced
   changed: the same benchmarks run against the same budgets, on code built
