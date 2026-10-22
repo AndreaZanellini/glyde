@@ -96,6 +96,8 @@ In `crates/glyde-core/tests/golden/`. **Written before the implementation. Never
 - **Spike preservation**: 10 M samples of zeros with a single 1-sample spike of amplitude 1.0 → rendering into 800 pixel columns *must* show max = 1.0 in the correct column. A lost spike = failed test.
 - **Envelope exactness**: for random data, min/max per bucket must equal the brute-force min/max over the same time range, exactly, at every pyramid level.
 - **Pyramid consistency**: level *k+1* min/max == aggregation of level *k* min/max, exactly.
+- **Boundary exactness** (issue #147): every bucket's `first_value`/`last_value` equals the raw sample at its first/last timestamp, exactly, at every pyramid level and in every `decimate_viewport` result. This includes buckets that start or end on a NaN.
+- **Continuity** (issue #147): in the aggregated regime, rendering a steep signal with few samples per column draws a connector between every pair of consecutive columns. Each connector runs from the last raw sample of one column to the first raw sample of the next. A pixel-coverage check shows no uninked rows between consecutive columns' extents. Across a NaN, no connector is drawn.
 - **Convergence**: as zoom increases past 1 sample/pixel, rendered values equal raw samples exactly.
 - **No aliasing**: 1 kHz sine sampled at 100 kHz, decimated to 500 columns → the rendered envelope is the true ±amplitude band, with no beat/moiré pattern (assert envelope constancy).
 

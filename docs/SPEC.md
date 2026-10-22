@@ -105,9 +105,12 @@ Rendering N samples into P pixel columns where N ≫ P uses **min/max aggregatio
 
 - For each pixel column, compute `min` and `max` of the raw samples whose timestamps fall in that column's time range; draw the vertical extent between them.
 - This preserves every peak and every outlier: a spike one sample wide is always visible. Averaging (destroys peaks), naive subsampling (aliasing), and LTTB (can drop true extrema) are **forbidden** for the time-domain view.
+- **Consecutive columns are connected (decision, issue #147).** Each column also records the value of its **first** and **last** raw sample. Between two consecutive non-empty columns, draw a connector from the previous column's last sample to the current column's first sample: exactly the line the convergence regime (below) draws between those same two raw samples. The trace is therefore the true sample-to-sample path, with each column's interior collapsed to its min/max extent. This is the "peak detect + vectors" display of digital oscilloscopes. Without it, a signal that moves faster than its within-column range is drawn as disconnected bars that look dashed, and the holes read as missing data. The connector invents no value: it spans only the step between two real, consecutive samples.
+  - A connector is omitted exactly where the convergence regime's line would be broken: when either of the two boundary samples is NaN (§1.3, "never interpolated"). A NaN run therefore stays a visible discontinuity in both regimes.
+  - Connectors never hide or shorten a bar: every column still shows its full min/max extent, so spike preservation is unchanged.
 - Precomputed min/max pyramids are built at index time (see `ARCHITECTURE.md` §Index) so that any zoom level resolves in O(pixels).
 - When the visible range contains fewer samples than pixels, draw the **raw samples** with visible point markers — the user must be able to reach the individual sample. Zooming in far enough always converges to the true samples.
-- The pyramid must be exact: level *k+1* min/max derives from level *k* min/max, never from resampled values.
+- The pyramid must be exact: level *k+1* min/max derives from level *k* min/max, never from resampled values. Likewise a bucket's first/last value is its first child's first value and its last child's last value. Each always equals the raw sample at the bucket's edge.
 
 ### 3.2 PSD (Welch)
 
