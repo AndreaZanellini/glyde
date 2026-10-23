@@ -149,7 +149,7 @@ impl<S: TickSource + ?Sized> KeyStream for DeviationKeys<'_, S> {
     fn for_each(&self, visit: &mut dyn FnMut(u128)) -> Result<()> {
         let median_delta = self.median_delta;
         for_each_delta(self.source, self.range.clone(), &mut |delta| {
-            visit(deviation_key((delta as f64 - median_delta).abs()));
+            visit(deviation_key((delta_as_f64(delta) - median_delta).abs()));
             Ok(())
         })
     }
@@ -270,7 +270,19 @@ fn median_delta<S: TickSource + ?Sized>(source: &S, range: Range<usize>) -> Resu
 /// measure and is vacuously uniform; an all-equal-Δt segment (median Δt of
 /// zero, e.g. duplicate timestamps) is uniform only if every Δt is also zero.
 fn is_uniform<S: TickSource + ?Sized>(source: &S, range: Range<usize>) -> Result<bool> {
-    let Some(median_delta) = median_delta(source, range.clone())? else {
+    let median = median_delta(source, range.clone())?;
+    is_uniform_around(source, range, median)
+}
+
+/// [`is_uniform`] for a `range` whose median Δt ([`median_delta`]) is already
+/// known: every pass over Δt reads every tick of the range again, and a
+/// median is at least one such pass per middle key (issue #163).
+fn is_uniform_around<S: TickSource + ?Sized>(
+    source: &S,
+    range: Range<usize>,
+    median_delta: Option<f64>,
+) -> Result<bool> {
+    let Some(median_delta) = median_delta else {
         return Ok(true);
     };
 
@@ -300,7 +312,19 @@ fn is_uniform<S: TickSource + ?Sized>(source: &S, range: Range<usize>) -> Result
 /// times the median? `threshold` is always [`GAP_MULTIPLE_OF_MEDIAN`] × the
 /// median Δt of the series the Δt came from.
 fn is_gap(delta: i128, threshold: f64) -> bool {
-    delta as f64 > threshold
+    delta_as_f64(delta) > threshold
+}
+
+/// `delta as f64`, through `i64` whenever `delta` fits one, which every Δt
+/// of a real time axis does: the same round-to-nearest of the same integer,
+/// so the same value, but one instruction instead of the software `i128`
+/// conversion the summary's passes otherwise spend much of their time in
+/// (issue #163).
+fn delta_as_f64(delta: i128) -> f64 {
+    match i64::try_from(delta) {
+        Ok(delta) => delta as f64,
+        Err(_) => delta as f64,
+    }
 }
 
 /// Hands every gap in `range` — with indices relative to the source's own row
@@ -426,7 +450,8 @@ pub fn scan_range<S: TickSource + ?Sized>(
     on_segment(segment_start..end)?;
 
     let sampling_class = if gap_count == 0 {
-        if is_uniform(source, start..end)? {
+        // The whole range is one segment: its median is the one above.
+        if is_uniform_around(source, start..end, Some(median_delta))? {
             SamplingClass::Uniform
         } else {
             SamplingClass::Irregular
@@ -585,6 +610,38 @@ mod tests {
     use crate::time::corpus_fixture::corpus_ticks;
     use crate::time::ticks::test_support::ChunkedTicks;
     use proptest::prelude::*;
+
+    // Issue #163: the fast Δt conversion is `as f64`, bit for bit, at every
+    // edge of `i64` and of `f64`'s exact integers, and beyond `i64`.
+    #[test]
+    fn delta_as_f64_is_as_f64_bit_for_bit() {
+        let edges: [i128; 14] = [
+            0,
+            1,
+            -1,
+            (1 << 53) - 1,
+            1 << 53,
+            (1 << 53) + 1,
+            (1 << 53) + 3,
+            -(1 << 53) - 1,
+            i64::MAX as i128,
+            i64::MIN as i128,
+            i64::MAX as i128 + 1,
+            i64::MIN as i128 - 1,
+            i128::MAX,
+            i128::MIN,
+        ];
+        for delta in edges
+            .into_iter()
+            .chain((0..64).map(|shift| (1i128 << shift) * 3 + 1))
+        {
+            assert_eq!(
+                delta_as_f64(delta).to_bits(),
+                (delta as f64).to_bits(),
+                "Δt {delta}"
+            );
+        }
+    }
 
     /// The straightforward median: sort the whole distribution and take the
     /// middle. This is the reference [`median_key`]'s bounded selection is
