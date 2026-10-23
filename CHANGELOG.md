@@ -12,6 +12,20 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **A stretch that is almost flat can no longer vanish from the plot (issue
+  #146).** When a screen column's values differ by less than the screen can
+  show (for example a channel decaying towards zero, like `torque` in
+  `measures_v2.csv`), its vertical bar has no height, and the graphics
+  library drew such a bar as nothing at all: whole stretches with data
+  looked empty. The joining lines added for issue #147 already draw most of
+  these stretches. This fixes the rest, a column whose first and last
+  values are missing (NaN), which has no joining line to lean on: its bar
+  is now drawn as a dot as wide as a line.
+  - **Assumption to veto:** the issue offered two looks for this case, the
+    larger dot used for an exactly flat column, or a bar stretched to one
+    pixel. This uses neither: a zero-length line drawn the way most drawing
+    programs draw one, as a small dot as wide as the line. The big dot
+    keeps meaning "exactly flat", and nothing is stretched.
 - **The plot stays smooth under the mouse when the time column is not in
   time order (issue #143).** Some files have a time column that restarts
   at zero, for example once per test run, and Glyde keeps their rows in
