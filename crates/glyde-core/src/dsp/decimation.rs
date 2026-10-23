@@ -585,6 +585,13 @@ pub fn decimate_viewport_levels<L: BucketLevel>(
 /// boundary buckets that straddle the edge of the query. This is the
 /// "exact edges, aggregated interior" requirement the spike-preservation
 /// golden test locks in: O(PYRAMID_FACTOR · log(n)) per column, not O(n).
+///
+/// Level 0 is never read: a level-1 bucket the edge straddles is aggregated
+/// from its (fewer than `PYRAMID_FACTOR²`) covered raw samples directly. They
+/// cost about what the level-0 buckets over them would, and lie where the
+/// edge's own raw samples are, whereas level 0 is another file: for a spilled
+/// column, one more disk page per column edge, each a random read once the
+/// page cache has dropped it (issue #145: ~2 s of a cold first full view).
 fn aggregate_range<L: BucketLevel>(
     pyramid: &[L],
     samples: &[f64],
@@ -602,8 +609,9 @@ fn aggregate_range<L: BucketLevel>(
     )
 }
 
-/// `level == -1` means "raw samples" (the recursion's base case); `level ==
-/// k` (0-indexed into `pyramid`) means bucket span `PYRAMID_FACTOR.pow(k+1)`.
+/// `level <= 0` means "raw samples" (the recursion's base case, level 0
+/// included: see [`aggregate_range`]); `level == k` (0-indexed into
+/// `pyramid`) means bucket span `PYRAMID_FACTOR.pow(k+1)`.
 ///
 /// Only the *last* bucket at any level can cover fewer than `span` raw
 /// samples ([`slice::chunks`] only ever leaves a short group at the end), so
@@ -617,7 +625,7 @@ fn aggregate_at_level<L: BucketLevel>(
     lo: usize,
     hi: usize,
 ) -> Bucket {
-    let Some(level) = usize::try_from(level).ok() else {
+    let Some(level) = usize::try_from(level).ok().filter(|&level| level > 0) else {
         return raw_range_bucket(&samples[lo..=hi], &timestamps[lo..=hi]);
     };
 

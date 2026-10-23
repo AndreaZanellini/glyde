@@ -142,6 +142,7 @@ The multi-resolution min/max pyramid is the heart of the performance contract.
 - Built progressively during background indexing; the plot improves as levels complete.
 - Bounded by the RAM budget; spills to a cache file in the OS app-data dir, keyed by file path + size + mtime, so reopening a known file is instant.
 - The pyramid serves **rendering only**. DSP never reads it.
+- A column's exact edges are read from the raw samples themselves up to the first level-1 bucket boundary: decimation never reads level 0 (`pyramid[0]`, 8 samples per bucket). Those 8 samples cost about what their bucket does, and they sit next to the edge's own raw samples, whereas level 0 is another file; for a spilled column that is one disk page fewer per column edge (issue #145).
 
 ### Where Level 0 actually lives (decision, issue #59)
 
