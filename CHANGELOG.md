@@ -12,6 +12,19 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Opening a file spends less time checking its time column (issue
+  #163).** After reading a file, Glyde checks its time column for gaps,
+  regular sampling and order, in a step that cannot run in parallel. It
+  used to read the whole column four to seven times for that, depending
+  on the file. It now reads it three times, each pass about twice as fast:
+  on the 1 GB Parquet benchmark file the step takes 0.14 s instead of
+  0.25 s. CSV files get the same speedup, because the check is shared.
+  Nothing changes in what it finds.
+  - On the reference MacBook Air, opening that 1 GB Parquet file and
+    building its zoom index now measures 0.74 to 0.88 s, within the 1 s
+    per GB budget. The 1.5 to 2 s in the issue were measured while the
+    machine was swapping heavily. Two runs of the same code still differ
+    by about 15%, so the budget holds only with that margin.
 - **The first view of a file too large for memory appears sooner (issue
   #145).** Such a file is kept on disk while you work. To draw its whole
   length, Glyde reads a little of every channel at every screen column,
