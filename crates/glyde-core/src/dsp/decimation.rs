@@ -801,12 +801,35 @@ pub fn connectors(columns: &[Bucket]) -> impl Iterator<Item = Connector> + '_ {
 /// number of infinite samples, never with the column's length. With no
 /// pyramid at all (`pyramid` empty), `samples` is scanned.
 pub fn finite_range<L: BucketLevel>(pyramid: &[L], samples: &[f64]) -> Option<(f64, f64)> {
+    finite_range_from::<L, 0>(pyramid, samples)
+}
+
+/// [`finite_range`] for a pyramid whose level 0 is not stored (an on-disk
+/// one, issue #174): under a level-1 bucket whose envelope reaches ±∞, its
+/// (at most `PYRAMID_FACTOR²`) samples are scanned instead of its level-0
+/// children. The same answer.
+pub fn finite_range_skipping_level_0<L: BucketLevel>(
+    pyramid: &[L],
+    samples: &[f64],
+) -> Option<(f64, f64)> {
+    finite_range_from::<L, 1>(pyramid, samples)
+}
+
+/// The finite range, reading no pyramid level below `LOWEST_LEVEL`.
+fn finite_range_from<L: BucketLevel, const LOWEST_LEVEL: usize>(
+    pyramid: &[L],
+    samples: &[f64],
+) -> Option<(f64, f64)> {
     let mut range = (f64::INFINITY, f64::NEG_INFINITY);
-    match pyramid.len().checked_sub(1) {
+    match pyramid
+        .len()
+        .checked_sub(1)
+        .filter(|&top| top >= LOWEST_LEVEL)
+    {
         None => widen_with_samples(&mut range, samples),
         Some(top) => {
             for index in 0..pyramid[top].bucket_count() {
-                widen_with_bucket(&mut range, pyramid, samples, top, index);
+                widen_with_bucket::<L, LOWEST_LEVEL>(&mut range, pyramid, samples, top, index);
             }
         }
     }
@@ -814,7 +837,7 @@ pub fn finite_range<L: BucketLevel>(pyramid: &[L], samples: &[f64]) -> Option<(f
 }
 
 /// Widens `range` to the finite samples under bucket `index` of `level`.
-fn widen_with_bucket<L: BucketLevel>(
+fn widen_with_bucket<L: BucketLevel, const LOWEST_LEVEL: usize>(
     range: &mut (f64, f64),
     pyramid: &[L],
     samples: &[f64],
@@ -832,20 +855,20 @@ fn widen_with_bucket<L: BucketLevel>(
         return;
     }
     // An infinite sample is under this bucket; its finite ones are found
-    // below it.
-    match level.checked_sub(1) {
-        None => {
-            let start = index * PYRAMID_FACTOR;
-            let end = (start + PYRAMID_FACTOR).min(samples.len());
-            widen_with_samples(range, samples.get(start..end).unwrap_or_default());
-        }
-        Some(below) => {
-            let children = pyramid[below].bucket_count();
-            let first = index * PYRAMID_FACTOR;
-            for child in first..(first + PYRAMID_FACTOR).min(children) {
-                widen_with_bucket(range, pyramid, samples, below, child);
-            }
-        }
+    // below it: in its children, or in its own samples at the lowest level
+    // read.
+    if level == LOWEST_LEVEL {
+        let span = PYRAMID_FACTOR.pow(level as u32 + 1);
+        let start = index * span;
+        let end = (start + span).min(samples.len());
+        widen_with_samples(range, samples.get(start..end).unwrap_or_default());
+        return;
+    }
+    let below = level - 1;
+    let children = pyramid[below].bucket_count();
+    let first = index * PYRAMID_FACTOR;
+    for child in first..(first + PYRAMID_FACTOR).min(children) {
+        widen_with_bucket::<L, LOWEST_LEVEL>(range, pyramid, samples, below, child);
     }
 }
 

@@ -21,9 +21,7 @@
 //! one — the golden tests lock that function, and the disk-backed path must
 //! not be a second, unlocked algorithm.
 
-use glyde_core::dsp::decimation::{
-    build_pyramid, decimate_viewport, decimate_viewport_levels, Bucket, BucketLevel,
-};
+use glyde_core::dsp::decimation::{build_pyramid, decimate_viewport, Bucket, BucketLevel, Pyramid};
 use glyde_core::index::disk_pyramid::build_disk_pyramid;
 use glyde_core::index::spill::SpillSet;
 
@@ -70,6 +68,11 @@ fn the_disk_pyramid_is_the_in_memory_pyramid_bucket_for_bucket() {
                 in_memory.len(),
                 "n={n} level {level}"
             );
+            // Level 0 is not written (issue #174): only its count is kept.
+            if !on_disk.is_stored() {
+                assert_eq!(level, 0, "n={n}: only level 0 is unwritten");
+                continue;
+            }
             for (index, bucket) in in_memory.iter().enumerate() {
                 assert!(
                     same(&on_disk.bucket(index), bucket),
@@ -100,8 +103,9 @@ fn decimating_through_the_disk_pyramid_matches_decimate_viewport() {
     ] {
         for pixel_columns in [1, 7, 640, 1_920, 100_000] {
             let expected = decimate_viewport(&memory, &samples, &ticks, range, pixel_columns);
-            let actual =
-                decimate_viewport_levels(disk.levels(), &samples, &ticks, range, pixel_columns);
+            // The on-disk pyramid's own decimation, which never reads its
+            // unwritten level 0 (issues #145, #174).
+            let actual = disk.decimate(&samples, &ticks, range, pixel_columns);
             assert_eq!(actual.len(), expected.len(), "{range:?} @ {pixel_columns}");
             for (a, b) in actual.iter().zip(&expected) {
                 assert!(same(a, b), "{range:?} @ {pixel_columns}: {a:?} != {b:?}");
@@ -164,12 +168,73 @@ fn a_spilled_dataset_gets_the_same_pyramids_on_disk() {
                 assert_eq!(disk.levels().len(), memory.len(), "column {column}");
                 for (on_disk, in_memory) in disk.levels().iter().zip(memory) {
                     assert_eq!(on_disk.bucket_count(), in_memory.len());
+                    if !on_disk.is_stored() {
+                        continue;
+                    }
                     for (index, bucket) in in_memory.iter().enumerate() {
                         assert!(same(&on_disk.bucket(index), bucket), "column {column}");
                     }
                 }
             }
             other => panic!("column {column}: {other:?}"),
+        }
+    }
+}
+
+/// Bytes of every file under `dir`.
+fn bytes_under(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .expect("read dir")
+        .map(|entry| {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                bytes_under(&path)
+            } else {
+                std::fs::metadata(&path).expect("stat").len()
+            }
+        })
+        .sum()
+}
+
+// Issue #174: decimation over an on-disk pyramid never reads level 0 (#145),
+// so level 0 is not written: one 80-byte bucket per 8 samples, most of the
+// pyramid's disk. Its bucket count is kept (the decimation's level
+// arithmetic counts it), every level above is still the in-memory
+// pyramid's, bucket for bucket, and the files hold less than level 0 alone
+// would have.
+#[test]
+fn the_disk_pyramid_writes_no_level_0() {
+    for n in [1, 63, 64, 65, 513, 100_003] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let set = SpillSet::create(dir.path()).expect("spill set");
+        let (samples, ticks) = fixture(n);
+        let memory = build_pyramid(&samples, &ticks);
+        let disk = build_disk_pyramid(&set, &samples[..], &ticks[..]).expect("build on disk");
+        let levels = disk.levels();
+        assert_eq!(levels.len(), memory.len(), "level count for n={n}");
+        assert!(!levels[0].is_stored(), "n={n}: level 0 is not written");
+        assert_eq!(levels[0].bucket_count(), memory[0].len(), "n={n}");
+        for (level, (on_disk, in_memory)) in levels.iter().zip(&memory).enumerate().skip(1) {
+            assert!(on_disk.is_stored(), "n={n} level {level}");
+            assert_eq!(
+                on_disk.bucket_count(),
+                in_memory.len(),
+                "n={n} level {level}"
+            );
+            for (index, bucket) in in_memory.iter().enumerate() {
+                assert!(
+                    same(&on_disk.bucket(index), bucket),
+                    "n={n} level {level} {index}"
+                );
+            }
+        }
+        let level_0_bytes = memory[0].len() as u64 * 80;
+        if n >= 100_000 {
+            assert!(
+                bytes_under(set.dir()) < level_0_bytes / 4,
+                "n={n}: {} bytes on disk, level 0 alone would be {level_0_bytes}",
+                bytes_under(set.dir())
+            );
         }
     }
 }

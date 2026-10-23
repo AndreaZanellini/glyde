@@ -67,7 +67,7 @@ fn assert_every_storage_agrees(samples: &[f64], what: &str) {
     let set = SpillSet::create(dir.path()).expect("spill set");
     let disk = build_disk_pyramid(&set, samples, &ticks[..]).expect("disk pyramid");
     assert_eq!(
-        finite_range(disk.levels(), samples),
+        Pyramid::finite_range(&disk, samples),
         expected,
         "{what}: on-disk pyramid"
     );

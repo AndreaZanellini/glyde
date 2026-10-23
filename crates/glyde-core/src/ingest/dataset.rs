@@ -2694,8 +2694,9 @@ pub(crate) fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<()> {
 /// next to its pyramid, eight bytes per row (issue #178): what the view reads
 /// its edges from instead of an `f64` copy in RAM.
 ///
-/// The pyramids take about as much disk as they would have taken RAM (one
-/// 80-byte bucket per ~7 samples, per numeric column), so that space is
+/// The pyramids take about an eighth of the disk they would have taken RAM
+/// (one 80-byte bucket per ~56 samples, per numeric column: level 0 is not
+/// written, issue #174), so that space is
 /// checked first, with the same headroom the spill itself keeps (SPEC §5.1:
 /// check affordability before acting); if it is not there, no pyramid is
 /// built and the file still renders, from its raw samples.
@@ -2719,8 +2720,10 @@ pub fn disk_pyramids_for_dataset(
             series.values().sample_source().is_some() && series.values().as_f64_slice().is_none()
         })
         .count() as u64;
+    // Every level from 1 up: one bucket per ~56 samples. Level 0 is not
+    // written (issue #174).
     let pyramid_bytes = rows
-        .div_ceil(7)
+        .div_ceil(56)
         .saturating_mul(crate::index::disk_pyramid::PACKED_BUCKET_BYTES)
         .saturating_mul(numeric)
         .saturating_add(rows.saturating_mul(8).saturating_mul(converted));

@@ -37,8 +37,8 @@
 use bytemuck::{Pod, Zeroable};
 
 use crate::dsp::decimation::{
-    decimate_viewport_levels_skipping_level_0, finite_range, merge_buckets, Bucket, BucketLevel,
-    Level0Stream, Pyramid, PYRAMID_FACTOR,
+    decimate_viewport_levels_skipping_level_0, finite_range_skipping_level_0, merge_buckets,
+    Bucket, BucketLevel, Level0Stream, Pyramid, PYRAMID_FACTOR,
 };
 use crate::index::spill::{SpillSet, SpillVec, SpillVecWriter};
 use crate::series::SampleSource;
@@ -100,17 +100,51 @@ impl From<PackedBucket> for Bucket {
     }
 }
 
-/// One pyramid level on disk.
+/// One pyramid level on disk — or level 0, of which only the bucket count
+/// is kept (issue #174): decimation over an on-disk pyramid reads a column
+/// edge's raw samples instead (#145), and its finite range scans them under
+/// a level-1 bucket that holds ±∞, so its buckets — one per 8 samples, most
+/// of the pyramid's size — are never written.
 #[derive(Clone, Debug)]
-pub struct DiskLevel(SpillVec<PackedBucket>);
+pub struct DiskLevel {
+    buckets: Option<SpillVec<PackedBucket>>,
+    count: usize,
+}
+
+impl DiskLevel {
+    fn stored(buckets: SpillVec<PackedBucket>) -> Self {
+        let count = buckets.len();
+        Self {
+            buckets: Some(buckets),
+            count,
+        }
+    }
+
+    fn unwritten(count: usize) -> Self {
+        Self {
+            buckets: None,
+            count,
+        }
+    }
+
+    /// Whether this level's buckets are on disk: every level but 0.
+    pub fn is_stored(&self) -> bool {
+        self.buckets.is_some()
+    }
+}
 
 impl BucketLevel for DiskLevel {
     fn bucket_count(&self) -> usize {
-        self.0.len()
+        self.count
     }
 
     fn bucket(&self, index: usize) -> Bucket {
-        self.0
+        self.buckets
+            .as_ref()
+            .expect(
+                "level 0 of an on-disk pyramid is never read: its decimation and its finite \
+                 range skip it (issue #174)",
+            )
             .get(index)
             .expect("callers index below bucket_count()")
             .into()
@@ -118,8 +152,9 @@ impl BucketLevel for DiskLevel {
 }
 
 /// A whole pyramid on disk: `levels()[0]` groups every [`PYRAMID_FACTOR`]
-/// samples, each level above groups [`PYRAMID_FACTOR`] buckets of the one
-/// below — exactly `build_pyramid`'s levels. Cheap to clone; the files go
+/// samples — counted, not written (issue #174) — and each level above groups
+/// [`PYRAMID_FACTOR`] buckets of the one below: exactly `build_pyramid`'s
+/// levels. Cheap to clone; the files go
 /// when the last clone does.
 #[derive(Clone, Debug, Default)]
 pub struct DiskPyramid {
@@ -145,13 +180,15 @@ impl DiskPyramid {
 }
 
 /// By content, bucket for bucket — never by which files hold it. The kept
-/// samples are not compared: they are the column's own, not the pyramid's.
+/// samples are not compared: they are the column's own, not the pyramid's;
+/// nor is level 0, of which only the count exists.
 impl PartialEq for DiskPyramid {
     fn eq(&self, other: &Self) -> bool {
         self.levels.len() == other.levels.len()
             && self.levels.iter().zip(&other.levels).all(|(a, b)| {
                 a.bucket_count() == b.bucket_count()
-                    && (0..a.bucket_count()).all(|i| a.bucket(i) == b.bucket(i))
+                    && a.is_stored() == b.is_stored()
+                    && (!a.is_stored() || (0..a.bucket_count()).all(|i| a.bucket(i) == b.bucket(i)))
             })
     }
 }
@@ -174,7 +211,7 @@ impl Pyramid for DiskPyramid {
     }
 
     fn finite_range(&self, samples: &[f64]) -> Option<(f64, f64)> {
-        finite_range(&self.levels, samples)
+        finite_range_skipping_level_0(&self.levels, samples)
     }
 
     fn samples(&self) -> Option<&[f64]> {
@@ -272,8 +309,16 @@ where
     }
     let stem = unique_stem();
 
-    // Level 0, streamed exactly like `build_pyramid_streaming` reads it.
-    let mut writer = SpillVecWriter::<PackedBucket>::create(set, &format!("{stem}.l0"))?;
+    // Level 0, streamed exactly like `build_pyramid_streaming` reads it, and
+    // aggregated into level 1 as its buckets go past: level 0 itself is not
+    // written (issue #174).
+    let mut level_1 = LevelOne {
+        set,
+        name: format!("{stem}.l1"),
+        level_0: 0,
+        group: None,
+        writer: None,
+    };
     let mut kept = keep_samples
         .then(|| SpillVecWriter::<f64>::create(set, &format!("{stem}.samples")))
         .transpose()?;
@@ -289,20 +334,25 @@ where
             }
             let end = offset + sample_chunk.len();
             stream.push_chunk(sample_chunk, &tick_chunk[offset..end], &mut |bucket| {
-                writer.push(bucket.into())
+                level_1.push(bucket)
             })?;
             offset = end;
             Ok(())
         })?;
         Ok(())
     })?;
-    stream.finish(&mut |bucket| writer.push(bucket.into()))?;
-    let mut levels = vec![DiskLevel(writer.finish()?)];
+    stream.finish(&mut |bucket| level_1.push(bucket))?;
+    let (level_0, level_1) = level_1.finish()?;
+    let mut levels = vec![DiskLevel::unwritten(level_0)];
+    levels.extend(level_1.map(DiskLevel::stored));
 
     // Every level above, from the one below, while it can still be grouped
     // (`grow_levels`' own stopping rule).
-    while levels.last().expect("never empty").0.len() >= PYRAMID_FACTOR {
-        let below = &levels.last().expect("never empty").0;
+    while let Some(below) = levels
+        .last()
+        .and_then(|level| level.buckets.as_ref())
+        .filter(|below| below.len() >= PYRAMID_FACTOR)
+    {
         let mut writer =
             SpillVecWriter::<PackedBucket>::create(set, &format!("{stem}.l{}", levels.len()))?;
         let mut cursor = below.cursor()?;
@@ -320,12 +370,58 @@ where
         if let Some((merged, _)) = group {
             writer.push(merged.into())?;
         }
-        levels.push(DiskLevel(writer.finish()?));
+        levels.push(DiskLevel::stored(writer.finish()?));
     }
     Ok(DiskPyramid {
         levels,
         samples: kept.map(SpillVecWriter::finish).transpose()?,
     })
+}
+
+/// Level 1 of an on-disk pyramid, aggregated from level 0's buckets as they
+/// stream past — exactly what aggregating a level-0 file would give, in the
+/// same order — so level 0 is never written (issue #174). Level 1 exists when
+/// level 0 has at least [`PYRAMID_FACTOR`] buckets (`grow_levels`' rule), so
+/// its file is created with its first full group.
+struct LevelOne<'a> {
+    set: &'a SpillSet,
+    name: String,
+    /// Level-0 buckets seen.
+    level_0: usize,
+    group: Option<(Bucket, usize)>,
+    writer: Option<SpillVecWriter<PackedBucket>>,
+}
+
+impl LevelOne<'_> {
+    fn push(&mut self, bucket: Bucket) -> Result<()> {
+        self.level_0 += 1;
+        let (merged, count) = match self.group.take() {
+            Some((merged, count)) => (merge_buckets(merged, bucket), count + 1),
+            None => (bucket, 1),
+        };
+        if count < PYRAMID_FACTOR {
+            self.group = Some((merged, count));
+            return Ok(());
+        }
+        if self.writer.is_none() {
+            self.writer = Some(SpillVecWriter::create(self.set, &self.name)?);
+        }
+        self.writer
+            .as_mut()
+            .expect("created above")
+            .push(merged.into())
+    }
+
+    /// Level 0's bucket count, and level 1 if it exists.
+    fn finish(self) -> Result<(usize, Option<SpillVec<PackedBucket>>)> {
+        let Some(mut writer) = self.writer else {
+            return Ok((self.level_0, None));
+        };
+        if let Some((merged, _)) = self.group {
+            writer.push(merged.into())?;
+        }
+        Ok((self.level_0, Some(writer.finish()?)))
+    }
 }
 
 /// Distinguishes the files of several pyramids written into one set.
