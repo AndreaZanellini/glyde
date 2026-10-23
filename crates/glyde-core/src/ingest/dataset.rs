@@ -2527,13 +2527,13 @@ pub(crate) fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<()> {
 /// Every numeric column's min/max pyramid for a *spilled* dataset, built on
 /// disk (issue #102, [`crate::index::disk_pyramid`]) into a spill set of its
 /// own under `cache_dir`, so a file too large for memory gets the same
-/// pyramid-accelerated rendering as one that fits — without the ~9 bytes per
+/// pyramid-accelerated rendering as one that fits — without the ~11 bytes per
 /// sample of RAM an in-memory pyramid would cost. `None` for a non-numeric
 /// column, and for any column whose pyramid could not be written (logged at
 /// `warn`): the view then decimates its raw samples, as before.
 ///
 /// The pyramids take about as much disk as they would have taken RAM (one
-/// 64-byte bucket per ~7 samples, per numeric column), so that space is
+/// 80-byte bucket per ~7 samples, per numeric column), so that space is
 /// checked first, with the same headroom the spill itself keeps (SPEC §5.1:
 /// check affordability before acting); if it is not there, no pyramid is
 /// built and the file still renders, from its raw samples.
@@ -2548,7 +2548,10 @@ pub fn disk_pyramids_for_dataset(
         .filter(|series| series.values().sample_source().is_some())
         .count() as u64;
     let rows = dataset.time.len() as u64;
-    let pyramid_bytes = rows.div_ceil(7).saturating_mul(64).saturating_mul(numeric);
+    let pyramid_bytes = rows
+        .div_ceil(7)
+        .saturating_mul(crate::index::disk_pyramid::PACKED_BUCKET_BYTES)
+        .saturating_mul(numeric);
     if let Some(available) = crate::budget::available_disk_bytes(cache_dir) {
         if let Err(err) = crate::budget::check_disk_affordable(pyramid_bytes, available, cache_dir)
         {
@@ -2963,7 +2966,7 @@ pub type DerivedCaches = (ColumnPyramids, ColumnLevel0Caches);
 ///
 /// Callers must not call this over a [`Dataset::is_spilled`] dataset. Reading
 /// one is bounded as of issue #88, but both caches would still *produce*
-/// something proportional to file size — the pyramid ~9 bytes per sample per
+/// something proportional to file size — the pyramid ~11 bytes per sample per
 /// column in RAM, the Level-0 cache a whole second copy of the column on disk
 /// and mapped — against SPEC §5's flat cap (issue #102).
 pub fn derived_caches_for_dataset_cached(

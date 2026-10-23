@@ -152,6 +152,16 @@ fn assert_same_pyramid(streamed: &[Vec<Bucket>], expected: &[Vec<Bucket>], what:
                 "{what}: level {level} bucket {index} last_ts"
             );
             assert_eq!(
+                got.first_value.to_bits(),
+                want.first_value.to_bits(),
+                "{what}: level {level} bucket {index} first_value"
+            );
+            assert_eq!(
+                got.last_value.to_bits(),
+                want.last_value.to_bits(),
+                "{what}: level {level} bucket {index} last_value"
+            );
+            assert_eq!(
                 got.nan_count, want.nan_count,
                 "{what}: level {level} bucket {index} nan_count"
             );

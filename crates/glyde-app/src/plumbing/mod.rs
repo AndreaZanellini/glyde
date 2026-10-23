@@ -175,7 +175,7 @@ pub enum IndexingMessage {
     /// *Reading* a spilled column is bounded as of issue #88
     /// (`ingest::pyramids_for_dataset` streams it), so that is no longer what
     /// keeps both of these off the spilled path. What keeps them off it is
-    /// what they would produce: a pyramid costs ~9 bytes per sample per
+    /// what they would produce: a pyramid costs ~11 bytes per sample per
     /// column held owned in RAM, and a Level-0 cache is a whole second copy
     /// of the column's `(timestamp, value)` pairs — both proportional to file
     /// size, so neither fits SPEC §5's flat cap on the very files that spill

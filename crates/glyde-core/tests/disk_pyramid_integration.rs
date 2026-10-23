@@ -14,7 +14,7 @@
 
 //! Issue #102: the min/max pyramid of a file too large for memory lives on
 //! disk, one memory-mapped spill file per level, instead of as an owned
-//! `Vec<Vec<Bucket>>` costing ~9 bytes of RAM per sample per column. It must
+//! `Vec<Vec<Bucket>>` costing ~11 bytes of RAM per sample per column. It must
 //! be the *same* pyramid, bucket for bucket, as the golden-tested
 //! [`build_pyramid`] (SPEC §3.1, Golden Rule 4), and decimating through it
 //! must give exactly what [`decimate_viewport`] gives over the in-memory
@@ -49,6 +49,8 @@ fn same(a: &Bucket, b: &Bucket) -> bool {
         && a.max.to_bits() == b.max.to_bits()
         && a.first_ts == b.first_ts
         && a.last_ts == b.last_ts
+        && a.first_value.to_bits() == b.first_value.to_bits()
+        && a.last_value.to_bits() == b.last_value.to_bits()
         && a.nan_count == b.nan_count
 }
 

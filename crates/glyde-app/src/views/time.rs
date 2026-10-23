@@ -28,7 +28,9 @@
 //! builds at index time — wherever it is available, and falling back to a
 //! direct, viewport-bounded raw scan when it is not (see
 //! [`crate::plumbing::IndexingMessage::Completed`]'s doc comment for when
-//! that happens). A pixel column with no finite reading collapses to a gap
+//! that happens). Consecutive columns are joined from one column's last raw
+//! sample to the next column's first ([`connectors`], SPEC §3.1, issue
+//! #147). A pixel column with no finite reading collapses to a gap
 //! bucket ([`bucket_is_gap`]) and is skipped, never interpolated across
 //! (SPEC §1.3); once the viewport has zoomed in far enough that every raw
 //! sample gets its own pixel column, `decimate_viewport` itself switches to
@@ -44,7 +46,7 @@
 use std::sync::Arc;
 
 use egui_plot::{GridMark, Line, Plot, PlotBounds, PlotPoints, Points};
-use glyde_core::dsp::decimation::{decimate_viewport, Bucket, Pyramid};
+use glyde_core::dsp::decimation::{connectors, decimate_viewport, Bucket, Pyramid};
 use glyde_core::ingest::{
     progressive_tick_to_value, progressive_value_to_tick, Dataset, Level0Cache, TimeAxis,
 };
@@ -463,8 +465,8 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         // condition `decimate_viewport` itself branches on internally, but
         // needed here too since the branches render differently: connected
         // (SPEC §3.1's raw-samples-plus-markers regime, docs/ROADMAP.md M2)
-        // vs. separate per-column vertical bars ("and nothing else"). Kept
-        // with each decimation, which is drawn the way it was computed.
+        // vs. per-column vertical bars joined by connectors (issue #147).
+        // Kept with each decimation, which is drawn the way it was computed.
         let converged = is_converged(ticks, range, pixel_columns);
 
         // Decimate every plotted column whose cached decimation is not for
@@ -583,10 +585,14 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 }
             } else {
                 // SPEC §3.1's aggregated regime: one vertical extent per
-                // pixel column — never a line connecting one pixel column
-                // to the next, and never interpolated across a gap bucket
-                // (SPEC §1.3). All of a channel's extents are one plot item
-                // (issue #137), not one `Line` each.
+                // pixel column, and a connector from each column's last raw
+                // sample to the next column's first — the line the
+                // convergence regime draws between those two samples, so a
+                // steep signal stays one continuous trace instead of
+                // looking dashed (issue #147). Never a connector touching a
+                // NaN sample, so a gap bucket stays a visible break (SPEC
+                // §1.3). All of a channel's extents and connectors are one
+                // plot item (issue #137), not one `Line` each.
                 let mut points: Vec<[f64; 2]> = Vec::new();
                 let mut bars = MinMaxBars::new(series.name(), color, bar_encoding);
                 for bucket in buckets {
@@ -600,6 +606,10 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                     } else {
                         bars.push(bucket_x, bucket.min, bucket.max);
                     }
+                }
+                let at = |(tick, value): (i128, f64)| [tick_to_seconds(&dataset.time, tick), value];
+                for connector in connectors(buckets) {
+                    bars.connect(at(connector.from), at(connector.to));
                 }
                 if !bars.is_empty() {
                     plot_ui.add(bars);
@@ -825,17 +835,22 @@ enum BarEncoding {
 }
 
 /// One channel's vertical min/max extents in SPEC §3.1's aggregated regime,
-/// as a single plot item (issue #137). Drawn exactly like the one-`Line`-
-/// per-extent it replaces — a 1.5-point stroke in the channel's color from
-/// each extent's min to its max, hoverable at either end — without
-/// `egui_plot`'s per-item cost (a boxed item, a name, bounds and a point
-/// buffer each) paid ~2,000 times per channel per frame.
+/// and the connectors between consecutive columns (issue #147), as a single
+/// plot item (issue #137). Drawn exactly like the one-`Line`-per-extent it
+/// replaces — a 1.5-point stroke in the channel's color from each extent's
+/// min to its max, hoverable at either end — without `egui_plot`'s per-item
+/// cost (a boxed item, a name, bounds and a point buffer each) paid ~2,000
+/// times per channel per frame. Each connector is the same stroke, between
+/// its two raw samples.
 struct MinMaxBars {
     name: String,
     color: egui::Color32,
     encoding: BarEncoding,
     /// One `[(x, min), (x, max)]` pair per extent.
     extents: Vec<[egui_plot::PlotPoint; 2]>,
+    /// One `[(x, value), (x, value)]` pair per connector, from one column's
+    /// last raw sample to the next column's first.
+    connectors: Vec<[egui_plot::PlotPoint; 2]>,
     bounds: PlotBounds,
     highlighted: bool,
 }
@@ -850,6 +865,7 @@ impl MinMaxBars {
             color,
             encoding,
             extents: Vec::new(),
+            connectors: Vec::new(),
             bounds: PlotBounds::NOTHING,
             highlighted: false,
         }
@@ -866,8 +882,18 @@ impl MinMaxBars {
         self.extents.push(extent);
     }
 
+    /// A connector from the raw sample at `from` to the one at `to`, each
+    /// `[x, value]`.
+    fn connect(&mut self, from: [f64; 2], to: [f64; 2]) {
+        let connector = [from.into(), to.into()];
+        for end in &connector {
+            self.bounds.extend_with(end);
+        }
+        self.connectors.push(connector);
+    }
+
     fn is_empty(&self) -> bool {
-        self.extents.is_empty()
+        self.extents.is_empty() && self.connectors.is_empty()
     }
 }
 
@@ -884,7 +910,8 @@ impl egui_plot::PlotItem for MinMaxBars {
             Self::STROKE_WIDTH
         };
         let stroke = egui::Stroke::new(width, self.color);
-        let extents = self.extents.iter().map(|extent| {
+        // Every extent, then every connector: the order they are painted in.
+        let extents = self.extents.iter().chain(&self.connectors).map(|extent| {
             [
                 transform.position_from_point(&extent[0]),
                 transform.position_from_point(&extent[1]),
@@ -2301,14 +2328,16 @@ mod render_tests {
     // Issue #137's lock on SPEC §3.1's aggregated regime, written before
     // changing how its bars are emitted: each channel draws exactly one
     // vertical min/max stroke per non-flat, non-gap bucket and one dot per
-    // flat one, never a stroke from one pixel column to another, never
-    // anything for a gap bucket, in the channel's color at the same width —
-    // and every mark sits exactly where one affine plot transform puts its
-    // bucket, so nothing is moved, merged, dropped or invented. Checked on
-    // the strokes encoding, where each mark is a shape of its own; the
-    // encoding the app draws with must then tessellate into exactly the
-    // same triangles, vertex for vertex (adapted with the maintainer's
-    // approval when bars became one pre-tessellated mesh per channel).
+    // flat one, one connector stroke per pair of consecutive columns whose
+    // boundary samples are not NaN, never anything for a gap bucket, in the
+    // channel's color at the same width — and every mark sits exactly where
+    // one affine plot transform puts its bucket or its two raw samples, so
+    // nothing is moved, merged, dropped or invented. Checked on the strokes
+    // encoding, where each mark is a shape of its own; the encoding the app
+    // draws with must then tessellate into exactly the same triangles,
+    // vertex for vertex (adapted with the maintainer's approval when bars
+    // became one pre-tessellated mesh per channel, and when SPEC §3.1 gained
+    // connectors, issue #147).
     #[test]
     fn aggregated_bars_are_exactly_the_buckets() {
         let n = 20_000usize;
@@ -2407,6 +2436,11 @@ mod render_tests {
                     bars.push((x, bucket.min, bucket.max));
                 }
             }
+            let at =
+                |(tick, value): (i128, f64)| (tick_to_seconds(&fixture.dataset.time, tick), value);
+            let links: Vec<((f64, f64), (f64, f64))> = connectors(&cached.buckets)
+                .map(|connector| (at(connector.from), at(connector.to)))
+                .collect();
             assert!(bars.len() > 100, "a meaningful fixture");
             assert_eq!(
                 !flats.is_empty(),
@@ -2414,21 +2448,26 @@ mod render_tests {
                 "only `second` has a flat stretch"
             );
             assert_eq!(
+                links.len() + 1 < cached.buckets.len(),
+                column == 0,
+                "only `first`'s gap breaks the trace"
+            );
+            assert_eq!(
                 strokes.len(),
-                bars.len(),
-                "column {column}: one stroke per bar"
+                bars.len() + links.len(),
+                "column {column}: one stroke per bar and one per connector"
             );
             assert_eq!(
                 dots.len(),
                 flats.len(),
                 "column {column}: one dot per flat bucket"
             );
+            // Painted in that order: every bar, then every connector.
+            let (strokes, link_strokes) = strokes.split_at(bars.len());
 
             // Screen = (x * sx + ox, y * sy + oy): solved from the two
             // outermost bars (x) and the tallest one (y), then every mark
             // must match it.
-            let mut strokes = strokes;
-            strokes.sort_by(|a, b| a.0.x.total_cmp(&b.0.x));
             let [sx, ox, sy, oy] = *transform.get_or_insert_with(|| {
                 let (a, b) = (bars[0], bars[bars.len() - 1]);
                 let (sa, sb) = (strokes[0], strokes[strokes.len() - 1]);
@@ -2461,6 +2500,16 @@ mod render_tests {
             for (&(center, radius), &(x, value)) in dots.iter().zip(&flats) {
                 assert_eq!(radius, 2.0);
                 assert!(close(center.x, x * sx + ox) && close(center.y, value * sy + oy));
+            }
+            let on = |end: egui::Pos2, (x, value): (f64, f64)| {
+                close(end.x, x * sx + ox) && close(end.y, value * sy + oy)
+            };
+            for (&(top, bottom, width), &(from, to)) in link_strokes.iter().zip(&links) {
+                assert_eq!(width, 1.5);
+                assert!(
+                    (on(top, from) && on(bottom, to)) || (on(top, to) && on(bottom, from)),
+                    "connector from {from:?} to {to:?} misplaced: drawn {top:?} to {bottom:?}"
+                );
             }
         }
     }
@@ -2526,6 +2575,72 @@ mod render_tests {
         inked
     }
 
+    /// One frame of `fixture` on an 800×600-point screen at
+    /// `pixels_per_point`, once the plot shows exactly x `0..=x_max` and y
+    /// `-1..=1`, as zooming would set it: the device pixels it inks in the
+    /// first channel's color, with the state and transform it drew with.
+    fn ink_of_a_known_view(
+        fixture: &ViewFixture,
+        pixels_per_point: f32,
+    ) -> (
+        TimeViewState,
+        std::collections::HashSet<(i32, i32)>,
+        egui_plot::PlotTransform,
+    ) {
+        let x_max = tick_to_seconds(
+            &fixture.dataset.time,
+            *fixture.ticks.last().expect("a non-empty fixture"),
+        );
+        let plot_id = std::cell::Cell::new(None);
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(pixels_per_point);
+        let mut state = TimeViewState::default();
+        let mut frame = |focus| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    plot_id.set(Some(
+                        ui.make_persistent_id(egui::Id::new("time_domain_view")),
+                    ));
+                    show_with_selection(
+                        ui,
+                        &fixture.dataset,
+                        &fixture.pyramids,
+                        &fixture.ticks,
+                        &fixture.sample_cache,
+                        &[],
+                        CursorLookup::for_time(&fixture.dataset.time),
+                        &mut state,
+                        focus,
+                    );
+                });
+            })
+        };
+        for _ in 0..3 {
+            frame(Some((0.0, x_max)));
+        }
+        // A known vertical span, as zooming would set it.
+        let id = plot_id.get().expect("a frame ran");
+        let mut memory = egui_plot::PlotMemory::load(&ctx, id).expect("plot memory");
+        memory.auto_bounds = egui::Vec2b::FALSE;
+        memory.set_bounds(PlotBounds::from_min_max([0.0, -1.0], [x_max, 1.0]));
+        memory.store(&ctx, id);
+        frame(None);
+        let output = frame(None);
+        let transform = egui_plot::PlotMemory::load(&ctx, id)
+            .expect("plot memory")
+            .transform();
+        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let inked = inked_pixels(&primitives, series_color(0), pixels_per_point);
+        (state, inked, transform)
+    }
+
     // SPEC §3.1: every aggregated bucket stays visible however small its
     // min/max extent. A slowly drifting signal gives every pixel column an
     // extent of a fraction of a point; drawn as `egui` line segments, whose
@@ -2548,56 +2663,9 @@ mod render_tests {
         };
         dataset.columns = vec![Series::new("ramp", SeriesValues::F64(ramp))];
         let fixture = ViewFixture::new(dataset);
-        let plot_id = std::cell::Cell::new(None);
 
         for pixels_per_point in [1.0, 2.0] {
-            let ctx = egui::Context::default();
-            ctx.set_pixels_per_point(pixels_per_point);
-            let mut state = TimeViewState::default();
-            let mut frame = |focus| {
-                let input = egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(800.0, 600.0),
-                    )),
-                    ..Default::default()
-                };
-                ctx.run(input, |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        plot_id.set(Some(
-                            ui.make_persistent_id(egui::Id::new("time_domain_view")),
-                        ));
-                        show_with_selection(
-                            ui,
-                            &fixture.dataset,
-                            &fixture.pyramids,
-                            &fixture.ticks,
-                            &fixture.sample_cache,
-                            &[],
-                            CursorLookup::for_time(&fixture.dataset.time),
-                            &mut state,
-                            focus,
-                        );
-                    });
-                })
-            };
-            for _ in 0..3 {
-                frame(Some((0.0, (n - 1) as f64)));
-            }
-            // A known vertical span, as zooming would set it.
-            let id = plot_id.get().expect("a frame ran");
-            let mut memory = egui_plot::PlotMemory::load(&ctx, id).expect("plot memory");
-            memory.auto_bounds = egui::Vec2b::FALSE;
-            memory.set_bounds(PlotBounds::from_min_max([0.0, -1.0], [(n - 1) as f64, 1.0]));
-            memory.store(&ctx, id);
-            frame(None);
-            let output = frame(None);
-            let transform = egui_plot::PlotMemory::load(&ctx, id)
-                .expect("plot memory")
-                .transform();
-            let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
-            let inked = inked_pixels(&primitives, series_color(0), pixels_per_point);
-
+            let (state, inked, transform) = ink_of_a_known_view(&fixture, pixels_per_point);
             let cached = state.decimated[0].as_ref().expect("decimated");
             assert!(!cached.converged, "this view must be aggregated");
             let (mut bars, mut sub_pixel, mut empty) = (0, 0, Vec::new());
@@ -2629,6 +2697,122 @@ mod render_tests {
                  column empty, the first at x = {:?}",
                 empty.len(),
                 empty.first()
+            );
+        }
+    }
+
+    /// A steep signal at ~2.4 samples per pixel column, as `measures_v2.csv`'s
+    /// `torque` looked dashed (issue #147), with a NaN run wide enough to
+    /// span several columns.
+    fn steep_fixture() -> ViewFixture {
+        let n = 1_800usize;
+        let mut steep: Vec<f64> = (0..n).map(|i| (i as f64 * 0.9).sin() * 0.9).collect();
+        for value in &mut steep[1_000..1_040] {
+            *value = f64::NAN;
+        }
+        let mut dataset = sample_dataset();
+        dataset.time = TimeAxis::Absolute {
+            timestamps: (0..n as i128)
+                .map(|i| Timestamp::new(i, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        dataset.columns = vec![Series::new("steep", SeriesValues::F64(steep))];
+        ViewFixture::new(dataset)
+    }
+
+    // SPEC §3.1 / QUALITY §2 "Continuity" (issue #147), on the pixels the
+    // app really paints: between two consecutive columns, every device
+    // pixel row from the lower of their extents to the higher is inked, so
+    // a steep signal is one continuous trace, not a dashed one. Bars alone
+    // leave most of those pairs with a hole.
+    #[test]
+    fn consecutive_columns_leave_no_uninked_rows_between_their_extents() {
+        let fixture = steep_fixture();
+        for pixels_per_point in [1.0, 2.0] {
+            let (state, inked, transform) = ink_of_a_known_view(&fixture, pixels_per_point);
+            let cached = state.decimated[0].as_ref().expect("decimated");
+            assert!(!cached.converged, "this view must be aggregated");
+            let at = |tick: i128, value: f64| {
+                transform.position_from_point(&egui_plot::PlotPoint::new(
+                    tick_to_seconds(&fixture.dataset.time, tick),
+                    value,
+                )) * pixels_per_point
+            };
+            let (mut pairs, mut holes_without_connectors, mut holes) = (0, 0, Vec::new());
+            for connector in connectors(&cached.buckets) {
+                let column = |tick: i128| {
+                    cached
+                        .buckets
+                        .iter()
+                        .find(|b| b.first_ts <= tick && tick <= b.last_ts)
+                        .expect("a connector ends on a column")
+                };
+                let (left, right) = (column(connector.from.0), column(connector.to.0));
+                let mid = |b: &Bucket| (b.first_ts + b.last_ts) / 2;
+                // Device rows, top to bottom, of each bar.
+                let rows = |b: &Bucket| (at(mid(b), b.max).y, at(mid(b), b.min).y);
+                let (bars, x_lo, x_hi) = (
+                    [rows(left), rows(right)],
+                    at(mid(left), 0.0).x.floor() as i32 - 1,
+                    at(mid(right), 0.0).x.ceil() as i32 + 1,
+                );
+                let top = bars[0].0.min(bars[1].0);
+                let bottom = bars[0].1.max(bars[1].1);
+                // Rows whose centres lie inside the span, ends excluded: a
+                // stroke's flat end may cover its last row only partly.
+                let span = top.ceil() as i32..(bottom - 1.0).floor() as i32;
+                pairs += 1;
+                if span.clone().any(|r| {
+                    bars.iter()
+                        .all(|&(t, b)| (r as f32 + 0.5) < t || (r as f32 + 0.5) > b)
+                }) {
+                    holes_without_connectors += 1;
+                }
+                if let Some(row) = span
+                    .clone()
+                    .find(|&r| !(x_lo..=x_hi).any(|x| inked.contains(&(x, r))))
+                {
+                    holes.push((connector.from.0, row));
+                }
+            }
+            assert!(
+                holes_without_connectors * 2 > pairs,
+                "the fixture must be steep: bars alone must leave a hole between most of \
+                 the {pairs} joined pairs, only {holes_without_connectors} do"
+            );
+            assert!(
+                holes.is_empty(),
+                "at {pixels_per_point} px/pt, {} of {pairs} pairs of consecutive columns \
+                 leave an uninked row between their extents, the first (tick, row) {:?}",
+                holes.len(),
+                holes.first()
+            );
+
+            // The NaN run stays a visible break: nothing is drawn between
+            // the marks on either side of its gap buckets, beyond a dot's
+            // 2-point radius and its anti-aliased rim (a column holding one
+            // finite sample is a dot).
+            let gap = |b: &Bucket| bucket_is_gap(b);
+            let first_gap = cached.buckets.iter().position(gap).expect("a gap");
+            let after = first_gap
+                + cached.buckets[first_gap..]
+                    .iter()
+                    .position(|b| !gap(b))
+                    .expect("data after the gap");
+            let mark_x = |b: &Bucket| at((b.first_ts + b.last_ts) / 2, 0.0).x;
+            let reach = 4.0 * pixels_per_point;
+            let gap_x = (mark_x(&cached.buckets[first_gap - 1]) + reach).ceil() as i32
+                ..=(mark_x(&cached.buckets[after]) - reach).floor() as i32;
+            assert!(
+                gap_x.end() - gap_x.start() > 4,
+                "the gap spans several pixels"
+            );
+            let in_gap = inked.iter().filter(|(x, _)| gap_x.contains(x)).count();
+            assert_eq!(
+                in_gap, 0,
+                "at {pixels_per_point} px/pt, pixels are inked inside the NaN run ({gap_x:?})"
             );
         }
     }
@@ -3047,6 +3231,8 @@ mod tests {
                 max: 1.0,
                 first_ts: 0,
                 last_ts: 0,
+                first_value: 1.0,
+                last_value: 1.0,
                 nan_count: 0,
             },
             Bucket {
@@ -3054,6 +3240,8 @@ mod tests {
                 max: 2.0,
                 first_ts: 1,
                 last_ts: 1,
+                first_value: 2.0,
+                last_value: 2.0,
                 nan_count: 0,
             },
         ];
@@ -3076,6 +3264,8 @@ mod tests {
                 max: 1.0,
                 first_ts: 0,
                 last_ts: 0,
+                first_value: 1.0,
+                last_value: 1.0,
                 nan_count: 0,
             },
             Bucket {
@@ -3083,6 +3273,8 @@ mod tests {
                 max: f64::NAN,
                 first_ts: 1,
                 last_ts: 1,
+                first_value: f64::NAN,
+                last_value: f64::NAN,
                 nan_count: 1,
             },
             Bucket {
@@ -3090,6 +3282,8 @@ mod tests {
                 max: 3.0,
                 first_ts: 2,
                 last_ts: 2,
+                first_value: 3.0,
+                last_value: 3.0,
                 nan_count: 0,
             },
         ];
@@ -3370,6 +3564,8 @@ mod tests {
             max: f64::NAN,
             first_ts: 0,
             last_ts: 0,
+            first_value: f64::NAN,
+            last_value: f64::NAN,
             nan_count: 1,
         };
         let all_nan_aggregate = Bucket {
@@ -3377,6 +3573,8 @@ mod tests {
             max: f64::NEG_INFINITY,
             first_ts: 0,
             last_ts: 7,
+            first_value: f64::NAN,
+            last_value: f64::NAN,
             nan_count: 8,
         };
 
@@ -3391,6 +3589,8 @@ mod tests {
             max: 1.5,
             first_ts: 0,
             last_ts: 0,
+            first_value: 1.5,
+            last_value: 1.5,
             nan_count: 0,
         };
         let aggregate_with_one_finite_reading = Bucket {
@@ -3398,6 +3598,8 @@ mod tests {
             max: 2.0,
             first_ts: 0,
             last_ts: 7,
+            first_value: f64::NAN,
+            last_value: 2.0,
             nan_count: 7,
         };
 
@@ -3414,6 +3616,8 @@ mod tests {
             max: f64::INFINITY,
             first_ts: 0,
             last_ts: 1,
+            first_value: 1.0,
+            last_value: f64::INFINITY,
             nan_count: 0,
         };
 
