@@ -18,13 +18,14 @@
 //! what is indexed, keep indexing in background)".
 //!
 //! This measures wall-clock from calling
-//! [`ingest::open_dataset_progressive`] on a large fixture to its *first*
+//! [`ingest::open_dataset_progressive_in`] (the app's open, with a cache
+//! directory of the bench's own) on a large fixture to its *first*
 //! progress checkpoint — the moment a real, renderable [`ingest::Dataset`]
 //! first becomes available, which is what lets `glyde-app`'s indexer thread
 //! send the UI its first [`IndexingMessage::Progress`] (see
 //! `crates/glyde-app/src/plumbing/mod.rs`).
 //!
-//! `open_dataset_progressive` itself is a single blocking call that only
+//! `open_dataset_progressive_in` itself is a single blocking call that only
 //! returns once the *whole* file has been parsed (the checkpoint callback
 //! fires early, mid-call, but the call doesn't return until completion) —
 //! `glyde-app`'s real indexer thread gets around this by running it on a
@@ -44,9 +45,19 @@
 //! checkpoint latency — expected and harmless, since (per `index_build`'s
 //! own module doc) that section is a local regression aid only, never a CI
 //! gate.
+//!
+//! Every measured open is a **cold** open (issue #154): it gets a cache
+//! directory of its own, emptied before the open. An unchanged file that
+//! fits in memory is otherwise served on a second open straight from the
+//! whole-dataset cache (issue #106) without being read, so no checkpoint
+//! fires and only the very first open is measured. SPEC §5's "first
+//! meaningful plot" is about opening a file, not reopening it.
 
-use criterion::{criterion_group, criterion_main, Criterion};
-use glyde_core::ingest;
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use glyde_core::budget::RamBudget;
+use glyde_core::ingest::{self, IngestOverrides};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -75,7 +86,7 @@ fn bench_first_plot(c: &mut Criterion) {
     // Absolute-ceiling gate: one clean timed run to the first checkpoint,
     // asserted directly against the SPEC §5 budget (docs/QUALITY.md §3:
     // "exceeding a budget fails the build").
-    let elapsed = time_to_first_checkpoint(&fixture);
+    let elapsed = time_to_first_checkpoint(&fixture, &cold_cache_dir());
     assert!(
         elapsed <= FIRST_PLOT_CEILING,
         "first progress checkpoint on a 1 GB CSV took {elapsed:?}, exceeding the \
@@ -92,26 +103,52 @@ fn bench_first_plot(c: &mut Criterion) {
     let mut group = c.benchmark_group("first_plot");
     group.sample_size(10);
     group.bench_function("csv_1gb_first_checkpoint", |b| {
-        b.iter(|| time_to_first_checkpoint(std::hint::black_box(&fixture)))
+        b.iter_batched(
+            cold_cache_dir,
+            |cache_dir| time_to_first_checkpoint(std::hint::black_box(&fixture), &cache_dir),
+            BatchSize::PerIteration,
+        )
     });
     group.finish();
 }
 
-/// Runs [`ingest::open_dataset_progressive`] on `fixture` — a single,
-/// synchronous, un-threaded call (see the module doc for why this bench
-/// deliberately avoids spawning a thread per call) — and returns the
-/// wall-clock time from the call until its first checkpoint fired, measured
-/// via [`Instant`]s taken before the call and inside the checkpoint
-/// callback. The call itself keeps running after that (to completion, like
-/// any full parse) before this function can return the already-measured
-/// value.
-fn time_to_first_checkpoint(fixture: &std::path::Path) -> Duration {
+/// The bench's own cache directory, emptied: what makes the next open a
+/// cold one (see the module doc). Called outside the timed part of each
+/// iteration.
+fn cold_cache_dir() -> PathBuf {
+    let dir = support::fixture_dir().join("first_plot_cache");
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => panic!("could not empty the first_plot bench cache directory: {err}"),
+    }
+    std::fs::create_dir_all(&dir).expect("could not create the first_plot bench cache directory");
+    dir
+}
+
+/// Runs [`ingest::open_dataset_progressive_in`] on `fixture`, with the
+/// machine's own RAM budget (as [`ingest::open_dataset_progressive`] uses)
+/// and `cache_dir` as its cache — a single, synchronous, un-threaded call
+/// (see the module doc for why this bench deliberately avoids spawning a
+/// thread per call) — and returns the wall-clock time from the call until
+/// its first checkpoint fired, measured via [`Instant`]s taken before the
+/// call and inside the checkpoint callback. The call itself keeps running
+/// after that (to completion, like any full parse) before this function can
+/// return the already-measured value.
+fn time_to_first_checkpoint(fixture: &Path, cache_dir: &Path) -> Duration {
     let start = Instant::now();
     let (tx, rx) = mpsc::channel();
 
-    ingest::open_dataset_progressive(fixture, |checkpoint| {
-        let _ = tx.send((Instant::now(), checkpoint.rows_read));
-    })
+    ingest::open_dataset_progressive_in(
+        fixture,
+        IngestOverrides::default(),
+        RamBudget::from_system(),
+        cache_dir,
+        &AtomicBool::new(false),
+        |checkpoint| {
+            let _ = tx.send((Instant::now(), checkpoint.rows_read));
+        },
+    )
     .expect("first_plot bench fixture must open");
 
     let (first_checkpoint_at, rows_read) = rx

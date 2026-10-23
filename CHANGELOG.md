@@ -11,6 +11,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **The "first plot" speed benchmark no longer crashes when it runs more
+  than once on the same machine (issue #154).** Nothing changes in the app.
+  The benchmark opens the same 1 GB file again and again. Since reopening
+  an unchanged file became instant (it is served from the cache, without
+  reading the file), every open after the first one was a reopen: nothing
+  was read, so the benchmark had no first plot to time and stopped with an
+  error. Each timed open now starts from an empty cache, so every one is a
+  real first open, which is what the 2-second budget is about. It never
+  failed in CI, probably because CI's machine has less memory and does not
+  keep that file in the cache.
+
 ### Changed
 - **The zoomed-out time plot now draws a continuous trace instead of a
   dashed one (issue #147).** At zoom levels where each screen column holds
