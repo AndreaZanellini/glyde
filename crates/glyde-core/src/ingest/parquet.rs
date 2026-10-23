@@ -51,10 +51,12 @@
 //! groups' exact min/max, from which `index::row_groups` builds the
 //! pyramid's upper levels where that is exact (issue #162). What
 //! the typed columns will cost is known exactly from the footer before a
-//! single page is decoded, so SPEC §5.1's affordability check runs first
-//! and a file that does not fit is refused with the numbers. There is no
-//! spilled path for Parquet yet, and no progress checkpoint: the plot
-//! appears when the read completes.
+//! single page is decoded, so SPEC §5.1's affordability check runs first.
+//! A file that does not fit is read into the on-disk spill cache instead
+//! (issue #155, [`spill`]), column by column as its batches arrive, after
+//! checking the free disk; with no cache directory it is refused with the
+//! numbers. There is no progress checkpoint: the plot appears when the read
+//! completes.
 //!
 //! **Partitioned directories** (issue #159). A directory holding `.parquet`
 //! files at any depth is one dataset: its files are read in path order and
@@ -99,6 +101,9 @@ use parquet::file::metadata::ParquetMetaData;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
+
+#[path = "parquet_spill.rs"]
+mod spill;
 
 /// Recognizes `.parquet` files and partitioned Parquet directories (SPEC
 /// §1.1).
@@ -169,7 +174,7 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
 fn open_checking_disk(
     path: &Path,
     request: OpenRequest<'_>,
-    _available_disk_bytes: impl FnOnce(&Path) -> Option<u64>,
+    available_disk_bytes: impl FnOnce(&Path) -> Option<u64>,
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
     log_ignored_overrides(request.overrides);
     let sources = source_files(path)?;
@@ -243,15 +248,35 @@ fn open_checking_disk(
         })
         .fold(0, u64::saturating_add);
     if !request.budget.affords(estimated_bytes) {
-        warn!(
-            estimated_bytes,
-            cap_bytes = request.budget.cap_bytes(),
-            "refusing to open a Parquet file whose columns do not fit the RAM budget (SPEC §5.1)"
+        // SPEC §5.1's affordable alternative (issue #155): the on-disk spill
+        // cache, as for a CSV file too large for memory.
+        let Some(cache_dir) = request.cache_dir else {
+            warn!(
+                estimated_bytes,
+                cap_bytes = request.budget.cap_bytes(),
+                "refusing to open a Parquet file whose columns do not fit the RAM budget, with \
+                 no cache directory to spill to (SPEC §5.1)"
+            );
+            return Err(GlydeError::BudgetExceeded {
+                requested_bytes: estimated_bytes,
+                cap_bytes: request.budget.cap_bytes(),
+            });
+        };
+        return spill::open_spilled(
+            spill::Footers {
+                sources: &sources,
+                schema: &schema,
+                partition_keys,
+                columns,
+                file_columns,
+                loaded,
+                declared_rows,
+                estimated_bytes,
+            },
+            request,
+            cache_dir,
+            available_disk_bytes,
         );
-        return Err(GlydeError::BudgetExceeded {
-            requested_bytes: estimated_bytes,
-            cap_bytes: request.budget.cap_bytes(),
-        });
     }
     info!(
         estimated_bytes,
@@ -304,20 +329,40 @@ fn open_checking_disk(
     let unloaded_columns = columns
         .into_iter()
         .filter_map(|column| match column.state {
-            ColumnState::Unloaded(reason) => {
-                warn!(
-                    column = %column.name,
-                    reason = %reason,
-                    "Parquet column not loaded; listed in the inference bar"
-                );
-                Some(UnloadedColumn {
-                    name: column.name,
-                    reason,
-                })
-            }
+            ColumnState::Unloaded(reason) => Some(unloaded_column(column.name, reason)),
             _ => None,
         })
-        .collect::<Vec<_>>();
+        .collect();
+    finish_open(
+        &schema,
+        partition_keys,
+        row_count,
+        unloaded_columns,
+        dataset,
+        time_index,
+    )
+}
+
+/// A column not loaded, logged and listed for the inference bar.
+fn unloaded_column(name: String, reason: String) -> UnloadedColumn {
+    warn!(
+        column = %name,
+        reason = %reason,
+        "Parquet column not loaded; listed in the inference bar"
+    );
+    UnloadedColumn { name, reason }
+}
+
+/// The open's summary and report from what it read: shared by the
+/// in-memory and the spilled open (issue #155).
+fn finish_open(
+    schema: &Schema,
+    partition_keys: Vec<String>,
+    row_count: u64,
+    unloaded_columns: Vec<UnloadedColumn>,
+    dataset: Dataset,
+    time_index: TimeIndexInference,
+) -> Result<(OpenSummary, InferenceReport, Dataset)> {
     let facts = SourceFacts {
         column_names: schema
             .fields()
@@ -999,18 +1044,16 @@ impl SourceColumn {
             numeric => Some(exact_f64_with_gaps(numeric, &validity).map(ColumnValues::F64)),
         };
         match promoted {
-            None => info!(
-                column = %self.name,
-                missing,
-                "Parquet nulls kept as gaps in the column's own dtype (SPEC §1.3)"
-            ),
+            None => log_gaps_kept(&self.name, missing),
             Some(Ok(values)) => {
-                info!(
-                    column = %self.name,
+                log_gaps_converted(
+                    &self.name,
                     missing,
-                    to = if matches!(values, ColumnValues::F64(_)) { "f64 with NaN gaps" } else { "text" },
-                    "Parquet column with nulls converted so its gaps can be shown (SPEC §1.3); \
-                     every present value is unchanged"
+                    if matches!(values, ColumnValues::F64(_)) {
+                        "f64 with NaN gaps"
+                    } else {
+                        "text"
+                    },
                 );
                 self.state = ColumnState::Loading(values);
             }
@@ -1146,27 +1189,9 @@ impl ColumnValues {
             ColumnValues::F64(values) => {
                 values.extend(array.as_primitive::<Float64Type>().values())
             }
-            ColumnValues::String(values) => match array.data_type() {
-                DataType::Dictionary(..) => append_dictionary_labels(values, array),
-                DataType::LargeUtf8 => values.extend(
-                    array
-                        .as_string::<i64>()
-                        .iter()
-                        .map(|value| value.unwrap_or_default().to_string()),
-                ),
-                DataType::Utf8View => values.extend(
-                    array
-                        .as_string_view()
-                        .iter()
-                        .map(|value| value.unwrap_or_default().to_string()),
-                ),
-                _ => values.extend(
-                    array
-                        .as_string::<i32>()
-                        .iter()
-                        .map(|value| value.unwrap_or_default().to_string()),
-                ),
-            },
+            ColumnValues::String(values) => {
+                for_each_text(array, |text| values.push(text.to_string()))
+            }
             ColumnValues::Timestamp { ticks, .. } => match array.data_type() {
                 DataType::Timestamp(ArrowTimeUnit::Second, _) => {
                     ticks.extend(array.as_primitive::<TimestampSecondType>().values())
@@ -1203,6 +1228,32 @@ impl ColumnValues {
     }
 }
 
+/// Logs SPEC §1.3's gaps a column's nulls became in its own dtype.
+fn log_gaps_kept(column: &str, missing: usize) {
+    info!(
+        column = %column,
+        missing,
+        "Parquet nulls kept as gaps in the column's own dtype (SPEC §1.3)"
+    );
+}
+
+/// Logs a column with nulls converted (`to` names into what) so its gaps can
+/// be shown.
+fn log_gaps_converted(column: &str, missing: usize, to: &str) {
+    info!(
+        column = %column,
+        missing,
+        to,
+        "Parquet column with nulls converted so its gaps can be shown (SPEC §1.3); \
+         every present value is unchanged"
+    );
+}
+
+/// Why an integer column with nulls is not loaded when its values cannot all
+/// become `f64` exactly.
+const TOO_LARGE_FOR_GAPS: &str = "it has missing values, and its integers are too large to show \
+     as decimals exactly (beyond ±2^53), so Glyde cannot mark the gaps without changing a value";
+
 /// Overwrites every null row's placeholder with `gap`.
 fn mark_missing<T: Clone>(values: &mut [T], validity: &[bool], gap: T) {
     for (value, &valid) in values.iter_mut().zip(validity) {
@@ -1236,44 +1287,49 @@ fn exact_f64_with_gaps(
         _ => true,
     };
     if !fits {
-        return Err(
-            "it has missing values, and its integers are too large to show as decimals exactly \
-             (beyond ±2^53), so Glyde cannot mark the gaps without changing a value"
-                .to_string(),
-        );
+        return Err(TOO_LARGE_FOR_GAPS.to_string());
     }
     let mut converted = values.to_f64();
     mark_missing(&mut converted, validity, f64::NAN);
     Ok(converted)
 }
 
-/// Decodes a dictionary-encoded UTF-8 batch to one label per row: the
-/// categorical column as the plain text column the rest of Glyde reads.
-fn append_dictionary_labels(values: &mut Vec<String>, array: &ArrayRef) {
-    let dictionary = array.as_any_dictionary();
-    let labels = dictionary.values();
-    let label = |key: usize| -> String {
-        if key >= labels.len() || labels.is_null(key) {
-            return String::new();
-        }
-        match labels.data_type() {
-            DataType::LargeUtf8 => labels.as_string::<i64>().value(key).to_string(),
-            _ => labels.as_string::<i32>().value(key).to_string(),
-        }
-    };
-    values.extend(
-        dictionary
-            .normalized_keys()
-            .into_iter()
-            .enumerate()
-            .map(|(row, key)| {
-                if array.is_null(row) {
-                    String::new()
-                } else {
-                    label(key)
+/// Hands `visit` one text per row of a text batch — plain, large or view
+/// UTF-8, or dictionary-encoded UTF-8 decoded to its labels (the
+/// categorical column as the plain text column the rest of Glyde reads) —
+/// with an empty text where the row, or the label its key points at, is
+/// null. Shared by the in-memory and the spilled open (issue #155).
+fn for_each_text(array: &ArrayRef, mut visit: impl FnMut(&str)) {
+    match array.data_type() {
+        DataType::Dictionary(..) => {
+            let dictionary = array.as_any_dictionary();
+            let labels = dictionary.values();
+            let label = |key: usize| -> &str {
+                if key >= labels.len() || labels.is_null(key) {
+                    return "";
                 }
-            }),
-    );
+                match labels.data_type() {
+                    DataType::LargeUtf8 => labels.as_string::<i64>().value(key),
+                    _ => labels.as_string::<i32>().value(key),
+                }
+            };
+            for (row, key) in dictionary.normalized_keys().into_iter().enumerate() {
+                visit(if array.is_null(row) { "" } else { label(key) });
+            }
+        }
+        DataType::LargeUtf8 => array
+            .as_string::<i64>()
+            .iter()
+            .for_each(|value| visit(value.unwrap_or_default())),
+        DataType::Utf8View => array
+            .as_string_view()
+            .iter()
+            .for_each(|value| visit(value.unwrap_or_default())),
+        _ => array
+            .as_string::<i32>()
+            .iter()
+            .for_each(|value| visit(value.unwrap_or_default())),
+    }
 }
 
 /// A timestamp column's timezone (SPEC §2.1: "if the source carries one,
