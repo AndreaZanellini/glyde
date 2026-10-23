@@ -726,8 +726,10 @@ impl FitBounds {
                     .get(index)
                     .and_then(Option::as_ref)
                     .map(Arc::as_ref);
-                let samples = column_f64_samples(series.values(), cached, level0);
-                match pyramids.get(index).and_then(Option::as_ref) {
+                let pyramid = pyramids.get(index).and_then(Option::as_ref);
+                let kept = pyramid.and_then(Pyramid::samples);
+                let samples = column_f64_samples(series.values(), cached, level0, kept);
+                match pyramid {
                     Some(pyramid) => pyramid.finite_range(samples),
                     None => finite_range::<Vec<Bucket>>(&[], samples),
                 }
@@ -1092,8 +1094,10 @@ pub fn decimate_column<P: Pyramid>(
         .get(column_index)
         .and_then(Option::as_ref)
         .map(Arc::as_ref);
-    let samples = column_f64_samples(series.values(), cached, level0);
-    match pyramids.get(column_index).and_then(Option::as_ref) {
+    let pyramid = pyramids.get(column_index).and_then(Option::as_ref);
+    let kept = pyramid.and_then(Pyramid::samples);
+    let samples = column_f64_samples(series.values(), cached, level0, kept);
+    match pyramid {
         Some(pyramid) => pyramid.decimate(samples, ticks, range, pixel_columns),
         None => decimate_viewport(&[], samples, ticks, range, pixel_columns),
     }
@@ -1124,9 +1128,12 @@ pub(crate) fn series_color(index: usize) -> egui::Color32 {
 /// to) the on-disk cache (issue #92) — first when present, since it already
 /// holds exactly the converted values this column would otherwise need to
 /// re-derive on every reopen; then zero-copy via
-/// [`SeriesValues::as_f64_slice`] when the column is already `f64`;
-/// otherwise `cached` — a converted copy [`cache_column_samples`] already
-/// built for this column once, at the last status change, not this frame.
+/// [`SeriesValues::as_f64_slice`] when the column is already `f64`; then
+/// `kept`, the `f64` samples an on-disk pyramid wrote for a spilled column
+/// of another dtype (issue #178: memory-mapped, so a file too large for RAM
+/// never gets an `f64` copy in it); otherwise `cached` — a converted copy
+/// [`cache_column_samples`] already built for this column once, at the last
+/// status change, not this frame.
 /// Never calls [`SeriesValues::to_f64_vec`] itself: doing the conversion
 /// here, inline, was the exact per-frame O(n) cost (worse still for
 /// `i64`/`u64`, which additionally run `warn_if_precision_loss` per element)
@@ -1145,14 +1152,16 @@ fn column_f64_samples<'a>(
     values: &'a SeriesValues,
     cached: Option<&'a Vec<f64>>,
     level0: Option<&'a Level0Cache>,
+    kept: Option<&'a [f64]>,
 ) -> &'a [f64] {
     if let Some(cache) = level0 {
         return cache.samples();
     }
-    match values.as_f64_slice() {
-        Some(slice) => slice,
-        None => cached.map(Vec::as_slice).unwrap_or(&[]),
-    }
+    values
+        .as_f64_slice()
+        .or(kept)
+        .or(cached.map(Vec::as_slice))
+        .unwrap_or(&[])
 }
 
 /// Builds `sample_cache` for [`show`]: `dataset.columns`-parallel, `Some`
@@ -4133,7 +4142,7 @@ mod tests {
     fn column_f64_samples_is_zero_copy_for_an_f64_series_even_with_no_cache() {
         let values = SeriesValues::F64(vec![1.0, 2.0, 3.0]);
 
-        let samples = column_f64_samples(&values, None, None);
+        let samples = column_f64_samples(&values, None, None, None);
 
         assert_eq!(samples, &[1.0, 2.0, 3.0]);
     }
@@ -4143,7 +4152,7 @@ mod tests {
         let values = SeriesValues::I64(vec![1, 2, 3]);
         let cached = vec![1.0, 2.0, 3.0];
 
-        let samples = column_f64_samples(&values, Some(&cached), None);
+        let samples = column_f64_samples(&values, Some(&cached), None, None);
 
         // Not merely equal in value — this asserts it is `cached`'s own
         // allocation, i.e. `column_f64_samples` never itself calls
@@ -4155,7 +4164,7 @@ mod tests {
     fn column_f64_samples_of_a_non_f64_dtype_with_no_cache_falls_back_to_empty() {
         let values = SeriesValues::I64(vec![1, 2, 3]);
 
-        let samples = column_f64_samples(&values, None, None);
+        let samples = column_f64_samples(&values, None, None, None);
 
         assert!(samples.is_empty());
     }
@@ -4163,7 +4172,7 @@ mod tests {
     #[test]
     fn column_f64_samples_of_a_non_numeric_series_is_empty() {
         let values = SeriesValues::Bool(vec![true, false]);
-        let samples = column_f64_samples(&values, None, None);
+        let samples = column_f64_samples(&values, None, None, None);
 
         assert!(samples.is_empty());
     }
@@ -4187,7 +4196,7 @@ mod tests {
         let values = SeriesValues::F64(vec![1.0, 2.0, 3.0]);
         let cached = vec![1.0, 2.0, 3.0];
 
-        let samples = column_f64_samples(&values, Some(&cached), Some(&level0));
+        let samples = column_f64_samples(&values, Some(&cached), Some(&level0), None);
 
         assert_eq!(samples, &[9.0, 8.0, 7.0]);
     }
