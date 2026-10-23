@@ -265,7 +265,7 @@ fn render_frame(
     } else {
         Vec::new()
     };
-    render_frame_with(ctx, fixture, state, events, view).visible
+    render_frame_with(ctx, fixture, state, events, Some(view)).visible
 }
 
 /// What [`render_frame_with`] reports about its frame.
@@ -278,13 +278,14 @@ struct Frame {
     plot_id: egui::Id,
 }
 
-/// [`render_frame`] with `events` as the frame's input.
+/// [`render_frame`] with `events` as the frame's input, and the view left
+/// where it is when `view` is `None`.
 fn render_frame_with(
     ctx: &egui::Context,
     fixture: &Fixture,
     state: &mut TimeViewState,
     events: Vec<egui::Event>,
-    view: (f64, f64),
+    view: Option<(f64, f64)>,
 ) -> Frame {
     let input = egui::RawInput {
         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, VIEWPORT_SIZE)),
@@ -306,7 +307,7 @@ fn render_frame_with(
                 fixture.cursor,
                 &fixture.fit,
                 state,
-                Some(view),
+                view,
             );
         });
     });
@@ -574,9 +575,9 @@ fn bench_fit_click(c: &mut Criterion, fixture: &Fixture) {
     let ctx = egui::Context::default();
     let full = full_view(fixture);
     let mut state = TimeViewState::default();
-    let mut frame = render_frame_with(&ctx, fixture, &mut state, Vec::new(), full);
+    let mut frame = render_frame_with(&ctx, fixture, &mut state, Vec::new(), Some(full));
     for _ in 0..2 {
-        frame = render_frame_with(&ctx, fixture, &mut state, Vec::new(), full);
+        frame = render_frame_with(&ctx, fixture, &mut state, Vec::new(), Some(full));
     }
     let (button, plot_id) = (text_centre(&frame.shapes, "Fit to data"), frame.plot_id);
     let press = |pressed| egui::Event::PointerButton {
@@ -591,17 +592,19 @@ fn bench_fit_click(c: &mut Criterion, fixture: &Fixture) {
         memory.auto_bounds = egui::Vec2b::FALSE;
         memory.set_bounds(away);
         memory.store(&ctx, plot_id);
+        // No focus on these frames: a focus keeps the plot's y range as it
+        // was, which would undo the fit on the frame it is applied.
         render_frame_with(
             &ctx,
             fixture,
             state,
             vec![egui::Event::PointerMoved(button), press(true)],
-            full,
+            None,
         );
         let start = Instant::now();
-        render_frame_with(&ctx, fixture, state, vec![press(false)], full);
+        render_frame_with(&ctx, fixture, state, vec![press(false)], None);
         let elapsed = start.elapsed();
-        render_frame_with(&ctx, fixture, state, Vec::new(), full);
+        render_frame_with(&ctx, fixture, state, Vec::new(), None);
         elapsed
     };
 
