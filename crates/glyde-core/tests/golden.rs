@@ -15,6 +15,8 @@
 //! Golden DSP tests (docs/QUALITY.md §2), one module per algorithm family.
 //! Written before their implementation; never modified to make code pass.
 
+#[path = "golden/connected_buckets.rs"]
+mod connected_buckets;
 #[path = "golden/decimation.rs"]
 mod decimation;
 #[path = "golden/time.rs"]

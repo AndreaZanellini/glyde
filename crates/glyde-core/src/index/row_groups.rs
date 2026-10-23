@@ -32,6 +32,9 @@
 //!   as 0 when a writer omitted it).
 //! - **`first_ts`/`last_ts`** are the time axis's ticks at the bucket's edge
 //!   rows, read directly: exact, and no scan.
+//! - **`first_value`/`last_value`** (issue #147) are the series' raw samples
+//!   at the same two rows, read directly too: the footer does not carry
+//!   them.
 //! - A row group with no min/max is accepted only when the NaN runs show
 //!   every one of its rows is missing (an all-null group, whose bucket has
 //!   the empty envelope a scan gives it). Otherwise the whole column is
@@ -174,12 +177,13 @@ pub fn first_stats_level(
     Ok(level)
 }
 
-/// Level `level` built from `stats` alone: each bucket the union of its
-/// whole row groups (see the module docs). The caller has checked the
-/// alignment with [`first_stats_level`].
+/// Level `level` built from `stats` alone, plus the two edge samples of each
+/// bucket: each bucket the union of its whole row groups (see the module
+/// docs). The caller has checked the alignment with [`first_stats_level`].
 fn stats_level(
     stats: &RowGroupStats,
     level: usize,
+    samples: &[f64],
     ticks: &[i128],
     nan_runs: &[Range<usize>],
 ) -> Vec<Bucket> {
@@ -203,6 +207,8 @@ fn stats_level(
                     .fold(f64::NEG_INFINITY, f64::max),
                 first_ts: ticks[start],
                 last_ts: ticks[end - 1],
+                first_value: samples[start],
+                last_value: samples[end - 1],
                 nan_count: nan_count_in(nan_runs, start..end),
             }
         })
@@ -228,7 +234,7 @@ pub fn build_pyramid_with_row_groups(
     // aggregate it, so they never touch a sample either.
     let stats_from = first.ok();
     let level = |level: usize, below: Option<&Vec<Bucket>>| match below {
-        _ if stats_from == Some(level) => stats_level(stats, level, ticks, nan_runs),
+        _ if stats_from == Some(level) => stats_level(stats, level, samples, ticks, nan_runs),
         Some(below) => bucket_level_from_buckets(below),
         None => bucket_level_from_samples(samples, ticks),
     };
@@ -289,6 +295,8 @@ mod tests {
                         && a.max == b.max
                         && a.first_ts == b.first_ts
                         && a.last_ts == b.last_ts
+                        && a.first_value.to_bits() == b.first_value.to_bits()
+                        && a.last_value.to_bits() == b.last_value.to_bits()
                         && a.nan_count == b.nan_count,
                     "level {level} bucket {index}: {a:?} != {b:?}"
                 );

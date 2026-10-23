@@ -33,9 +33,9 @@
 //! aggregation work (and the need to have Level 0 open at all to recompute
 //! it), not zero-copy; the locked decimation API is untouched.
 //!
-//! **Disk cost.** Each bucket record is a fixed 56 bytes; the total bucket
+//! **Disk cost.** Each bucket record is a fixed 72 bytes; the total bucket
 //! count across all levels sums to roughly `n / (PYRAMID_FACTOR - 1)`, i.e.
-//! about 8 bytes per raw sample on top of Level 0's 24 bytes/sample.
+//! about 10 bytes per raw sample on top of Level 0's 24 bytes/sample.
 //! **Cache eviction is not implemented**, same as Level 0 (the cache
 //! directory only ever grows).
 //!
@@ -65,15 +65,19 @@ use crate::time::TickSource;
 use crate::{GlydeError, Result};
 
 const MAGIC: &[u8; 8] = b"GLYDEPYR";
-const FORMAT_VERSION: u32 = 1;
+/// Bumped whenever [`Bucket`]'s fields change, so a cache written by an
+/// older build is rebuilt, never misread (ARCH §The index). Version 2 added
+/// `first_value`/`last_value` (issue #147).
+const FORMAT_VERSION: u32 = 2;
 /// Fixed header size: an 8-byte magic, a 4-byte format version, a 4-byte
 /// level count.
 const HEADER_LEN: usize = 16;
 /// One [`Bucket`] on disk: `min` (f64, 8) + `max` (f64, 8) + `first_ts`
-/// (i128, 16) + `last_ts` (i128, 16) + `nan_count` (u64, 8), written as raw
-/// field bytes with no padding — this is a hand-packed record, not a cast
-/// over [`Bucket`]'s in-memory (padded) layout.
-const BUCKET_RECORD_LEN: usize = 56;
+/// (i128, 16) + `last_ts` (i128, 16) + `first_value` (f64, 8) + `last_value`
+/// (f64, 8) + `nan_count` (u64, 8), written as raw field bytes with no
+/// padding — this is a hand-packed record, not a cast over [`Bucket`]'s
+/// in-memory (padded) layout.
+const BUCKET_RECORD_LEN: usize = 72;
 
 fn cache_paths(cache_dir: &Path, key: &CacheKey) -> (PathBuf, PathBuf) {
     let stem = key.cache_stem();
@@ -352,7 +356,9 @@ fn encode_bucket(bucket: &Bucket) -> [u8; BUCKET_RECORD_LEN] {
     record[8..16].copy_from_slice(&bucket.max.to_ne_bytes());
     record[16..32].copy_from_slice(&bucket.first_ts.to_ne_bytes());
     record[32..48].copy_from_slice(&bucket.last_ts.to_ne_bytes());
-    record[48..56].copy_from_slice(&bucket.nan_count.to_ne_bytes());
+    record[48..56].copy_from_slice(&bucket.first_value.to_ne_bytes());
+    record[56..64].copy_from_slice(&bucket.last_value.to_ne_bytes());
+    record[64..72].copy_from_slice(&bucket.nan_count.to_ne_bytes());
     record
 }
 
@@ -362,7 +368,9 @@ fn decode_bucket(record: &[u8; BUCKET_RECORD_LEN]) -> Bucket {
         max: f64::from_ne_bytes(record[8..16].try_into().expect("8-byte slice")),
         first_ts: i128::from_ne_bytes(record[16..32].try_into().expect("16-byte slice")),
         last_ts: i128::from_ne_bytes(record[32..48].try_into().expect("16-byte slice")),
-        nan_count: u64::from_ne_bytes(record[48..56].try_into().expect("8-byte slice")),
+        first_value: f64::from_ne_bytes(record[48..56].try_into().expect("8-byte slice")),
+        last_value: f64::from_ne_bytes(record[56..64].try_into().expect("8-byte slice")),
+        nan_count: u64::from_ne_bytes(record[64..72].try_into().expect("8-byte slice")),
     }
 }
 
@@ -504,6 +512,48 @@ mod tests {
         );
     }
 
+    // Issue #147 added `first_value`/`last_value` to every bucket: a
+    // well-formed cache written by an older build has neither, and must be
+    // rebuilt on the next open, never read as if it had them.
+    #[test]
+    fn a_cache_written_before_first_and_last_values_is_rebuilt_not_misread() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key = temp_key(dir.path(), "version-1");
+        let (samples, timestamps) = sine_wave(200);
+        let expected = build_pyramid(&samples, &timestamps);
+
+        // Exactly what version 1 wrote: the same header and level table,
+        // then 56-byte records of min, max, first_ts, last_ts and nan_count.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&1u32.to_ne_bytes());
+        bytes.extend_from_slice(&(expected.len() as u32).to_ne_bytes());
+        for level in &expected {
+            bytes.extend_from_slice(&(level.len() as u64).to_ne_bytes());
+        }
+        for bucket in expected.iter().flatten() {
+            bytes.extend_from_slice(&bucket.min.to_ne_bytes());
+            bytes.extend_from_slice(&bucket.max.to_ne_bytes());
+            bytes.extend_from_slice(&bucket.first_ts.to_ne_bytes());
+            bytes.extend_from_slice(&bucket.last_ts.to_ne_bytes());
+            bytes.extend_from_slice(&bucket.nan_count.to_ne_bytes());
+        }
+        let (final_path, _) = cache_paths(dir.path(), &key);
+        std::fs::write(&final_path, bytes).expect("write a version-1 cache");
+
+        let hit = try_open(dir.path(), &key).expect("must not error, only miss");
+        assert!(hit.is_none(), "a version-1 cache must be a miss");
+        let reopened =
+            build_or_open(dir.path(), &key, &samples, &timestamps).expect("rebuild must succeed");
+        assert_eq!(reopened, expected, "rebuilt with first/last values");
+        assert_eq!(
+            try_open(dir.path(), &key)
+                .expect("must not error")
+                .expect("the rebuild replaced the old cache"),
+            expected
+        );
+    }
+
     #[test]
     fn a_truncated_cache_file_is_rejected_not_misread() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -585,6 +635,14 @@ mod tests {
             for (bucket_built, bucket_reopened) in level_built.iter().zip(level_reopened.iter()) {
                 assert_eq!(bucket_built.min.to_bits(), bucket_reopened.min.to_bits());
                 assert_eq!(bucket_built.max.to_bits(), bucket_reopened.max.to_bits());
+                assert_eq!(
+                    bucket_built.first_value.to_bits(),
+                    bucket_reopened.first_value.to_bits()
+                );
+                assert_eq!(
+                    bucket_built.last_value.to_bits(),
+                    bucket_reopened.last_value.to_bits()
+                );
                 assert_eq!(bucket_built.nan_count, bucket_reopened.nan_count);
             }
         }

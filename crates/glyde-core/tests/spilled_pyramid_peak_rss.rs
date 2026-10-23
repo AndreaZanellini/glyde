@@ -28,7 +28,7 @@
 //! §5's flat `min(25% RAM, 4 GB)` cap on a large enough file.
 //!
 //! **What this test does and does not bound.** The pyramid *itself* is
-//! `O(rows)` — roughly `size_of::<Bucket>() / (PYRAMID_FACTOR - 1)` ≈ 9 bytes
+//! `O(rows)` — roughly `size_of::<Bucket>() / (PYRAMID_FACTOR - 1)` ≈ 11 bytes
 //! per sample per column, summed over every level — and that is not what issue
 //! #88 was about. So the assertion below subtracts the pyramid's own measured
 //! bucket bytes and bounds what is left: the *reading* of the source columns,

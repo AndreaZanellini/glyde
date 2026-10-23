@@ -42,15 +42,39 @@ use crate::series::SampleSource;
 use crate::time::TickSource;
 use crate::Result;
 
-/// One pyramid bucket: `(min, max, first_ts, last_ts, nan_count)` over the
-/// raw samples/time-range it aggregates (ARCH §The index).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// One pyramid bucket: `(min, max, first_ts, last_ts, first_value,
+/// last_value, nan_count)` over the raw samples/time-range it aggregates
+/// (ARCH §The index).
+///
+/// `first_value`/`last_value` are the values of the bucket's first and last
+/// raw sample, NaN included: what lets the view join consecutive columns
+/// (SPEC §3.1, issue #147, [`connectors`]).
+#[derive(Debug, Clone, Copy)]
 pub struct Bucket {
     pub min: f64,
     pub max: f64,
     pub first_ts: i128,
     pub last_ts: i128,
+    pub first_value: f64,
+    pub last_value: f64,
     pub nan_count: u64,
+}
+
+/// Field by field, with NaN equal to NaN: two buckets are equal when they
+/// describe the same raw samples. A bucket that starts or ends on a NaN
+/// sample, or a converged bucket of one NaN sample (`min == max == NaN`),
+/// is then equal to itself, which a derived `==` would deny.
+impl PartialEq for Bucket {
+    fn eq(&self, other: &Self) -> bool {
+        let same = |a: f64, b: f64| a == b || (a.is_nan() && b.is_nan());
+        same(self.min, other.min)
+            && same(self.max, other.max)
+            && self.first_ts == other.first_ts
+            && self.last_ts == other.last_ts
+            && same(self.first_value, other.first_value)
+            && same(self.last_value, other.last_value)
+            && self.nan_count == other.nan_count
+    }
 }
 
 /// Bucket-size growth factor between consecutive pyramid levels (ARCH §The
@@ -93,7 +117,7 @@ pub fn build_pyramid(samples: &[f64], timestamps: &[i128]) -> Vec<Vec<Bucket>> {
 /// instead, so the only memory this call adds beyond the pyramid it returns is
 /// two fixed-size chunk buffers.
 ///
-/// The pyramid itself is still `O(rows)` — about 9 bytes per sample across all
+/// The pyramid itself is still `O(rows)` — about 11 bytes per sample across all
 /// levels — so this bounds the *input*, not the output (issue #102).
 ///
 /// Both sources must hold the same number of elements and `timestamps` must be
@@ -282,8 +306,9 @@ pub(crate) fn bucket_level_from_samples(samples: &[f64], timestamps: &[i128]) ->
 }
 
 /// Aggregates one pyramid level into the next, exactly — min-of-mins,
-/// max-of-maxes over groups of [`PYRAMID_FACTOR`] children (SPEC §3.1: "never
-/// from resampled or averaged data").
+/// max-of-maxes, the first child's `first_value` and the last child's
+/// `last_value`, over groups of [`PYRAMID_FACTOR`] children (SPEC §3.1:
+/// "never from resampled or averaged data").
 pub(crate) fn bucket_level_from_buckets(children: &[Bucket]) -> Vec<Bucket> {
     children
         .chunks(PYRAMID_FACTOR)
@@ -301,7 +326,8 @@ pub(crate) fn bucket_level_from_buckets(children: &[Bucket]) -> Vec<Bucket> {
 /// non-empty), treating NaN samples as excluded from the min/max envelope but
 /// counted separately (docs/SPEC.md §4.1 anomaly gutter reads `nan_count`;
 /// the envelope itself must stay a real number whenever any non-NaN sample is
-/// present).
+/// present). `first_value`/`last_value` are the first and last sample as
+/// they are, NaN or not (SPEC §3.1).
 fn raw_range_bucket(samples: &[f64], timestamps: &[i128]) -> Bucket {
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
@@ -319,6 +345,8 @@ fn raw_range_bucket(samples: &[f64], timestamps: &[i128]) -> Bucket {
         max,
         first_ts: timestamps[0],
         last_ts: *timestamps.last().expect("non-empty chunk"),
+        first_value: samples[0],
+        last_value: *samples.last().expect("non-empty chunk"),
         nan_count,
     }
 }
@@ -331,6 +359,8 @@ pub(crate) fn merge_buckets(left: Bucket, right: Bucket) -> Bucket {
         max: left.max.max(right.max),
         first_ts: left.first_ts,
         last_ts: right.last_ts,
+        first_value: left.first_value,
+        last_value: right.last_value,
         nan_count: left.nan_count + right.nan_count,
     }
 }
@@ -519,6 +549,8 @@ pub fn decimate_viewport_levels<L: BucketLevel>(
                 max: samples[i],
                 first_ts: timestamps[i],
                 last_ts: timestamps[i],
+                first_value: samples[i],
+                last_value: samples[i],
                 nan_count: u64::from(samples[i].is_nan()),
             })
             .collect();
@@ -537,9 +569,10 @@ pub fn decimate_viewport_levels<L: BucketLevel>(
         .collect()
 }
 
-/// Exact min/max/first_ts/last_ts/nan_count over raw sample indices
-/// `lo..=hi`, using precomputed pyramid buckets wherever a bucket's raw range
-/// falls entirely inside `[lo, hi]` and recursing to finer levels — down to
+/// Exact min/max/first_ts/last_ts/first_value/last_value/nan_count over raw
+/// sample indices `lo..=hi`, using precomputed pyramid buckets wherever a
+/// bucket's raw range falls entirely inside `[lo, hi]` and recursing to finer
+/// levels — down to
 /// individual raw samples — only for the (at most `PYRAMID_FACTOR` per level)
 /// boundary buckets that straddle the edge of the query. This is the
 /// "exact edges, aggregated interior" requirement the spike-preservation
@@ -613,4 +646,36 @@ fn aggregate_at_level<L: BucketLevel>(
     }
 
     merged.expect("bucket_lo..=bucket_hi is always non-empty")
+}
+
+/// A straight line between two consecutive raw samples, each as `(tick,
+/// value)`: what the time view draws from one column to the next (SPEC
+/// §3.1, issue #147).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Connector {
+    pub from: (i128, f64),
+    pub to: (i128, f64),
+}
+
+/// The connectors between consecutive `columns` of one
+/// [`decimate_viewport`] result, in column order (SPEC §3.1, issue #147):
+/// from each column's last raw sample to the next column's first, wherever
+/// neither of the two is NaN.
+///
+/// The columns of one result cover consecutive runs of raw samples, so the
+/// two ends of a connector are always consecutive samples, and a connector
+/// is exactly the line the convergence regime draws between them. It is also
+/// that line's own rule: over converged columns, one per raw sample, the
+/// connectors are the convergence line, broken at every NaN (SPEC §1.3).
+/// A column of nothing but NaN (a gap bucket) is never joined to either
+/// neighbour.
+pub fn connectors(columns: &[Bucket]) -> impl Iterator<Item = Connector> + '_ {
+    columns
+        .iter()
+        .zip(columns.iter().skip(1))
+        .filter(|(left, right)| !left.last_value.is_nan() && !right.first_value.is_nan())
+        .map(|(left, right)| Connector {
+            from: (left.last_ts, left.last_value),
+            to: (right.first_ts, right.first_value),
+        })
 }

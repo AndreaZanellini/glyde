@@ -12,20 +12,31 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
-- **Decision recorded (issue #147): the zoomed-out time plot will draw a
-  continuous trace instead of a dashed one.** This entry only updates the
-  documents. The app does not change yet; the next pull request
-  implements it. At zoom levels where each screen column holds only a few
-  samples, a steep signal currently looks dashed, with holes that look
-  like missing data although nothing is missing. The new rule, the one
-  digital oscilloscopes use ("peak detect + vectors"): every column still
-  shows its full min-to-max range, so no peak can disappear, and a short
-  line now joins each column's last sample to the next column's first
-  sample. That is exactly the line drawn between those two samples when
-  you zoom all the way in. Nothing is invented, and a missing value (NaN)
-  still breaks the trace, as before. Cost to expect in the next PR: the
-  zoom index grows by about a quarter, and indexes cached by older
-  versions are rebuilt once on first open.
+- **The zoomed-out time plot now draws a continuous trace instead of a
+  dashed one (issue #147).** At zoom levels where each screen column holds
+  only a few samples, a steep signal used to look dashed, with holes that
+  looked like missing data although nothing was missing (for example
+  `torque` in `measures_v2.csv`). Now a short line joins each column's last
+  sample to the next column's first sample: the rule digital oscilloscopes
+  use ("peak detect + vectors"). That line is exactly the one drawn between
+  those two samples when you zoom all the way in, so nothing is invented.
+  Every column still shows its full min-to-max range, so no peak can
+  disappear, and a missing value (NaN) still breaks the trace, as before.
+  - Try it: open `measures_v2.csv`, show only `torque`, and zoom until the
+    view covers about 0.2% of the file. The trace is continuous. Zoom in
+    further and it turns, without a jump, into the line through the
+    individual samples.
+  - Cost: the zoom index is about a quarter larger, in memory and on disk
+    (about 11 instead of 9 bytes per sample per channel). Zoom indexes
+    that older versions cached on disk are rebuilt once, automatically, the
+    first time you reopen each file, so that one reopen is a little slower
+    than the ones after it.
+  - Side effect, for the better: stretches that are almost flat but not
+    quite (issue #146, for example `torque` decaying towards zero) used to
+    show nothing at all, because each column's bar was too short to draw.
+    The joining lines now draw them. On a test signal like that, at 2 to
+    10,000 samples per column, no column with data is left empty any more
+    (before: 85% to 98% of them were).
 - **CI is much faster: the performance job drops from ~80–90 minutes back
   to an estimated ~15–20.** Nothing about what is measured or enforced
   changed: the same benchmarks run against the same budgets, on code built

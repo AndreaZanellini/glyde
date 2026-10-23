@@ -190,7 +190,8 @@ Resolved as follows:
   accumulator and the same level-growing step, and a golden test locks them to
   bucket-for-bucket equality at every chunk size, so Hard rule 4 still holds.
 - **Amendment (issue #102): the pyramid's *buckets* may live on disk.** The
-  built pyramid is ~9 bytes per sample per column, so for a spilled file it
+  built pyramid is ~11 bytes per sample per column (~9 before issue #147's
+  `first_value`/`last_value`), so for a spilled file it
   is written as one memory-mapped file per level
   (`index::disk_pyramid`) instead of held as `Vec<Vec<Bucket>>`. Samples and
   ticks are still the same `&[f64]`/`&[i128]` slices; only the bucket
@@ -224,7 +225,7 @@ Resolved as follows:
   refused with an explanation (`GlydeError::DiskSpaceExceeded`).
 - **Deferred, tracked separately:** cache eviction for the *reused* caches
   (the cache directory still only grows for Level 0 and the pyramid);
-  and the size of an owned pyramid itself — ~9 bytes per sample per column
+  and the size of an owned pyramid itself — ~11 bytes per sample per column
   across all levels, which is proportional to file size and is what a
   pyramid-accelerated view of a *spilled* file would hit first (issue #102).
 

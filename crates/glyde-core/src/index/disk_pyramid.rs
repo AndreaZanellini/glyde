@@ -16,7 +16,7 @@
 //! #102).
 //!
 //! [`crate::dsp::decimation::build_pyramid`] returns an owned
-//! `Vec<Vec<Bucket>>`: about 9 bytes of RAM per sample per column, which is
+//! `Vec<Vec<Bucket>>`: about 11 bytes of RAM per sample per column, which is
 //! what SPEC §5's flat `min(25% RAM, 4 GB)` cap forbids on exactly the files
 //! that spill. Here every level is a [`SpillVec`] — one memory-mapped spill
 //! file per level, written once, deleted with its [`SpillSet`] — and is read
@@ -52,17 +52,22 @@ pub struct PackedBucket {
     last_ts: i128,
     min: f64,
     max: f64,
+    first_value: f64,
+    last_value: f64,
     nan_count: u64,
     _reserved: u64,
 }
 
 // SAFETY: `repr(C)`, plain numeric fields only, and no padding: 16 + 16 + 8
-// + 8 + 8 + 8 bytes at offsets 0, 16, 32, 40, 48, 56 — 64 in all, a multiple
-// of the 16-byte alignment. Every bit pattern is a valid value (an f64 of
-// any bits is a valid f64), all-zero included.
+// + 8 + 8 + 8 + 8 + 8 bytes at offsets 0, 16, 32, 40, 48, 56, 64, 72 — 80 in
+// all, a multiple of the 16-byte alignment. Every bit pattern is a valid
+// value (an f64 of any bits is a valid f64), all-zero included.
 unsafe impl Zeroable for PackedBucket {}
 unsafe impl Pod for PackedBucket {}
-const _: () = assert!(std::mem::size_of::<PackedBucket>() == 64);
+const _: () = assert!(std::mem::size_of::<PackedBucket>() == 80);
+
+/// Bytes one bucket takes on disk, for sizing a pyramid before writing it.
+pub const PACKED_BUCKET_BYTES: u64 = std::mem::size_of::<PackedBucket>() as u64;
 
 impl From<Bucket> for PackedBucket {
     fn from(bucket: Bucket) -> Self {
@@ -71,6 +76,8 @@ impl From<Bucket> for PackedBucket {
             last_ts: bucket.last_ts,
             min: bucket.min,
             max: bucket.max,
+            first_value: bucket.first_value,
+            last_value: bucket.last_value,
             nan_count: bucket.nan_count,
             _reserved: 0,
         }
@@ -84,6 +91,8 @@ impl From<PackedBucket> for Bucket {
             max: packed.max,
             first_ts: packed.first_ts,
             last_ts: packed.last_ts,
+            first_value: packed.first_value,
+            last_value: packed.last_value,
             nan_count: packed.nan_count,
         }
     }
