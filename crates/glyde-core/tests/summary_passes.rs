@@ -16,7 +16,9 @@
 //! monotonicity) is a sequential stretch of every open, a quarter of a 1 GB
 //! Parquet file's. Each of its passes reads every tick again, so it must
 //! not make one it does not need: the median Δt of a gap-free axis is the
-//! one its uniformity test needs, so it is computed once, not twice.
+//! one its uniformity test needs, so it is computed once, not twice; and the
+//! two middle keys of an even count, equal on a real time axis, come from
+//! one selection.
 
 use std::cell::Cell;
 use std::ops::Range;
@@ -48,12 +50,12 @@ impl TickSource for Counted<'_> {
 }
 
 // A constant Δt makes every exact selection a single pass (its keys are all
-// equal), so the passes can be counted: two for the median Δt (an even
-// number of Δt takes two middle keys), one for the scan that counts gaps
-// and checks monotonicity, two for the median absolute deviation. Five
-// passes over the axis, not seven: the uniformity test reuses the median.
+// equal), so the passes can be counted: one for the median Δt (an even
+// number of Δt, whose two equal middle keys come from that one selection),
+// one for the scan that counts gaps and checks monotonicity, one for the
+// median absolute deviation. Three passes over the axis, not seven.
 #[test]
-fn a_gap_free_axis_is_summarized_in_five_passes_with_its_median_computed_once() {
+fn a_gap_free_axis_is_summarized_in_three_passes_with_its_median_computed_once() {
     let n = 100_001usize;
     let ticks: Vec<i128> = (0..n as i128)
         .map(|i| 1_700_000_000_000 + i * 1_000)
@@ -68,7 +70,7 @@ fn a_gap_free_axis_is_summarized_in_five_passes_with_its_median_computed_once() 
     assert_eq!(stats.monotonicity.non_monotonic_count, 0);
     assert_eq!(
         axis.read.get(),
-        5 * n,
+        3 * n,
         "the summary read the axis {} times",
         axis.read.get() as f64 / n as f64
     );

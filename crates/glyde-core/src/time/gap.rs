@@ -766,6 +766,26 @@ mod tests {
             prop_assert_eq!(bounded_median_delta(&ticks), sorted_median_delta(&ticks));
         }
 
+        /// Issue #163: the two middle keys of an even count come from one
+        /// selection when they are equal, and from one more pass when they
+        /// are not. A real time axis has few distinct Δt, so many equal
+        /// keys: the median must still be the sorted median, whichever way.
+        #[test]
+        fn the_bounded_median_equals_the_sorted_median_with_few_distinct_deltas(
+            deltas in prop::collection::vec(
+                prop::sample::select(vec![-3i128, 0, 1, 2, 1_000, 1 << 40]),
+                1..300,
+            ),
+        ) {
+            let ticks: Vec<i128> = std::iter::once(0)
+                .chain(deltas.iter().scan(0i128, |tick, delta| {
+                    *tick += delta;
+                    Some(*tick)
+                }))
+                .collect();
+            prop_assert_eq!(bounded_median_delta(&ticks), sorted_median_delta(&ticks));
+        }
+
         /// The same guarantee for the statistics built on top of the median:
         /// a source that hands its ticks over in tiny chunks (standing in for
         /// a spilled axis, which reads them back a buffer at a time) must
