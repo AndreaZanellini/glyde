@@ -1902,7 +1902,15 @@ enum TimeValue {
 /// costs no allocation.
 pub(super) enum ColumnValue<'a> {
     Bool(bool),
+    I8(i8),
+    I16(i16),
+    I32(i32),
     I64(i64),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    F32(f32),
     F64(f64),
     Str(&'a str),
 }
@@ -1913,9 +1921,17 @@ pub(super) enum ColumnValue<'a> {
 /// fallbacks here mirror `infer_column`'s own.
 pub(super) enum ColumnSpillWriter {
     Bool(SpillVecWriter<u8>),
+    I8(SpillVecWriter<i8>),
+    I16(SpillVecWriter<i16>),
+    I32(SpillVecWriter<i32>),
     I64(SpillVecWriter<i64>),
+    U8(SpillVecWriter<u8>),
+    U16(SpillVecWriter<u16>),
+    U32(SpillVecWriter<u32>),
+    U64(SpillVecWriter<u64>),
     /// SPEC §1.3's NaN runs are flagged as the samples stream past, so the
     /// finished column never has to be read back to find them.
+    F32(SpillVecWriter<f32>, NanRunScan),
     F64(SpillVecWriter<f64>, NanRunScan),
     String(SpillStringsWriter),
 }
@@ -1924,15 +1940,21 @@ impl ColumnSpillWriter {
     pub(super) fn create(set: &SpillSet, stem: &str, dtype: Dtype) -> Result<Self> {
         Ok(match dtype {
             Dtype::Bool => ColumnSpillWriter::Bool(SpillVecWriter::create(set, stem)?),
+            Dtype::I8 => ColumnSpillWriter::I8(SpillVecWriter::create(set, stem)?),
+            Dtype::I16 => ColumnSpillWriter::I16(SpillVecWriter::create(set, stem)?),
+            Dtype::I32 => ColumnSpillWriter::I32(SpillVecWriter::create(set, stem)?),
             Dtype::I64 => ColumnSpillWriter::I64(SpillVecWriter::create(set, stem)?),
+            Dtype::U8 => ColumnSpillWriter::U8(SpillVecWriter::create(set, stem)?),
+            Dtype::U16 => ColumnSpillWriter::U16(SpillVecWriter::create(set, stem)?),
+            Dtype::U32 => ColumnSpillWriter::U32(SpillVecWriter::create(set, stem)?),
+            Dtype::U64 => ColumnSpillWriter::U64(SpillVecWriter::create(set, stem)?),
+            Dtype::F32 => {
+                ColumnSpillWriter::F32(SpillVecWriter::create(set, stem)?, NanRunScan::default())
+            }
             Dtype::F64 => {
                 ColumnSpillWriter::F64(SpillVecWriter::create(set, stem)?, NanRunScan::default())
             }
-            // Every other dtype is unreachable from `ColumnDtypeScan`, which
-            // only ever settles on bool/i64/f64/string (SPEC §1.4 via
-            // `infer_column`); a Parquet reader's narrower widths land with
-            // docs/ROADMAP.md M7 and will extend both together.
-            _ => ColumnSpillWriter::String(SpillStringsWriter::create(set, stem)?),
+            Dtype::String => ColumnSpillWriter::String(SpillStringsWriter::create(set, stem)?),
         })
     }
 
@@ -1949,6 +1971,50 @@ impl ColumnSpillWriter {
                 let value = field.trim().parse::<i64>().unwrap_or_default();
                 values.push(value)?;
                 Ok(ColumnValue::I64(value))
+            }
+            // CSV's `ColumnDtypeScan` never settles on these: only a column
+            // written from typed values (`push_value`) has one. Parsed as the
+            // `i64` arm parses, should a text field ever reach them.
+            ColumnSpillWriter::I8(values) => {
+                let value = field.trim().parse::<i8>().unwrap_or_default();
+                values.push(value)?;
+                Ok(ColumnValue::I8(value))
+            }
+            ColumnSpillWriter::I16(values) => {
+                let value = field.trim().parse::<i16>().unwrap_or_default();
+                values.push(value)?;
+                Ok(ColumnValue::I16(value))
+            }
+            ColumnSpillWriter::I32(values) => {
+                let value = field.trim().parse::<i32>().unwrap_or_default();
+                values.push(value)?;
+                Ok(ColumnValue::I32(value))
+            }
+            ColumnSpillWriter::U8(values) => {
+                let value = field.trim().parse::<u8>().unwrap_or_default();
+                values.push(value)?;
+                Ok(ColumnValue::U8(value))
+            }
+            ColumnSpillWriter::U16(values) => {
+                let value = field.trim().parse::<u16>().unwrap_or_default();
+                values.push(value)?;
+                Ok(ColumnValue::U16(value))
+            }
+            ColumnSpillWriter::U32(values) => {
+                let value = field.trim().parse::<u32>().unwrap_or_default();
+                values.push(value)?;
+                Ok(ColumnValue::U32(value))
+            }
+            ColumnSpillWriter::U64(values) => {
+                let value = field.trim().parse::<u64>().unwrap_or_default();
+                values.push(value)?;
+                Ok(ColumnValue::U64(value))
+            }
+            ColumnSpillWriter::F32(values, nan_runs) => {
+                let value = field.trim().parse::<f32>().unwrap_or_default();
+                nan_runs.observe(f64::from(value));
+                values.push(value)?;
+                Ok(ColumnValue::F32(value))
             }
             ColumnSpillWriter::F64(values, nan_runs) => {
                 let value = field.trim().parse::<f64>().unwrap_or_default();
@@ -1971,7 +2037,18 @@ impl ColumnSpillWriter {
             (ColumnSpillWriter::Bool(values), ColumnValue::Bool(value)) => {
                 values.push(u8::from(value))
             }
+            (ColumnSpillWriter::I8(values), ColumnValue::I8(value)) => values.push(value),
+            (ColumnSpillWriter::I16(values), ColumnValue::I16(value)) => values.push(value),
+            (ColumnSpillWriter::I32(values), ColumnValue::I32(value)) => values.push(value),
             (ColumnSpillWriter::I64(values), ColumnValue::I64(value)) => values.push(value),
+            (ColumnSpillWriter::U8(values), ColumnValue::U8(value)) => values.push(value),
+            (ColumnSpillWriter::U16(values), ColumnValue::U16(value)) => values.push(value),
+            (ColumnSpillWriter::U32(values), ColumnValue::U32(value)) => values.push(value),
+            (ColumnSpillWriter::U64(values), ColumnValue::U64(value)) => values.push(value),
+            (ColumnSpillWriter::F32(values, nan_runs), ColumnValue::F32(value)) => {
+                nan_runs.observe(f64::from(value));
+                values.push(value)
+            }
             (ColumnSpillWriter::F64(values, nan_runs), ColumnValue::F64(value)) => {
                 nan_runs.observe(value);
                 values.push(value)
@@ -1992,33 +2069,74 @@ impl ColumnSpillWriter {
                 name,
                 SeriesValues::Spilled(SpilledValues::Bool(values.finish()?)),
             ),
+            ColumnSpillWriter::I8(values) => Series::new(
+                name,
+                SeriesValues::Spilled(SpilledValues::I8(values.finish()?)),
+            ),
+            ColumnSpillWriter::I16(values) => Series::new(
+                name,
+                SeriesValues::Spilled(SpilledValues::I16(values.finish()?)),
+            ),
+            ColumnSpillWriter::I32(values) => Series::new(
+                name,
+                SeriesValues::Spilled(SpilledValues::I32(values.finish()?)),
+            ),
             ColumnSpillWriter::I64(values) => Series::new(
                 name,
                 SeriesValues::Spilled(SpilledValues::I64(values.finish()?)),
             ),
-            ColumnSpillWriter::F64(values, nan_runs) => {
-                let nan_runs = nan_runs.finish();
-                if !nan_runs.is_empty() {
-                    warn!(
-                        run_count = nan_runs.len(),
-                        "NaN run(s) flagged in a numeric column (SPEC §1.3)"
-                    );
-                }
-                Series::with_anomalies(
-                    name,
-                    SeriesValues::Spilled(SpilledValues::F64(values.finish()?)),
-                    Anomalies {
-                        nan_runs,
-                        ..Anomalies::default()
-                    },
-                )
-            }
+            ColumnSpillWriter::U8(values) => Series::new(
+                name,
+                SeriesValues::Spilled(SpilledValues::U8(values.finish()?)),
+            ),
+            ColumnSpillWriter::U16(values) => Series::new(
+                name,
+                SeriesValues::Spilled(SpilledValues::U16(values.finish()?)),
+            ),
+            ColumnSpillWriter::U32(values) => Series::new(
+                name,
+                SeriesValues::Spilled(SpilledValues::U32(values.finish()?)),
+            ),
+            ColumnSpillWriter::U64(values) => Series::new(
+                name,
+                SeriesValues::Spilled(SpilledValues::U64(values.finish()?)),
+            ),
+            ColumnSpillWriter::F32(values, nan_runs) => with_nan_runs(
+                name,
+                SeriesValues::Spilled(SpilledValues::F32(values.finish()?)),
+                nan_runs,
+            ),
+            ColumnSpillWriter::F64(values, nan_runs) => with_nan_runs(
+                name,
+                SeriesValues::Spilled(SpilledValues::F64(values.finish()?)),
+                nan_runs,
+            ),
             ColumnSpillWriter::String(values) => Series::new(
                 name,
                 SeriesValues::Spilled(SpilledValues::String(values.finish()?)),
             ),
         })
     }
+}
+
+/// A spilled float column with the NaN runs its writer flagged on the way
+/// in (SPEC §1.3).
+fn with_nan_runs(name: String, values: SeriesValues, nan_runs: NanRunScan) -> Series {
+    let nan_runs = nan_runs.finish();
+    if !nan_runs.is_empty() {
+        warn!(
+            run_count = nan_runs.len(),
+            "NaN run(s) flagged in a numeric column (SPEC §1.3)"
+        );
+    }
+    Series::with_anomalies(
+        name,
+        values,
+        Anomalies {
+            nan_runs,
+            ..Anomalies::default()
+        },
+    )
 }
 
 /// How many rows of a spilled open the progressive preview keeps in memory.

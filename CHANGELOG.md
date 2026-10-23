@@ -92,6 +92,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
   keep that file in the cache.
 
 ### Changed
+- **Groundwork for opening Parquet files too large for memory (issue
+  #155).** Nothing changes in the app yet. A file too large for memory is
+  kept on disk while you work, but only in the four kinds of column a CSV
+  file has (true/false, whole numbers, decimals, text). A Parquet file also
+  has narrower kinds, such as small integers and single-precision decimals.
+  Those can now be kept on disk too, in their own kind, never converted to
+  a wider one. Each reads back exactly as it does from memory, and goes
+  through a time sort with its row like the others.
 - **The zoomed-out time plot now draws a continuous trace instead of a
   dashed one (issue #147).** At zoom levels where each screen column holds
   only a few samples, a steep signal used to look dashed, with holes that

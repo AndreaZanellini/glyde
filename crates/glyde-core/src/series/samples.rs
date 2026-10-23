@@ -43,6 +43,7 @@ use std::ops::Range;
 
 use super::dtype::warn_if_precision_loss;
 use super::{SeriesValues, SpilledValues};
+use crate::index::spill::SpillVec;
 use crate::Result;
 
 /// Samples per chunk a [`SampleSource`] hands its visitor: 1 MiB worth of
@@ -144,16 +145,34 @@ impl SampleSource for SeriesSamples<'_> {
             // stay in the OS page cache (which the SPEC §5 cap does not count)
             // instead of in this process's RSS.
             SeriesValues::Spilled(SpilledValues::F64(v)) => v.read_chunks(window, visit),
-            SeriesValues::Spilled(SpilledValues::I64(v)) => {
-                let mut buffer = Vec::with_capacity(SAMPLE_CHUNK_LEN);
-                v.read_chunks(window, &mut |chunk| {
-                    buffer.clear();
-                    buffer.extend(chunk.iter().map(|&n| {
-                        warn_if_precision_loss(n.unsigned_abs() as u128, n);
-                        n as f64
-                    }));
-                    visit(&buffer)
-                })
+            SeriesValues::Spilled(SpilledValues::I64(v)) => read_converted(v, window, visit, |n| {
+                warn_if_precision_loss(n.unsigned_abs() as u128, n);
+                n as f64
+            }),
+            SeriesValues::Spilled(SpilledValues::U64(v)) => read_converted(v, window, visit, |n| {
+                warn_if_precision_loss(n as u128, n);
+                n as f64
+            }),
+            SeriesValues::Spilled(SpilledValues::I8(v)) => {
+                read_converted(v, window, visit, f64::from)
+            }
+            SeriesValues::Spilled(SpilledValues::I16(v)) => {
+                read_converted(v, window, visit, f64::from)
+            }
+            SeriesValues::Spilled(SpilledValues::I32(v)) => {
+                read_converted(v, window, visit, f64::from)
+            }
+            SeriesValues::Spilled(SpilledValues::U8(v)) => {
+                read_converted(v, window, visit, f64::from)
+            }
+            SeriesValues::Spilled(SpilledValues::U16(v)) => {
+                read_converted(v, window, visit, f64::from)
+            }
+            SeriesValues::Spilled(SpilledValues::U32(v)) => {
+                read_converted(v, window, visit, f64::from)
+            }
+            SeriesValues::Spilled(SpilledValues::F32(v)) => {
+                read_converted(v, window, visit, f64::from)
             }
             // Every other numeric dtype needs a real conversion, so it is
             // promoted one bounded chunk at a time — never into a whole-column
@@ -176,6 +195,24 @@ impl SampleSource for SeriesSamples<'_> {
             }
         }
     }
+}
+
+/// A spilled numeric column's `window`, read back through a fixed-size
+/// buffer (as [`SpillVec::read_chunks`] does for `f64`, so its pages stay in
+/// the OS page cache rather than this process's RSS) and handed to `visit`
+/// promoted to `f64` by `convert`, one bounded chunk at a time.
+fn read_converted<T: bytemuck::Pod>(
+    values: &SpillVec<T>,
+    window: Range<usize>,
+    visit: &mut dyn FnMut(&[f64]) -> Result<()>,
+    convert: impl Fn(T) -> f64,
+) -> Result<()> {
+    let mut buffer = Vec::with_capacity(SAMPLE_CHUNK_LEN);
+    values.read_chunks(window, &mut |chunk| {
+        buffer.clear();
+        buffer.extend(chunk.iter().map(|&value| convert(value)));
+        visit(&buffer)
+    })
 }
 
 /// `range` clamped to `len`, or `None` when it selects nothing.
