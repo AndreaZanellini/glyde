@@ -49,7 +49,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 
-use glyde_core::dsp::decimation::Bucket;
+use glyde_core::dsp::decimation::{Bucket, Pyramid};
 use glyde_core::index::disk_pyramid::ColumnPyramid;
 use glyde_core::index::spill::SweepReport;
 use glyde_core::ingest::{
@@ -235,13 +235,22 @@ pub struct PreparedView {
     pub state_lanes: Vec<Option<StateLane>>,
     /// See `views::time::CursorLookup`.
     pub cursor: views::time::CursorLookup,
+    /// See `views::time::FitBounds`.
+    pub fit: views::time::FitBounds,
 }
 
 impl PreparedView {
     /// `bool_tick_limit` caps how many rows the boolean bands cover (a
     /// still-growing checkpoint previews only the head of the file, matching
-    /// what the UI used to compute for it).
-    pub fn new(dataset: &Dataset, level0_caches: &Level0Caches, bool_tick_limit: usize) -> Self {
+    /// what the UI used to compute for it). `pyramids` is the same data's
+    /// (`dataset.columns`-parallel), what "Fit to data" reads its bounds
+    /// from.
+    pub fn new<P: Pyramid>(
+        dataset: &Dataset,
+        pyramids: &[Option<P>],
+        level0_caches: &Level0Caches,
+        bool_tick_limit: usize,
+    ) -> Self {
         let ticks = dataset.time.to_pyramid_ticks().into_owned();
         let mut sample_cache = views::time::cache_column_samples_except(dataset, |index| {
             level0_caches.get(index).is_some_and(Option::is_some)
@@ -255,6 +264,14 @@ impl PreparedView {
         let state_lanes = views::state_timeline::cache_state_lanes(dataset, state_ticks);
         let marker_lanes = views::state_timeline::cache_marker_lanes(dataset, state_ticks);
         let cursor = views::time::CursorLookup::for_time(&dataset.time);
+        let fit = views::time::FitBounds::for_dataset(
+            dataset,
+            pyramids,
+            &ticks,
+            &sample_cache,
+            level0_caches,
+            cursor.is_sorted(),
+        );
         Self {
             ticks,
             sample_cache,
@@ -262,6 +279,7 @@ impl PreparedView {
             marker_lanes,
             state_lanes,
             cursor,
+            fit,
         }
     }
 }
@@ -415,8 +433,12 @@ fn run_index_job(
         overrides,
         cancel,
         |checkpoint| {
-            let prepared =
-                PreparedView::new(&checkpoint.dataset, &Vec::new(), PROGRESS_BOOL_BAND_ROWS);
+            let prepared = PreparedView::new(
+                &checkpoint.dataset,
+                &checkpoint.pyramids,
+                &Vec::new(),
+                PROGRESS_BOOL_BAND_ROWS,
+            );
             let _ = tx.send(IndexingMessage::Progress {
                 generation,
                 path: path.clone(),
@@ -492,7 +514,7 @@ fn run_index_job(
                 log_cancelled(&path);
                 return;
             }
-            let prepared = PreparedView::new(&dataset, &level0_caches, usize::MAX);
+            let prepared = PreparedView::new(&dataset, &pyramids, &level0_caches, usize::MAX);
             let _ = tx.send(IndexingMessage::Completed {
                 generation,
                 path,
@@ -875,6 +897,7 @@ mod tests {
                     marker_lanes: Vec::new(),
                     state_lanes: Vec::new(),
                     cursor: views::time::CursorLookup::default(),
+                    fit: views::time::FitBounds::default(),
                 }),
                 time_index: TimeIndexPreview {
                     column_names: Vec::new(),

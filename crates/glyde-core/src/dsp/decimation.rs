@@ -493,6 +493,10 @@ pub trait Pyramid {
         range: (i128, i128),
         pixel_columns: usize,
     ) -> Vec<Bucket>;
+
+    /// The column's smallest and largest finite sample: [`finite_range`]
+    /// over this pyramid.
+    fn finite_range(&self, samples: &[f64]) -> Option<(f64, f64)>;
 }
 
 impl Pyramid for Vec<Vec<Bucket>> {
@@ -504,6 +508,10 @@ impl Pyramid for Vec<Vec<Bucket>> {
         pixel_columns: usize,
     ) -> Vec<Bucket> {
         decimate_viewport_levels(self, samples, timestamps, range, pixel_columns)
+    }
+
+    fn finite_range(&self, samples: &[f64]) -> Option<(f64, f64)> {
+        finite_range(self, samples)
     }
 }
 
@@ -678,4 +686,71 @@ pub fn connectors(columns: &[Bucket]) -> impl Iterator<Item = Connector> + '_ {
             from: (left.last_ts, left.last_value),
             to: (right.first_ts, right.first_value),
         })
+}
+
+/// The smallest and largest *finite* sample of a column, NaN and ±∞ left
+/// out, or `None` when it has none: what "Fit to data" frames (issue #144).
+///
+/// Read from `pyramid`, the column's pyramid in any storage, not from its
+/// samples. A bucket's envelope never includes NaN, so a bucket whose min
+/// and max are both finite already holds the finite extremes of its
+/// samples: a column without an infinite value costs the few buckets of its
+/// top level. Only a bucket whose envelope reaches ±∞ is opened, child by
+/// child and down to its raw samples if need be, so the cost grows with the
+/// number of infinite samples, never with the column's length. With no
+/// pyramid at all (`pyramid` empty), `samples` is scanned.
+pub fn finite_range<L: BucketLevel>(pyramid: &[L], samples: &[f64]) -> Option<(f64, f64)> {
+    let mut range = (f64::INFINITY, f64::NEG_INFINITY);
+    match pyramid.len().checked_sub(1) {
+        None => widen_with_samples(&mut range, samples),
+        Some(top) => {
+            for index in 0..pyramid[top].bucket_count() {
+                widen_with_bucket(&mut range, pyramid, samples, top, index);
+            }
+        }
+    }
+    (range.0 <= range.1).then_some(range)
+}
+
+/// Widens `range` to the finite samples under bucket `index` of `level`.
+fn widen_with_bucket<L: BucketLevel>(
+    range: &mut (f64, f64),
+    pyramid: &[L],
+    samples: &[f64],
+    level: usize,
+    index: usize,
+) {
+    let bucket = pyramid[level].bucket(index);
+    if bucket.min.is_finite() && bucket.max.is_finite() {
+        range.0 = range.0.min(bucket.min);
+        range.1 = range.1.max(bucket.max);
+        return;
+    }
+    if bucket.min > bucket.max {
+        // Nothing but NaN: the empty envelope.
+        return;
+    }
+    // An infinite sample is under this bucket; its finite ones are found
+    // below it.
+    match level.checked_sub(1) {
+        None => {
+            let start = index * PYRAMID_FACTOR;
+            let end = (start + PYRAMID_FACTOR).min(samples.len());
+            widen_with_samples(range, samples.get(start..end).unwrap_or_default());
+        }
+        Some(below) => {
+            let children = pyramid[below].bucket_count();
+            let first = index * PYRAMID_FACTOR;
+            for child in first..(first + PYRAMID_FACTOR).min(children) {
+                widen_with_bucket(range, pyramid, samples, below, child);
+            }
+        }
+    }
+}
+
+fn widen_with_samples(range: &mut (f64, f64), samples: &[f64]) {
+    for &value in samples.iter().filter(|value| value.is_finite()) {
+        range.0 = range.0.min(value);
+        range.1 = range.1.max(value);
+    }
 }

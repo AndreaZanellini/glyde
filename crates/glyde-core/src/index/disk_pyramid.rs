@@ -35,8 +35,8 @@
 use bytemuck::{Pod, Zeroable};
 
 use crate::dsp::decimation::{
-    decimate_viewport_levels, merge_buckets, Bucket, BucketLevel, Level0Stream, Pyramid,
-    PYRAMID_FACTOR,
+    decimate_viewport_levels, finite_range, merge_buckets, Bucket, BucketLevel, Level0Stream,
+    Pyramid, PYRAMID_FACTOR,
 };
 use crate::index::spill::{SpillSet, SpillVec, SpillVecWriter};
 use crate::series::SampleSource;
@@ -151,6 +151,10 @@ impl Pyramid for DiskPyramid {
     ) -> Vec<Bucket> {
         decimate_viewport_levels(&self.levels, samples, timestamps, range, pixel_columns)
     }
+
+    fn finite_range(&self, samples: &[f64]) -> Option<(f64, f64)> {
+        finite_range(&self.levels, samples)
+    }
 }
 
 /// A column's pyramid, wherever it lives: in memory for a file that fits the
@@ -176,6 +180,13 @@ impl Pyramid for ColumnPyramid {
             ColumnPyramid::Disk(pyramid) => {
                 pyramid.decimate(samples, timestamps, range, pixel_columns)
             }
+        }
+    }
+
+    fn finite_range(&self, samples: &[f64]) -> Option<(f64, f64)> {
+        match self {
+            ColumnPyramid::Memory(levels) => levels.finite_range(samples),
+            ColumnPyramid::Disk(pyramid) => pyramid.finite_range(samples),
         }
     }
 }

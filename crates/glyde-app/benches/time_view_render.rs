@@ -114,6 +114,8 @@ struct Fixture {
     ticks: Vec<i128>,
     sample_cache: Vec<Option<Vec<f64>>>,
     cursor: views::time::CursorLookup,
+    /// Prepared once, as the indexer thread prepares it for the app.
+    fit: views::time::FitBounds,
 }
 
 fn dataset_with_column(sample_count: usize, values: SeriesValues) -> Dataset {
@@ -132,13 +134,21 @@ fn dataset_with_column(sample_count: usize, values: SeriesValues) -> Dataset {
 
 fn synthetic_fixture(label: &'static str, sample_count: usize, values: SeriesValues) -> Fixture {
     let dataset = dataset_with_column(sample_count, values);
-    let pyramids = pyramids_for_dataset(&dataset)
+    let pyramids: Vec<Option<ColumnPyramid>> = pyramids_for_dataset(&dataset)
         .into_iter()
         .map(|pyramid| pyramid.map(ColumnPyramid::Memory))
         .collect();
     let ticks = dataset.time.to_pyramid_ticks().into_owned();
     let sample_cache = views::time::cache_column_samples(&dataset);
     let cursor = views::time::CursorLookup::for_time(&dataset.time);
+    let fit = views::time::FitBounds::for_dataset(
+        &dataset,
+        &pyramids,
+        &ticks,
+        &sample_cache,
+        &[],
+        cursor.is_sorted(),
+    );
     Fixture {
         label,
         _dir: None,
@@ -147,6 +157,7 @@ fn synthetic_fixture(label: &'static str, sample_count: usize, values: SeriesVal
         ticks,
         sample_cache,
         cursor,
+        fit,
     }
 }
 
@@ -202,13 +213,22 @@ fn spilled_fixture(label: &'static str, sample_count: usize, channels: usize) ->
     );
     assert_eq!(dataset.time.len(), sample_count);
     // Exactly what the app builds for a completed spilled load (issue #102).
-    let pyramids = glyde_core::ingest::disk_pyramids_for_dataset(&dataset, dir.path())
-        .into_iter()
-        .map(|pyramid| pyramid.map(ColumnPyramid::Disk))
-        .collect();
+    let pyramids: Vec<Option<ColumnPyramid>> =
+        glyde_core::ingest::disk_pyramids_for_dataset(&dataset, dir.path())
+            .into_iter()
+            .map(|pyramid| pyramid.map(ColumnPyramid::Disk))
+            .collect();
     let ticks = dataset.time.to_pyramid_ticks().into_owned();
     let sample_cache = views::time::cache_column_samples(&dataset);
     let cursor = views::time::CursorLookup::for_time(&dataset.time);
+    let fit = views::time::FitBounds::for_dataset(
+        &dataset,
+        &pyramids,
+        &ticks,
+        &sample_cache,
+        &[],
+        cursor.is_sorted(),
+    );
     Fixture {
         label,
         _dir: Some(dir),
@@ -217,6 +237,7 @@ fn spilled_fixture(label: &'static str, sample_count: usize, channels: usize) ->
         ticks,
         sample_cache,
         cursor,
+        fit,
     }
 }
 
@@ -244,14 +265,37 @@ fn render_frame(
     } else {
         Vec::new()
     };
+    render_frame_with(ctx, fixture, state, events, view).visible
+}
+
+/// What [`render_frame_with`] reports about its frame.
+struct Frame {
+    /// The tick range the frame decimated.
+    visible: (i128, i128),
+    /// Its shapes, as drawn (before tessellation).
+    shapes: Vec<egui::epaint::ClippedShape>,
+    /// The time plot's id, to read its bounds from egui's memory.
+    plot_id: egui::Id,
+}
+
+/// [`render_frame`] with `events` as the frame's input.
+fn render_frame_with(
+    ctx: &egui::Context,
+    fixture: &Fixture,
+    state: &mut TimeViewState,
+    events: Vec<egui::Event>,
+    view: (f64, f64),
+) -> Frame {
     let input = egui::RawInput {
         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, VIEWPORT_SIZE)),
         events,
         ..Default::default()
     };
     let mut visible = (0, 0);
+    let mut plot_id = None;
     let output = ctx.run(input, |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
+            plot_id = Some(ui.make_persistent_id(egui::Id::new("time_domain_view")));
             visible = views::time::show_with_selection(
                 ui,
                 &fixture.dataset,
@@ -260,6 +304,7 @@ fn render_frame(
                 &fixture.sample_cache,
                 &[],
                 fixture.cursor,
+                &fixture.fit,
                 state,
                 Some(view),
             );
@@ -268,8 +313,30 @@ fn render_frame(
     // What `eframe` does with every frame's shapes before painting them:
     // part of the frame's cost, and the part that grows with every mark
     // drawn (issue #137).
-    std::hint::black_box(ctx.tessellate(output.shapes, output.pixels_per_point));
-    visible
+    std::hint::black_box(ctx.tessellate(output.shapes.clone(), output.pixels_per_point));
+    Frame {
+        visible,
+        shapes: output.shapes,
+        plot_id: plot_id.expect("a frame ran"),
+    }
+}
+
+/// The centre of the text `label` in `shapes`, where a click lands on the
+/// widget that shows it.
+fn text_centre(shapes: &[egui::epaint::ClippedShape], label: &str) -> Pos2 {
+    fn find(shape: &egui::Shape, label: &str) -> Option<Pos2> {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, label)),
+            egui::Shape::Text(text) if text.galley.text() == label => {
+                Some(text.pos + text.galley.size() / 2.0)
+            }
+            _ => None,
+        }
+    }
+    shapes
+        .iter()
+        .find_map(|clipped| find(&clipped.shape, label))
+        .unwrap_or_else(|| panic!("no {label:?} on screen"))
 }
 
 /// The fixture's whole time span, in plot seconds.
@@ -497,6 +564,74 @@ fn bench_background_pan(c: &mut Criterion, fixture: &Fixture) {
     );
 }
 
+/// A "Fit to data" click with every channel of `fixture` shown (issue
+/// #144). The frame that handles it frames them from bounds prepared with
+/// the data, so it costs a frame, not a scan of every sample on the UI
+/// thread (6 s on a 37M-row spilled file before). Each iteration is one
+/// click, timed from the frame that releases the button; the view is first
+/// moved off the data vertically, so the click has something to do.
+fn bench_fit_click(c: &mut Criterion, fixture: &Fixture) {
+    let ctx = egui::Context::default();
+    let full = full_view(fixture);
+    let mut state = TimeViewState::default();
+    let mut frame = render_frame_with(&ctx, fixture, &mut state, Vec::new(), full);
+    for _ in 0..2 {
+        frame = render_frame_with(&ctx, fixture, &mut state, Vec::new(), full);
+    }
+    let (button, plot_id) = (text_centre(&frame.shapes, "Fit to data"), frame.plot_id);
+    let press = |pressed| egui::Event::PointerButton {
+        pos: button,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    };
+    let away = egui_plot::PlotBounds::from_min_max([full.0, 50.0], [full.1, 60.0]);
+    let click = |state: &mut TimeViewState| {
+        let mut memory = egui_plot::PlotMemory::load(&ctx, plot_id).expect("plot memory");
+        memory.auto_bounds = egui::Vec2b::FALSE;
+        memory.set_bounds(away);
+        memory.store(&ctx, plot_id);
+        render_frame_with(
+            &ctx,
+            fixture,
+            state,
+            vec![egui::Event::PointerMoved(button), press(true)],
+            full,
+        );
+        let start = Instant::now();
+        render_frame_with(&ctx, fixture, state, vec![press(false)], full);
+        let elapsed = start.elapsed();
+        render_frame_with(&ctx, fixture, state, Vec::new(), full);
+        elapsed
+    };
+
+    let elapsed = click(&mut state);
+    let memory = egui_plot::PlotMemory::load(&ctx, plot_id).expect("plot memory");
+    let bounds = memory.bounds();
+    assert!(
+        bounds.max()[1] <= 1.0 && bounds.min()[1] >= -1.0,
+        "the click must frame the channels' values (every one a sine), not \
+         leave the plot at y {:?}..{:?}",
+        bounds.min()[1],
+        bounds.max()[1]
+    );
+    assert!(
+        elapsed <= FRAME_TIME_CEILING,
+        "a \"Fit to data\" click with all {} channels of {} shown took {elapsed:?}, \
+         exceeding the {FRAME_TIME_CEILING:?} build-blocking ceiling",
+        fixture.dataset.columns.len(),
+        fixture.label
+    );
+    c.bench_function(
+        &format!(
+            "time_view_render/{}, all {} shown/fit to data click",
+            fixture.label,
+            fixture.dataset.columns.len()
+        ),
+        |b| b.iter_custom(|iterations| (0..iterations).map(|_| click(&mut state)).sum()),
+    );
+}
+
 fn bench_time_view_render(c: &mut Criterion) {
     let all = ChannelVisibility::default;
     bench_one_fixture(c, &f64_fixture(SAMPLE_COUNT), all(), "");
@@ -521,6 +656,7 @@ fn bench_time_view_render(c: &mut Criterion) {
     bench_one_fixture(c, &many, one_shown, &format!("1 of {MULTI_CHANNELS} shown"));
     bench_picker_click(c, &many);
     bench_background_pan(c, &many);
+    bench_fit_click(c, &many);
 }
 
 criterion_group!(benches, bench_time_view_render);

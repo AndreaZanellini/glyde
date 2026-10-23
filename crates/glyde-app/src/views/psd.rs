@@ -1092,6 +1092,14 @@ mod render_tests {
                     &sample_cache,
                     &[],
                     crate::views::time::CursorLookup::for_time(&dataset.time),
+                    &crate::views::time::FitBounds::for_dataset(
+                        &dataset,
+                        &pyramids,
+                        &ticks,
+                        &sample_cache,
+                        &[],
+                        crate::views::time::CursorLookup::for_time(&dataset.time).is_sorted(),
+                    ),
                     &mut time_view,
                 );
             });
