@@ -94,8 +94,12 @@ const SELECT_BUCKETS: usize = 1 << 16;
 /// plain unsigned comparison, so a statistic over a signed or floating-point
 /// distribution encodes its values order-preservingly first (see
 /// [`delta_key`] and [`deviation_key`]).
+///
+/// Generic rather than `dyn` (issue #163): a selection pass makes one call
+/// per key, so a dynamic one per key — and another per Δt below it — was most
+/// of a pass's cost; monomorphized, the whole pass inlines into one loop.
 trait KeyStream {
-    fn for_each(&self, visit: &mut dyn FnMut(u128)) -> Result<()>;
+    fn for_each(&self, visit: &mut impl FnMut(u128)) -> Result<()>;
 }
 
 /// Order-preserving `i128` → `u128` key: flipping the sign bit makes unsigned
@@ -128,7 +132,7 @@ struct DeltaKeys<'a, S: ?Sized> {
 }
 
 impl<S: TickSource + ?Sized> KeyStream for DeltaKeys<'_, S> {
-    fn for_each(&self, visit: &mut dyn FnMut(u128)) -> Result<()> {
+    fn for_each(&self, visit: &mut impl FnMut(u128)) -> Result<()> {
         for_each_delta(self.source, self.range.clone(), &mut |delta| {
             visit(delta_key(delta));
             Ok(())
@@ -146,7 +150,7 @@ struct DeviationKeys<'a, S: ?Sized> {
 }
 
 impl<S: TickSource + ?Sized> KeyStream for DeviationKeys<'_, S> {
-    fn for_each(&self, visit: &mut dyn FnMut(u128)) -> Result<()> {
+    fn for_each(&self, visit: &mut impl FnMut(u128)) -> Result<()> {
         let median_delta = self.median_delta;
         for_each_delta(self.source, self.range.clone(), &mut |delta| {
             visit(deviation_key((delta_as_f64(delta) - median_delta).abs()));
@@ -168,7 +172,23 @@ impl<S: TickSource + ?Sized> KeyStream for DeviationKeys<'_, S> {
 /// value a full sort would have selected — not an approximation of it.
 ///
 /// `k` must be less than the number of keys the stream yields.
-fn select_kth_key(keys: &dyn KeyStream, k: usize) -> Result<u128> {
+fn select_kth_key(keys: &impl KeyStream, k: usize) -> Result<u128> {
+    Ok(select_kth(keys, k)?.key)
+}
+
+/// What [`select_kth`] found: the `k`-th smallest key, how many keys rank
+/// strictly below it, and how many are equal to it.
+#[derive(Debug, Clone, Copy)]
+struct Selected {
+    key: u128,
+    rank_below: usize,
+    equal: usize,
+}
+
+/// [`select_kth_key`], also counting the keys below and equal to the one it
+/// finds: the surviving range is one key value when the selection ends, and
+/// its last histogram already counted the keys in it.
+fn select_kth(keys: &impl KeyStream, k: usize) -> Result<Selected> {
     let mut lo = u128::MAX;
     let mut hi = 0u128;
     let mut count = 0usize;
@@ -186,6 +206,8 @@ fn select_kth_key(keys: &dyn KeyStream, k: usize) -> Result<u128> {
     let mut counts = vec![0usize; SELECT_BUCKETS];
     // How many keys rank strictly below the surviving range.
     let mut rank_below = 0usize;
+    // How many keys the surviving range holds.
+    let mut in_range = count;
 
     while lo < hi {
         // Ceil-divides the surviving span into at most `SELECT_BUCKETS`
@@ -207,6 +229,7 @@ fn select_kth_key(keys: &dyn KeyStream, k: usize) -> Result<u128> {
                 lo = range_lo + bucket as u128 * width;
                 hi = range_hi.min(lo.saturating_add(width - 1));
                 rank_below = cumulative;
+                in_range = count;
                 narrowed = true;
                 break;
             }
@@ -224,7 +247,25 @@ fn select_kth_key(keys: &dyn KeyStream, k: usize) -> Result<u128> {
         }
     }
 
-    Ok(lo)
+    Ok(Selected {
+        key: lo,
+        rank_below,
+        // Every key in a range of one value equals it; a broken invariant
+        // above leaves a wider range, counted as no equal key so the caller
+        // looks further rather than trusting it.
+        equal: if lo == hi { in_range } else { 0 },
+    })
+}
+
+/// The smallest key `keys` yields above `key`: one pass. There must be one.
+fn smallest_key_above(keys: &impl KeyStream, key: u128) -> Result<u128> {
+    let mut above = u128::MAX;
+    keys.for_each(&mut |candidate| {
+        if candidate > key {
+            above = above.min(candidate);
+        }
+    })?;
+    Ok(above)
 }
 
 /// The median of the `count` keys `keys` yields, decoded to the `f64` space
@@ -234,14 +275,22 @@ fn select_kth_key(keys: &dyn KeyStream, k: usize) -> Result<u128> {
 /// the tests compare against (`tests::sorted_median`) value for value: the
 /// middle key of an odd-sized distribution, the average of the two middle keys
 /// of an even-sized one.
-fn median_key(keys: &dyn KeyStream, count: usize, decode: fn(u128) -> f64) -> Result<f64> {
-    let upper = decode(select_kth_key(keys, count / 2)?);
+///
+/// The two middle keys of an even count come from one selection (issue
+/// #163): the lower one is selected, and the upper one is that same key when
+/// enough keys equal it — nearly always on a time axis, whose Δt take few
+/// distinct values — or else the smallest key above it, one more pass.
+fn median_key(keys: &impl KeyStream, count: usize, decode: fn(u128) -> f64) -> Result<f64> {
     if count % 2 == 1 {
-        Ok(upper)
-    } else {
-        let lower = decode(select_kth_key(keys, count / 2 - 1)?);
-        Ok((lower + upper) / 2.0)
+        return Ok(decode(select_kth_key(keys, count / 2)?));
     }
+    let lower = select_kth(keys, count / 2 - 1)?;
+    let upper = if lower.rank_below + lower.equal > count / 2 {
+        lower.key
+    } else {
+        smallest_key_above(keys, lower.key)?
+    };
+    Ok((decode(lower.key) + decode(upper)) / 2.0)
 }
 
 /// Decodes a Δt key into the `f64` the statistics are computed in. `i128 as
@@ -318,11 +367,12 @@ fn is_gap(delta: i128, threshold: f64) -> bool {
 /// `delta as f64`, through `i64` whenever `delta` fits one, which every Δt
 /// of a real time axis does: the same round-to-nearest of the same integer,
 /// so the same value, but one instruction instead of the software `i128`
-/// conversion the summary's passes otherwise spend much of their time in
-/// (issue #163).
+/// conversion the summary's passes otherwise spend a third of their time in
+/// (issue #163). The `black_box` is what keeps it: without it, LLVM folds the
+/// conversion of the checked `i64` back into the `i128` one.
 fn delta_as_f64(delta: i128) -> f64 {
     match i64::try_from(delta) {
-        Ok(delta) => delta as f64,
+        Ok(delta) => std::hint::black_box(delta) as f64,
         Err(_) => delta as f64,
     }
 }

@@ -96,10 +96,13 @@ impl TickSource for [i128] {
 /// ticks, never a rounded or rescaled one (Golden Rule 1).
 ///
 /// A `range` shorter than two ticks has no Δt at all and visits nothing.
+///
+/// `visit` is generic, not `dyn`: it runs once per Δt, and a dynamic call
+/// each time was most of a summary pass's cost (issue #163).
 pub(crate) fn for_each_delta<S: TickSource + ?Sized>(
     source: &S,
     range: Range<usize>,
-    visit: &mut dyn FnMut(i128) -> Result<()>,
+    visit: &mut impl FnMut(i128) -> Result<()>,
 ) -> Result<()> {
     let mut previous: Option<i128> = None;
     source.visit_tick_chunks(range, &mut |chunk| {
