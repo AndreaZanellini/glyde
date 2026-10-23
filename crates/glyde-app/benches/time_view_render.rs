@@ -104,6 +104,13 @@ const VIEWPORT_SIZE: Vec2 = Vec2::new(1920.0, 1080.0);
 /// SPEC §5 "Pan/zoom frame time": p99 ≤100ms.
 const FRAME_TIME_CEILING: Duration = Duration::from_millis(100);
 
+/// SPEC §5 "Pan/zoom frame time": p50 ≤16ms.
+const FRAME_TIME_P50: Duration = Duration::from_millis(16);
+
+/// How many times the unordered fixture's time axis restarts at zero: as
+/// often as the `time in s` column of issue #143's file did.
+const AXIS_RESTARTS: usize = 73;
+
 struct Fixture {
     label: &'static str,
     /// Keeps a spilled fixture's source CSV alive (its spill files live as
@@ -133,7 +140,11 @@ fn dataset_with_column(sample_count: usize, values: SeriesValues) -> Dataset {
 }
 
 fn synthetic_fixture(label: &'static str, sample_count: usize, values: SeriesValues) -> Fixture {
-    let dataset = dataset_with_column(sample_count, values);
+    in_memory_fixture(label, dataset_with_column(sample_count, values))
+}
+
+/// `dataset`, held in memory and prepared as the app prepares it.
+fn in_memory_fixture(label: &'static str, dataset: Dataset) -> Fixture {
     let pyramids: Vec<Option<ColumnPyramid>> = pyramids_for_dataset(&dataset)
         .into_iter()
         .map(|pyramid| pyramid.map(ColumnPyramid::Memory))
@@ -306,7 +317,7 @@ fn render_frame_with(
                 &fixture.ticks,
                 &fixture.sample_cache,
                 &[],
-                fixture.cursor,
+                &fixture.cursor,
                 &fixture.fit,
                 state,
                 view,
@@ -643,6 +654,76 @@ fn bench_fit_click(c: &mut Criterion, fixture: &Fixture) {
     );
 }
 
+/// [`f64_fixture`]'s samples on a time axis that restarts at zero
+/// [`AXIS_RESTARTS`] times, as a per-operating-point time column does
+/// (SPEC §2.1 keeps it in source order, issue #143).
+fn unordered_fixture(sample_count: usize) -> Fixture {
+    let mut dataset = dataset_with_column(
+        sample_count,
+        SeriesValues::F64(
+            (0..sample_count)
+                .map(|i| (i as f64 * 0.001).sin())
+                .collect(),
+        ),
+    );
+    let period = (sample_count / AXIS_RESTARTS) as i128;
+    dataset.time = TimeAxis::Absolute {
+        timestamps: (0..sample_count as i128)
+            .map(|i| Timestamp::new(i % period, TimeUnit::Seconds))
+            .collect::<Vec<_>>()
+            .into(),
+        format: TimestampFormat::EpochSeconds,
+    };
+    in_memory_fixture("f64, time axis restarting", dataset)
+}
+
+/// Frames with the pointer resting over the plot of a time axis that is
+/// not time-ordered (issue #143): the cursor readout finds the sample
+/// nearest the pointer every such frame. It used to scan the whole axis
+/// for it, 85 ms a frame at 37M rows; SPEC §5's p50 is gated here.
+fn bench_hover_unordered(c: &mut Criterion, fixture: &Fixture) {
+    assert!(
+        !fixture.cursor.is_sorted(),
+        "the fixture's axis must be unordered"
+    );
+    let ctx = egui::Context::default();
+    let mut state = TimeViewState::default();
+    let full = full_view(fixture);
+    for _ in 0..3 {
+        render_frame(&ctx, fixture, &mut state, true, full);
+    }
+    let mut frames: Vec<Duration> = (0..21)
+        .map(|_| {
+            let start = Instant::now();
+            render_frame(&ctx, fixture, &mut state, true, full);
+            start.elapsed()
+        })
+        .collect();
+    frames.sort();
+    let (p50, slowest) = (frames[frames.len() / 2], frames[frames.len() - 1]);
+    assert!(
+        p50 <= FRAME_TIME_P50 && slowest <= FRAME_TIME_CEILING,
+        "hovered frames over {} {} samples took {p50:?} at p50 and {slowest:?} at worst, \
+         exceeding SPEC §5's {FRAME_TIME_P50:?} p50 or {FRAME_TIME_CEILING:?} ceiling",
+        fixture.ticks.len(),
+        fixture.label
+    );
+    c.bench_function(
+        &format!("time_view_render/{}/hovered", fixture.label),
+        |b| {
+            b.iter(|| {
+                render_frame(
+                    std::hint::black_box(&ctx),
+                    std::hint::black_box(fixture),
+                    &mut state,
+                    true,
+                    full,
+                )
+            })
+        },
+    );
+}
+
 fn bench_time_view_render(c: &mut Criterion) {
     let all = ChannelVisibility::default;
     bench_one_fixture(c, &f64_fixture(SAMPLE_COUNT), all(), "");
@@ -668,6 +749,7 @@ fn bench_time_view_render(c: &mut Criterion) {
     bench_picker_click(c, &many);
     bench_background_pan(c, &many);
     bench_fit_click(c, &many);
+    bench_hover_unordered(c, &unordered_fixture(SAMPLE_COUNT));
 }
 
 criterion_group!(benches, bench_time_view_render);

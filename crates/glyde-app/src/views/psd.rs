@@ -1091,7 +1091,7 @@ mod render_tests {
                     &ticks,
                     &sample_cache,
                     &[],
-                    crate::views::time::CursorLookup::for_time(&dataset.time),
+                    &crate::views::time::CursorLookup::for_time(&dataset.time),
                     &crate::views::time::FitBounds::for_dataset(
                         &dataset,
                         &pyramids,
