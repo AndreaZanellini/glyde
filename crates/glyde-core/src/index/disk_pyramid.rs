@@ -20,8 +20,10 @@
 //! what SPEC §5's flat `min(25% RAM, 4 GB)` cap forbids on exactly the files
 //! that spill. Here every level is a [`SpillVec`] — one memory-mapped spill
 //! file per level, written once, deleted with its [`SpillSet`] — and is read
-//! through [`BucketLevel`], so [`decimate_viewport_levels`] decimates over it
-//! with the very code the golden tests lock through `decimate_viewport`.
+//! through [`BucketLevel`], so [`decimate_viewport_levels_skipping_level_0`]
+//! decimates over it with the very code the golden tests lock through
+//! `decimate_viewport`, minus level 0: a level file of its own, one disk page
+//! more per column edge than the raw samples it summarises (issue #145).
 //!
 //! Building it never holds a level in memory: level 0 is streamed from the
 //! column (bounded chunks, the same grouping `build_pyramid` uses), and each
@@ -30,13 +32,13 @@
 //! then touches only the handful of buckets per pixel column the query
 //! needs.
 //!
-//! [`decimate_viewport_levels`]: crate::dsp::decimation::decimate_viewport_levels
+//! [`decimate_viewport_levels_skipping_level_0`]: crate::dsp::decimation::decimate_viewport_levels_skipping_level_0
 
 use bytemuck::{Pod, Zeroable};
 
 use crate::dsp::decimation::{
-    decimate_viewport_levels, finite_range, merge_buckets, Bucket, BucketLevel, Level0Stream,
-    Pyramid, PYRAMID_FACTOR,
+    decimate_viewport_levels_skipping_level_0, finite_range, merge_buckets, Bucket, BucketLevel,
+    Level0Stream, Pyramid, PYRAMID_FACTOR,
 };
 use crate::index::spill::{SpillSet, SpillVec, SpillVecWriter};
 use crate::series::SampleSource;
@@ -149,7 +151,13 @@ impl Pyramid for DiskPyramid {
         range: (i128, i128),
         pixel_columns: usize,
     ) -> Vec<Bucket> {
-        decimate_viewport_levels(&self.levels, samples, timestamps, range, pixel_columns)
+        decimate_viewport_levels_skipping_level_0(
+            &self.levels,
+            samples,
+            timestamps,
+            range,
+            pixel_columns,
+        )
     }
 
     fn finite_range(&self, samples: &[f64]) -> Option<(f64, f64)> {

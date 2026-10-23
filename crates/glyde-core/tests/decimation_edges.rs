@@ -19,15 +19,19 @@
 //! longer holds them, each page is one random read from disk.
 //!
 //! A level-0 bucket summarises [`PYRAMID_FACTOR`] raw samples, and the raw
-//! samples next to it are on the page the edge reads anyway. So an edge
-//! aggregates up to `PYRAMID_FACTOR²` raw samples itself and never reads
-//! level 0: same buckets, one page fewer per edge. Locked here on an
-//! instrumented pyramid, against a raw-scan reference.
+//! samples next to it are on the page the edge reads anyway. So the on-disk
+//! pyramid's decimation ([`decimate_viewport_levels_skipping_level_0`])
+//! aggregates up to `PYRAMID_FACTOR²` raw samples at an edge itself and
+//! never reads level 0: same buckets, one page fewer per edge. Locked here
+//! on an instrumented pyramid, against a raw-scan reference, together with
+//! the in-memory decimation, which keeps reading level 0 because in memory
+//! that is the cheaper of the two.
 
 use std::cell::Cell;
 
 use glyde_core::dsp::decimation::{
-    build_pyramid, decimate_viewport_levels, Bucket, BucketLevel, PYRAMID_FACTOR,
+    build_pyramid, decimate_viewport_levels, decimate_viewport_levels_skipping_level_0, Bucket,
+    BucketLevel, PYRAMID_FACTOR,
 };
 
 /// One pyramid level that counts how many buckets were read from it.
@@ -85,7 +89,7 @@ fn reference(samples: &[f64], ticks: &[i128], range: (i128, i128), columns: usiz
 }
 
 #[test]
-fn a_decimation_never_reads_level_0_and_still_gives_the_exact_buckets() {
+fn the_on_disk_decimation_never_reads_level_0_and_still_gives_the_exact_buckets() {
     let n = 1_000_003usize;
     let samples: Vec<f64> = (0..n)
         .map(|i| match i % 1_009 {
@@ -117,14 +121,20 @@ fn a_decimation_never_reads_level_0_and_still_gives_the_exact_buckets() {
         ((ticks[777], ticks[777 + 500]), 400),
     ];
     for (range, columns) in views {
+        let expected = reference(&samples, &ticks, range, columns);
+        assert_eq!(
+            decimate_viewport_levels(&pyramid, &samples, &ticks, range, columns),
+            expected,
+            "view {range:?} at {columns} columns, every level read"
+        );
         for level in &levels {
             level.reads.set(0);
         }
-        let decimated = decimate_viewport_levels(&levels, &samples, &ticks, range, columns);
+        let decimated =
+            decimate_viewport_levels_skipping_level_0(&levels, &samples, &ticks, range, columns);
         assert_eq!(
-            decimated,
-            reference(&samples, &ticks, range, columns),
-            "view {range:?} at {columns} columns"
+            decimated, expected,
+            "view {range:?} at {columns} columns, level 0 skipped"
         );
         assert_eq!(
             levels[0].reads.get(),

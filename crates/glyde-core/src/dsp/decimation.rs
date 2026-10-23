@@ -351,6 +351,58 @@ fn raw_range_bucket(samples: &[f64], timestamps: &[i128]) -> Bucket {
     }
 }
 
+/// [`raw_range_bucket`] for the edges of the on-disk decimation
+/// ([`decimate_viewport_levels_skipping_level_0`]), which scan up to
+/// `PYRAMID_FACTOR²` samples (issue #145): from [`FOUR_LANES_FROM`] samples
+/// on, in four lanes ([`envelope_in_four_lanes`]). Everything else, the
+/// in-memory decimation and the pyramid build, keeps the one-lane scan.
+fn raw_range_bucket_of_an_edge(samples: &[f64], timestamps: &[i128]) -> Bucket {
+    if samples.len() < FOUR_LANES_FROM {
+        return raw_range_bucket(samples, timestamps);
+    }
+    let (min, max, nan_count) = envelope_in_four_lanes(samples);
+    Bucket {
+        min,
+        max,
+        first_ts: timestamps[0],
+        last_ts: *timestamps.last().expect("non-empty chunk"),
+        first_value: samples[0],
+        last_value: *samples.last().expect("non-empty chunk"),
+        nan_count,
+    }
+}
+
+/// Below this many samples, one running min/max pair is faster than four.
+const FOUR_LANES_FROM: usize = 16;
+
+/// The min and max of the non-NaN `samples` and how many are NaN, as
+/// [`raw_range_bucket`] finds them, with four independent running pairs, so
+/// consecutive samples are compared without waiting on each other. `f64::min`/`f64::max`
+/// already leave a NaN operand out, so NaN needs no branch. The same values
+/// (`-0.0` and `0.0` may swap, which [`Bucket`]'s equality, like the plot,
+/// does not tell apart).
+fn envelope_in_four_lanes(samples: &[f64]) -> (f64, f64, u64) {
+    let mut min = [f64::INFINITY; 4];
+    let mut max = [f64::NEG_INFINITY; 4];
+    let mut nan_count = 0u64;
+    let (quads, rest) = samples.as_chunks::<4>();
+    for quad in quads {
+        for lane in 0..4 {
+            min[lane] = min[lane].min(quad[lane]);
+            max[lane] = max[lane].max(quad[lane]);
+            nan_count += u64::from(quad[lane].is_nan());
+        }
+    }
+    for &value in rest {
+        min[0] = min[0].min(value);
+        max[0] = max[0].max(value);
+        nan_count += u64::from(value.is_nan());
+    }
+    let min = min.into_iter().fold(f64::INFINITY, f64::min);
+    let max = max.into_iter().fold(f64::NEG_INFINITY, f64::max);
+    (min, max, nan_count)
+}
+
 /// Merges two buckets that cover adjacent ranges, `left` before `right` in
 /// time/index order.
 pub(crate) fn merge_buckets(left: Bucket, right: Bucket) -> Bucket {
@@ -525,6 +577,37 @@ pub fn decimate_viewport_levels<L: BucketLevel>(
     range: (i128, i128),
     pixel_columns: usize,
 ) -> Vec<Bucket> {
+    decimate_from_level::<L, 0>(pyramid, samples, timestamps, range, pixel_columns)
+}
+
+/// [`decimate_viewport_levels`], bucket for bucket, for a pyramid stored
+/// away from its raw samples (on disk: `index::disk_pyramid`): it never
+/// reads level 0. A level-1 bucket a column edge straddles is aggregated
+/// from its covered raw samples (fewer than `PYRAMID_FACTOR²`) instead,
+/// which lie next to the edge's own raw samples, whereas level 0 is
+/// another file: one disk page fewer per column edge, each a random read
+/// once the page cache has dropped it (issue #145: the cold first full view
+/// of a spilled file took 2–3 s). In memory, level 0 is cheaper to read
+/// than those raw samples are to scan, so [`decimate_viewport_levels`]
+/// keeps it.
+pub fn decimate_viewport_levels_skipping_level_0<L: BucketLevel>(
+    pyramid: &[L],
+    samples: &[f64],
+    timestamps: &[i128],
+    range: (i128, i128),
+    pixel_columns: usize,
+) -> Vec<Bucket> {
+    decimate_from_level::<L, 1>(pyramid, samples, timestamps, range, pixel_columns)
+}
+
+/// The decimation itself, reading no pyramid level below `LOWEST_LEVEL`.
+fn decimate_from_level<L: BucketLevel, const LOWEST_LEVEL: usize>(
+    pyramid: &[L],
+    samples: &[f64],
+    timestamps: &[i128],
+    range: (i128, i128),
+    pixel_columns: usize,
+) -> Vec<Bucket> {
     debug_assert_eq!(
         samples.len(),
         timestamps.len(),
@@ -572,7 +655,7 @@ pub fn decimate_viewport_levels<L: BucketLevel>(
             // every column gets at least one raw sample.
             let column_lo = lo + (column * total_in_range) / pixel_columns;
             let column_hi = lo + ((column + 1) * total_in_range) / pixel_columns - 1;
-            aggregate_range(pyramid, samples, timestamps, column_lo, column_hi)
+            aggregate_range::<L, LOWEST_LEVEL>(pyramid, samples, timestamps, column_lo, column_hi)
         })
         .collect()
 }
@@ -585,21 +668,16 @@ pub fn decimate_viewport_levels<L: BucketLevel>(
 /// boundary buckets that straddle the edge of the query. This is the
 /// "exact edges, aggregated interior" requirement the spike-preservation
 /// golden test locks in: O(PYRAMID_FACTOR · log(n)) per column, not O(n).
-///
-/// Level 0 is never read: a level-1 bucket the edge straddles is aggregated
-/// from its (fewer than `PYRAMID_FACTOR²`) covered raw samples directly. They
-/// cost about what the level-0 buckets over them would, and lie where the
-/// edge's own raw samples are, whereas level 0 is another file: for a spilled
-/// column, one more disk page per column edge, each a random read once the
-/// page cache has dropped it (issue #145: ~2 s of a cold first full view).
-fn aggregate_range<L: BucketLevel>(
+/// No level below `LOWEST_LEVEL` is read: the raw samples stand in for it
+/// ([`decimate_viewport_levels_skipping_level_0`]).
+fn aggregate_range<L: BucketLevel, const LOWEST_LEVEL: usize>(
     pyramid: &[L],
     samples: &[f64],
     timestamps: &[i128],
     lo: usize,
     hi: usize,
 ) -> Bucket {
-    aggregate_at_level(
+    aggregate_at_level::<L, LOWEST_LEVEL>(
         pyramid,
         samples,
         timestamps,
@@ -609,15 +687,15 @@ fn aggregate_range<L: BucketLevel>(
     )
 }
 
-/// `level <= 0` means "raw samples" (the recursion's base case, level 0
-/// included: see [`aggregate_range`]); `level == k` (0-indexed into
-/// `pyramid`) means bucket span `PYRAMID_FACTOR.pow(k+1)`.
+/// `level < LOWEST_LEVEL` means "raw samples" (the recursion's base case;
+/// `-1` with `LOWEST_LEVEL == 0`); `level == k` (0-indexed into `pyramid`)
+/// means bucket span `PYRAMID_FACTOR.pow(k+1)`.
 ///
 /// Only the *last* bucket at any level can cover fewer than `span` raw
 /// samples ([`slice::chunks`] only ever leaves a short group at the end), so
 /// every bucket's start index is exactly `index * span`; only its end needs
 /// clamping to the real sample count.
-fn aggregate_at_level<L: BucketLevel>(
+fn aggregate_at_level<L: BucketLevel, const LOWEST_LEVEL: usize>(
     pyramid: &[L],
     samples: &[f64],
     timestamps: &[i128],
@@ -625,8 +703,16 @@ fn aggregate_at_level<L: BucketLevel>(
     lo: usize,
     hi: usize,
 ) -> Bucket {
-    let Some(level) = usize::try_from(level).ok().filter(|&level| level > 0) else {
-        return raw_range_bucket(&samples[lo..=hi], &timestamps[lo..=hi]);
+    let Some(level) = usize::try_from(level)
+        .ok()
+        .filter(|&level| level >= LOWEST_LEVEL)
+    else {
+        let (samples, timestamps) = (&samples[lo..=hi], &timestamps[lo..=hi]);
+        return if LOWEST_LEVEL == 0 {
+            raw_range_bucket(samples, timestamps)
+        } else {
+            raw_range_bucket_of_an_edge(samples, timestamps)
+        };
     };
 
     let span = PYRAMID_FACTOR.pow((level + 1) as u32);
@@ -645,7 +731,7 @@ fn aggregate_at_level<L: BucketLevel>(
         } else {
             let covered_lo = bucket_start.max(lo);
             let covered_hi = bucket_end.min(hi);
-            aggregate_at_level(
+            aggregate_at_level::<L, LOWEST_LEVEL>(
                 pyramid,
                 samples,
                 timestamps,
@@ -760,5 +846,38 @@ fn widen_with_samples(range: &mut (f64, f64), samples: &[f64]) {
     for &value in samples.iter().filter(|value| value.is_finite()) {
         range.0 = range.0.min(value);
         range.1 = range.1.max(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Issue #145: the four-lane scan the on-disk edges use must give the
+    // one-lane scan's answer at every length and offset, NaN and ±∞
+    // anywhere, a run of nothing but NaN included.
+    #[test]
+    fn the_four_lane_envelope_is_the_one_lane_envelope() {
+        let pattern: Vec<f64> = (0..400)
+            .map(|i| match i % 37 {
+                3..=5 => f64::NAN,
+                11 => f64::INFINITY,
+                29 => f64::NEG_INFINITY,
+                _ => ((i * 7_919) % 1_009) as f64 - 504.5,
+            })
+            .chain(std::iter::repeat_n(f64::NAN, 70))
+            .collect();
+        let ticks: Vec<i128> = (0..pattern.len() as i128).collect();
+        for start in 0..pattern.len() - 100 {
+            for len in 1..=100 {
+                let range = start..start + len;
+                let (samples, ticks) = (&pattern[range.clone()], &ticks[range]);
+                assert_eq!(
+                    raw_range_bucket_of_an_edge(samples, ticks),
+                    raw_range_bucket(samples, ticks),
+                    "{len} samples from {start}"
+                );
+            }
+        }
     }
 }

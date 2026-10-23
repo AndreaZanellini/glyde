@@ -21,9 +21,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   read: on the 3.2 GB file of the issue, opened on a 16 GB machine busy with
   other apps, the plot said "Updating…" for about 3 seconds.
   It now reads one place fewer for each, and the picture is exactly the
-  same. Measured on 8 channels of 8 million rows: 1.4 s down to 0.44 s when
-  the disk has to be read, 17 ms down to 10 ms when the file is still in
-  memory. On a file the size of the issue's, it reads about 30% less, so
+  same. Measured on 8 channels of 8 million rows: from 1.4 s to about half
+  a second when the disk has to be read, and from 17 ms to about 11 ms when
+  the file is still in memory. Files that fit in memory are not affected. On a file the size of the issue's, it reads about 30% less, so
   expect it to drop to roughly 2 seconds, not to nothing: an exact picture
   needs at least one read per screen column of every channel. Two ways to
   go further are written up as issues for you to decide.
