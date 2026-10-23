@@ -265,27 +265,29 @@ fn render_frame(
     } else {
         Vec::new()
     };
-    render_frame_with(ctx, fixture, state, events, Some(view)).visible
+    render_frame_with(ctx, fixture, state, events, Some(view), false).visible
 }
 
 /// What [`render_frame_with`] reports about its frame.
 struct Frame {
     /// The tick range the frame decimated.
     visible: (i128, i128),
-    /// Its shapes, as drawn (before tessellation).
+    /// Its shapes, as drawn (before tessellation); empty unless asked for.
     shapes: Vec<egui::epaint::ClippedShape>,
     /// The time plot's id, to read its bounds from egui's memory.
     plot_id: egui::Id,
 }
 
 /// [`render_frame`] with `events` as the frame's input, and the view left
-/// where it is when `view` is `None`.
+/// where it is when `view` is `None`. `keep_shapes` returns the frame's
+/// shapes too, at the cost of a copy of them, so a timed frame never asks.
 fn render_frame_with(
     ctx: &egui::Context,
     fixture: &Fixture,
     state: &mut TimeViewState,
     events: Vec<egui::Event>,
     view: Option<(f64, f64)>,
+    keep_shapes: bool,
 ) -> Frame {
     let input = egui::RawInput {
         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, VIEWPORT_SIZE)),
@@ -314,10 +316,15 @@ fn render_frame_with(
     // What `eframe` does with every frame's shapes before painting them:
     // part of the frame's cost, and the part that grows with every mark
     // drawn (issue #137).
-    std::hint::black_box(ctx.tessellate(output.shapes.clone(), output.pixels_per_point));
+    let shapes = if keep_shapes {
+        output.shapes.clone()
+    } else {
+        Vec::new()
+    };
+    std::hint::black_box(ctx.tessellate(output.shapes, output.pixels_per_point));
     Frame {
         visible,
-        shapes: output.shapes,
+        shapes,
         plot_id: plot_id.expect("a frame ran"),
     }
 }
@@ -575,9 +582,9 @@ fn bench_fit_click(c: &mut Criterion, fixture: &Fixture) {
     let ctx = egui::Context::default();
     let full = full_view(fixture);
     let mut state = TimeViewState::default();
-    let mut frame = render_frame_with(&ctx, fixture, &mut state, Vec::new(), Some(full));
+    let mut frame = render_frame_with(&ctx, fixture, &mut state, Vec::new(), Some(full), true);
     for _ in 0..2 {
-        frame = render_frame_with(&ctx, fixture, &mut state, Vec::new(), Some(full));
+        frame = render_frame_with(&ctx, fixture, &mut state, Vec::new(), Some(full), true);
     }
     let (button, plot_id) = (text_centre(&frame.shapes, "Fit to data"), frame.plot_id);
     let press = |pressed| egui::Event::PointerButton {
@@ -600,11 +607,12 @@ fn bench_fit_click(c: &mut Criterion, fixture: &Fixture) {
             state,
             vec![egui::Event::PointerMoved(button), press(true)],
             None,
+            false,
         );
         let start = Instant::now();
-        render_frame_with(&ctx, fixture, state, vec![press(false)], None);
+        render_frame_with(&ctx, fixture, state, vec![press(false)], None, false);
         let elapsed = start.elapsed();
-        render_frame_with(&ctx, fixture, state, Vec::new(), None);
+        render_frame_with(&ctx, fixture, state, Vec::new(), None, false);
         elapsed
     };
 
