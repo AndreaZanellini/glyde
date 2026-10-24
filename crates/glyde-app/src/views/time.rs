@@ -986,7 +986,12 @@ impl egui_plot::PlotItem for MinMaxBars {
         });
         // Two-point paths, exactly what each `egui_plot::Line` drew: never
         // line segments, whose tessellation snaps both ends to pixel
-        // centres and so erases a bar shorter than about a pixel.
+        // centres and so erases a bar shorter than about a pixel. A stroke
+        // whose two ends land on the same screen point — a bar whose min and
+        // max differ by less than the screen resolves — is a path of zero
+        // length, which epaint tessellates into nothing (issue #146); it is
+        // drawn as what a zero-length stroke is, a dot as wide as the stroke.
+        let dot = |at: egui::Pos2| egui::epaint::CircleShape::filled(at, width / 2.0, self.color);
         match self.encoding {
             BarEncoding::Mesh => {
                 // Exactly what `egui::Context::tessellate` would set up for
@@ -1004,6 +1009,10 @@ impl egui_plot::PlotItem for MinMaxBars {
                 // One path reused for every bar: no allocation per bar.
                 let mut path = egui::epaint::PathShape::line(Vec::with_capacity(2), stroke);
                 for extent in extents {
+                    if extent[0] == extent[1] {
+                        tessellator.tessellate_circle(dot(extent[0]), &mut mesh);
+                        continue;
+                    }
                     path.points.clear();
                     path.points.extend(extent);
                     tessellator.tessellate_path(&path, &mut mesh);
@@ -1013,7 +1022,13 @@ impl egui_plot::PlotItem for MinMaxBars {
                 }
             }
             BarEncoding::Strokes => {
-                shapes.extend(extents.map(|extent| egui::Shape::line(extent.to_vec(), stroke)));
+                shapes.extend(extents.map(|extent| {
+                    if extent[0] == extent[1] {
+                        egui::Shape::Circle(dot(extent[0]))
+                    } else {
+                        egui::Shape::line(extent.to_vec(), stroke)
+                    }
+                }));
             }
         }
     }
@@ -2978,6 +2993,112 @@ mod render_tests {
                 empty.is_empty(),
                 "at {pixels_per_point} px/pt, {} of {bars} bars left their pixel \
                  column empty, the first at x = {:?}",
+                empty.len(),
+                empty.first()
+            );
+        }
+    }
+
+    /// `values` on a seconds axis, in a fixture of its own.
+    fn one_channel_fixture(values: Vec<f64>) -> ViewFixture {
+        let mut dataset = sample_dataset();
+        dataset.time = TimeAxis::Absolute {
+            timestamps: (0..values.len() as i128)
+                .map(|i| Timestamp::new(i, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        dataset.columns = vec![Series::new("channel", SeriesValues::F64(values))];
+        ViewFixture::new(dataset)
+    }
+
+    /// The columns of the last frame's decimation that hold data and leave
+    /// their pixel column empty (no inked device pixel within one of their
+    /// bar's middle), out of all those that hold data.
+    fn empty_columns(fixture: &ViewFixture, pixels_per_point: f32) -> (Vec<i128>, usize, usize) {
+        let (state, inked, transform) = ink_of_a_known_view(fixture, pixels_per_point);
+        let cached = state.decimated[0].as_ref().expect("decimated");
+        assert!(!cached.converged, "this view must be aggregated");
+        let (mut empty, mut columns, mut zero_height) = (Vec::new(), 0, 0);
+        for bucket in cached.buckets.iter().filter(|b| !bucket_is_gap(b)) {
+            let mid = (bucket.first_ts + bucket.last_ts) / 2;
+            let x = tick_to_seconds(&fixture.dataset.time, mid);
+            let at = |y| {
+                transform.position_from_point(&egui_plot::PlotPoint::new(x, y)) * pixels_per_point
+            };
+            let (top, bottom) = (at(bucket.max), at(bucket.min));
+            columns += 1;
+            zero_height += usize::from(bucket.min != bucket.max && top == bottom);
+            let middle = top.lerp(bottom, 0.5);
+            let (px, py) = (middle.x.floor() as i32, middle.y.floor() as i32);
+            if !(-1..=1).any(|dx| (-1..=1).any(|dy| inked.contains(&(px + dx, py + dy)))) {
+                empty.push(mid);
+            }
+        }
+        (empty, columns, zero_height)
+    }
+
+    // Issue #146, as reported: a channel decaying smoothly towards zero
+    // (`measures_v2.csv`'s `torque`: −5.6e-5, −9e-11, … −1.7e-184) gives
+    // columns whose min and max differ by far less than the screen
+    // resolves, so their bars have zero height on screen, and epaint draws
+    // a zero-length stroke as nothing. Every such column must still ink its
+    // pixel column, at any zoom: the connectors between columns (issue
+    // #147) do it here.
+    #[test]
+    fn a_nearly_flat_stretch_inks_every_pixel_column_at_every_zoom() {
+        for samples_per_column in [2.4, 10.0, 100.0] {
+            let n = (750.0 * samples_per_column) as usize;
+            let decay = n as f64 / 400.0;
+            let fixture = one_channel_fixture(
+                (0..n)
+                    .map(|i| -5.6e-5 * (-(i as f64) / decay).exp())
+                    .collect(),
+            );
+            for pixels_per_point in [1.0, 2.0] {
+                let (empty, columns, zero_height) = empty_columns(&fixture, pixels_per_point);
+                assert!(
+                    zero_height * 2 > columns,
+                    "the fixture must be mostly zero-height bars: {zero_height} of {columns}"
+                );
+                assert!(
+                    empty.is_empty(),
+                    "at {samples_per_column} samples per column and {pixels_per_point} px/pt, \
+                     {} of {columns} columns with data are empty, the first at tick {:?}",
+                    empty.len(),
+                    empty.first()
+                );
+            }
+        }
+    }
+
+    // Issue #146's remainder: a nearly flat column with a NaN at both of its
+    // edges has no connector to either neighbour (SPEC §3.1 never joins a
+    // NaN), so its zero-height bar is all that can mark it, and must.
+    #[test]
+    fn a_nearly_flat_column_between_nans_inks_its_pixel_column() {
+        // A pair of nearly equal finite samples in the middle of every 40,
+        // NaN elsewhere: ~20 samples per column, so most pairs sit inside
+        // one column, NaN on both sides.
+        let values = (0..15_000)
+            .map(|i| match i % 40 {
+                20 => 0.3,
+                21 => 0.3 + 1e-12,
+                _ => f64::NAN,
+            })
+            .collect();
+        let fixture = one_channel_fixture(values);
+        for pixels_per_point in [1.0, 2.0] {
+            let (empty, columns, zero_height) = empty_columns(&fixture, pixels_per_point);
+            assert!(
+                zero_height * 2 > columns,
+                "the fixture must be mostly zero-height bars: {zero_height} of {columns}"
+            );
+            assert!(
+                empty.is_empty(),
+                "at {pixels_per_point} px/pt, {} of {columns} columns with data are empty, \
+                 the first at tick {:?}",
                 empty.len(),
                 empty.first()
             );
