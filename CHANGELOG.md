@@ -46,10 +46,17 @@ Versioning: [Semantic Versioning](https://semver.org/).
   It now reads one place fewer for each, and the picture is exactly the
   same. Measured on 8 channels of 8 million rows: from 1.4 s to about half
   a second when the disk has to be read, and from 17 ms to about 11 ms when
-  the file is still in memory. Files that fit in memory are not affected. On a file the size of the issue's, it reads about 30% less, so
-  expect it to drop to roughly 2 seconds, not to nothing: an exact picture
-  needs at least one read per screen column of every channel. Two ways to
-  go further are written up as issues for you to decide.
+  the file is still in memory. Files that fit in memory are not affected.
+  - Not measured on the issue's file itself: on a file shaped like it
+    (37 million rows), it reads about 30% fewer places from disk, so a
+    projection, not a measurement, puts the issue's 3 seconds at roughly
+    2. An exact picture needs at least one read per screen column of every
+    channel. Two ways to go further are written up as issues: #174, done
+    by a later change in this same batch, and #175, which needs your
+    decision.
+  - **Trade-off to veto:** once such a file is in memory, panning it is
+    2 to 5% slower (a few hundredths of a millisecond per frame), because
+    each screen column now reads a few more values itself.
   - Try it: with other apps using most of the memory, open a file of
     several GB and time how long "Updating…" stays on the first full view.
 - **A stretch that is almost flat can no longer vanish from the plot (issue
@@ -78,6 +85,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
   The readout shows exactly the same sample as before, ties included.
   - Try it: open a file whose time column restarts (or pick such a column
     with the time-column picker) and move the mouse over the plot.
+  - **Assumption to veto:** the issue offered two ways to do this, a
+    sorted copy of the time column (150 to 300 MB at 37 million rows) or a
+    search limited to what is on screen. This uses neither: the small
+    summary above, which finds exactly the sample the old search found and
+    costs about 9 MB.
 - **"Fit to data" no longer freezes the app on a large file (issue #144).**
   On a 3.2 GB file stored on disk, the click froze the whole window for up
   to 6 seconds, because it went through every value of every shown channel
@@ -109,7 +121,8 @@ Versioning: [Semantic Versioning](https://semver.org/).
   has narrower kinds, such as small integers and single-precision decimals.
   Those can now be kept on disk too, in their own kind, never converted to
   a wider one. Each reads back exactly as it does from memory, and goes
-  through a time sort with its row like the others.
+  through a time sort with its row like the others. No CSV file can produce
+  these kinds: only the Parquet change that follows (issue #155) uses them.
 - **The zoomed-out time plot now draws a continuous trace instead of a
   dashed one (issue #147).** At zoom levels where each screen column holds
   only a few samples, a steep signal used to look dashed, with holes that
