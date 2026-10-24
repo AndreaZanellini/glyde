@@ -116,6 +116,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
   keep that file in the cache.
 
 ### Changed
+- **A file too large for memory takes much less disk while it is open
+  (issue #174).** Glyde keeps such a file on disk with a zoom index next to
+  it. The finest level of that index (one entry per 8 values, most of its
+  size) is no longer written: the plot stopped reading it with issue #145,
+  and reads the values themselves instead. The picture is exactly the same.
+  On the 1 GB benchmark file, the index went from 1.75 GB to 0.6 GB on
+  disk. On a 3 GB file with 11 channels, it is about 4 GB less, which is
+  also the space Glyde checks for before building the index at all, so a
+  nearly full disk now gets the fast index where it used to get none.
 - **Groundwork for opening Parquet files too large for memory (issue
   #155).** Nothing changes in the app yet. A file too large for memory is
   kept on disk while you work, but only in the four kinds of column a CSV
