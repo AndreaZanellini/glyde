@@ -28,8 +28,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
     (37 million rows), it reads about 30% fewer places from disk, so a
     projection, not a measurement, puts the issue's 3 seconds at roughly
     2. An exact picture needs at least one read per screen column of every
-    channel. Two ways to go further are issues for you to decide: #174
-    (decided since: it needs no decision) and #175.
+    channel. Two ways to go further are written up as issues: #174, done
+    by a later change in this same batch, and #175, which needs your
+    decision.
   - **Trade-off to veto:** once such a file is in memory, panning it is
     2 to 5% slower (a few hundredths of a millisecond per frame), because
     each screen column now reads a few more values itself.
