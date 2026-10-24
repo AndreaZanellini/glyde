@@ -12,6 +12,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **A file too large for memory no longer copies its whole-number columns
+  into memory (issue #178).** When a file is kept on disk because it does
+  not fit in memory, the plot still needs each column's values as decimals.
+  A decimal column is read straight from the disk, but a whole-number
+  column was converted into a full decimal copy held in memory: 8 bytes per
+  row per such column, on exactly the files whose size is the problem.
+  That copy is now written to disk, next to the zoom index, in the same
+  pass that builds the index, and read from there. What you see is
+  unchanged. Such a file uses up to 8 bytes per row per whole-number column
+  more disk while it is open, and that much less memory.
+  - Limitation: when there is not enough free disk to build the zoom index
+    at all (Glyde checks first), the copy is made in memory as before.
 - **Opening a file spends less time checking its time column (issue
   #163).** After reading a file, Glyde checks its time column for gaps,
   regular sampling and order, in a step that cannot run in parallel. It

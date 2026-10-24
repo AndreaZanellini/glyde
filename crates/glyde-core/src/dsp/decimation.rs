@@ -549,6 +549,13 @@ pub trait Pyramid {
     /// The column's smallest and largest finite sample: [`finite_range`]
     /// over this pyramid.
     fn finite_range(&self, samples: &[f64]) -> Option<(f64, f64)>;
+
+    /// The column's samples as `f64`, when this pyramid keeps them: an
+    /// on-disk pyramid of a spilled column whose own dtype is not `f64`
+    /// (issue #178), so its caller needs no `f64` copy of the column.
+    fn samples(&self) -> Option<&[f64]> {
+        None
+    }
 }
 
 impl Pyramid for Vec<Vec<Bucket>> {

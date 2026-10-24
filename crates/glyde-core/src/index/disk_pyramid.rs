@@ -124,15 +124,28 @@ impl BucketLevel for DiskLevel {
 #[derive(Clone, Debug, Default)]
 pub struct DiskPyramid {
     levels: Vec<DiskLevel>,
+    /// The column's samples as `f64`, written in the same pass that built
+    /// level 0, for a column whose own dtype is not `f64`
+    /// ([`build_disk_pyramid_keeping_samples`], issue #178): what the view
+    /// reads its exact edge samples from instead of an `f64` copy in RAM.
+    /// `None` for a column already `f64`, whose own spill file serves.
+    samples: Option<SpillVec<f64>>,
 }
 
 impl DiskPyramid {
     pub fn levels(&self) -> &[DiskLevel] {
         &self.levels
     }
+
+    /// The column's samples as `f64`, when this pyramid keeps them
+    /// ([`build_disk_pyramid_keeping_samples`]).
+    pub fn samples(&self) -> Option<&[f64]> {
+        self.samples.as_ref().map(SpillVec::as_slice)
+    }
 }
 
-/// By content, bucket for bucket — never by which files hold it.
+/// By content, bucket for bucket — never by which files hold it. The kept
+/// samples are not compared: they are the column's own, not the pyramid's.
 impl PartialEq for DiskPyramid {
     fn eq(&self, other: &Self) -> bool {
         self.levels.len() == other.levels.len()
@@ -162,6 +175,10 @@ impl Pyramid for DiskPyramid {
 
     fn finite_range(&self, samples: &[f64]) -> Option<(f64, f64)> {
         finite_range(&self.levels, samples)
+    }
+
+    fn samples(&self) -> Option<&[f64]> {
+        DiskPyramid::samples(self)
     }
 }
 
@@ -197,11 +214,49 @@ impl Pyramid for ColumnPyramid {
             ColumnPyramid::Disk(pyramid) => pyramid.finite_range(samples),
         }
     }
+
+    fn samples(&self) -> Option<&[f64]> {
+        match self {
+            ColumnPyramid::Memory(_) => None,
+            ColumnPyramid::Disk(pyramid) => pyramid.samples(),
+        }
+    }
 }
 
 /// Builds the pyramid of `samples` over `timestamps` (same length,
 /// non-decreasing ticks) into `set`, level by level, in bounded memory.
 pub fn build_disk_pyramid<S, T>(set: &SpillSet, samples: &S, timestamps: &T) -> Result<DiskPyramid>
+where
+    S: SampleSource + ?Sized,
+    T: TickSource + ?Sized,
+{
+    build(set, samples, timestamps, false)
+}
+
+/// [`build_disk_pyramid`], also keeping the samples it reads as `f64`, in a
+/// spill file of the same set ([`DiskPyramid::samples`]): for a spilled
+/// column whose own dtype is not `f64`, whose view would otherwise need an
+/// `f64` copy of the whole column in RAM to read its edges from (issue
+/// #178). They are written in the pass that builds level 0, so the column is
+/// read once either way.
+pub fn build_disk_pyramid_keeping_samples<S, T>(
+    set: &SpillSet,
+    samples: &S,
+    timestamps: &T,
+) -> Result<DiskPyramid>
+where
+    S: SampleSource + ?Sized,
+    T: TickSource + ?Sized,
+{
+    build(set, samples, timestamps, true)
+}
+
+fn build<S, T>(
+    set: &SpillSet,
+    samples: &S,
+    timestamps: &T,
+    keep_samples: bool,
+) -> Result<DiskPyramid>
 where
     S: SampleSource + ?Sized,
     T: TickSource + ?Sized,
@@ -219,6 +274,9 @@ where
 
     // Level 0, streamed exactly like `build_pyramid_streaming` reads it.
     let mut writer = SpillVecWriter::<PackedBucket>::create(set, &format!("{stem}.l0"))?;
+    let mut kept = keep_samples
+        .then(|| SpillVecWriter::<f64>::create(set, &format!("{stem}.samples")))
+        .transpose()?;
     let mut stream = Level0Stream::default();
     let mut position = 0usize;
     timestamps.visit_tick_chunks(0..sample_count, &mut |tick_chunk| {
@@ -226,6 +284,9 @@ where
         position += tick_chunk.len();
         let mut offset = 0usize;
         samples.visit_sample_chunks(start..position, &mut |sample_chunk| {
+            if let Some(kept) = &mut kept {
+                kept.extend_from_slice(sample_chunk)?;
+            }
             let end = offset + sample_chunk.len();
             stream.push_chunk(sample_chunk, &tick_chunk[offset..end], &mut |bucket| {
                 writer.push(bucket.into())
@@ -261,7 +322,10 @@ where
         }
         levels.push(DiskLevel(writer.finish()?));
     }
-    Ok(DiskPyramid { levels })
+    Ok(DiskPyramid {
+        levels,
+        samples: kept.map(SpillVecWriter::finish).transpose()?,
+    })
 }
 
 /// Distinguishes the files of several pyramids written into one set.

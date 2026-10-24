@@ -252,8 +252,14 @@ impl PreparedView {
         bool_tick_limit: usize,
     ) -> Self {
         let ticks = dataset.time.to_pyramid_ticks().into_owned();
+        // A column whose on-disk pyramid keeps its `f64` samples needs no
+        // copy in RAM either (issue #178).
         let mut sample_cache = views::time::cache_column_samples_except(dataset, |index| {
             level0_caches.get(index).is_some_and(Option::is_some)
+                || pyramids
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|pyramid| pyramid.samples().is_some())
         });
         sample_cache.resize_with(dataset.columns.len(), || None);
         let bool_bands = views::state_timeline::cache_bool_bands(
@@ -553,6 +559,86 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// Issue #178: a spilled integer column gets no `f64` copy in RAM. Its
+    /// on-disk pyramid keeps its samples as `f64`, and the view decimates
+    /// from them exactly as from the same column held in memory.
+    #[test]
+    fn a_spilled_integer_column_is_decimated_from_disk_with_no_copy_in_ram() {
+        use glyde_core::budget::RamBudget;
+        use glyde_core::index::disk_pyramid::ColumnPyramid;
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("counts.csv");
+        let mut file = std::fs::File::create(&path).expect("create fixture");
+        writeln!(file, "timestamp,count").expect("write fixture");
+        for i in 0..20_000i64 {
+            writeln!(
+                file,
+                "{},{}",
+                1_700_000_000 + i,
+                (i * 7_919) % 10_007 - 5_000
+            )
+            .expect("write fixture");
+        }
+        drop(file);
+        let open =
+            |budget| glyde_core::ingest::load_with_budget(&path, budget, dir.path()).expect("open");
+        let spilled = open(RamBudget::from_total_ram_bytes(0));
+        let in_memory = open(RamBudget::from_total_ram_bytes(u64::MAX));
+        assert!(spilled.is_spilled() && !in_memory.is_spilled());
+
+        let pyramids: ColumnPyramids =
+            glyde_core::ingest::disk_pyramids_for_dataset(&spilled, dir.path())
+                .into_iter()
+                .map(|pyramid| pyramid.map(ColumnPyramid::Disk))
+                .collect();
+        let prepared = PreparedView::new(
+            &spilled,
+            &pyramids,
+            &vec![None; spilled.columns.len()],
+            usize::MAX,
+        );
+        assert!(
+            prepared.sample_cache.iter().all(Option::is_none),
+            "a spilled column must not be copied into RAM"
+        );
+
+        let memory_pyramids = glyde_core::ingest::pyramids_for_dataset(&in_memory);
+        let memory_ticks = in_memory.time.to_pyramid_ticks().into_owned();
+        let memory_cache = views::time::cache_column_samples(&in_memory);
+        let (first, last) = (memory_ticks[0], memory_ticks[memory_ticks.len() - 1]);
+        for (range, pixel_columns) in [
+            ((first, last), 1_440),
+            ((first + 1_234, first + 9_876), 333),
+        ] {
+            let from_disk = views::time::decimate_column(
+                &spilled,
+                &pyramids,
+                &prepared.ticks,
+                &prepared.sample_cache,
+                &[],
+                0,
+                range,
+                pixel_columns,
+            );
+            let from_memory = views::time::decimate_column(
+                &in_memory,
+                &memory_pyramids,
+                &memory_ticks,
+                &memory_cache,
+                &[],
+                0,
+                range,
+                pixel_columns,
+            );
+            assert!(!from_disk.is_empty(), "{range:?}: the column is drawn");
+            assert_eq!(
+                from_disk, from_memory,
+                "{range:?} at {pixel_columns} columns"
+            );
+        }
+    }
 
     /// Issue #119: a job whose flag is raised stops without sending a
     /// result — neither `Completed` nor `Failed` — since the UI has already

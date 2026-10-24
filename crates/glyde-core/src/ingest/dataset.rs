@@ -2624,6 +2624,10 @@ pub(crate) fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<()> {
 /// column, and for any column whose pyramid could not be written (logged at
 /// `warn`): the view then decimates its raw samples, as before.
 ///
+/// A column whose own dtype is not `f64` also keeps its samples as `f64`
+/// next to its pyramid, eight bytes per row (issue #178): what the view reads
+/// its edges from instead of an `f64` copy in RAM.
+///
 /// The pyramids take about as much disk as they would have taken RAM (one
 /// 80-byte bucket per ~7 samples, per numeric column), so that space is
 /// checked first, with the same headroom the spill itself keeps (SPEC §5.1:
@@ -2640,10 +2644,20 @@ pub fn disk_pyramids_for_dataset(
         .filter(|series| series.values().sample_source().is_some())
         .count() as u64;
     let rows = dataset.time.len() as u64;
+    // A column that is not `f64` also keeps its samples as `f64` (issue
+    // #178), eight bytes per row.
+    let converted = dataset
+        .columns
+        .iter()
+        .filter(|series| {
+            series.values().sample_source().is_some() && series.values().as_f64_slice().is_none()
+        })
+        .count() as u64;
     let pyramid_bytes = rows
         .div_ceil(7)
         .saturating_mul(crate::index::disk_pyramid::PACKED_BUCKET_BYTES)
-        .saturating_mul(numeric);
+        .saturating_mul(numeric)
+        .saturating_add(rows.saturating_mul(8).saturating_mul(converted));
     if let Some(available) = crate::budget::available_disk_bytes(cache_dir) {
         if let Err(err) = crate::budget::check_disk_affordable(pyramid_bytes, available, cache_dir)
         {
@@ -2668,7 +2682,16 @@ pub fn disk_pyramids_for_dataset(
         .iter()
         .map(|series| {
             let samples = series.values().sample_source()?;
-            match crate::index::disk_pyramid::build_disk_pyramid(&set, &samples, &dataset.time) {
+            let built = if series.values().as_f64_slice().is_some() {
+                crate::index::disk_pyramid::build_disk_pyramid(&set, &samples, &dataset.time)
+            } else {
+                crate::index::disk_pyramid::build_disk_pyramid_keeping_samples(
+                    &set,
+                    &samples,
+                    &dataset.time,
+                )
+            };
+            match built {
                 Ok(pyramid) => Some(pyramid),
                 Err(err) => {
                     warn!(
