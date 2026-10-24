@@ -1264,6 +1264,14 @@ mod render_tests {
                         &samples,
                         &[],
                         super::super::time::CursorLookup::for_time(&dataset.time),
+                        &super::super::time::FitBounds::for_dataset(
+                            dataset,
+                            &pyramids,
+                            &ticks,
+                            &samples,
+                            &[],
+                            super::super::time::CursorLookup::for_time(&dataset.time).is_sorted(),
+                        ),
                         time_state,
                         focus,
                     )

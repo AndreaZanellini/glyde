@@ -46,7 +46,7 @@
 use std::sync::Arc;
 
 use egui_plot::{GridMark, Line, Plot, PlotBounds, PlotPoints, Points};
-use glyde_core::dsp::decimation::{connectors, decimate_viewport, Bucket, Pyramid};
+use glyde_core::dsp::decimation::{connectors, decimate_viewport, finite_range, Bucket, Pyramid};
 use glyde_core::ingest::{
     progressive_tick_to_value, progressive_value_to_tick, Dataset, Level0Cache, TimeAxis,
 };
@@ -86,8 +86,9 @@ use crate::views::channels::{self, ChannelVisibility};
 /// the cache holds exactly the converted values, already mapped, so the
 /// reopen that produced it never had to convert them again
 /// (`ingest::derived_caches_for_dataset_cached`). `&[]` for a still-loading
-/// partial dataset, which has no cache of its own yet. `state`: see
-/// [`show_with_selection`].
+/// partial dataset, which has no cache of its own yet. `fit_bounds` is what
+/// "Fit to data" frames, prepared with the data ([`FitBounds`]). `state`:
+/// see [`show_with_selection`].
 #[allow(clippy::too_many_arguments)]
 pub fn show<P: Pyramid + Sync>(
     ui: &mut egui::Ui,
@@ -97,6 +98,7 @@ pub fn show<P: Pyramid + Sync>(
     sample_cache: &[Option<Vec<f64>>],
     level0_caches: &[Option<Arc<Level0Cache>>],
     cursor: CursorLookup,
+    fit_bounds: &FitBounds,
     state: &mut TimeViewState,
 ) {
     show_with_selection(
@@ -107,6 +109,7 @@ pub fn show<P: Pyramid + Sync>(
         sample_cache,
         level0_caches,
         cursor,
+        fit_bounds,
         state,
         None,
     );
@@ -152,9 +155,6 @@ pub struct TimeViewState {
     background: Option<BackgroundDecimator>,
     /// The background decimation running now, if any.
     pending: Option<PendingDecimation>,
-    /// The whole-file x range ([`fit_range`]), once computed: once per
-    /// data ([`Self::data_changed`] drops it), never per frame.
-    fit: Option<Option<(f64, f64)>>,
     /// Where this frame's plot put its x axis, for the lanes below it.
     shared_axis: Option<SharedAxis>,
     /// How aggregated bars are handed to egui; the tests switch it to the
@@ -278,7 +278,6 @@ impl TimeViewState {
     pub fn data_changed(&mut self) {
         self.decimated.clear();
         self.pending = None;
-        self.fit = None;
     }
 
     /// Where the last frame's plot put its x axis; `None` before the first
@@ -358,6 +357,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     sample_cache: &[Option<Vec<f64>>],
     level0_caches: &[Option<Arc<Level0Cache>>],
     cursor: CursorLookup,
+    fit_bounds: &FitBounds,
     state: &mut TimeViewState,
     focus: Option<(f64, f64)>,
 ) -> (i128, i128) {
@@ -367,9 +367,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         state.ticks_identity = ticks_identity;
     }
     state.collect_background_results(ticks, dataset.columns.len());
-    let fit = *state
-        .fit
-        .get_or_insert_with(|| fit_range(ticks, cursor.is_sorted(), &dataset.time));
+    let fit = fit_bounds.x;
     #[cfg(test)]
     let bar_encoding = state.bar_encoding;
     #[cfg(not(test))]
@@ -418,19 +416,13 @@ pub fn show_with_selection<P: Pyramid + Sync>(
 
     let response = plot.show(ui, |plot_ui| {
         if fit_clicked {
-            // Computed lazily, only on the frame the button was actually
-            // clicked (SPEC §5 frame-time budget, issue #80's bench found
-            // this cost dominating a per-frame unconditional computation —
-            // see `x_axis_seconds`'s doc comment).
-            let x = x_axis_seconds(&dataset.time);
-            let shown = plotted.iter().map(|&(_, _, series)| series);
-            if let Some(bounds) = data_bounds(&x, shown) {
-                // The span the lanes fit to as well.
-                let (x_min, x_max) = fit.unwrap_or((bounds.x_min, bounds.x_max));
-                plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                    [x_min, bounds.y_min],
-                    [x_max, bounds.y_max],
-                ));
+            // Prepared with the data, off the UI thread (issue #144): this
+            // reads no sample, however large the file. It used to scan the
+            // whole axis and every shown channel here, in the frame —
+            // seconds on a spilled file.
+            let shown = plotted.iter().map(|&(_, column_index, _)| column_index);
+            if let Some(bounds) = fit_bounds.frame(shown) {
+                plot_ui.set_plot_bounds(bounds);
             }
         }
 
@@ -691,6 +683,82 @@ pub(crate) fn fit_range(ticks: &[i128], sorted: bool, time: &TimeAxis) -> Option
     Some(axis_bounds(min, max, time))
 }
 
+/// What "Fit to data" frames (issue #144), prepared once per dataset where
+/// the rest of the view's inputs are (`crate::plumbing::PreparedView`, on
+/// the indexer thread): the whole axis's span ([`fit_range`]) and each
+/// numeric column's smallest and largest finite value, read from its
+/// pyramid ([`glyde_core::dsp::decimation::finite_range`]). A click then
+/// frames the shown channels in O(channels), without reading a sample.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FitBounds {
+    /// The whole axis in plot seconds; `None` with no samples.
+    x: Option<(f64, f64)>,
+    /// `dataset.columns`-parallel; `None` for a non-numeric column and for
+    /// one with no finite value (NaN and ±∞ are flagged anomalies, never a
+    /// fit target, SPEC §1.3).
+    y: Vec<Option<(f64, f64)>>,
+}
+
+impl FitBounds {
+    /// Reads `dataset`'s bounds from `pyramids` (`dataset.columns`-parallel,
+    /// as [`show`] takes them), scanning the samples of a column that has
+    /// none. `ticks`, `sample_cache` and `level0_caches` are [`show`]'s;
+    /// `sorted` is [`CursorLookup::is_sorted`]. O(rows) at worst: call it
+    /// where the data is prepared, never per frame.
+    pub fn for_dataset<P: Pyramid>(
+        dataset: &Dataset,
+        pyramids: &[Option<P>],
+        ticks: &[i128],
+        sample_cache: &[Option<Vec<f64>>],
+        level0_caches: &[Option<Arc<Level0Cache>>],
+        sorted: bool,
+    ) -> Self {
+        let y = dataset
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, series)| {
+                if series.view_kind() != ViewKind::TimeDomain {
+                    return None;
+                }
+                let cached = sample_cache.get(index).and_then(Option::as_ref);
+                let level0 = level0_caches
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .map(Arc::as_ref);
+                let samples = column_f64_samples(series.values(), cached, level0);
+                match pyramids.get(index).and_then(Option::as_ref) {
+                    Some(pyramid) => pyramid.finite_range(samples),
+                    None => finite_range::<Vec<Bucket>>(&[], samples),
+                }
+            })
+            .collect();
+        Self {
+            x: fit_range(ticks, sorted, &dataset.time),
+            y,
+        }
+    }
+
+    /// The whole axis in plot seconds, as a fit shows it; `None` with no
+    /// samples.
+    pub fn x(&self) -> Option<(f64, f64)> {
+        self.x
+    }
+
+    /// What a fit shows with `columns` plotted: the whole axis, by the span
+    /// of their finite values (padded when that is a single value). `None`
+    /// when none of them has a finite value, or the axis has no samples.
+    fn frame(&self, columns: impl IntoIterator<Item = usize>) -> Option<PlotBounds> {
+        let (x_min, x_max) = self.x?;
+        let (y_min, y_max) = columns
+            .into_iter()
+            .filter_map(|column| self.y.get(column).copied().flatten())
+            .reduce(|(lo, hi), (min, max)| (lo.min(min), hi.max(max)))?;
+        let (y_min, y_max) = pad_if_degenerate(y_min, y_max);
+        Some(PlotBounds::from_min_max([x_min, y_min], [x_max, y_max]))
+    }
+}
+
 /// `min_tick..max_tick` in plot seconds, padded by a second either side
 /// when that is a single instant (a zero-width axis cannot be drawn).
 pub(crate) fn axis_bounds(min_tick: i128, max_tick: i128, time: &TimeAxis) -> (f64, f64) {
@@ -711,12 +779,11 @@ pub(crate) fn axis_bounds(min_tick: i128, max_tick: i128, time: &TimeAxis) -> (f
 /// seconds" governs [`Dataset`]'s own fields, which stay `i128` ticks; nothing
 /// here mutates them).
 ///
-/// O(n) — every raw sample, not the decimated view — so [`show`] only ever
-/// calls this lazily, on the (rare, at most one per frame) occasions it is
-/// actually needed: a "Fit to data" click, or the pointer hovering the plot
-/// for the cursor readout. Never called unconditionally once per frame; see
-/// [`format_x_axis_tick`]'s doc comment for the per-frame call site this
-/// used to be on and why that had to change.
+/// O(n) — every raw sample, not the decimated view — so the view never
+/// calls it: the cursor readout ([`CursorLookup`]) and "Fit to data"
+/// ([`FitBounds`]) answer without it. Kept as the reference the tests
+/// compare both against.
+#[cfg(test)]
 fn x_axis_seconds(time: &TimeAxis) -> Vec<f64> {
     match time {
         TimeAxis::Absolute { timestamps, .. } => timestamps
@@ -1250,6 +1317,10 @@ pub(crate) fn seconds_to_tick(time: &TimeAxis, seconds: f64) -> i128 {
 /// `columns`' numeric series — what "Fit to data" resets the plot's view to.
 /// `None` when there is nothing plottable at all (e.g. every column is
 /// non-numeric).
+///
+/// The full scan "Fit to data" did on every click before issue #144, kept
+/// as the reference [`FitBounds`] is tested against.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DataBounds {
     x_min: f64,
@@ -1258,6 +1329,7 @@ struct DataBounds {
     y_max: f64,
 }
 
+#[cfg(test)]
 fn data_bounds<'a>(x: &[f64], columns: impl IntoIterator<Item = &'a Series>) -> Option<DataBounds> {
     let (x_min, x_max) = finite_min_max(x.iter().copied())?;
 
@@ -1283,6 +1355,7 @@ fn data_bounds<'a>(x: &[f64], columns: impl IntoIterator<Item = &'a Series>) -> 
 /// The min and max of every finite value in `values`, ignoring NaN/infinite
 /// readings (SPEC §1.3: they are flagged anomalies, not fit targets) —
 /// `None` if nothing finite was seen at all.
+#[cfg(test)]
 fn finite_min_max(values: impl Iterator<Item = f64>) -> Option<(f64, f64)> {
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
@@ -1455,6 +1528,7 @@ fn sorted_nearest(len: usize, x: impl Fn(usize) -> f64, target: f64) -> usize {
 /// The per-dtype match itself lives in `glyde_core::series` (Hard rule 2:
 /// all product logic in core, and one canonical implementation of it) —
 /// this is the rendering-side name for it.
+#[cfg(test)]
 fn value_as_f64(values: &SeriesValues, index: usize) -> Option<f64> {
     values.f64_at(index)
 }
@@ -1541,6 +1615,14 @@ mod render_tests {
                     &sample_cache,
                     &[],
                     CursorLookup::for_time(&dataset.time),
+                    &FitBounds::for_dataset(
+                        &dataset,
+                        &pyramids,
+                        &ticks,
+                        &sample_cache,
+                        &[],
+                        CursorLookup::for_time(&dataset.time).is_sorted(),
+                    ),
                     &mut TimeViewState::default(),
                 );
             });
@@ -1586,6 +1668,14 @@ mod render_tests {
                         &sample_cache,
                         &[],
                         cursor,
+                        &FitBounds::for_dataset(
+                            &dataset,
+                            &pyramids,
+                            &ticks,
+                            &sample_cache,
+                            &[],
+                            cursor.is_sorted(),
+                        ),
                         &mut TimeViewState::default(),
                     );
                 });
@@ -1631,6 +1721,14 @@ mod render_tests {
                     &[],
                     &[],
                     CursorLookup::default(),
+                    &FitBounds::for_dataset::<Vec<Vec<Bucket>>>(
+                        &dataset,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        CursorLookup::default().is_sorted(),
+                    ),
                     &mut TimeViewState::default(),
                 );
             });
@@ -1702,6 +1800,14 @@ mod render_tests {
                     &sample_cache,
                     &[],
                     CursorLookup::for_time(&dataset.time),
+                    &FitBounds::for_dataset(
+                        &dataset,
+                        &pyramids,
+                        &ticks,
+                        &sample_cache,
+                        &[],
+                        CursorLookup::for_time(&dataset.time).is_sorted(),
+                    ),
                     &mut TimeViewState::default(),
                 );
             });
@@ -1769,6 +1875,14 @@ mod render_tests {
                     &sample_cache,
                     &[],
                     CursorLookup::for_time(&dataset.time),
+                    &FitBounds::for_dataset(
+                        &dataset,
+                        &pyramids,
+                        &ticks,
+                        &sample_cache,
+                        &[],
+                        CursorLookup::for_time(&dataset.time).is_sorted(),
+                    ),
                     &mut TimeViewState::default(),
                 );
             });
@@ -1799,6 +1913,10 @@ mod render_tests {
             self.calls.lock().unwrap().push(self.column);
             self.levels
                 .decimate(samples, timestamps, range, pixel_columns)
+        }
+
+        fn finite_range(&self, samples: &[f64]) -> Option<(f64, f64)> {
+            self.levels.finite_range(samples)
         }
     }
 
@@ -1882,6 +2000,14 @@ mod render_tests {
                         &sample_cache,
                         &[],
                         CursorLookup::for_time(&dataset.time),
+                        &FitBounds::for_dataset(
+                            &dataset,
+                            &pyramids,
+                            &ticks,
+                            &sample_cache,
+                            &[],
+                            CursorLookup::for_time(&dataset.time).is_sorted(),
+                        ),
                         state,
                     );
                 });
@@ -1959,6 +2085,14 @@ mod render_tests {
                         &sample_cache,
                         &[],
                         CursorLookup::for_time(&dataset.time),
+                        &FitBounds::for_dataset(
+                            &dataset,
+                            &pyramids,
+                            ticks,
+                            &sample_cache,
+                            &[],
+                            CursorLookup::for_time(&dataset.time).is_sorted(),
+                        ),
                         &mut state,
                     );
                 });
@@ -1984,14 +2118,27 @@ mod render_tests {
         pyramids: Vec<Option<Vec<Vec<Bucket>>>>,
         ticks: Vec<i128>,
         sample_cache: Vec<Option<Vec<f64>>>,
+        fit: FitBounds,
     }
 
     impl ViewFixture {
         fn new(dataset: Dataset) -> Self {
+            let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
+            let ticks = dataset.time.to_pyramid_ticks().into_owned();
+            let sample_cache = cache_column_samples(&dataset);
+            let fit = FitBounds::for_dataset(
+                &dataset,
+                &pyramids,
+                &ticks,
+                &sample_cache,
+                &[],
+                CursorLookup::for_time(&dataset.time).is_sorted(),
+            );
             Self {
-                pyramids: glyde_core::ingest::pyramids_for_dataset(&dataset),
-                ticks: dataset.time.to_pyramid_ticks().into_owned(),
-                sample_cache: cache_column_samples(&dataset),
+                pyramids,
+                ticks,
+                sample_cache,
+                fit,
                 dataset,
             }
         }
@@ -2015,6 +2162,7 @@ mod render_tests {
                     &fixture.sample_cache,
                     &[],
                     CursorLookup::for_time(&fixture.dataset.time),
+                    &fixture.fit,
                     state,
                     focus,
                 );
@@ -2616,6 +2764,7 @@ mod render_tests {
                         &fixture.sample_cache,
                         &[],
                         CursorLookup::for_time(&fixture.dataset.time),
+                        &fixture.fit,
                         &mut state,
                         focus,
                     );
@@ -2817,14 +2966,200 @@ mod render_tests {
         }
     }
 
+    /// What a "Fit to data" click framed before issue #144, by scanning
+    /// the whole axis and every shown channel: the reference [`FitBounds`]
+    /// must reproduce.
+    fn scanned_fit(fixture: &ViewFixture, shown: &[usize]) -> Option<PlotBounds> {
+        let x = x_axis_seconds(&fixture.dataset.time);
+        let columns = shown.iter().map(|&column| &fixture.dataset.columns[column]);
+        let bounds = data_bounds(&x, columns)?;
+        let sorted = CursorLookup::for_time(&fixture.dataset.time).is_sorted();
+        let (x_min, x_max) = fit_range(&fixture.ticks, sorted, &fixture.dataset.time)?;
+        Some(PlotBounds::from_min_max(
+            [x_min, bounds.y_min],
+            [x_max, bounds.y_max],
+        ))
+    }
+
+    // Issue #144: the bounds prepared with the data frame exactly what the
+    // full scan framed, for every choice of shown channels — NaN and ±∞
+    // left out, integers converted the same way, a constant channel padded,
+    // a non-numeric or all-NaN one ignored, on a time-ordered axis and on
+    // one that is not.
     #[test]
-    fn fit_to_data_covers_only_the_shown_channels() {
-        let columns = [
-            Series::new("small", SeriesValues::F64(vec![1.0, 2.0])),
-            Series::new("huge", SeriesValues::F64(vec![1000.0, 2000.0])),
+    fn fit_bounds_frame_exactly_what_a_full_scan_frames() {
+        let n = 30_011usize;
+        let mut wave: Vec<f64> = (0..n).map(|i| (i as f64 * 0.013).sin() * 7.5).collect();
+        wave[17] = f64::INFINITY;
+        wave[n / 2] = f64::NEG_INFINITY;
+        wave[n / 3] = -12.25;
+        for value in &mut wave[100..900] {
+            *value = f64::NAN;
+        }
+        let columns = vec![
+            Series::new("wave", SeriesValues::F64(wave)),
+            Series::new(
+                "counts",
+                SeriesValues::I64((0..n as i64).map(|i| (i * 7919) % 10_007 - 5_000).collect()),
+            ),
+            Series::new(
+                "big",
+                SeriesValues::U64((0..n as u64).map(|i| (1 << 60) + i * 1_000_003).collect()),
+            ),
+            Series::new("flat", SeriesValues::F64(vec![3.0; n])),
+            Series::new("missing", SeriesValues::F64(vec![f64::NAN; n])),
+            Series::new(
+                "label",
+                SeriesValues::String((0..n).map(|i| format!("s{}", i % 3)).collect()),
+            ),
         ];
-        let bounds = data_bounds(&[0.0, 1.0], [&columns[0]]).expect("bounds");
-        assert_eq!((bounds.y_min, bounds.y_max), (1.0, 2.0));
+        let axes = [
+            (0..n as i128).collect::<Vec<_>>(),
+            // Restarts at zero, as a per-run time column does (issue #143).
+            (0..n as i128).map(|i| i % 1_000).collect(),
+        ];
+        for ticks in axes {
+            let mut dataset = sample_dataset();
+            dataset.time = TimeAxis::Absolute {
+                timestamps: ticks
+                    .iter()
+                    .map(|&t| Timestamp::new(t, TimeUnit::Milliseconds))
+                    .collect::<Vec<_>>()
+                    .into(),
+                format: TimestampFormat::EpochMillis,
+            };
+            dataset.columns = columns.clone();
+            let fixture = ViewFixture::new(dataset);
+            for shown in (0u32..1 << columns.len()).map(|mask| {
+                (0..columns.len())
+                    .filter(|column| mask & (1 << column) != 0)
+                    .collect::<Vec<_>>()
+            }) {
+                assert_eq!(
+                    fixture.fit.frame(shown.iter().copied()),
+                    scanned_fit(&fixture, &shown),
+                    "channels {shown:?} shown"
+                );
+            }
+        }
+    }
+
+    /// One frame of `fixture` on an 800×600-point screen with `events`;
+    /// returns its shapes and the plot's id.
+    fn frame_with_events(
+        ctx: &egui::Context,
+        fixture: &ViewFixture,
+        state: &mut TimeViewState,
+        events: Vec<egui::Event>,
+    ) -> (Vec<egui::epaint::ClippedShape>, egui::Id) {
+        let mut plot_id = None;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                plot_id = Some(ui.make_persistent_id(egui::Id::new("time_domain_view")));
+                show(
+                    ui,
+                    &fixture.dataset,
+                    &fixture.pyramids,
+                    &fixture.ticks,
+                    &fixture.sample_cache,
+                    &[],
+                    CursorLookup::for_time(&fixture.dataset.time),
+                    &fixture.fit,
+                    state,
+                );
+            });
+        });
+        (output.shapes, plot_id.expect("a frame ran"))
+    }
+
+    /// The centre of the text `label` in `shapes`, where a click lands on
+    /// the widget that shows it.
+    fn text_centre(shapes: &[egui::epaint::ClippedShape], label: &str) -> egui::Pos2 {
+        fn find(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, label)),
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                _ => None,
+            }
+        }
+        shapes
+            .iter()
+            .find_map(|clipped| find(&clipped.shape, label))
+            .unwrap_or_else(|| panic!("no {label:?} on screen"))
+    }
+
+    // Issue #144, end to end: a click on "Fit to data" frames the whole axis
+    // by the shown channels' finite values only, whatever the view was.
+    #[test]
+    fn clicking_fit_to_data_frames_the_shown_channels() {
+        let n = 5_000usize;
+        let mut small: Vec<f64> = (0..n).map(|i| (i as f64 * 0.01).sin()).collect();
+        small[100] = f64::INFINITY;
+        small[200] = f64::NAN;
+        small[300] = -3.0;
+        let max = small
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let huge: Vec<f64> = (0..n).map(|i| 1_000.0 + i as f64).collect();
+        let mut dataset = sample_dataset();
+        dataset.time = TimeAxis::Absolute {
+            timestamps: (0..n as i128)
+                .map(|i| Timestamp::new(i, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        dataset.columns = vec![
+            Series::new("small", SeriesValues::F64(small)),
+            Series::new("huge", SeriesValues::F64(huge)),
+        ];
+        let fixture = ViewFixture::new(dataset);
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        let (shapes, id) = frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        state.channels.toggle(1);
+        // Somewhere else entirely, as a zoom would leave it.
+        let mut memory = egui_plot::PlotMemory::load(&ctx, id).expect("plot memory");
+        memory.auto_bounds = egui::Vec2b::FALSE;
+        memory.set_bounds(PlotBounds::from_min_max([10.0, 50.0], [20.0, 60.0]));
+        memory.store(&ctx, id);
+        frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+
+        let button = text_centre(&shapes, "Fit to data");
+        let press = |pressed| egui::Event::PointerButton {
+            pos: button,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        frame_with_events(
+            &ctx,
+            &fixture,
+            &mut state,
+            vec![egui::Event::PointerMoved(button), press(true)],
+        );
+        frame_with_events(&ctx, &fixture, &mut state, vec![press(false)]);
+        frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+
+        let memory = egui_plot::PlotMemory::load(&ctx, id).expect("plot memory");
+        let bounds = memory.bounds();
+        assert_eq!(
+            (bounds.min(), bounds.max()),
+            ([0.0, -3.0], [(n - 1) as f64, max]),
+            "the whole axis, by `small`'s finite values only"
+        );
     }
 
     // docs/ROADMAP.md M3 "Zoom all the way in → converges to individual
@@ -2875,6 +3210,14 @@ mod render_tests {
                     &sample_cache,
                     &[],
                     CursorLookup::for_time(&dataset.time),
+                    &FitBounds::for_dataset(
+                        &dataset,
+                        &pyramids,
+                        &ticks,
+                        &sample_cache,
+                        &[],
+                        CursorLookup::for_time(&dataset.time).is_sorted(),
+                    ),
                     &mut TimeViewState::default(),
                 );
             });

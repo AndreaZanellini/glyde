@@ -491,6 +491,7 @@ impl eframe::App for GlydeApp {
                                 // `None` entry would.
                                 &[],
                                 partial.prepared.cursor,
+                                &partial.prepared.fit,
                                 &mut self.time_view,
                             )
                         });
@@ -548,6 +549,7 @@ impl eframe::App for GlydeApp {
                             &prepared.sample_cache,
                             level0_caches,
                             prepared.cursor,
+                            &prepared.fit,
                             &mut self.time_view,
                             self.time_focus.take(),
                         )
@@ -728,6 +730,7 @@ mod tests {
     fn sample_prepared() -> Box<PreparedView> {
         Box::new(PreparedView::new(
             &sample_dataset(),
+            &sample_pyramids(),
             &sample_level0_caches(),
             usize::MAX,
         ))
@@ -827,6 +830,7 @@ mod tests {
                     &prepared.sample_cache,
                     &[],
                     prepared.cursor,
+                    &prepared.fit,
                     &mut app.time_view,
                 );
             });
@@ -1002,12 +1006,18 @@ mod tests {
         )
         .expect("spilled fixture must open");
         assert!(spilled.is_spilled());
-        let pyramids = glyde_core::ingest::disk_pyramids_for_dataset(&spilled, dir.path())
-            .into_iter()
-            .map(|pyramid| pyramid.map(glyde_core::index::disk_pyramid::ColumnPyramid::Disk))
-            .collect();
+        let pyramids: ColumnPyramids =
+            glyde_core::ingest::disk_pyramids_for_dataset(&spilled, dir.path())
+                .into_iter()
+                .map(|pyramid| pyramid.map(glyde_core::index::disk_pyramid::ColumnPyramid::Disk))
+                .collect();
         let level0_caches = vec![None; spilled.columns.len()];
-        let prepared = Box::new(PreparedView::new(&spilled, &level0_caches, usize::MAX));
+        let prepared = Box::new(PreparedView::new(
+            &spilled,
+            &pyramids,
+            &level0_caches,
+            usize::MAX,
+        ));
 
         let mut app = GlydeApp::new();
         app.generation = 1;

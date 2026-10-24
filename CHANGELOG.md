@@ -12,6 +12,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **"Fit to data" no longer freezes the app on a large file (issue #144).**
+  On a 3.2 GB file stored on disk, the click froze the whole window for up
+  to 6 seconds, because it went through every value of every shown channel
+  at the moment you clicked. Glyde now works out each channel's range once,
+  in the background while the file loads, mostly from the zoom index it
+  builds anyway, so the click responds immediately. The result is exactly
+  the same as before: the whole time span, and the full range of the shown
+  channels' values, with missing values (NaN) and infinities left out. The
+  first frame of a file whose timestamps are not in time order also no
+  longer works out the time span on the spot.
+  - Try it: open a large file, zoom far in, click "Fit to data": the whole
+    file is back at once.
 - **The "first plot" speed benchmark no longer crashes when it runs more
   than once on the same machine (issue #154).** Nothing changes in the app.
   The benchmark opens the same 1 GB file again and again. Since reopening
