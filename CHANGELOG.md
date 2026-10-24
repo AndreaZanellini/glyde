@@ -12,6 +12,23 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **The plot stays smooth under the mouse when the time column is not in
+  time order (issue #143).** Some files have a time column that restarts
+  at zero, for example once per test run, and Glyde keeps their rows in
+  file order. On such a file, every frame with the mouse over the plot
+  searched the whole time column for the sample under the pointer: about
+  85 ms per frame at 37 million rows, so moving the mouse felt sluggish
+  (about 12 frames per second). Glyde now builds a small summary of the
+  time column while the file loads (about 9 MB for 37 million rows), and
+  the search skips every stretch of rows that cannot hold a closer sample.
+  The readout shows exactly the same sample as before, ties included.
+  - Try it: open a file whose time column restarts (or pick such a column
+    with the time-column picker) and move the mouse over the plot.
+  - **Assumption to veto:** the issue offered two ways to do this, a
+    sorted copy of the time column (150 to 300 MB at 37 million rows) or a
+    search limited to what is on screen. This uses neither: the small
+    summary above, which finds exactly the sample the old search found and
+    costs about 9 MB.
 - **"Fit to data" no longer freezes the app on a large file (issue #144).**
   On a 3.2 GB file stored on disk, the click froze the whole window for up
   to 6 seconds, because it went through every value of every shown channel

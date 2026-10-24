@@ -1263,7 +1263,7 @@ mod render_tests {
                         &ticks,
                         &samples,
                         &[],
-                        super::super::time::CursorLookup::for_time(&dataset.time),
+                        &super::super::time::CursorLookup::for_time(&dataset.time),
                         &super::super::time::FitBounds::for_dataset(
                             dataset,
                             &pyramids,

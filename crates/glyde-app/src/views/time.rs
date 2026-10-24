@@ -97,7 +97,7 @@ pub fn show<P: Pyramid + Sync>(
     ticks: &[i128],
     sample_cache: &[Option<Vec<f64>>],
     level0_caches: &[Option<Arc<Level0Cache>>],
-    cursor: CursorLookup,
+    cursor: &CursorLookup,
     fit_bounds: &FitBounds,
     state: &mut TimeViewState,
 ) {
@@ -356,7 +356,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     ticks: &[i128],
     sample_cache: &[Option<Vec<f64>>],
     level0_caches: &[Option<Arc<Level0Cache>>],
-    cursor: CursorLookup,
+    cursor: &CursorLookup,
     fit_bounds: &FitBounds,
     state: &mut TimeViewState,
     focus: Option<(f64, f64)>,
@@ -1422,15 +1422,22 @@ fn x_at(time: &TimeAxis, index: usize) -> f64 {
 /// The readout used to materialize the whole axis as `f64` and scan it on
 /// every hovered frame — tens of milliseconds at ten million rows, on the
 /// UI thread, for as long as the mouse rests on the plot. A time-ordered
-/// axis (the overwhelmingly common case) is now answered by binary search;
-/// a non-monotonic one (SPEC §2.1 preserves source order) keeps the exact
-/// linear scan, just without the allocation. Both return exactly what
+/// axis (the overwhelmingly common case) is now answered by binary search.
+/// A non-monotonic one (SPEC §2.1 preserves source order) is answered from
+/// its [`XRanges`], which skip every run of samples that cannot hold a
+/// closer one (issue #143: the exact linear scan it used before cost 85 ms
+/// a frame at 37 million rows). All of them return exactly what
 /// [`nearest_index`] would over [`x_axis_seconds`], ties included —
-/// `tests::cursor_lookup_matches_the_linear_scan` locks that.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// `tests::cursor_lookup_matches_the_linear_scan` and
+/// `tests::cursor_lookup_of_a_long_unordered_axis_matches_the_linear_scan`
+/// lock that.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CursorLookup {
     /// Every x-coordinate is `<=` the next (so, in particular, none is NaN).
     sorted: bool,
+    /// The x span of every run of samples, for an axis that is not sorted;
+    /// `None` for a sorted or empty one.
+    unsorted: Option<Arc<XRanges>>,
 }
 
 impl CursorLookup {
@@ -1444,7 +1451,9 @@ impl CursorLookup {
     pub fn for_time(time: &TimeAxis) -> Self {
         let len = time.len();
         let sorted = (1..len).all(|index| x_at(time, index - 1) <= x_at(time, index));
-        Self { sorted }
+        let unsorted =
+            (!sorted && len > 0).then(|| Arc::new(XRanges::build(len, |index| x_at(time, index))));
+        Self { sorted, unsorted }
     }
 
     fn nearest(&self, time: &TimeAxis, target: f64) -> Option<usize> {
@@ -1452,10 +1461,135 @@ impl CursorLookup {
         if len == 0 {
             return None;
         }
-        if !self.sorted || !target.is_finite() {
-            return linear_nearest(len, |index| x_at(time, index), target);
+        let x = |index| x_at(time, index);
+        if !target.is_finite() {
+            return linear_nearest(len, x, target);
         }
-        Some(sorted_nearest(len, |index| x_at(time, index), target))
+        if self.sorted {
+            return Some(sorted_nearest(len, x, target));
+        }
+        match &self.unsorted {
+            Some(ranges) if ranges.len == len => Some(ranges.nearest(x, target)),
+            _ => linear_nearest(len, x, target),
+        }
+    }
+}
+
+/// The smallest and largest x of every run of [`Self::BLOCK`] consecutive
+/// samples of an axis, and of every run of [`Self::FANOUT`] runs above them,
+/// up to a top level of at most [`Self::FANOUT`] (issue #143). NaN x values
+/// are left out; a run with none but NaN has the empty span `(+∞, −∞)`.
+///
+/// It is what lets the cursor find the sample nearest the pointer on an
+/// axis that is not time-ordered without visiting every sample: a run
+/// whose span lies farther from the pointer than the best sample found so
+/// far holds no closer one, so it is skipped whole. On an axis that
+/// restarts now and then (a time column per operating point) only the
+/// runs near the pointer of each restart are visited. Its cost is 16 bytes
+/// per 64 samples: about 9 MB at 37 million rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct XRanges {
+    len: usize,
+    /// `levels[0][b]` spans samples `b * BLOCK..(b + 1) * BLOCK`;
+    /// `levels[k + 1][b]` spans nodes `b * FANOUT..(b + 1) * FANOUT` of
+    /// `levels[k]`.
+    levels: Vec<Vec<(f64, f64)>>,
+}
+
+impl XRanges {
+    /// Samples per run at the lowest level.
+    const BLOCK: usize = 64;
+    /// Runs per run at every level above.
+    const FANOUT: usize = 64;
+
+    /// The spans of `x(0..len)` (`len > 0`).
+    fn build(len: usize, x: impl Fn(usize) -> f64) -> Self {
+        let widen = |(lo, hi): (f64, f64), (min, max): (f64, f64)| (lo.min(min), hi.max(max));
+        let empty = (f64::INFINITY, f64::NEG_INFINITY);
+        let lowest = (0..len.div_ceil(Self::BLOCK))
+            .map(|block| {
+                let start = block * Self::BLOCK;
+                (start..(start + Self::BLOCK).min(len))
+                    .map(&x)
+                    .filter(|value| !value.is_nan())
+                    .fold(empty, |span, value| widen(span, (value, value)))
+            })
+            .collect();
+        let mut levels: Vec<Vec<(f64, f64)>> = vec![lowest];
+        while levels.last().expect("never empty").len() > Self::FANOUT {
+            let above = levels
+                .last()
+                .expect("never empty")
+                .chunks(Self::FANOUT)
+                .map(|spans| spans.iter().copied().fold(empty, widen))
+                .collect();
+            levels.push(above);
+        }
+        Self { len, levels }
+    }
+
+    /// [`nearest_index`]'s answer over `x(0..self.len)` for a finite
+    /// `target`. The scan keeps the first sample unless a later one is
+    /// strictly closer, and never moves to (or off) a NaN distance, so it
+    /// answers with the first index at the smallest distance — or with
+    /// index 0 outright when sample 0's x is NaN. The runs are visited in
+    /// index order and a sample only replaces the best one when strictly
+    /// closer, so ties keep the earlier index here too, and a run is
+    /// skipped when even its nearest possible x is no closer than the best
+    /// distance so far. Floating-point subtraction is monotonic, so that
+    /// bound is never larger than the distance of any sample in the run.
+    fn nearest(&self, x: impl Fn(usize) -> f64, target: f64) -> usize {
+        let first = x(0);
+        if first.is_nan() {
+            return 0;
+        }
+        let mut best = (0, (first - target).abs());
+        let top = self.levels.len() - 1;
+        for node in 0..self.levels[top].len() {
+            self.visit(top, node, &x, target, &mut best);
+        }
+        best.0
+    }
+
+    fn visit(
+        &self,
+        level: usize,
+        node: usize,
+        x: &impl Fn(usize) -> f64,
+        target: f64,
+        best: &mut (usize, f64),
+    ) {
+        let (min, max) = self.levels[level][node];
+        if min > max {
+            return;
+        }
+        let bound = if target < min {
+            min - target
+        } else if target > max {
+            target - max
+        } else {
+            0.0
+        };
+        if bound >= best.1 {
+            return;
+        }
+        match level.checked_sub(1) {
+            None => {
+                let start = node * Self::BLOCK;
+                for index in start..(start + Self::BLOCK).min(self.len) {
+                    let distance = (x(index) - target).abs();
+                    if distance < best.1 {
+                        *best = (index, distance);
+                    }
+                }
+            }
+            Some(below) => {
+                let start = node * Self::FANOUT;
+                for child in start..(start + Self::FANOUT).min(self.levels[below].len()) {
+                    self.visit(below, child, x, target, best);
+                }
+            }
+        }
     }
 }
 
@@ -1614,7 +1748,7 @@ mod render_tests {
                     &ticks,
                     &sample_cache,
                     &[],
-                    CursorLookup::for_time(&dataset.time),
+                    &CursorLookup::for_time(&dataset.time),
                     &FitBounds::for_dataset(
                         &dataset,
                         &pyramids,
@@ -1667,7 +1801,7 @@ mod render_tests {
                         &ticks,
                         &sample_cache,
                         &[],
-                        cursor,
+                        &cursor,
                         &FitBounds::for_dataset(
                             &dataset,
                             &pyramids,
@@ -1720,7 +1854,7 @@ mod render_tests {
                     &[],
                     &[],
                     &[],
-                    CursorLookup::default(),
+                    &CursorLookup::default(),
                     &FitBounds::for_dataset::<Vec<Vec<Bucket>>>(
                         &dataset,
                         &[],
@@ -1799,7 +1933,7 @@ mod render_tests {
                     &ticks,
                     &sample_cache,
                     &[],
-                    CursorLookup::for_time(&dataset.time),
+                    &CursorLookup::for_time(&dataset.time),
                     &FitBounds::for_dataset(
                         &dataset,
                         &pyramids,
@@ -1874,7 +2008,7 @@ mod render_tests {
                     &ticks,
                     &sample_cache,
                     &[],
-                    CursorLookup::for_time(&dataset.time),
+                    &CursorLookup::for_time(&dataset.time),
                     &FitBounds::for_dataset(
                         &dataset,
                         &pyramids,
@@ -1999,7 +2133,7 @@ mod render_tests {
                         &ticks,
                         &sample_cache,
                         &[],
-                        CursorLookup::for_time(&dataset.time),
+                        &CursorLookup::for_time(&dataset.time),
                         &FitBounds::for_dataset(
                             &dataset,
                             &pyramids,
@@ -2084,7 +2218,7 @@ mod render_tests {
                         ticks,
                         &sample_cache,
                         &[],
-                        CursorLookup::for_time(&dataset.time),
+                        &CursorLookup::for_time(&dataset.time),
                         &FitBounds::for_dataset(
                             &dataset,
                             &pyramids,
@@ -2161,7 +2295,7 @@ mod render_tests {
                     &fixture.ticks,
                     &fixture.sample_cache,
                     &[],
-                    CursorLookup::for_time(&fixture.dataset.time),
+                    &CursorLookup::for_time(&fixture.dataset.time),
                     &fixture.fit,
                     state,
                     focus,
@@ -2763,7 +2897,7 @@ mod render_tests {
                         &fixture.ticks,
                         &fixture.sample_cache,
                         &[],
-                        CursorLookup::for_time(&fixture.dataset.time),
+                        &CursorLookup::for_time(&fixture.dataset.time),
                         &fixture.fit,
                         &mut state,
                         focus,
@@ -3071,7 +3205,7 @@ mod render_tests {
                     &fixture.ticks,
                     &fixture.sample_cache,
                     &[],
-                    CursorLookup::for_time(&fixture.dataset.time),
+                    &CursorLookup::for_time(&fixture.dataset.time),
                     &fixture.fit,
                     state,
                 );
@@ -3209,7 +3343,7 @@ mod render_tests {
                     &ticks,
                     &sample_cache,
                     &[],
-                    CursorLookup::for_time(&dataset.time),
+                    &CursorLookup::for_time(&dataset.time),
                     &FitBounds::for_dataset(
                         &dataset,
                         &pyramids,
@@ -3339,6 +3473,90 @@ mod tests {
                 prop_assert_eq!(lookup.nearest(&time, exact), nearest_index(&x, exact));
             }
         });
+    }
+
+    // Issue #143: an axis that is not time-ordered is answered from its
+    // `XRanges`, not by a scan, and must still give exactly the scan's
+    // answer, ties included — on axes long enough for every level of runs:
+    // one that restarts at zero, as a per-run time column does; one that
+    // runs backwards; one in random order; one whose large epoch values
+    // round to equal x; and progressive ones with NaN, first or not.
+    #[test]
+    fn cursor_lookup_of_a_long_unordered_axis_matches_the_linear_scan() {
+        let mut state = 0x143u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let absolute = |ticks: Vec<i128>, unit: TimeUnit| TimeAxis::Absolute {
+            timestamps: ticks
+                .into_iter()
+                .map(|t| Timestamp::new(t, unit))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::Iso8601Naive,
+        };
+        let n = 300_007usize;
+        let mut shuffled: Vec<i128> = (0..n as i128).collect();
+        for i in (1..n).rev() {
+            shuffled.swap(i, next() as usize % (i + 1));
+        }
+        let mut with_nan: Vec<f64> = (0..n).map(|i| (i % 5_000) as f64 * 0.25).collect();
+        for i in (0..n).step_by(997) {
+            with_nan[i + 3] = f64::NAN;
+        }
+        let mut nan_first = with_nan.clone();
+        nan_first[0] = f64::NAN;
+        let axes = [
+            absolute(
+                (0..n as i128).map(|i| i % (n as i128 / 73)).collect(),
+                TimeUnit::Milliseconds,
+            ),
+            absolute((0..n as i128).rev().collect(), TimeUnit::Seconds),
+            absolute(shuffled, TimeUnit::Seconds),
+            absolute(
+                (0..n as i128)
+                    .map(|i| 1_700_000_000_000_000_000 + (i * 7_919) % 100_003)
+                    .collect(),
+                TimeUnit::Nanoseconds,
+            ),
+            TimeAxis::Progressive {
+                values: with_nan.into(),
+            },
+            TimeAxis::Progressive {
+                values: nan_first.into(),
+            },
+        ];
+        for time in &axes {
+            let x = x_axis_seconds(time);
+            let lookup = CursorLookup::for_time(time);
+            assert!(!lookup.sorted);
+            let ranges = lookup
+                .unsorted
+                .as_ref()
+                .expect("an unsorted axis gets its ranges");
+            assert!(ranges.levels.len() >= 3, "every level is exercised");
+            let finite = x.iter().copied().filter(|v| v.is_finite());
+            let low = finite.clone().fold(f64::INFINITY, f64::min);
+            let high = finite.fold(f64::NEG_INFINITY, f64::max);
+            for probe in 0..60 {
+                let target = match probe % 3 {
+                    0 => low - 10.0 + (high - low + 20.0) * (next() % 10_000) as f64 / 10_000.0,
+                    1 => x[next() as usize % n],
+                    _ => x[next() as usize % n] + 0.4,
+                };
+                if !target.is_finite() {
+                    continue;
+                }
+                assert_eq!(
+                    lookup.nearest(time, target),
+                    nearest_index(&x, target),
+                    "target {target}"
+                );
+            }
+        }
     }
 
     #[test]

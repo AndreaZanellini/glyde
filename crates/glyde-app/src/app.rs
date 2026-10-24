@@ -490,7 +490,7 @@ impl eframe::App for GlydeApp {
                                 // dataset like it always has, same as a
                                 // `None` entry would.
                                 &[],
-                                partial.prepared.cursor,
+                                &partial.prepared.cursor,
                                 &partial.prepared.fit,
                                 &mut self.time_view,
                             )
@@ -548,7 +548,7 @@ impl eframe::App for GlydeApp {
                             &prepared.ticks,
                             &prepared.sample_cache,
                             level0_caches,
-                            prepared.cursor,
+                            &prepared.cursor,
                             &prepared.fit,
                             &mut self.time_view,
                             self.time_focus.take(),
@@ -829,7 +829,7 @@ mod tests {
                     &prepared.ticks,
                     &prepared.sample_cache,
                     &[],
-                    prepared.cursor,
+                    &prepared.cursor,
                     &prepared.fit,
                     &mut app.time_view,
                 );
