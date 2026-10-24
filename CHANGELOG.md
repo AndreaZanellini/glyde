@@ -22,6 +22,8 @@ Versioning: [Semantic Versioning](https://semver.org/).
   pass that builds the index, and read from there. What you see is
   unchanged. Such a file uses up to 8 bytes per row per whole-number column
   more disk while it is open, and that much less memory.
+  - Limitation: when there is not enough free disk to build the zoom index
+    at all (Glyde checks first), the copy is made in memory as before.
 - **Opening a file spends less time checking its time column (issue
   #163).** After reading a file, Glyde checks its time column for gaps,
   regular sampling and order, in a step that cannot run in parallel. It
