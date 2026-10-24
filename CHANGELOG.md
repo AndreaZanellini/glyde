@@ -12,6 +12,30 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **The first view of a file too large for memory appears sooner (issue
+  #145).** Such a file is kept on disk while you work. To draw its whole
+  length, Glyde reads a little of every channel at every screen column,
+  and it used to read two separate places on disk for each. When the
+  computer no longer holds those places in memory (memory is short, so it
+  has already dropped the files Glyde just wrote), every one is a slow disk
+  read: on the 3.2 GB file of the issue, opened on a 16 GB machine busy with
+  other apps, the plot said "Updating…" for about 3 seconds.
+  It now reads one place fewer for each, and the picture is exactly the
+  same. Measured on 8 channels of 8 million rows: from 1.4 s to about half
+  a second when the disk has to be read, and from 17 ms to about 11 ms when
+  the file is still in memory. Files that fit in memory are not affected.
+  - Not measured on the issue's file itself: on a file shaped like it
+    (37 million rows), it reads about 30% fewer places from disk, so a
+    projection, not a measurement, puts the issue's 3 seconds at roughly
+    2. An exact picture needs at least one read per screen column of every
+    channel. Two ways to go further are written up as issues: #174, done
+    by a later change in this same batch, and #175, which needs your
+    decision.
+  - **Trade-off to veto:** once such a file is in memory, panning it is
+    2 to 5% slower (a few hundredths of a millisecond per frame), because
+    each screen column now reads a few more values itself.
+  - Try it: with other apps using most of the memory, open a file of
+    several GB and time how long "Updating…" stays on the first full view.
 - **A stretch that is almost flat can no longer vanish from the plot (issue
   #146).** When a screen column's values differ by less than the screen can
   show (for example a channel decaying towards zero, like `torque` in
