@@ -177,8 +177,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
   Before writing anything, Glyde checks there is enough free disk, and
   refuses with the numbers if there is not. Memory stays small: about
   40 MB at its peak for a 1 GB file. Opening is slower than in memory:
-  about 5 seconds for 1 GB on the reference MacBook Air, mostly spent
-  writing to disk. Making it faster is issue #181.
+  about 5 seconds for 1 GB on the reference MacBook Air (its disk nearly
+  full), mostly spent writing to disk.
+  - **Assumption to veto: this is outside SPEC §5's budget** for building
+    a Parquet file's index (10 s per 10 GB, so about 1 s per GB). The
+    choice made here is that opening such a file slowly is better than
+    refusing it, which SPEC §5.1 also forbids ("offers the affordable
+    alternative"). Making it faster is issue #181; if you would rather keep
+    refusing these files until it is within budget, do not merge this.
   - Try it: open a Parquet file larger than a quarter of your computer's
     memory.
 - **Parquet time columns stored as plain numbers or text now become a real
