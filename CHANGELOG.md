@@ -55,6 +55,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
   The readout shows exactly the same sample as before, ties included.
   - Try it: open a file whose time column restarts (or pick such a column
     with the time-column picker) and move the mouse over the plot.
+  - **Assumption to veto:** the issue offered two ways to do this, a
+    sorted copy of the time column (150 to 300 MB at 37 million rows) or a
+    search limited to what is on screen. This uses neither: the small
+    summary above, which finds exactly the sample the old search found and
+    costs about 9 MB.
 - **"Fit to data" no longer freezes the app on a large file (issue #144).**
   On a 3.2 GB file stored on disk, the click froze the whole window for up
   to 6 seconds, because it went through every value of every shown channel
