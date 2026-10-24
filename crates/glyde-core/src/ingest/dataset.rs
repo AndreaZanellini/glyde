@@ -1808,10 +1808,62 @@ enum TimeAxisSpillWriter {
 /// [`TimeAxisSpillWriter::Absolute`]'s payload: SPEC §2.1's ticks, per-row
 /// [`TimeUnit`] and per-row UTC offset, each in its own spill file.
 struct AbsoluteAxisSpillWriter {
+    timestamps: TimestampsSpillWriter,
+    format: TimestampFormat,
+}
+
+/// A spilled absolute axis's [`Timestamps`], written row by row: SPEC §2.1's
+/// ticks, per-row [`TimeUnit`] and per-row UTC offset, each in its own spill
+/// file (`stem`, `{stem}unit`, `{stem}offset`). The CSV and the Parquet
+/// spilled opens both write through it (issue #155).
+pub(super) struct TimestampsSpillWriter {
     ticks: SpillVecWriter<i128>,
     units: SpillVecWriter<u8>,
     offsets: SpillVecWriter<i64>,
-    format: TimestampFormat,
+}
+
+impl TimestampsSpillWriter {
+    pub(super) fn create(set: &SpillSet, stem: &str) -> Result<Self> {
+        Ok(Self {
+            ticks: SpillVecWriter::create(set, stem)?,
+            units: SpillVecWriter::create(set, &format!("{stem}unit"))?,
+            offsets: SpillVecWriter::create(set, &format!("{stem}offset"))?,
+        })
+    }
+
+    pub(super) fn push(&mut self, timestamp: &Timestamp) -> Result<()> {
+        self.ticks.push(timestamp.ticks)?;
+        self.units.push(time_unit_code(timestamp.unit))?;
+        self.offsets.push(
+            timestamp
+                .offset_seconds
+                .map_or(NO_UTC_OFFSET, |offset| offset as i64),
+        )
+    }
+
+    pub(super) fn finish(self) -> Result<Timestamps> {
+        Ok(Timestamps::Spilled {
+            ticks: self.ticks.finish()?,
+            units: self.units.finish()?,
+            offsets: self.offsets.finish()?,
+        })
+    }
+}
+
+/// SPEC §2.1's generated row index of `rows` rows, spilled into `set` under
+/// `stem`: the spilled open's counterpart of [`row_ordinal_axis`].
+pub(super) fn spilled_row_ordinal_axis(
+    set: &SpillSet,
+    stem: &str,
+    rows: usize,
+) -> Result<TimeAxis> {
+    let mut values = SpillVecWriter::create(set, stem)?;
+    for row in 0..rows {
+        values.push(row as f64)?;
+    }
+    Ok(TimeAxis::Progressive {
+        values: ProgressiveValues::Spilled(values.finish()?),
+    })
 }
 
 impl TimeAxisSpillWriter {
@@ -1823,9 +1875,7 @@ impl TimeAxisSpillWriter {
         match format {
             Some(format) => Ok(TimeAxisSpillWriter::Absolute(Box::new(
                 AbsoluteAxisSpillWriter {
-                    ticks: SpillVecWriter::create(set, "ts")?,
-                    units: SpillVecWriter::create(set, "tsunit")?,
-                    offsets: SpillVecWriter::create(set, "tsoffset")?,
+                    timestamps: TimestampsSpillWriter::create(set, "ts")?,
                     format,
                 },
             ))),
@@ -1846,13 +1896,7 @@ impl TimeAxisSpillWriter {
         match self {
             TimeAxisSpillWriter::Absolute(writer) => {
                 let timestamp = parse_timestamp(field, writer.format)?;
-                writer.ticks.push(timestamp.ticks)?;
-                writer.units.push(time_unit_code(timestamp.unit))?;
-                writer.offsets.push(
-                    timestamp
-                        .offset_seconds
-                        .map_or(NO_UTC_OFFSET, |offset| offset as i64),
-                )?;
+                writer.timestamps.push(&timestamp)?;
                 Ok(TimeValue::Absolute(timestamp))
             }
             TimeAxisSpillWriter::Progressive(values) => {
@@ -1875,11 +1919,7 @@ impl TimeAxisSpillWriter {
     fn finish(self) -> Result<TimeAxis> {
         match self {
             TimeAxisSpillWriter::Absolute(writer) => Ok(TimeAxis::Absolute {
-                timestamps: Timestamps::Spilled {
-                    ticks: writer.ticks.finish()?,
-                    units: writer.units.finish()?,
-                    offsets: writer.offsets.finish()?,
-                },
+                timestamps: writer.timestamps.finish()?,
                 format: writer.format,
             }),
             TimeAxisSpillWriter::Progressive(values)

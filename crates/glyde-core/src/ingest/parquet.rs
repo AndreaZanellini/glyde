@@ -51,10 +51,12 @@
 //! groups' exact min/max, from which `index::row_groups` builds the
 //! pyramid's upper levels where that is exact (issue #162). What
 //! the typed columns will cost is known exactly from the footer before a
-//! single page is decoded, so SPEC §5.1's affordability check runs first
-//! and a file that does not fit is refused with the numbers. There is no
-//! spilled path for Parquet yet, and no progress checkpoint: the plot
-//! appears when the read completes.
+//! single page is decoded, so SPEC §5.1's affordability check runs first.
+//! A file that does not fit is read into the on-disk spill cache instead
+//! (issue #155, [`spill`]), column by column as its batches arrive, after
+//! checking the free disk; with no cache directory it is refused with the
+//! numbers. There is no progress checkpoint: the plot appears when the read
+//! completes.
 //!
 //! **Partitioned directories** (issue #159). A directory holding `.parquet`
 //! files at any depth is one dataset: its files are read in path order and
@@ -99,6 +101,9 @@ use parquet::file::metadata::ParquetMetaData;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
+
+#[path = "parquet_spill.rs"]
+mod spill;
 
 /// Recognizes `.parquet` files and partitioned Parquet directories (SPEC
 /// §1.1).
@@ -160,6 +165,17 @@ fn invalid(path: &Path, reason: impl ToString) -> GlydeError {
 }
 
 fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, InferenceReport, Dataset)> {
+    open_checking_disk(path, request, crate::budget::available_disk_bytes)
+}
+
+/// [`open`] with the free-disk-space query a spilled open checks injected,
+/// so a test can stand in for a full disk (as `dataset::choose_storage_with_disk`
+/// does for CSV).
+fn open_checking_disk(
+    path: &Path,
+    request: OpenRequest<'_>,
+    available_disk_bytes: impl FnOnce(&Path) -> Option<u64>,
+) -> Result<(OpenSummary, InferenceReport, Dataset)> {
     log_ignored_overrides(request.overrides);
     let sources = source_files(path)?;
     let schema = sources[0].metadata.schema().clone();
@@ -232,15 +248,35 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
         })
         .fold(0, u64::saturating_add);
     if !request.budget.affords(estimated_bytes) {
-        warn!(
-            estimated_bytes,
-            cap_bytes = request.budget.cap_bytes(),
-            "refusing to open a Parquet file whose columns do not fit the RAM budget (SPEC §5.1)"
+        // SPEC §5.1's affordable alternative (issue #155): the on-disk spill
+        // cache, as for a CSV file too large for memory.
+        let Some(cache_dir) = request.cache_dir else {
+            warn!(
+                estimated_bytes,
+                cap_bytes = request.budget.cap_bytes(),
+                "refusing to open a Parquet file whose columns do not fit the RAM budget, with \
+                 no cache directory to spill to (SPEC §5.1)"
+            );
+            return Err(GlydeError::BudgetExceeded {
+                requested_bytes: estimated_bytes,
+                cap_bytes: request.budget.cap_bytes(),
+            });
+        };
+        return spill::open_spilled(
+            spill::Footers {
+                sources: &sources,
+                schema: &schema,
+                partition_keys,
+                columns,
+                file_columns,
+                loaded,
+                declared_rows,
+                estimated_bytes,
+            },
+            request,
+            cache_dir,
+            available_disk_bytes,
         );
-        return Err(GlydeError::BudgetExceeded {
-            requested_bytes: estimated_bytes,
-            cap_bytes: request.budget.cap_bytes(),
-        });
     }
     info!(
         estimated_bytes,
@@ -293,20 +329,40 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
     let unloaded_columns = columns
         .into_iter()
         .filter_map(|column| match column.state {
-            ColumnState::Unloaded(reason) => {
-                warn!(
-                    column = %column.name,
-                    reason = %reason,
-                    "Parquet column not loaded; listed in the inference bar"
-                );
-                Some(UnloadedColumn {
-                    name: column.name,
-                    reason,
-                })
-            }
+            ColumnState::Unloaded(reason) => Some(unloaded_column(column.name, reason)),
             _ => None,
         })
-        .collect::<Vec<_>>();
+        .collect();
+    finish_open(
+        &schema,
+        partition_keys,
+        row_count,
+        unloaded_columns,
+        dataset,
+        time_index,
+    )
+}
+
+/// A column not loaded, logged and listed for the inference bar.
+fn unloaded_column(name: String, reason: String) -> UnloadedColumn {
+    warn!(
+        column = %name,
+        reason = %reason,
+        "Parquet column not loaded; listed in the inference bar"
+    );
+    UnloadedColumn { name, reason }
+}
+
+/// The open's summary and report from what it read: shared by the
+/// in-memory and the spilled open (issue #155).
+fn finish_open(
+    schema: &Schema,
+    partition_keys: Vec<String>,
+    row_count: u64,
+    unloaded_columns: Vec<UnloadedColumn>,
+    dataset: Dataset,
+    time_index: TimeIndexInference,
+) -> Result<(OpenSummary, InferenceReport, Dataset)> {
     let facts = SourceFacts {
         column_names: schema
             .fields()
@@ -334,6 +390,25 @@ fn read_column(
     column: &mut SourceColumn,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
+    let name = column.name.clone();
+    read_column_batches(source, index, &name, cancelled, |array| {
+        column.append(array);
+        Ok(())
+    })
+}
+
+/// Hands every record batch of the file's column `index` (a root of its
+/// schema, named `name`) to `append`, in order and bounded in size,
+/// checking `cancelled` between them; then checks the rows read against
+/// the footer. The in-memory and the spilled open (issue #155) both read
+/// through it.
+fn read_column_batches(
+    source: &SourceFile,
+    index: usize,
+    name: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+    mut append: impl FnMut(&ArrayRef) -> Result<()>,
+) -> Result<()> {
     let file = File::open(&source.path).map_err(|error| GlydeError::Io {
         path: source.path.clone(),
         source: error,
@@ -345,20 +420,19 @@ fn read_column(
         .with_batch_size(BATCH_ROWS)
         .build()
         .map_err(|e| invalid(&source.path, e))?;
-    let rows_before = column.rows;
+    let mut read = 0u64;
     for batch in batches {
         super::dataset::ensure_not_cancelled(cancelled)?;
         let batch = batch.map_err(|e| invalid(&source.path, e))?;
-        column.append(batch.column(0));
+        read += batch.num_rows() as u64;
+        append(batch.column(0))?;
     }
-    let read = (column.rows - rows_before) as u64;
     if read != source.declared_rows() {
         return Err(invalid(
             &source.path,
             format!(
-                "its footer declares {} rows, but its column `{}` holds {read}",
-                source.declared_rows(),
-                column.name
+                "its footer declares {} rows, but its column `{name}` holds {read}",
+                source.declared_rows()
             ),
         ));
     }
@@ -970,18 +1044,16 @@ impl SourceColumn {
             numeric => Some(exact_f64_with_gaps(numeric, &validity).map(ColumnValues::F64)),
         };
         match promoted {
-            None => info!(
-                column = %self.name,
-                missing,
-                "Parquet nulls kept as gaps in the column's own dtype (SPEC §1.3)"
-            ),
+            None => log_gaps_kept(&self.name, missing),
             Some(Ok(values)) => {
-                info!(
-                    column = %self.name,
+                log_gaps_converted(
+                    &self.name,
                     missing,
-                    to = if matches!(values, ColumnValues::F64(_)) { "f64 with NaN gaps" } else { "text" },
-                    "Parquet column with nulls converted so its gaps can be shown (SPEC §1.3); \
-                     every present value is unchanged"
+                    if matches!(values, ColumnValues::F64(_)) {
+                        "f64 with NaN gaps"
+                    } else {
+                        "text"
+                    },
                 );
                 self.state = ColumnState::Loading(values);
             }
@@ -1117,27 +1189,9 @@ impl ColumnValues {
             ColumnValues::F64(values) => {
                 values.extend(array.as_primitive::<Float64Type>().values())
             }
-            ColumnValues::String(values) => match array.data_type() {
-                DataType::Dictionary(..) => append_dictionary_labels(values, array),
-                DataType::LargeUtf8 => values.extend(
-                    array
-                        .as_string::<i64>()
-                        .iter()
-                        .map(|value| value.unwrap_or_default().to_string()),
-                ),
-                DataType::Utf8View => values.extend(
-                    array
-                        .as_string_view()
-                        .iter()
-                        .map(|value| value.unwrap_or_default().to_string()),
-                ),
-                _ => values.extend(
-                    array
-                        .as_string::<i32>()
-                        .iter()
-                        .map(|value| value.unwrap_or_default().to_string()),
-                ),
-            },
+            ColumnValues::String(values) => {
+                for_each_text(array, |text| values.push(text.to_string()))
+            }
             ColumnValues::Timestamp { ticks, .. } => match array.data_type() {
                 DataType::Timestamp(ArrowTimeUnit::Second, _) => {
                     ticks.extend(array.as_primitive::<TimestampSecondType>().values())
@@ -1174,6 +1228,32 @@ impl ColumnValues {
     }
 }
 
+/// Logs SPEC §1.3's gaps a column's nulls became in its own dtype.
+fn log_gaps_kept(column: &str, missing: usize) {
+    info!(
+        column = %column,
+        missing,
+        "Parquet nulls kept as gaps in the column's own dtype (SPEC §1.3)"
+    );
+}
+
+/// Logs a column with nulls converted (`to` names into what) so its gaps can
+/// be shown.
+fn log_gaps_converted(column: &str, missing: usize, to: &str) {
+    info!(
+        column = %column,
+        missing,
+        to,
+        "Parquet column with nulls converted so its gaps can be shown (SPEC §1.3); \
+         every present value is unchanged"
+    );
+}
+
+/// Why an integer column with nulls is not loaded when its values cannot all
+/// become `f64` exactly.
+const TOO_LARGE_FOR_GAPS: &str = "it has missing values, and its integers are too large to show \
+     as decimals exactly (beyond ±2^53), so Glyde cannot mark the gaps without changing a value";
+
 /// Overwrites every null row's placeholder with `gap`.
 fn mark_missing<T: Clone>(values: &mut [T], validity: &[bool], gap: T) {
     for (value, &valid) in values.iter_mut().zip(validity) {
@@ -1207,44 +1287,49 @@ fn exact_f64_with_gaps(
         _ => true,
     };
     if !fits {
-        return Err(
-            "it has missing values, and its integers are too large to show as decimals exactly \
-             (beyond ±2^53), so Glyde cannot mark the gaps without changing a value"
-                .to_string(),
-        );
+        return Err(TOO_LARGE_FOR_GAPS.to_string());
     }
     let mut converted = values.to_f64();
     mark_missing(&mut converted, validity, f64::NAN);
     Ok(converted)
 }
 
-/// Decodes a dictionary-encoded UTF-8 batch to one label per row: the
-/// categorical column as the plain text column the rest of Glyde reads.
-fn append_dictionary_labels(values: &mut Vec<String>, array: &ArrayRef) {
-    let dictionary = array.as_any_dictionary();
-    let labels = dictionary.values();
-    let label = |key: usize| -> String {
-        if key >= labels.len() || labels.is_null(key) {
-            return String::new();
-        }
-        match labels.data_type() {
-            DataType::LargeUtf8 => labels.as_string::<i64>().value(key).to_string(),
-            _ => labels.as_string::<i32>().value(key).to_string(),
-        }
-    };
-    values.extend(
-        dictionary
-            .normalized_keys()
-            .into_iter()
-            .enumerate()
-            .map(|(row, key)| {
-                if array.is_null(row) {
-                    String::new()
-                } else {
-                    label(key)
+/// Hands `visit` one text per row of a text batch — plain, large or view
+/// UTF-8, or dictionary-encoded UTF-8 decoded to its labels (the
+/// categorical column as the plain text column the rest of Glyde reads) —
+/// with an empty text where the row, or the label its key points at, is
+/// null. Shared by the in-memory and the spilled open (issue #155).
+fn for_each_text(array: &ArrayRef, mut visit: impl FnMut(&str)) {
+    match array.data_type() {
+        DataType::Dictionary(..) => {
+            let dictionary = array.as_any_dictionary();
+            let labels = dictionary.values();
+            let label = |key: usize| -> &str {
+                if key >= labels.len() || labels.is_null(key) {
+                    return "";
                 }
-            }),
-    );
+                match labels.data_type() {
+                    DataType::LargeUtf8 => labels.as_string::<i64>().value(key),
+                    _ => labels.as_string::<i32>().value(key),
+                }
+            };
+            for (row, key) in dictionary.normalized_keys().into_iter().enumerate() {
+                visit(if array.is_null(row) { "" } else { label(key) });
+            }
+        }
+        DataType::LargeUtf8 => array
+            .as_string::<i64>()
+            .iter()
+            .for_each(|value| visit(value.unwrap_or_default())),
+        DataType::Utf8View => array
+            .as_string_view()
+            .iter()
+            .for_each(|value| visit(value.unwrap_or_default())),
+        _ => array
+            .as_string::<i32>()
+            .iter()
+            .for_each(|value| visit(value.unwrap_or_default())),
+    }
 }
 
 /// A timestamp column's timezone (SPEC §2.1: "if the source carries one,
@@ -1338,51 +1423,138 @@ fn displayable(ticks: i128, unit: TimeUnit) -> bool {
         .is_some()
 }
 
-/// The time axis from a timestamp column's ticks, or why it cannot be one:
-/// an instant outside the calendar range `chrono` can display (beyond about
-/// ±262,000 years) is not a time Glyde can place on an axis, and every
-/// formatter downstream relies on an axis timestamp being displayable.
-fn absolute_axis(
+/// The values of a typed timestamp column, wherever they are stored: in
+/// memory, or in the spill cache (issue #155).
+trait TickValues {
+    fn len(&self) -> usize;
+    /// Every tick, in row order.
+    fn for_each_tick(&self, visit: &mut dyn FnMut(i64)) -> Result<()>;
+}
+
+impl TickValues for [i64] {
+    fn len(&self) -> usize {
+        <[i64]>::len(self)
+    }
+
+    fn for_each_tick(&self, visit: &mut dyn FnMut(i64)) -> Result<()> {
+        self.iter().for_each(|&tick| visit(tick));
+        Ok(())
+    }
+}
+
+/// Where a time axis is built: in memory ([`InMemory`]), or in the spill
+/// cache (issue #155). The decisions that build one are the same either
+/// way ([`absolute_axis`], [`time_axis_from_text`]).
+trait AxisSink {
+    type Progressive: AxisWriter<f64, Output = ProgressiveValues>;
+    type Absolute: AxisWriter<Timestamp, Output = Timestamps>;
+    fn progressive(&self, rows: usize) -> Result<Self::Progressive>;
+    fn absolute(&self, rows: usize) -> Result<Self::Absolute>;
+}
+
+/// One time axis being written, value by value, in row order.
+trait AxisWriter<T> {
+    type Output;
+    fn push(&mut self, value: T) -> Result<()>;
+    fn finish(self) -> Result<Self::Output>;
+}
+
+/// The in-memory [`AxisSink`].
+struct InMemory;
+
+impl AxisSink for InMemory {
+    type Progressive = Vec<f64>;
+    type Absolute = Vec<Timestamp>;
+
+    fn progressive(&self, rows: usize) -> Result<Vec<f64>> {
+        Ok(Vec::with_capacity(rows))
+    }
+
+    fn absolute(&self, rows: usize) -> Result<Vec<Timestamp>> {
+        Ok(Vec::with_capacity(rows))
+    }
+}
+
+impl AxisWriter<f64> for Vec<f64> {
+    type Output = ProgressiveValues;
+
+    fn push(&mut self, value: f64) -> Result<()> {
+        Vec::push(self, value);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<ProgressiveValues> {
+        Ok(ProgressiveValues::Memory(self))
+    }
+}
+
+impl AxisWriter<Timestamp> for Vec<Timestamp> {
+    type Output = Timestamps;
+
+    fn push(&mut self, value: Timestamp) -> Result<()> {
+        Vec::push(self, value);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Timestamps> {
+        Ok(Timestamps::Memory(self))
+    }
+}
+
+/// A typed timestamp column as the absolute time axis, built into `sink`:
+/// its unit kept as the tick unit, its zone honored per row (SPEC §2.1). The
+/// outer `Result` is the sink's own I/O; the inner `Err` is why the column
+/// cannot be the axis: an instant outside the calendar range `chrono` can
+/// display (beyond about ±262,000 years) is not a time Glyde can place on an
+/// axis, and every formatter downstream relies on an axis timestamp being
+/// displayable.
+fn absolute_axis<T: TickValues + ?Sized, S: AxisSink>(
     unit: TimeUnit,
-    zone: Zone,
-    ticks: Vec<i64>,
-) -> std::result::Result<TimeAxis, String> {
+    zone: &Zone,
+    ticks: &T,
+    sink: &S,
+) -> Result<std::result::Result<TimeAxis, String>> {
     let displayable = |tick: i64| displayable(i128::from(tick), unit);
     // The displayable instants are one contiguous range, so checking the
     // extremes checks every row; the row is only looked for to name it.
-    let (min, max) = ticks.iter().fold((i64::MAX, i64::MIN), |(min, max), &t| {
-        (min.min(t), max.max(t))
-    });
-    if !ticks.is_empty() && !(displayable(min) && displayable(max)) {
-        let row = ticks
-            .iter()
-            .position(|&tick| !displayable(tick))
-            .unwrap_or_default();
-        return Err(format!(
+    let (mut min, mut max) = (i64::MAX, i64::MIN);
+    ticks.for_each_tick(&mut |tick| {
+        min = min.min(tick);
+        max = max.max(tick);
+    })?;
+    if ticks.len() > 0 && !(displayable(min) && displayable(max)) {
+        let (mut row, mut found) = (0usize, false);
+        ticks.for_each_tick(&mut |tick| {
+            if !found {
+                found = !displayable(tick);
+                row += usize::from(!found);
+            }
+        })?;
+        return Ok(Err(format!(
             "its timestamp on row {row} is outside the dates Glyde can display"
-        ));
+        )));
     }
-    let timestamps = match zone {
-        Zone::Naive => ticks
-            .into_iter()
-            .map(|tick| Timestamp::new(i128::from(tick), unit))
-            .collect(),
-        Zone::Fixed(offset) => ticks
-            .into_iter()
-            .map(|tick| Timestamp::with_offset(i128::from(tick), unit, offset))
-            .collect(),
-        Zone::Named(_) => ticks
-            .into_iter()
-            .map(|tick| match zone.offset_seconds(tick, unit) {
+    let mut timestamps = sink.absolute(ticks.len())?;
+    let mut written = Ok(());
+    ticks.for_each_tick(&mut |tick| {
+        if written.is_err() {
+            return;
+        }
+        let timestamp = match zone {
+            Zone::Naive => Timestamp::new(i128::from(tick), unit),
+            Zone::Fixed(offset) => Timestamp::with_offset(i128::from(tick), unit, *offset),
+            Zone::Named(_) => match zone.offset_seconds(tick, unit) {
                 Some(offset) => Timestamp::with_offset(i128::from(tick), unit, offset),
                 None => Timestamp::new(i128::from(tick), unit),
-            })
-            .collect(),
-    };
-    Ok(TimeAxis::Absolute {
-        timestamps: Timestamps::Memory(timestamps),
+            },
+        };
+        written = timestamps.push(timestamp);
+    })?;
+    written?;
+    Ok(Ok(TimeAxis::Absolute {
+        timestamps: timestamps.finish()?,
         format: TimestampFormat::ParquetTimestamp,
-    })
+    }))
 }
 
 /// Chooses the time index (see the module docs) and assembles the dataset
@@ -1399,26 +1571,8 @@ fn build_dataset(
             ColumnState::Loading(ColumnValues::Timestamp { .. })
         )
     };
-    let automatic = || {
-        columns
-            .iter()
-            .position(is_timestamp)
-            .or((!columns.is_empty()).then_some(0))
-    };
-    let (candidate, check_monotonic) = match overrides.time_column {
-        None => (automatic(), true),
-        Some(TimeColumnChoice::RowIndex) => (None, true),
-        Some(TimeColumnChoice::Column(index)) if index < columns.len() => (Some(index), false),
-        Some(TimeColumnChoice::Column(index)) => {
-            warn!(
-                picked_column = index,
-                column_count = columns.len(),
-                "the picked time column does not exist in this file; detecting the time column \
-                 automatically instead"
-            );
-            (automatic(), true)
-        }
-    };
+    let timestamps: Vec<bool> = columns.iter().map(is_timestamp).collect();
+    let (candidate, check_monotonic) = time_candidate(&timestamps, overrides);
 
     let mut time = None;
     let mut timestamp_format_ambiguous = false;
@@ -1447,7 +1601,7 @@ fn build_dataset(
                     );
                 }
                 if let Some(ColumnValues::Timestamp { unit, zone, ticks }) = columns[index].take() {
-                    match absolute_axis(unit, zone, ticks) {
+                    match absolute_axis(unit, &zone, &ticks[..], &InMemory)? {
                         Ok(axis) => time = Some(axis),
                         Err(reason) => {
                             columns[index].state = ColumnState::Unloaded(reason);
@@ -1459,10 +1613,11 @@ fn build_dataset(
             ColumnState::Loading(values) if values.is_numeric() || values.is_text() => {
                 match time_axis_from_text(
                     values,
+                    &InMemory,
                     &name,
                     overrides.timestamp_format,
                     check_monotonic,
-                ) {
+                )? {
                     Ok((axis, ambiguous)) => {
                         columns[index].take();
                         time = Some(axis);
@@ -1523,6 +1678,35 @@ fn build_dataset(
     ))
 }
 
+/// Which column is the time index candidate, and whether SPEC §2.1's
+/// monotonicity test applies to it: the first typed timestamp column
+/// (`timestamps[i]` says column `i` is one), else column 0, unless the user
+/// picked the row index or a column — taken as given (no monotonicity test),
+/// or ignored with a warning when it does not exist. Shared by the in-memory
+/// and the spilled open (issue #155).
+fn time_candidate(timestamps: &[bool], overrides: IngestOverrides) -> (Option<usize>, bool) {
+    let automatic = || {
+        timestamps
+            .iter()
+            .position(|&is_timestamp| is_timestamp)
+            .or((!timestamps.is_empty()).then_some(0))
+    };
+    match overrides.time_column {
+        None => (automatic(), true),
+        Some(TimeColumnChoice::RowIndex) => (None, true),
+        Some(TimeColumnChoice::Column(index)) if index < timestamps.len() => (Some(index), false),
+        Some(TimeColumnChoice::Column(index)) => {
+            warn!(
+                picked_column = index,
+                column_count = timestamps.len(),
+                "the picked time column does not exist in this file; detecting the time column \
+                 automatically instead"
+            );
+            (automatic(), true)
+        }
+    }
+}
+
 /// SPEC §2.1's decision for a time column of numbers or text, made exactly
 /// as the CSV path (`dataset::TimeAxisBuilder`) makes it for a column
 /// holding the same values as text (issue #166): the same
@@ -1542,12 +1726,13 @@ fn build_dataset(
 /// pick, or why the column is not a time index. A format correction the
 /// column cannot be read in falls back to the row index with the reason
 /// rather than failing the open (SPEC §1.3 "never abort the load").
-fn time_axis_from_text(
-    values: &ColumnValues,
+fn time_axis_from_text<V: CandidateValues + ?Sized, S: AxisSink>(
+    values: &V,
+    sink: &S,
     column: &str,
     format_override: Option<TimestampFormat>,
     check_monotonic: bool,
-) -> std::result::Result<(TimeAxis, bool), GeneratedIndexReason> {
+) -> Result<std::result::Result<(TimeAxis, bool), GeneratedIndexReason>> {
     let unreadable = || GeneratedIndexReason::Unreadable {
         column: column.to_string(),
     };
@@ -1555,21 +1740,19 @@ fn time_axis_from_text(
     let mut scan = TimestampFormatScan::default();
     // A number's own value is the exact one; parsing its text back would
     // only round-trip it.
-    let as_f64 = values.is_numeric().then(|| values.to_f64());
-    if let Some(numbers) = &as_f64 {
-        for &value in numbers {
-            candidate.observe_value(value);
-        }
+    let numeric = values.is_numeric();
+    if numeric {
+        values.for_each_f64(&mut |value| candidate.observe_value(value))?;
     }
-    if format_override.is_none() || as_f64.is_none() {
-        values.for_each_field(|field| {
+    if format_override.is_none() || !numeric {
+        values.for_each_field(&mut |field| {
             if format_override.is_none() {
                 scan.observe(field);
             }
-            if as_f64.is_none() {
+            if !numeric {
                 candidate.observe(field);
             }
-        });
+        })?;
     }
     let inference = match format_override {
         Some(format) => Some(TimestampFormatInference {
@@ -1579,52 +1762,57 @@ fn time_axis_from_text(
         None => scan.finish(),
     };
     if let Some(reason) = candidate.verdict(inference.is_some(), check_monotonic, column) {
-        return Err(reason);
+        return Ok(Err(reason));
     }
 
     let Some(inference) = inference else {
         // Every value is a number (the verdict saw to that) and none is a
         // timestamp: SPEC §2.1's progressive index.
-        let progressive = match as_f64 {
-            Some(numbers) => numbers,
-            None => {
-                let mut numbers = Vec::new();
-                let mut failed = false;
-                values.for_each_field(|field| match parse_progressive_value(field) {
-                    Ok(value) => numbers.push(value),
-                    Err(_) => failed = true,
-                });
-                if failed {
-                    return Err(unreadable());
+        let mut progressive = sink.progressive(values.len())?;
+        let mut written = Ok(());
+        let mut failed = false;
+        if numeric {
+            values.for_each_f64(&mut |value| {
+                if written.is_ok() {
+                    written = progressive.push(value);
                 }
-                numbers
-            }
-        };
-        return Ok((
+            })?;
+        } else {
+            values.for_each_field(&mut |field| match parse_progressive_value(field) {
+                Ok(value) if written.is_ok() => written = progressive.push(value),
+                Ok(_) => {}
+                Err(_) => failed = true,
+            })?;
+        }
+        written?;
+        if failed {
+            return Ok(Err(unreadable()));
+        }
+        return Ok(Ok((
             TimeAxis::Progressive {
-                values: ProgressiveValues::Memory(progressive),
+                values: progressive.finish()?,
             },
             false,
-        ));
+        )));
     };
 
-    // The `f64` copy only ever becomes a progressive axis: free it before
-    // the timestamps are built, so the open never holds both (PR #167
-    // review).
-    drop(as_f64);
-    let mut timestamps = Vec::with_capacity(values.len());
+    let mut timestamps = sink.absolute(values.len())?;
+    let mut read = 0usize;
+    let mut written = Ok(());
     let mut first_failure = None;
-    values.for_each_field(|field| {
-        if first_failure.is_some() {
+    values.for_each_field(&mut |field| {
+        if first_failure.is_some() || written.is_err() {
             return;
         }
         match parse_timestamp(field, inference.format) {
             Ok(timestamp) if displayable(timestamp.ticks, timestamp.unit) => {
-                timestamps.push(timestamp)
+                written = timestamps.push(timestamp);
+                read += 1;
             }
-            _ => first_failure = Some((timestamps.len(), field.to_string())),
+            _ => first_failure = Some((read, field.to_string())),
         }
-    });
+    })?;
+    written?;
     if let Some((row, field)) = first_failure {
         warn!(
             time_column = %column,
@@ -1635,7 +1823,7 @@ fn time_axis_from_text(
              or is outside the dates Glyde can display); plotting against a generated row \
              index instead (SPEC §1.3 \"never abort the load\")"
         );
-        return Err(unreadable());
+        return Ok(Err(unreadable()));
     }
     info!(
         time_column = %column,
@@ -1645,13 +1833,63 @@ fn time_axis_from_text(
         "time column of numbers or text read as absolute time, as the same values in a CSV \
          (SPEC §2.1)"
     );
-    Ok((
+    Ok(Ok((
         TimeAxis::Absolute {
-            timestamps: Timestamps::Memory(timestamps),
+            timestamps: timestamps.finish()?,
             format: inference.format,
         },
         inference.ambiguous,
-    ))
+    )))
+}
+
+/// A time-index candidate's values, wherever they are stored: in memory
+/// ([`ColumnValues`]) or in the spill cache (issue #155) —
+/// [`time_axis_from_text`] reads either the same way.
+trait CandidateValues {
+    /// Whether these are numbers, the only kind SPEC §2.1 lets stand in as
+    /// a progressive time index.
+    fn is_numeric(&self) -> bool;
+    /// The number of rows.
+    fn len(&self) -> usize;
+    /// A numeric column's values as `f64`, in row order: the same `f64` a
+    /// CSV progressive index holds.
+    fn for_each_f64(&self, visit: &mut dyn FnMut(f64)) -> Result<()>;
+    /// Each row's value as the text a CSV column would hold (see
+    /// [`ColumnValues::for_each_field`]).
+    fn for_each_field(&self, visit: &mut dyn FnMut(&str)) -> Result<()>;
+}
+
+impl CandidateValues for ColumnValues {
+    fn is_numeric(&self) -> bool {
+        ColumnValues::is_numeric(self)
+    }
+
+    fn len(&self) -> usize {
+        ColumnValues::len(self)
+    }
+
+    fn for_each_f64(&self, visit: &mut dyn FnMut(f64)) -> Result<()> {
+        match self {
+            ColumnValues::I8(v) => v.iter().for_each(|&n| visit(f64::from(n))),
+            ColumnValues::I16(v) => v.iter().for_each(|&n| visit(f64::from(n))),
+            ColumnValues::I32(v) => v.iter().for_each(|&n| visit(f64::from(n))),
+            ColumnValues::I64(v) => v.iter().for_each(|&n| visit(n as f64)),
+            ColumnValues::U8(v) => v.iter().for_each(|&n| visit(f64::from(n))),
+            ColumnValues::U16(v) => v.iter().for_each(|&n| visit(f64::from(n))),
+            ColumnValues::U32(v) => v.iter().for_each(|&n| visit(f64::from(n))),
+            ColumnValues::U64(v) => v.iter().for_each(|&n| visit(n as f64)),
+            ColumnValues::F32(v) => v.iter().for_each(|&n| visit(f64::from(n))),
+            ColumnValues::F64(v) => v.iter().for_each(|&n| visit(n)),
+            // Not numeric: never asked (see `is_numeric`).
+            ColumnValues::Bool(_) | ColumnValues::String(_) | ColumnValues::Timestamp { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn for_each_field(&self, visit: &mut dyn FnMut(&str)) -> Result<()> {
+        ColumnValues::for_each_field(self, visit);
+        Ok(())
+    }
 }
 
 impl ColumnValues {
@@ -3322,5 +3560,566 @@ mod tests {
         assert_eq!(parse_fixed_offset("+09"), Some(32_400));
         assert_eq!(parse_fixed_offset("+25:00"), None);
         assert_eq!(parse_fixed_offset("Europe/Rome"), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #155: a file larger than the RAM budget spills to the on-disk
+    // cache instead of being refused, and is the same data.
+    // ---------------------------------------------------------------------
+
+    /// `path` opened against a zero RAM budget, so it must spill into
+    /// `cache`.
+    fn open_spilled_with(
+        path: &Path,
+        overrides: IngestOverrides,
+        cache: &Path,
+    ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
+        open(
+            path,
+            OpenRequest {
+                overrides,
+                budget: RamBudget::from_total_ram_bytes(0),
+                cache_dir: Some(cache),
+                cancelled: &AtomicBool::new(false),
+                on_checkpoint: None,
+            },
+        )
+    }
+
+    /// The same data, sample for sample: `==`, except a float column (whose
+    /// NaN gaps are never `==` to anything) compared bit for bit.
+    fn assert_same_dataset(spilled: &Dataset, in_memory: &Dataset) {
+        assert_eq!(spilled.time, in_memory.time, "time axis");
+        assert_eq!(spilled.time_column_name, in_memory.time_column_name);
+        let names = |dataset: &Dataset| -> Vec<String> {
+            dataset
+                .columns
+                .iter()
+                .map(|series| series.name().to_string())
+                .collect()
+        };
+        assert_eq!(names(spilled), names(in_memory), "columns");
+        for (a, b) in spilled.columns.iter().zip(&in_memory.columns) {
+            assert_eq!(a.dtype(), b.dtype(), "{}: dtype", a.name());
+            assert_eq!(a.anomalies(), b.anomalies(), "{}: anomalies", a.name());
+            assert_eq!(
+                a.row_group_stats(),
+                b.row_group_stats(),
+                "{}: row-group statistics",
+                a.name()
+            );
+            if matches!(a.dtype(), Dtype::F32 | Dtype::F64) {
+                let bits = |series: &crate::series::Series| -> Vec<u64> {
+                    series
+                        .values()
+                        .to_f64_vec()
+                        .expect("a float column")
+                        .into_iter()
+                        .map(f64::to_bits)
+                        .collect()
+                };
+                assert_eq!(bits(a), bits(b), "{}: values", a.name());
+            } else {
+                assert_eq!(a.values(), b.values(), "{}: values", a.name());
+            }
+        }
+    }
+
+    /// Issue #155: `path` opens spilled exactly as it opens in memory —
+    /// the same summary, the same report, the same data — only stored on
+    /// disk. Returns the spilled dataset, with the cache that holds it.
+    fn assert_spills_like_memory(
+        path: &Path,
+        overrides: IngestOverrides,
+    ) -> (Dataset, tempfile::TempDir) {
+        let cache = tempfile::tempdir().expect("cache dir");
+        let (memory_summary, memory_report, in_memory) =
+            open_with(path, overrides).expect("opens in memory");
+        let (summary, report, spilled) =
+            open_spilled_with(path, overrides, cache.path()).expect("opens spilled");
+        assert!(!in_memory.is_spilled());
+        assert!(
+            spilled.is_spilled(),
+            "a zero budget must spill {}",
+            path.display()
+        );
+        assert_eq!(summary, memory_summary, "summary");
+        assert_eq!(report, memory_report, "report");
+        assert_same_dataset(&spilled, &in_memory);
+        (spilled, cache)
+    }
+
+    /// Small row groups, so a column is decoded over many record batches
+    /// and row groups.
+    fn spill_row_groups() -> Option<WriterProperties> {
+        Some(
+            WriterProperties::builder()
+                .set_max_row_group_size(700)
+                .build(),
+        )
+    }
+
+    fn with_nulls<T: Clone>(values: Vec<T>) -> Vec<Option<T>> {
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| (i % 7 != 3).then_some(value))
+            .collect()
+    }
+
+    const SPILL_ROWS: i64 = 3_001;
+
+    #[test]
+    fn every_dtype_spills_as_it_opens_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = SPILL_ROWS;
+        let labels: DictionaryArray<arrow::datatypes::Int32Type> = (0..n)
+            .map(|i| ["idle", "run", "fault"][i as usize % 3])
+            .collect();
+        let path = write_with(
+            &dir,
+            vec![
+                ("t", seconds(n)),
+                (
+                    "flag",
+                    Arc::new(BooleanArray::from(
+                        (0..n).map(|i| i % 3 == 0).collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "i8",
+                    Arc::new(Int8Array::from(
+                        (0..n).map(|i| (i % 250 - 125) as i8).collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "i16",
+                    Arc::new(Int16Array::from(
+                        (0..n).map(|i| (i * 11 - 9_000) as i16).collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "i32",
+                    Arc::new(Int32Array::from(
+                        (0..n).map(|i| (i * 70_001) as i32).collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "i64",
+                    Arc::new(Int64Array::from(
+                        (0..n)
+                            .map(|i| i * 1_000_003 - (1 << 40))
+                            .collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "u8",
+                    Arc::new(UInt8Array::from(
+                        (0..n).map(|i| (i % 256) as u8).collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "u16",
+                    Arc::new(UInt16Array::from(
+                        (0..n).map(|i| (i * 21) as u16).collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "u32",
+                    Arc::new(UInt32Array::from(
+                        (0..n).map(|i| (i * 1_000_003) as u32).collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "u64",
+                    Arc::new(UInt64Array::from(
+                        (0..n).map(|i| u64::MAX - i as u64).collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "f32",
+                    Arc::new(Float32Array::from(
+                        (0..n).map(|i| (i as f32 * 0.25).sin()).collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "f64",
+                    Arc::new(Float64Array::from(
+                        (0..n)
+                            .map(|i| {
+                                if i % 500 == 7 {
+                                    f64::NAN
+                                } else {
+                                    (i as f64).cos()
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "text",
+                    Arc::new(StringArray::from(
+                        (0..n).map(|i| format!("é{}", i % 13)).collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "large",
+                    Arc::new(LargeStringArray::from(
+                        (0..n).map(|i| format!("L{i}")).collect::<Vec<_>>(),
+                    )),
+                ),
+                ("state", Arc::new(labels)),
+            ],
+            spill_row_groups(),
+        );
+        let (spilled, _cache) = assert_spills_like_memory(&path, IngestOverrides::default());
+        assert_eq!(spilled.columns.len(), 14);
+    }
+
+    // Nulls become the same gaps spilled as in memory: NaN in a float,
+    // an empty label in text, a whole-number column turned into decimals
+    // with NaN gaps, a boolean one into text — and a 64-bit one too large
+    // to turn into decimals exactly is left out with the same reason.
+    #[test]
+    fn nulls_spill_as_the_same_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = SPILL_ROWS;
+        let labels: DictionaryArray<arrow::datatypes::Int32Type> = with_nulls(
+            (0..n)
+                .map(|i| ["idle", "run"][i as usize % 2])
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .collect();
+        let path = write_with(
+            &dir,
+            vec![
+                ("t", seconds(n)),
+                (
+                    "flag",
+                    Arc::new(BooleanArray::from(with_nulls(
+                        (0..n).map(|i| i % 2 == 0).collect(),
+                    ))),
+                ),
+                (
+                    "i8",
+                    Arc::new(Int8Array::from(with_nulls(
+                        (0..n).map(|i| (i % 100) as i8).collect(),
+                    ))),
+                ),
+                (
+                    "i32",
+                    Arc::new(Int32Array::from(with_nulls(
+                        (0..n).map(|i| (i * 7) as i32).collect(),
+                    ))),
+                ),
+                (
+                    "u16",
+                    Arc::new(UInt16Array::from(with_nulls(
+                        (0..n).map(|i| i as u16).collect(),
+                    ))),
+                ),
+                (
+                    "i64",
+                    Arc::new(Int64Array::from(with_nulls(
+                        (0..n).map(|i| i * 3).collect(),
+                    ))),
+                ),
+                (
+                    "huge",
+                    Arc::new(UInt64Array::from(with_nulls(
+                        (0..n).map(|i| u64::MAX - i as u64).collect(),
+                    ))),
+                ),
+                (
+                    "f32",
+                    Arc::new(Float32Array::from(with_nulls(
+                        (0..n).map(|i| i as f32).collect(),
+                    ))),
+                ),
+                (
+                    "f64",
+                    Arc::new(Float64Array::from(with_nulls(
+                        (0..n).map(|i| i as f64 * 0.5).collect(),
+                    ))),
+                ),
+                (
+                    "text",
+                    Arc::new(StringArray::from(with_nulls(
+                        (0..n).map(|i| format!("v{i}")).collect(),
+                    ))),
+                ),
+                ("state", Arc::new(labels)),
+            ],
+            spill_row_groups(),
+        );
+        let (_spilled, _cache) = assert_spills_like_memory(&path, IngestOverrides::default());
+    }
+
+    // A typed timestamp axis in every zone kind, and a timestamp column
+    // with a missing value, which cannot place rows in time.
+    #[test]
+    fn timestamp_axes_spill_in_every_zone_and_a_gap_falls_back_the_same_way() {
+        let n = SPILL_ROWS;
+        let value: ArrayRef = Arc::new(Float64Array::from(
+            (0..n).map(|i| i as f64).collect::<Vec<_>>(),
+        ));
+        // Across 2026's last Sunday of March, so a named zone changes offset.
+        let micros = |i: i64| 1_774_745_400_000_000 + i * 3_600 * SECOND_US / 10;
+        let zoned = |zone: Option<&str>| -> ArrayRef {
+            let array = TimestampMicrosecondArray::from((0..n).map(micros).collect::<Vec<_>>());
+            Arc::new(match zone {
+                Some(zone) => array.with_timezone(zone),
+                None => array,
+            })
+        };
+        for zone in [None, Some("UTC"), Some("+02:00"), Some("Europe/Rome")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_with(
+                &dir,
+                vec![("t", zoned(zone)), ("value", value.clone())],
+                spill_row_groups(),
+            );
+            assert_spills_like_memory(&path, IngestOverrides::default());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let gap: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(with_nulls((0..n).map(micros).collect()))
+                .with_timezone("UTC"),
+        );
+        let path = write_with(&dir, vec![("t", gap), ("value", value)], spill_row_groups());
+        let (spilled, _cache) = assert_spills_like_memory(&path, IngestOverrides::default());
+        assert!(matches!(spilled.time, TimeAxis::Progressive { .. }));
+    }
+
+    // A time column of numbers or text goes through the same SPEC §2.1
+    // decision spilled: epoch seconds, a progressive index, ISO text, and a
+    // first column that is no time at all.
+    #[test]
+    fn a_time_column_of_numbers_or_text_spills_with_the_same_decision() {
+        let n = SPILL_ROWS;
+        let value: ArrayRef = Arc::new(Float64Array::from(
+            (0..n).map(|i| i as f64).collect::<Vec<_>>(),
+        ));
+        let cases: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(
+                (0..n).map(|i| 1_772_352_000 + i).collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                (0..n).map(|i| i as f64 * 0.125).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                (0..n)
+                    .map(|i| format!("2026-03-01T08:{:02}:{:02}Z", i / 60 % 60, i % 60))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                (0..n)
+                    .map(|i| format!("batch {}", i % 4))
+                    .collect::<Vec<_>>(),
+            )),
+        ];
+        for time in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_with(
+                &dir,
+                vec![("time", time), ("value", value.clone())],
+                spill_row_groups(),
+            );
+            assert_spills_like_memory(&path, IngestOverrides::default());
+        }
+    }
+
+    // The user's corrections apply spilled as in memory: the row index, a
+    // picked column, a timestamp format, and SPEC §2.1's "[Sort]" of a
+    // scrambled axis (done on disk); and a second timestamp column is left
+    // out the same way.
+    #[test]
+    fn corrections_apply_to_a_spilled_open_as_in_memory() {
+        let n = SPILL_ROWS;
+        let dir = tempfile::tempdir().unwrap();
+        let scrambled: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(
+                (0..n)
+                    .map(|i| START_US + ((i * 1_009) % n) * SECOND_US)
+                    .collect::<Vec<_>>(),
+            )
+            .with_timezone("UTC"),
+        );
+        let text: ArrayRef = Arc::new(StringArray::from(
+            (0..n)
+                .map(|i| format!("01/03/2026 08:{:02}:{:02}", i / 60 % 60, i % 60))
+                .collect::<Vec<_>>(),
+        ));
+        let path = write_with(
+            &dir,
+            vec![
+                ("t", scrambled),
+                (
+                    "value",
+                    Arc::new(Float64Array::from(
+                        (0..n).map(|i| i as f64).collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "count",
+                    Arc::new(Int32Array::from(
+                        (0..n).map(|i| i as i32).collect::<Vec<_>>(),
+                    )),
+                ),
+                ("when", text),
+                ("second", seconds(n)),
+            ],
+            spill_row_groups(),
+        );
+        for overrides in [
+            IngestOverrides::default(),
+            IngestOverrides {
+                time_column: Some(TimeColumnChoice::RowIndex),
+                ..IngestOverrides::default()
+            },
+            IngestOverrides {
+                time_column: Some(TimeColumnChoice::Column(2)),
+                ..IngestOverrides::default()
+            },
+            IngestOverrides {
+                time_column: Some(TimeColumnChoice::Column(3)),
+                timestamp_format: Some(TimestampFormat::DayFirst),
+                ..IngestOverrides::default()
+            },
+            IngestOverrides {
+                sort_by_time: true,
+                ..IngestOverrides::default()
+            },
+        ] {
+            assert_spills_like_memory(&path, overrides);
+        }
+    }
+
+    // A partitioned directory spills as one dataset, its keys as text.
+    #[test]
+    fn a_partitioned_directory_spills_as_one_dataset() {
+        let dir = tempfile::tempdir().unwrap();
+        for (day, offset) in [("2026-01-01", 0i64), ("2026-01-02", SPILL_ROWS)] {
+            write_at(
+                &dir.path()
+                    .join(format!("date={day}"))
+                    .join("part-0.parquet"),
+                vec![
+                    (
+                        "t",
+                        Arc::new(
+                            TimestampMicrosecondArray::from(
+                                (0..SPILL_ROWS)
+                                    .map(|i| START_US + (offset + i) * SECOND_US)
+                                    .collect::<Vec<_>>(),
+                            )
+                            .with_timezone("UTC"),
+                        ) as ArrayRef,
+                    ),
+                    (
+                        "value",
+                        Arc::new(Float64Array::from(
+                            (0..SPILL_ROWS)
+                                .map(|i| (offset + i) as f64)
+                                .collect::<Vec<_>>(),
+                        )),
+                    ),
+                ],
+                spill_row_groups(),
+            );
+        }
+        let (spilled, _cache) = assert_spills_like_memory(dir.path(), IngestOverrides::default());
+        assert_eq!(spilled.time.len(), 2 * SPILL_ROWS as usize);
+    }
+
+    #[test]
+    fn an_empty_file_spills_like_it_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            vec![
+                ("t", seconds(0)),
+                ("value", Arc::new(Float64Array::from(Vec::<f64>::new()))),
+            ],
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let in_memory = open_default(&path);
+        let spilled = open_spilled_with(&path, IngestOverrides::default(), cache.path())
+            .expect("opens spilled");
+        assert_eq!(spilled.0, in_memory.0);
+        assert_eq!(spilled.1, in_memory.1);
+        assert_same_dataset(&spilled.2, &in_memory.2);
+    }
+
+    // SPEC §5.1: with no cache directory to spill to, an unaffordable open
+    // is still refused before reading; with one, and not enough free disk
+    // for the spill, it is refused too — before a byte is written.
+    #[test]
+    fn a_spill_that_does_not_fit_the_disk_is_refused_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            vec![
+                ("t", seconds(1_000)),
+                ("value", Arc::new(Float64Array::from(vec![0.0; 1_000]))),
+            ],
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let err = open_checking_disk(
+            &path,
+            OpenRequest {
+                overrides: IngestOverrides::default(),
+                budget: RamBudget::from_total_ram_bytes(0),
+                cache_dir: Some(cache.path()),
+                cancelled: &AtomicBool::new(false),
+                on_checkpoint: None,
+            },
+            |_| Some(1_000),
+        )
+        .expect_err("a 1 KB disk cannot hold the spill");
+        assert!(
+            matches!(err, GlydeError::DiskSpaceExceeded { .. }),
+            "{err:?}"
+        );
+        let sets = std::fs::read_dir(cache.path().join("spill"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(sets, 0, "nothing is written");
+    }
+
+    // A superseded open stops spilling, and its spill files go with it.
+    #[test]
+    fn a_cancelled_spilled_open_stops_and_leaves_no_spill_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_with(
+            &dir,
+            vec![
+                ("t", seconds(SPILL_ROWS)),
+                (
+                    "value",
+                    Arc::new(Float64Array::from(vec![1.0; SPILL_ROWS as usize])),
+                ),
+            ],
+            spill_row_groups(),
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let err = open(
+            &path,
+            OpenRequest {
+                overrides: IngestOverrides::default(),
+                budget: RamBudget::from_total_ram_bytes(0),
+                cache_dir: Some(cache.path()),
+                cancelled: &AtomicBool::new(true),
+                on_checkpoint: None,
+            },
+        )
+        .expect_err("a cancelled open");
+        assert!(matches!(err, GlydeError::Cancelled), "{err:?}");
+        assert!(crate::index::spill::wait_for_pending_deletions());
+        let sets = std::fs::read_dir(cache.path().join("spill"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(sets, 0, "the partial spill is deleted");
     }
 }

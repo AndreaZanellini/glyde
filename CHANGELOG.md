@@ -163,6 +163,30 @@ Versioning: [Semantic Versioning](https://semver.org/).
   previous commit instead of letting both run.
 
 ### Added
+- **Parquet files too large for memory now open (issue #155).** A Parquet
+  file whose columns do not fit the memory Glyde allows itself (a quarter
+  of the computer's memory, at most 4 GB) used to be refused. It is now
+  kept on disk while you work, as a CSV file of that size already was, and
+  everything about it is the same as if it had fitted:
+  - the same columns, in the same kinds (small integers stay small
+    integers);
+  - the same gaps where values are missing;
+  - the same time column choice, and the same corrections in the
+    inference bar, sorting by time included.
+
+  Before writing anything, Glyde checks there is enough free disk, and
+  refuses with the numbers if there is not. Memory stays small: about
+  40 MB at its peak for a 1 GB file. Opening is slower than in memory:
+  about 5 seconds for 1 GB on the reference MacBook Air (its disk nearly
+  full), mostly spent writing to disk.
+  - **Assumption to veto: this is outside SPEC §5's budget** for building
+    a Parquet file's index (10 s per 10 GB, so about 1 s per GB). The
+    choice made here is that opening such a file slowly is better than
+    refusing it, which SPEC §5.1 also forbids ("offers the affordable
+    alternative"). Making it faster is issue #181; if you would rather keep
+    refusing these files until it is within budget, do not merge this.
+  - Try it: open a Parquet file larger than a quarter of your computer's
+    memory.
 - **Parquet time columns stored as plain numbers or text now become a real
   time axis, exactly as in a CSV (milestone M7, last item).** Many tools
   write the time as a plain number (seconds, milliseconds, microseconds or
