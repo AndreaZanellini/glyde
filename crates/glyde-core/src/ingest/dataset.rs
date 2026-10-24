@@ -1973,49 +1973,23 @@ impl ColumnSpillWriter {
                 Ok(ColumnValue::I64(value))
             }
             // CSV's `ColumnDtypeScan` never settles on these: only a column
-            // written from typed values (`push_value`) has one. Parsed as the
-            // `i64` arm parses, should a text field ever reach them.
-            ColumnSpillWriter::I8(values) => {
-                let value = field.trim().parse::<i8>().unwrap_or_default();
-                values.push(value)?;
-                Ok(ColumnValue::I8(value))
-            }
-            ColumnSpillWriter::I16(values) => {
-                let value = field.trim().parse::<i16>().unwrap_or_default();
-                values.push(value)?;
-                Ok(ColumnValue::I16(value))
-            }
-            ColumnSpillWriter::I32(values) => {
-                let value = field.trim().parse::<i32>().unwrap_or_default();
-                values.push(value)?;
-                Ok(ColumnValue::I32(value))
-            }
-            ColumnSpillWriter::U8(values) => {
-                let value = field.trim().parse::<u8>().unwrap_or_default();
-                values.push(value)?;
-                Ok(ColumnValue::U8(value))
-            }
-            ColumnSpillWriter::U16(values) => {
-                let value = field.trim().parse::<u16>().unwrap_or_default();
-                values.push(value)?;
-                Ok(ColumnValue::U16(value))
-            }
-            ColumnSpillWriter::U32(values) => {
-                let value = field.trim().parse::<u32>().unwrap_or_default();
-                values.push(value)?;
-                Ok(ColumnValue::U32(value))
-            }
-            ColumnSpillWriter::U64(values) => {
-                let value = field.trim().parse::<u64>().unwrap_or_default();
-                values.push(value)?;
-                Ok(ColumnValue::U64(value))
-            }
-            ColumnSpillWriter::F32(values, nan_runs) => {
-                let value = field.trim().parse::<f32>().unwrap_or_default();
-                nan_runs.observe(f64::from(value));
-                values.push(value)?;
-                Ok(ColumnValue::F32(value))
-            }
+            // written from typed values (`push_value`: the spill sort, issue
+            // #155) has one. A text field reaching one would have to be read
+            // under a dtype no scan chose, so it is refused, never guessed
+            // (Golden Rule 2: not a silent `0`).
+            ColumnSpillWriter::I8(_)
+            | ColumnSpillWriter::I16(_)
+            | ColumnSpillWriter::I32(_)
+            | ColumnSpillWriter::U8(_)
+            | ColumnSpillWriter::U16(_)
+            | ColumnSpillWriter::U32(_)
+            | ColumnSpillWriter::U64(_)
+            | ColumnSpillWriter::F32(..) => Err(GlydeError::Io {
+                path: std::path::PathBuf::from("<spill>"),
+                source: std::io::Error::other(format!(
+                    "a text field ({field:?}) reached a column only typed values are written to"
+                )),
+            }),
             ColumnSpillWriter::F64(values, nan_runs) => {
                 let value = field.trim().parse::<f64>().unwrap_or_default();
                 nan_runs.observe(value);
@@ -3313,6 +3287,33 @@ mod tests {
     use super::*;
     use crate::series::{Dtype, SeriesValues};
     use std::path::{Path, PathBuf};
+
+    // Issue #155 review: a text field can never reach a column typed from
+    // typed values only (CSV never settles on these dtypes); if one did, it
+    // is refused, never silently read as 0.
+    #[test]
+    fn a_text_field_is_refused_by_a_typed_only_spill_column() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let set = SpillSet::create(dir.path()).expect("spill set");
+        for dtype in [
+            Dtype::I8,
+            Dtype::I16,
+            Dtype::I32,
+            Dtype::U8,
+            Dtype::U16,
+            Dtype::U32,
+            Dtype::U64,
+            Dtype::F32,
+        ] {
+            let mut writer =
+                ColumnSpillWriter::create(&set, &format!("{dtype:?}"), dtype).expect("create");
+            assert!(writer.push("12").is_err(), "{dtype:?} takes no text field");
+            assert!(
+                writer.push_value(ColumnValue::Str("12")).is_err(),
+                "{dtype:?} takes no text value"
+            );
+        }
+    }
 
     fn corpus_path(file_name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))

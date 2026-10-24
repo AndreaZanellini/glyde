@@ -111,7 +111,8 @@ Versioning: [Semantic Versioning](https://semver.org/).
   has narrower kinds, such as small integers and single-precision decimals.
   Those can now be kept on disk too, in their own kind, never converted to
   a wider one. Each reads back exactly as it does from memory, and goes
-  through a time sort with its row like the others.
+  through a time sort with its row like the others. No CSV file can produce
+  these kinds: only the Parquet change that follows (issue #155) uses them.
 - **The zoomed-out time plot now draws a continuous trace instead of a
   dashed one (issue #147).** At zoom levels where each screen column holds
   only a few samples, a steep signal used to look dashed, with holes that
