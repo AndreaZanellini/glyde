@@ -23,10 +23,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
   It now reads one place fewer for each, and the picture is exactly the
   same. Measured on 8 channels of 8 million rows: from 1.4 s to about half
   a second when the disk has to be read, and from 17 ms to about 11 ms when
-  the file is still in memory. Files that fit in memory are not affected. On a file the size of the issue's, it reads about 30% less, so
-  expect it to drop to roughly 2 seconds, not to nothing: an exact picture
-  needs at least one read per screen column of every channel. Two ways to
-  go further are written up as issues for you to decide.
+  the file is still in memory. Files that fit in memory are not affected.
+  - Not measured on the issue's file itself: on a file shaped like it
+    (37 million rows), it reads about 30% fewer places from disk, so a
+    projection, not a measurement, puts the issue's 3 seconds at roughly
+    2. An exact picture needs at least one read per screen column of every
+    channel. Two ways to go further are issues for you to decide: #174
+    (decided since: it needs no decision) and #175.
+  - **Trade-off to veto:** once such a file is in memory, panning it is
+    2 to 5% slower (a few hundredths of a millisecond per frame), because
+    each screen column now reads a few more values itself.
   - Try it: with other apps using most of the memory, open a file of
     several GB and time how long "Updating…" stays on the first full view.
 - **A stretch that is almost flat can no longer vanish from the plot (issue
