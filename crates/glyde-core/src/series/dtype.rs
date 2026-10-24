@@ -90,17 +90,25 @@ pub enum SeriesValues {
 
 /// A [`SeriesValues`] column backed by the on-disk spill cache
 /// (`crate::index::spill`), in the same dtype the in-memory path would have
-/// inferred for it. Only the dtypes CSV ingestion actually produces are
-/// representable here (`ingest::infer::infer_column`: bool, `i64`, `f64`,
-/// string) — a Parquet reader's narrower integer widths (docs/ROADMAP.md
-/// M7) will extend this when they land, rather than being upcast into one
-/// of these today.
+/// inferred for it. Every [`SeriesValues`] dtype has its spilled twin, never
+/// an upcast one (SPEC §1.4, Golden Rule 1: the dtype is part of the raw
+/// data): CSV ingestion only ever produces bool, `i64`, `f64` and string
+/// (`ingest::infer::infer_column`), a Parquet file the narrower widths too
+/// (issue #155).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpilledValues {
     /// `0`/`1` per sample: `bool` has no guaranteed byte representation to
     /// map directly, so it spills as `u8` and is read back as `!= 0`.
     Bool(crate::index::spill::SpillVec<u8>),
+    I8(crate::index::spill::SpillVec<i8>),
+    I16(crate::index::spill::SpillVec<i16>),
+    I32(crate::index::spill::SpillVec<i32>),
     I64(crate::index::spill::SpillVec<i64>),
+    U8(crate::index::spill::SpillVec<u8>),
+    U16(crate::index::spill::SpillVec<u16>),
+    U32(crate::index::spill::SpillVec<u32>),
+    U64(crate::index::spill::SpillVec<u64>),
+    F32(crate::index::spill::SpillVec<f32>),
     F64(crate::index::spill::SpillVec<f64>),
     String(crate::index::spill::SpillStrings),
 }
@@ -111,7 +119,15 @@ impl SpilledValues {
     pub fn dtype(&self) -> Dtype {
         match self {
             SpilledValues::Bool(_) => Dtype::Bool,
+            SpilledValues::I8(_) => Dtype::I8,
+            SpilledValues::I16(_) => Dtype::I16,
+            SpilledValues::I32(_) => Dtype::I32,
             SpilledValues::I64(_) => Dtype::I64,
+            SpilledValues::U8(_) => Dtype::U8,
+            SpilledValues::U16(_) => Dtype::U16,
+            SpilledValues::U32(_) => Dtype::U32,
+            SpilledValues::U64(_) => Dtype::U64,
+            SpilledValues::F32(_) => Dtype::F32,
             SpilledValues::F64(_) => Dtype::F64,
             SpilledValues::String(_) => Dtype::String,
         }
@@ -120,7 +136,15 @@ impl SpilledValues {
     pub fn len(&self) -> usize {
         match self {
             SpilledValues::Bool(v) => v.len(),
+            SpilledValues::I8(v) => v.len(),
+            SpilledValues::I16(v) => v.len(),
+            SpilledValues::I32(v) => v.len(),
             SpilledValues::I64(v) => v.len(),
+            SpilledValues::U8(v) => v.len(),
+            SpilledValues::U16(v) => v.len(),
+            SpilledValues::U32(v) => v.len(),
+            SpilledValues::U64(v) => v.len(),
+            SpilledValues::F32(v) => v.len(),
             SpilledValues::F64(v) => v.len(),
             SpilledValues::String(v) => v.len(),
         }
@@ -138,7 +162,15 @@ impl SpilledValues {
             (SpilledValues::Bool(a), SeriesValues::Bool(b)) => {
                 a.len() == b.len() && a.as_slice().iter().zip(b).all(|(&a, &b)| (a != 0) == b)
             }
+            (SpilledValues::I8(a), SeriesValues::I8(b)) => a.as_slice() == b.as_slice(),
+            (SpilledValues::I16(a), SeriesValues::I16(b)) => a.as_slice() == b.as_slice(),
+            (SpilledValues::I32(a), SeriesValues::I32(b)) => a.as_slice() == b.as_slice(),
             (SpilledValues::I64(a), SeriesValues::I64(b)) => a.as_slice() == b.as_slice(),
+            (SpilledValues::U8(a), SeriesValues::U8(b)) => a.as_slice() == b.as_slice(),
+            (SpilledValues::U16(a), SeriesValues::U16(b)) => a.as_slice() == b.as_slice(),
+            (SpilledValues::U32(a), SeriesValues::U32(b)) => a.as_slice() == b.as_slice(),
+            (SpilledValues::U64(a), SeriesValues::U64(b)) => a.as_slice() == b.as_slice(),
+            (SpilledValues::F32(a), SeriesValues::F32(b)) => a.as_slice() == b.as_slice(),
             (SpilledValues::F64(a), SeriesValues::F64(b)) => a.as_slice() == b.as_slice(),
             (SpilledValues::String(a), SeriesValues::String(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a == b)
@@ -331,6 +363,36 @@ impl SeriesValues {
                     })
                     .collect(),
             ),
+            SeriesValues::Spilled(SpilledValues::U64(v)) => Some(
+                v.as_slice()
+                    .iter()
+                    .map(|&n| {
+                        warn_if_precision_loss(n as u128, n);
+                        n as f64
+                    })
+                    .collect(),
+            ),
+            SeriesValues::Spilled(SpilledValues::I8(v)) => {
+                Some(v.as_slice().iter().map(|&n| n as f64).collect())
+            }
+            SeriesValues::Spilled(SpilledValues::I16(v)) => {
+                Some(v.as_slice().iter().map(|&n| n as f64).collect())
+            }
+            SeriesValues::Spilled(SpilledValues::I32(v)) => {
+                Some(v.as_slice().iter().map(|&n| n as f64).collect())
+            }
+            SeriesValues::Spilled(SpilledValues::U8(v)) => {
+                Some(v.as_slice().iter().map(|&n| n as f64).collect())
+            }
+            SeriesValues::Spilled(SpilledValues::U16(v)) => {
+                Some(v.as_slice().iter().map(|&n| n as f64).collect())
+            }
+            SeriesValues::Spilled(SpilledValues::U32(v)) => {
+                Some(v.as_slice().iter().map(|&n| n as f64).collect())
+            }
+            SeriesValues::Spilled(SpilledValues::F32(v)) => {
+                Some(v.as_slice().iter().map(|&n| n as f64).collect())
+            }
             SeriesValues::Bool(_) | SeriesValues::String(_) => None,
             SeriesValues::Spilled(SpilledValues::Bool(_) | SpilledValues::String(_)) => None,
         }
@@ -354,7 +416,17 @@ impl SeriesValues {
             SeriesValues::F64(v) => all_equal_bits(v, f64::to_bits),
             SeriesValues::String(v) => all_equal(v),
             SeriesValues::Spilled(SpilledValues::Bool(v)) => all_equal(v.as_slice()),
+            SeriesValues::Spilled(SpilledValues::I8(v)) => all_equal(v.as_slice()),
+            SeriesValues::Spilled(SpilledValues::I16(v)) => all_equal(v.as_slice()),
+            SeriesValues::Spilled(SpilledValues::I32(v)) => all_equal(v.as_slice()),
             SeriesValues::Spilled(SpilledValues::I64(v)) => all_equal(v.as_slice()),
+            SeriesValues::Spilled(SpilledValues::U8(v)) => all_equal(v.as_slice()),
+            SeriesValues::Spilled(SpilledValues::U16(v)) => all_equal(v.as_slice()),
+            SeriesValues::Spilled(SpilledValues::U32(v)) => all_equal(v.as_slice()),
+            SeriesValues::Spilled(SpilledValues::U64(v)) => all_equal(v.as_slice()),
+            SeriesValues::Spilled(SpilledValues::F32(v)) => {
+                all_equal_bits(v.as_slice(), f32::to_bits)
+            }
             SeriesValues::Spilled(SpilledValues::F64(v)) => {
                 all_equal_bits(v.as_slice(), f64::to_bits)
             }
@@ -415,7 +487,15 @@ impl SeriesValues {
             SeriesValues::U64(v) => v.get(index).map(|&n| n as f64),
             SeriesValues::F32(v) => v.get(index).map(|&n| n as f64),
             SeriesValues::F64(v) => v.get(index).copied(),
+            SeriesValues::Spilled(SpilledValues::I8(v)) => v.get(index).map(|n| n as f64),
+            SeriesValues::Spilled(SpilledValues::I16(v)) => v.get(index).map(|n| n as f64),
+            SeriesValues::Spilled(SpilledValues::I32(v)) => v.get(index).map(|n| n as f64),
             SeriesValues::Spilled(SpilledValues::I64(v)) => v.get(index).map(|n| n as f64),
+            SeriesValues::Spilled(SpilledValues::U8(v)) => v.get(index).map(|n| n as f64),
+            SeriesValues::Spilled(SpilledValues::U16(v)) => v.get(index).map(|n| n as f64),
+            SeriesValues::Spilled(SpilledValues::U32(v)) => v.get(index).map(|n| n as f64),
+            SeriesValues::Spilled(SpilledValues::U64(v)) => v.get(index).map(|n| n as f64),
+            SeriesValues::Spilled(SpilledValues::F32(v)) => v.get(index).map(|n| n as f64),
             SeriesValues::Spilled(SpilledValues::F64(v)) => v.get(index),
             SeriesValues::Bool(_) | SeriesValues::String(_) => None,
             SeriesValues::Spilled(SpilledValues::Bool(_) | SpilledValues::String(_)) => None,
@@ -445,6 +525,10 @@ impl SeriesValues {
                 warn_if_precision_loss(n.unsigned_abs() as u128, n);
                 n as f64
             }),
+            SeriesValues::Spilled(SpilledValues::U64(v)) => v.get(index).map(|n| {
+                warn_if_precision_loss(n as u128, n);
+                n as f64
+            }),
             other => other.f64_at(index),
         }
     }
@@ -465,7 +549,15 @@ impl SeriesValues {
             SeriesValues::U64(v) => v.get(index).map(u64::to_string),
             SeriesValues::F32(v) => v.get(index).map(f32::to_string),
             SeriesValues::F64(v) => v.get(index).map(f64::to_string),
+            SeriesValues::Spilled(SpilledValues::I8(v)) => v.get(index).map(|n| n.to_string()),
+            SeriesValues::Spilled(SpilledValues::I16(v)) => v.get(index).map(|n| n.to_string()),
+            SeriesValues::Spilled(SpilledValues::I32(v)) => v.get(index).map(|n| n.to_string()),
             SeriesValues::Spilled(SpilledValues::I64(v)) => v.get(index).map(|n| n.to_string()),
+            SeriesValues::Spilled(SpilledValues::U8(v)) => v.get(index).map(|n| n.to_string()),
+            SeriesValues::Spilled(SpilledValues::U16(v)) => v.get(index).map(|n| n.to_string()),
+            SeriesValues::Spilled(SpilledValues::U32(v)) => v.get(index).map(|n| n.to_string()),
+            SeriesValues::Spilled(SpilledValues::U64(v)) => v.get(index).map(|n| n.to_string()),
+            SeriesValues::Spilled(SpilledValues::F32(v)) => v.get(index).map(|n| n.to_string()),
             SeriesValues::Spilled(SpilledValues::F64(v)) => v.get(index).map(|n| n.to_string()),
             SeriesValues::Bool(_) | SeriesValues::String(_) => None,
             SeriesValues::Spilled(SpilledValues::Bool(_) | SpilledValues::String(_)) => None,

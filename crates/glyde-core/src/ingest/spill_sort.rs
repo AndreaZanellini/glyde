@@ -274,7 +274,15 @@ impl TimeCursor {
 /// Reads one data column row by row, appending each value to a buffer.
 enum ColumnCursor {
     Bool(SpillCursor<u8>),
+    I8(SpillCursor<i8>),
+    I16(SpillCursor<i16>),
+    I32(SpillCursor<i32>),
     I64(SpillCursor<i64>),
+    U8(SpillCursor<u8>),
+    U16(SpillCursor<u16>),
+    U32(SpillCursor<u32>),
+    U64(SpillCursor<u64>),
+    F32(SpillCursor<f32>),
     F64(SpillCursor<f64>),
     String(SpillStringsCursor, Vec<u8>),
 }
@@ -283,7 +291,15 @@ impl ColumnCursor {
     fn new(values: &SpilledValues) -> Result<ColumnCursor> {
         Ok(match values {
             SpilledValues::Bool(values) => ColumnCursor::Bool(values.cursor()?),
+            SpilledValues::I8(values) => ColumnCursor::I8(values.cursor()?),
+            SpilledValues::I16(values) => ColumnCursor::I16(values.cursor()?),
+            SpilledValues::I32(values) => ColumnCursor::I32(values.cursor()?),
             SpilledValues::I64(values) => ColumnCursor::I64(values.cursor()?),
+            SpilledValues::U8(values) => ColumnCursor::U8(values.cursor()?),
+            SpilledValues::U16(values) => ColumnCursor::U16(values.cursor()?),
+            SpilledValues::U32(values) => ColumnCursor::U32(values.cursor()?),
+            SpilledValues::U64(values) => ColumnCursor::U64(values.cursor()?),
+            SpilledValues::F32(values) => ColumnCursor::F32(values.cursor()?),
             SpilledValues::F64(values) => ColumnCursor::F64(values.cursor()?),
             SpilledValues::String(values) => ColumnCursor::String(values.cursor()?, Vec::new()),
         })
@@ -294,14 +310,16 @@ impl ColumnCursor {
             ColumnCursor::Bool(values) => {
                 payload.push(values.next_value()?.ok_or_else(short_column)?);
             }
-            ColumnCursor::I64(values) => {
-                let value = values.next_value()?.ok_or_else(short_column)?;
-                payload.extend_from_slice(&value.to_le_bytes());
-            }
-            ColumnCursor::F64(values) => {
-                let value = values.next_value()?.ok_or_else(short_column)?;
-                payload.extend_from_slice(&value.to_le_bytes());
-            }
+            ColumnCursor::I8(values) => append_le(values, payload, i8::to_le_bytes)?,
+            ColumnCursor::I16(values) => append_le(values, payload, i16::to_le_bytes)?,
+            ColumnCursor::I32(values) => append_le(values, payload, i32::to_le_bytes)?,
+            ColumnCursor::I64(values) => append_le(values, payload, i64::to_le_bytes)?,
+            ColumnCursor::U8(values) => append_le(values, payload, u8::to_le_bytes)?,
+            ColumnCursor::U16(values) => append_le(values, payload, u16::to_le_bytes)?,
+            ColumnCursor::U32(values) => append_le(values, payload, u32::to_le_bytes)?,
+            ColumnCursor::U64(values) => append_le(values, payload, u64::to_le_bytes)?,
+            ColumnCursor::F32(values) => append_le(values, payload, f32::to_le_bytes)?,
+            ColumnCursor::F64(values) => append_le(values, payload, f64::to_le_bytes)?,
             ColumnCursor::String(values, field) => {
                 if !values.next_into(field)? {
                     return Err(short_column());
@@ -312,6 +330,17 @@ impl ColumnCursor {
         }
         Ok(())
     }
+}
+
+/// Appends `values`' next value to `payload` as its little-endian bytes.
+fn append_le<T: bytemuck::Pod, const N: usize>(
+    values: &mut SpillCursor<T>,
+    payload: &mut Vec<u8>,
+    to_le_bytes: fn(T) -> [u8; N],
+) -> Result<()> {
+    let value = values.next_value()?.ok_or_else(short_column)?;
+    payload.extend_from_slice(&to_le_bytes(value));
+    Ok(())
 }
 
 /// One row on its way through the sort: its key and its encoded values.
@@ -555,9 +584,17 @@ impl RowWriter {
         for (writer, dtype) in self.columns.iter_mut().zip(&layout.columns) {
             let value = match dtype {
                 Dtype::Bool => ColumnValue::Bool(payload.take::<1>()?[0] != 0),
+                Dtype::I8 => ColumnValue::I8(i8::from_le_bytes(payload.take::<1>()?)),
+                Dtype::I16 => ColumnValue::I16(i16::from_le_bytes(payload.take::<2>()?)),
+                Dtype::I32 => ColumnValue::I32(i32::from_le_bytes(payload.take::<4>()?)),
                 Dtype::I64 => ColumnValue::I64(i64::from_le_bytes(payload.take::<8>()?)),
+                Dtype::U8 => ColumnValue::U8(u8::from_le_bytes(payload.take::<1>()?)),
+                Dtype::U16 => ColumnValue::U16(u16::from_le_bytes(payload.take::<2>()?)),
+                Dtype::U32 => ColumnValue::U32(u32::from_le_bytes(payload.take::<4>()?)),
+                Dtype::U64 => ColumnValue::U64(u64::from_le_bytes(payload.take::<8>()?)),
+                Dtype::F32 => ColumnValue::F32(f32::from_le_bytes(payload.take::<4>()?)),
                 Dtype::F64 => ColumnValue::F64(f64::from_le_bytes(payload.take::<8>()?)),
-                _ => {
+                Dtype::String => {
                     let len = u32::from_le_bytes(payload.take::<4>()?) as usize;
                     let bytes = payload.take_slice(len)?;
                     // Written from a `&str` by `ColumnCursor::append_next`.
@@ -750,6 +787,121 @@ mod tests {
                     b.values(),
                     "{} ({run_bytes}, {fan_in})",
                     a.name()
+                );
+            }
+        }
+    }
+
+    // Issue #155: a spilled Parquet file's narrower dtypes travel through
+    // the sort like CSV's own, each value staying with its row. The
+    // fixture's `value` column is the row's original index, so after the
+    // sort it says which original row each sorted row is.
+    #[test]
+    fn every_spilled_dtype_travels_through_the_sort_with_its_row() {
+        use crate::index::spill::{SpillVec, SpillVecWriter};
+        use crate::series::Series;
+        fn spilled<T: bytemuck::Pod>(set: &SpillSet, stem: &str, values: Vec<T>) -> SpillVec<T> {
+            let mut writer = SpillVecWriter::create(set, stem).expect("create");
+            writer.extend_from_slice(&values).expect("write");
+            writer.finish().expect("finish")
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = tempfile::tempdir().expect("temp cache dir");
+        let path = fixture(dir.path());
+        let reference = sorted_in_memory(&path, cache.path());
+        let mut dataset = load_with_budget(&path, RamBudget::from_total_ram_bytes(0), cache.path())
+            .expect("open");
+        let rows = dataset.time.len();
+        let set = SpillSet::create(cache.path()).expect("spill set");
+        let narrow = [
+            SpilledValues::I8(spilled(
+                &set,
+                "i8",
+                (0..rows).map(|i| (i % 256) as u8 as i8).collect(),
+            )),
+            SpilledValues::I16(spilled(
+                &set,
+                "i16",
+                (0..rows).map(|i| -(i as i16)).collect(),
+            )),
+            SpilledValues::I32(spilled(
+                &set,
+                "i32",
+                (0..rows).map(|i| i as i32 * -70_001).collect(),
+            )),
+            SpilledValues::U8(spilled(
+                &set,
+                "u8",
+                (0..rows).map(|i| (i % 256) as u8).collect(),
+            )),
+            SpilledValues::U16(spilled(
+                &set,
+                "u16",
+                (0..rows).map(|i| i as u16 * 31).collect(),
+            )),
+            SpilledValues::U32(spilled(
+                &set,
+                "u32",
+                (0..rows).map(|i| i as u32 * 2_000_003).collect(),
+            )),
+            SpilledValues::U64(spilled(
+                &set,
+                "u64",
+                (0..rows).map(|i| u64::MAX - i as u64).collect(),
+            )),
+            SpilledValues::F32(spilled(
+                &set,
+                "f32",
+                (0..rows)
+                    .map(|i| {
+                        if i.is_multiple_of(9) {
+                            f32::NAN
+                        } else {
+                            i as f32 * 0.5
+                        }
+                    })
+                    .collect(),
+            )),
+        ];
+        let expected = |values: &SpilledValues, original: usize| -> String {
+            match values {
+                SpilledValues::I8(_) => ((original % 256) as u8 as i8).to_string(),
+                SpilledValues::I16(_) => (-(original as i16)).to_string(),
+                SpilledValues::I32(_) => (original as i32 * -70_001).to_string(),
+                SpilledValues::U8(_) => ((original % 256) as u8).to_string(),
+                SpilledValues::U16(_) => (original as u16 * 31).to_string(),
+                SpilledValues::U32(_) => (original as u32 * 2_000_003).to_string(),
+                SpilledValues::U64(_) => (u64::MAX - original as u64).to_string(),
+                SpilledValues::F32(_) if original.is_multiple_of(9) => f32::NAN.to_string(),
+                SpilledValues::F32(_) => (original as f32 * 0.5).to_string(),
+                _ => unreachable!("only the narrow dtypes are added"),
+            }
+        };
+        let first_added = dataset.columns.len();
+        for (index, values) in narrow.iter().enumerate() {
+            dataset.columns.push(Series::new(
+                format!("narrow{index}"),
+                SeriesValues::Spilled(values.clone()),
+            ));
+        }
+        let sorted =
+            sort_spilled_by_time_with(dataset, cache.path(), 4_096, 3, &never()).expect("sort");
+        assert_eq!(sorted.time, reference.time);
+        assert_eq!(sorted.columns[0].values(), reference.columns[0].values());
+        for (offset, values) in narrow.iter().enumerate() {
+            let column = sorted.columns[first_added + offset].values();
+            assert_eq!(column.dtype(), values.dtype(), "the sort keeps the dtype");
+            for sorted_row in 0..rows {
+                let original = sorted.columns[0]
+                    .values()
+                    .display_at(sorted_row)
+                    .and_then(|text| text.parse::<i64>().ok())
+                    .expect("the row index column");
+                assert_eq!(
+                    column.display_at(sorted_row),
+                    Some(expected(values, original as usize)),
+                    "{:?} at sorted row {sorted_row}",
+                    values.dtype()
                 );
             }
         }
