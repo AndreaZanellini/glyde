@@ -26,8 +26,8 @@
 //! issue, not an edit.
 
 use glyde_core::dsp::decimation::{
-    build_pyramid, build_pyramid_streaming, connectors, decimate_viewport, extend_pyramid, Bucket,
-    Connector,
+    build_pyramid, build_pyramid_streaming, connectors, connectors_across_gaps, decimate_viewport,
+    extend_pyramid, Bucket, Connector,
 };
 use glyde_core::series::SampleSource;
 use glyde_core::time::TickSource;
@@ -490,4 +490,48 @@ fn converged_columns_are_joined_exactly_like_the_convergence_line() {
         .collect();
     assert_eq!(connectors(&columns).collect::<Vec<_>>(), expected);
     assert_eq!(expected.len(), 49 - 7, "seven segments touch a NaN");
+}
+
+/// SPEC §2.3 ("a gap looks like a gap"): a connector between two real,
+/// consecutive samples whose Δt exceeds the gap threshold is not drawn, so
+/// the truthful linear axis shows empty time, not a line through it. Every
+/// other connector — and every connector when there is no threshold — is
+/// untouched, so the samples themselves are never altered or dropped.
+#[test]
+fn connectors_are_not_drawn_across_a_time_gap() {
+    // 10 samples 1_000 ticks apart, then a 50_000-tick hole, then 10 more.
+    let mut timestamps: Vec<i128> = (0..10).map(|i| i * 1_000).collect();
+    timestamps.extend((0..10).map(|i| 59_000 + i * 1_000));
+    let samples: Vec<f64> = (0..20).map(|i| i as f64).collect();
+    let pyramid = build_pyramid(&samples, &timestamps);
+    let range = (timestamps[0], timestamps[19]);
+    let columns = decimate_viewport(&pyramid, &samples, &timestamps, range, 200);
+    assert_eq!(columns.len(), 20, "one column per raw sample");
+
+    let threshold = Some(10.0 * 1_000.0);
+    let drawn: Vec<Connector> = connectors_across_gaps(&columns, threshold).collect();
+    let expected: Vec<Connector> = (0..19)
+        .filter(|&i| i != 9)
+        .map(|i| line(&samples, &timestamps, i, i + 1))
+        .collect();
+    assert_eq!(drawn, expected, "only the connector over the hole is gone");
+
+    let unbroken: Vec<Connector> = connectors_across_gaps(&columns, None).collect();
+    assert_eq!(unbroken, connectors(&columns).collect::<Vec<_>>());
+    assert_eq!(unbroken.len(), 19, "no threshold, no connector is dropped");
+}
+
+/// A Δt exactly at the threshold is not a gap (`Δt > 10 × median`).
+#[test]
+fn a_delta_exactly_at_the_gap_threshold_is_still_connected() {
+    let timestamps: Vec<i128> = vec![0, 1_000, 11_000];
+    let samples = vec![1.0, 2.0, 3.0];
+    let pyramid = build_pyramid(&samples, &timestamps);
+    let columns = decimate_viewport(&pyramid, &samples, &timestamps, (0, 11_000), 200);
+    assert_eq!(columns.len(), 3);
+    assert_eq!(
+        connectors_across_gaps(&columns, Some(10_000.0)).count(),
+        2,
+        "Δt == threshold is not a gap"
+    );
 }

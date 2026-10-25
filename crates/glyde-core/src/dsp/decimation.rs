@@ -779,10 +779,28 @@ pub struct Connector {
 /// A column of nothing but NaN (a gap bucket) is never joined to either
 /// neighbour.
 pub fn connectors(columns: &[Bucket]) -> impl Iterator<Item = Connector> + '_ {
+    connectors_across_gaps(columns, None)
+}
+
+/// [`connectors`], minus any connector over a time gap (SPEC §2.3: "a gap
+/// looks like a gap"): one whose two samples are more than `gap_threshold`
+/// ticks apart (`Δt > 10 × median Δt`, [`crate::time::gap_threshold`]) is not
+/// drawn, so the truthful linear axis shows empty time instead of a line
+/// through it. A drawing decision only: no sample is altered or dropped, and
+/// `None` (no threshold known) drops nothing.
+pub fn connectors_across_gaps(
+    columns: &[Bucket],
+    gap_threshold: Option<f64>,
+) -> impl Iterator<Item = Connector> + '_ {
     columns
         .iter()
         .zip(columns.iter().skip(1))
         .filter(|(left, right)| !left.last_value.is_nan() && !right.first_value.is_nan())
+        .filter(move |(left, right)| {
+            gap_threshold.map_or(true, |threshold| {
+                (right.first_ts - left.last_ts) as f64 <= threshold
+            })
+        })
         .map(|(left, right)| Connector {
             from: (left.last_ts, left.last_value),
             to: (right.first_ts, right.first_value),

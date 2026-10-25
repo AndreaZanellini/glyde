@@ -46,7 +46,9 @@
 use std::sync::Arc;
 
 use egui_plot::{GridMark, Line, Plot, PlotBounds, PlotPoints, Points};
-use glyde_core::dsp::decimation::{connectors, decimate_viewport, finite_range, Bucket, Pyramid};
+use glyde_core::dsp::decimation::{
+    connectors_across_gaps, decimate_viewport, finite_range, Bucket, Pyramid,
+};
 use glyde_core::ingest::{
     progressive_tick_to_value, progressive_value_to_tick, Dataset, Level0Cache, TimeAxis,
 };
@@ -558,7 +560,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 // converged bucket into the point-markers list only, with
                 // no connecting line at all, rendering a small file as
                 // scattered disconnected dots instead of a line plot.
-                let segments = bucket_segments(&dataset.time, buckets);
+                let segments = bucket_segments(&dataset.time, buckets, fit_bounds.gap_threshold);
                 for segment in &segments {
                     plot_ui.line(
                         Line::new(PlotPoints::new(segment.clone()))
@@ -600,7 +602,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                     }
                 }
                 let at = |(tick, value): (i128, f64)| [tick_to_seconds(&dataset.time, tick), value];
-                for connector in connectors(buckets) {
+                for connector in connectors_across_gaps(buckets, fit_bounds.gap_threshold) {
                     bars.connect(at(connector.from), at(connector.to));
                 }
                 if !bars.is_empty() {
@@ -697,6 +699,10 @@ pub struct FitBounds {
     /// one with no finite value (NaN and ±∞ are flagged anomalies, never a
     /// fit target, SPEC §1.3).
     y: Vec<Option<(f64, f64)>>,
+    /// SPEC §2.3's gap threshold (`10 × median Δt`) in ticks; `None` when
+    /// the axis has too few samples to have one. The plot draws no line
+    /// across a Δt above it, so a gap looks like a gap.
+    gap_threshold: Option<f64>,
 }
 
 impl FitBounds {
@@ -738,6 +744,7 @@ impl FitBounds {
         Self {
             x: fit_range(ticks, sorted, &dataset.time),
             y,
+            gap_threshold: glyde_core::time::gap_threshold(ticks).ok().flatten(),
         }
     }
 
@@ -1281,16 +1288,32 @@ fn bucket_is_gap(bucket: &Bucket) -> bool {
 /// interpolated"), just over buckets instead of raw `(x, value)` pairs
 /// directly. Each run is drawn as its own connected `Line` by [`show`], so a
 /// gap can never be bridged by a single continuous line.
-fn bucket_segments(time: &TimeAxis, buckets: &[Bucket]) -> Vec<Vec<[f64; 2]>> {
+///
+/// A run is also split where two consecutive samples are more than
+/// `gap_threshold` ticks apart (SPEC §2.3, a time gap): the linear axis then
+/// shows the hole instead of a line through it. No sample is dropped.
+fn bucket_segments(
+    time: &TimeAxis,
+    buckets: &[Bucket],
+    gap_threshold: Option<f64>,
+) -> Vec<Vec<[f64; 2]>> {
     let mut segments: Vec<Vec<[f64; 2]>> = Vec::new();
     let mut current: Vec<[f64; 2]> = Vec::new();
+    let mut previous_ts: Option<i128> = None;
     for bucket in buckets {
         if bucket_is_gap(bucket) {
             if !current.is_empty() {
                 segments.push(std::mem::take(&mut current));
             }
+            previous_ts = None;
             continue;
         }
+        if let (Some(previous), Some(threshold)) = (previous_ts, gap_threshold) {
+            if (bucket.first_ts - previous) as f64 > threshold && !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+        }
+        previous_ts = Some(bucket.last_ts);
         let x = tick_to_seconds(time, (bucket.first_ts + bucket.last_ts) / 2);
         // In the convergence regime every bucket is exactly one raw sample,
         // so `min == max` is that sample's own value.
@@ -1731,6 +1754,7 @@ fn format_cursor_time(time: &TimeAxis, index: usize) -> String {
 #[cfg(test)]
 mod render_tests {
     use super::*;
+    use glyde_core::dsp::decimation::connectors;
     use glyde_core::series::Series;
     use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
 
@@ -3938,7 +3962,7 @@ mod tests {
         ];
 
         assert_eq!(
-            bucket_segments(&time, &buckets),
+            bucket_segments(&time, &buckets, None),
             vec![vec![[0.0, 1.0], [1.0, 2.0]]]
         );
     }
@@ -3980,9 +4004,44 @@ mod tests {
         ];
 
         assert_eq!(
-            bucket_segments(&time, &buckets),
+            bucket_segments(&time, &buckets, None),
             vec![vec![[0.0, 1.0]], vec![[2.0, 3.0]]]
         );
+    }
+
+    #[test]
+    fn bucket_segments_breaks_into_separate_runs_across_a_time_gap() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        let sample = |ts: i128, value: f64| Bucket {
+            min: value,
+            max: value,
+            first_ts: ts,
+            last_ts: ts,
+            first_value: value,
+            last_value: value,
+            nan_count: 0,
+        };
+        let buckets = vec![
+            sample(0, 1.0),
+            sample(1, 2.0),
+            sample(100, 3.0),
+            sample(101, 4.0),
+        ];
+
+        // Δt = 99 > 10: the hole is a break; every sample is still drawn.
+        assert_eq!(
+            bucket_segments(&time, &buckets, Some(10.0)),
+            vec![
+                vec![[0.0, 1.0], [1.0, 2.0]],
+                vec![[100.0, 3.0], [101.0, 4.0]]
+            ]
+        );
+        // Δt exactly at the threshold is not a gap; no threshold, no break.
+        assert_eq!(bucket_segments(&time, &buckets, Some(99.0)).len(), 1);
+        assert_eq!(bucket_segments(&time, &buckets, None).len(), 1);
     }
 
     #[test]
