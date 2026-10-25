@@ -797,9 +797,8 @@ pub fn connectors_across_gaps(
         .zip(columns.iter().skip(1))
         .filter(|(left, right)| !left.last_value.is_nan() && !right.first_value.is_nan())
         .filter(move |(left, right)| {
-            gap_threshold.map_or(true, |threshold| {
-                (right.first_ts - left.last_ts) as f64 <= threshold
-            })
+            gap_threshold
+                .is_none_or(|threshold| (right.first_ts - left.last_ts) as f64 <= threshold)
         })
         .map(|(left, right)| Connector {
             from: (left.last_ts, left.last_value),
