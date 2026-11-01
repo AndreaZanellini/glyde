@@ -2039,7 +2039,10 @@ mod render_tests {
         assert!(has_text(&linear, "1 gaps detected ·"), "affordance shown");
         assert!(has_text(&linear, "Compress"));
         assert!(!state.compressed, "never compressed automatically");
-        assert!(!has_text(&linear, "⫽ 2.8 h gap"), "linear axis has no break");
+        assert!(
+            !has_text(&linear, "⫽ 2.8 h gap"),
+            "linear axis has no break"
+        );
 
         state.compressed = true;
         let compressed = run_frames(&dataset, &mut state, 4);
