@@ -207,7 +207,7 @@ them, so CI stays green while honoring "written first."
 ## M8 — Gaps & anomalies (fidelity, made visible)
 
 - [ ] Truthful linear time axis is the default; a gap looks like a gap and is never auto-overridden → SPEC §2.3 · proven by: corpus 40 + gap-detection golden
-- [ ] Compressed/broken-axis escape hatch when gaps > 50% of total span (`N gaps · [Compress]`), break glyph, explicit labels; view-state only (no effect on data/DSP) → SPEC §2.3 · proven by: manual on a gap-heavy file
+- [x] Compressed/broken-axis escape hatch when gaps > 50% of total span (`N gaps · [Compress]`), break glyph, explicit labels; view-state only (no effect on data/DSP) → SPEC §2.3 · proven by: manual on a gap-heavy file
 - [ ] Click a gap-adjacent cluster → fits it to the viewport → SPEC §2.3 · proven by: manual
 - [ ] Anomaly gutter under the plot: NaN runs, skipped rows, flagged outliers; clickable to jump → SPEC §4.1 · proven by: corpus 43, 21, 45
 - [ ] Outlier detection: robust MAD-based rule (documented threshold), **flag only — never remove or clip** → SPEC §1.3 · proven by: corpus 45
