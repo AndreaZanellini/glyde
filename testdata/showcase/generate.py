@@ -425,7 +425,7 @@ def gearbox():
             ev[n // 2] = "ALARM: BPFO envelope > 4 g"
             alarmed = True
 
-        stamps = day0 + np.timedelta64(b * period_s, "s") + (np.arange(n) * 40).astype("timedelta64[ns]")
+        stamps = day0 + np.timedelta64(b * period_s, "s") + (np.arange(n) * 40_000).astype("timedelta64[ns]")  # 40 µs = 25 kHz
         bn = np.where(np.isnan(brg), None, brg)
         table = pa.table({
             "timestamp": pa.array(stamps.astype("datetime64[ns]"), type=pa.timestamp("ns")).cast(

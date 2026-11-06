@@ -19,7 +19,7 @@ Generation is deterministic (fixed seeds) and takes about 3 minutes.
 |---|---|---|---|---|
 | `01_engine_testbench.csv` | Engine test bench, 1 kHz, three runs separated by pauses | 1.44 M | 155 MB | in RAM |
 | `02_pv_inverter_spill.csv` | Grid-tied PV inverter, 20 kHz, 10.5 min | 12.55 M | 1.18 GB | **spilled to disk** |
-| `03_gearbox_cms_bursts.parquet` | Wind-turbine gearbox monitoring: 2 s at 25 kHz every 10 min for 24 h | 7.2 M | 248 MB | in RAM |
+| `03_gearbox_cms_bursts.parquet` | Wind-turbine gearbox monitoring: 2 s at 25 kHz every 10 min for 24 h | 7.2 M | 269 MB | in RAM |
 
 File 02 spills on any machine. The RAM budget is `min(25% of RAM, 4 GB)`, and the file's in-memory estimate is above 6 GB.
 Opening it needs about 1.7 GB free on the cache disk.
