@@ -52,4 +52,5 @@ InferenceReport {
         "acceleration [µm/s²]",
     ],
     unloaded_columns: [],
+    replaced_sequences: 0,
 }

@@ -61,7 +61,8 @@ use crate::time::{TimeUnit, Timestamp, TimestampFormat};
 use crate::{GlydeError, Result};
 
 const MAGIC: &[u8; 8] = b"GLYDEDS\0";
-const FORMAT_VERSION: u32 = 1;
+// 2: the outcome's `replaced_sequences` (issue #209).
+const FORMAT_VERSION: u32 = 2;
 const HEADER_LEN: usize = 24;
 
 /// Where a key's cache file lives under `cache_dir`.
@@ -154,6 +155,7 @@ struct OutcomeMeta {
     delimiter_confidence: bool,
     decimal_separator_confidence: bool,
     header_ambiguous: bool,
+    replaced_sequences: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -334,6 +336,7 @@ fn write(
             delimiter_confidence: confidence_high(outcome.delimiter_confidence),
             decimal_separator_confidence: confidence_high(outcome.decimal_separator_confidence),
             header_ambiguous: outcome.header_ambiguous,
+            replaced_sequences: outcome.replaced_sequences,
         },
         inference: InferenceMeta {
             timestamp_format_ambiguous: inference.timestamp_format_ambiguous,
@@ -623,6 +626,7 @@ fn read(inner: impl Read, file_len: u64) -> Result<Parsed> {
         delimiter_confidence: confidence(outcome.delimiter_confidence),
         decimal_separator_confidence: confidence(outcome.decimal_separator_confidence),
         header_ambiguous: outcome.header_ambiguous,
+        replaced_sequences: outcome.replaced_sequences,
     };
     let inference = TimeIndexInference {
         timestamp_format_ambiguous: meta.inference.timestamp_format_ambiguous,

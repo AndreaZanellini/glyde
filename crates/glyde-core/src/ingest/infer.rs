@@ -214,6 +214,16 @@ fn utf8_invalid_byte_fraction(bytes: &[u8]) -> f64 {
 /// and duplicate the entire memory-mapped file onto the heap regardless,
 /// see issue #58).
 pub fn decode<'a>(bytes: &'a [u8], inference: &EncodingInference) -> Cow<'a, str> {
+    decode_counting(bytes, inference).0
+}
+
+/// [`decode`], also returning how many replacement characters (U+FFFD) the
+/// decoding wrote for invalid byte sequences (issue #209): what the
+/// inference bar reports as text Glyde had to alter. Counted only when the
+/// decoder reported an error, so a clean file costs nothing; a U+FFFD the
+/// source itself encoded validly is then counted too, which errs on the
+/// side of saying more.
+pub fn decode_counting<'a>(bytes: &'a [u8], inference: &EncodingInference) -> (Cow<'a, str>, u64) {
     // Same BOM rule as `EncodingInference::new_decoder`.
     let (text, had_errors) = match inference.source {
         EncodingSource::UserCorrection => inference.encoding.decode_with_bom_removal(bytes),
@@ -222,13 +232,23 @@ pub fn decode<'a>(bytes: &'a [u8], inference: &EncodingInference) -> Cow<'a, str
             (text, had_errors)
         }
     };
+    let mut replaced = 0;
     if had_errors {
+        replaced = replacement_count(text.as_bytes());
         warn!(
             encoding = inference.encoding.name(),
-            "invalid byte sequences encountered; replaced with U+FFFD"
+            replaced, "invalid byte sequences encountered; replaced with U+FFFD"
         );
     }
-    text
+    (text, replaced)
+}
+
+/// How many U+FFFD replacement characters UTF-8 `text` holds.
+pub(crate) fn replacement_count(text: &[u8]) -> u64 {
+    const REPLACEMENT: &[u8] = "\u{FFFD}".as_bytes();
+    text.windows(REPLACEMENT.len())
+        .filter(|window| *window == REPLACEMENT)
+        .count() as u64
 }
 
 /// A field delimiter candidate (SPEC §1.2.2).

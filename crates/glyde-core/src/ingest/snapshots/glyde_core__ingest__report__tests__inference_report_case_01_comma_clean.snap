@@ -52,4 +52,5 @@ InferenceReport {
         "pressure",
     ],
     unloaded_columns: [],
+    replaced_sequences: 0,
 }

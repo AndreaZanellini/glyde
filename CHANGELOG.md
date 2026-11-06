@@ -52,6 +52,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
     change.
 
 ### Fixed
+- **Glyde now tells you when it had to replace unreadable characters (issue
+  #209).** When some bytes of a text file are not valid in its encoding,
+  Glyde replaces them with the `�` symbol so the file still opens. That
+  used to happen silently: the bar under the toolbar showed the encoding as
+  certain. Now it says, next to the encoding, how many characters were
+  replaced (`1 invalid character replaced with �`), opens by itself, and
+  offers the other encodings in one click, since this is often the sign
+  that the encoding was guessed wrong. If you picked the encoding yourself,
+  the count is still shown. Try
+  `testdata/corpus/case-12-invalid-byte-sequences.csv`. Files you opened
+  before this version are read again once, because the saved copy Glyde
+  keeps for a fast reopen did not record this count.
 - **No more stray marks in the middle of a pause in recording (issue
   #192).** Zoomed out, the plot used to draw a short vertical bar in the
   middle of a time gap, at a time where the file has no sample (for

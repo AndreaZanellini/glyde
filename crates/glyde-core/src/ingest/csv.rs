@@ -206,6 +206,10 @@ pub struct CsvParseOutcome {
     /// names (including the time column's) are a guess, not a resolved
     /// reading.
     pub header_ambiguous: bool,
+    /// How many replacement characters (U+FFFD) decoding wrote for invalid
+    /// byte sequences over the whole file (issue #209): source text Glyde
+    /// had to alter. Non-zero makes an inferred encoding low confidence.
+    pub replaced_sequences: u64,
 }
 
 /// Everything SPEC §1.2 infers from a file's bounded head sample: the
@@ -644,8 +648,9 @@ fn parse_bytes(
     cancelled: &AtomicBool,
 ) -> Result<(CsvParseOutcome, Vec<ColumnText>)> {
     let sniff = sniff_bytes(bytes, overrides)?;
-    let text = infer::decode(bytes, &sniff.encoding);
-    parse_rows(text.as_bytes(), &sniff, capture, on_chunk, cancelled)
+    let (text, replaced) = infer::decode_counting(bytes, &sniff.encoding);
+    let (outcome, captured) = parse_rows(text.as_bytes(), &sniff, capture, on_chunk, cancelled)?;
+    Ok((sniff.with_replacements(outcome, replaced), captured))
 }
 
 /// Streams every row of the file at `path` through `on_row`, decoding and
@@ -672,11 +677,14 @@ pub(crate) fn stream_path(
         path: path.to_path_buf(),
         source,
     })?;
+    let replaced = std::rc::Rc::new(std::cell::Cell::new(0));
     let reader = DecodedReader::new(
         BufReader::with_capacity(READ_BUFFER_BYTES, file),
         sniff.encoding.new_decoder(),
+        std::rc::Rc::clone(&replaced),
     );
-    parse_rows(reader, sniff, Capture::Sink(on_row), None, cancelled).map(|(outcome, _)| outcome)
+    let (outcome, _) = parse_rows(reader, sniff, Capture::Sink(on_row), None, cancelled)?;
+    Ok(sniff.with_replacements(outcome, replaced.get()))
 }
 
 /// The row loop, shared by every entry point above. `reader` yields the
@@ -889,7 +897,31 @@ impl Sniff {
             delimiter_confidence: self.delimiter_confidence,
             decimal_separator_confidence: self.decimal_separator_confidence,
             header_ambiguous: self.header.ambiguous,
+            replaced_sequences: 0,
         }
+    }
+
+    /// `outcome` with the whole file's replacement count (issue #209). For
+    /// an inferred encoding, any replacement makes it low confidence: text
+    /// was altered, and a wrong guess is the likely reason. A user's pick is
+    /// not a guess, so it keeps its confidence, but its count is still
+    /// reported.
+    fn with_replacements(&self, mut outcome: CsvParseOutcome, replaced: u64) -> CsvParseOutcome {
+        outcome.replaced_sequences = replaced;
+        if replaced > 0 {
+            let picked = self.encoding.source == infer::EncodingSource::UserCorrection;
+            if !picked {
+                outcome.encoding_confidence = Confidence::Low;
+            }
+            info!(
+                encoding = %self.encoding_label,
+                replaced,
+                user_picked = picked,
+                "invalid byte sequences replaced with U+FFFD: reported in the inference bar \
+                 (SPEC §1.3, issue #209)"
+            );
+        }
+        outcome
     }
 }
 
@@ -1086,10 +1118,17 @@ struct DecodedReader<R> {
     output_pos: usize,
     finished: bool,
     reported_errors: bool,
+    /// Replacement characters written so far (issue #209), read by the
+    /// caller once the reader is consumed.
+    replaced: std::rc::Rc<std::cell::Cell<u64>>,
 }
 
 impl<R: Read> DecodedReader<R> {
-    fn new(inner: R, decoder: encoding_rs::Decoder) -> Self {
+    fn new(
+        inner: R,
+        decoder: encoding_rs::Decoder,
+        replaced: std::rc::Rc<std::cell::Cell<u64>>,
+    ) -> Self {
         Self {
             inner,
             decoder,
@@ -1102,6 +1141,7 @@ impl<R: Read> DecodedReader<R> {
             output_pos: 0,
             finished: false,
             reported_errors: false,
+            replaced,
         }
     }
 }
@@ -1135,6 +1175,12 @@ impl<R: Read> BufRead for DecodedReader<R> {
             self.input_pos += read;
             self.output_pos = 0;
             self.output_len = written;
+            if had_errors {
+                // A replacement is never split across two outputs: the
+                // decoder writes whole characters.
+                let count = infer::replacement_count(&self.output[..written]);
+                self.replaced.set(self.replaced.get() + count);
+            }
             if had_errors && !self.reported_errors {
                 warn!(
                     encoding = self.decoder.encoding().name(),
