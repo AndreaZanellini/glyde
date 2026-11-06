@@ -31,6 +31,25 @@ Versioning: [Semantic Versioning](https://semver.org/).
     when it has more than 100,000 gaps; Glyde logs which of these applied.
     Clicking a cluster to zoom to it is a separate roadmap item.
 
+### Changed
+- **A gap in the data now looks like a gap on the plot.** The time axis was
+  already truthful (a pause in recording takes up its real width), but the
+  plot still drew a straight line across the hole as if the signal had
+  continued. A line is no longer drawn between two samples that are more
+  than 10 times the typical sample spacing apart (the same rule that counts
+  "gaps" in the inference bar). Every sample is still plotted and nothing in
+  the data changes; only the line over the empty time is gone. Try
+  `testdata/corpus/case-40-segmented-three-bursts.csv`: three separate bursts.
+  **Assumptions made (please veto by testing the app):**
+  - SPEC §2.3 says "a gap looks like a gap" without saying how; I read it as
+    "break the line", the same way a missing (NaN) value already breaks it.
+  - When most timestamps repeat (e.g. whole seconds on a 10 Hz log), the
+    typical spacing is zero and the rule would break the line at every step;
+    in that case the line is not broken at all, and the log says so.
+  - The compressed-axis `[Compress]` button, clicking a cluster to fit it,
+    and the anomaly gutter are separate roadmap items and are not in this
+    change.
+
 ### Fixed
 - **A file too large for memory no longer copies its whole-number columns
   into memory (issue #178).** When a file is kept on disk because it does
