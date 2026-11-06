@@ -449,7 +449,18 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         .enumerate()
         .filter(|(_, series)| series.view_kind() == ViewKind::TimeDomain)
         .collect();
-    channels.sync(all_channels.iter().map(|(_, series)| series.name()));
+    // A channel with nothing to draw says so in the legend (issue #207).
+    let channel_names: Vec<String> = all_channels
+        .iter()
+        .map(|&(column_index, series)| {
+            if fit_bounds.all_missing.get(column_index) == Some(&true) {
+                format!("{} — all missing", series.name())
+            } else {
+                series.name().to_owned()
+            }
+        })
+        .collect();
+    channels.sync(channel_names.iter().map(String::as_str));
     let plotted: Vec<(usize, usize, &Series)> = all_channels
         .iter()
         .enumerate()
@@ -697,12 +708,25 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                             .color(color),
                     );
                 }
-                let points: Vec<[f64; 2]> = segments.into_iter().flatten().collect();
+                // A run of one sample has no line to show it (issue #207):
+                // it gets the larger marker.
+                let (isolated, connected): (Vec<_>, Vec<_>) =
+                    segments.into_iter().partition(|segment| segment.len() == 1);
+                let points: Vec<[f64; 2]> = connected.into_iter().flatten().collect();
                 if !points.is_empty() {
                     plot_ui.points(
                         Points::new(PlotPoints::new(points))
                             .name(series.name())
                             .radius(2.0_f32)
+                            .color(color),
+                    );
+                }
+                let isolated: Vec<[f64; 2]> = isolated.into_iter().flatten().collect();
+                if !isolated.is_empty() {
+                    plot_ui.points(
+                        Points::new(PlotPoints::new(isolated))
+                            .name(series.name())
+                            .radius(ISOLATED_MARKER_RADIUS)
                             .color(color),
                     );
                 }
@@ -718,7 +742,13 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 // plot item (issue #137), not one `Line` each.
                 let mut points: Vec<[f64; 2]> = Vec::new();
                 let mut bars = MinMaxBars::new(series.name(), color, bar_encoding);
-                for bucket in buckets {
+                let mut isolated: Vec<[f64; 2]> = Vec::new();
+                let gap_at = |index: Option<usize>| {
+                    index
+                        .and_then(|index| buckets.get(index))
+                        .is_none_or(bucket_is_gap)
+                };
+                for (index, bucket) in buckets.iter().enumerate() {
                     if bucket_is_gap(bucket) {
                         continue;
                     }
@@ -729,7 +759,13 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                     if bucket.min == bucket.max {
                         // A lone ±∞ is only marked at the edge (issue #203).
                         if bucket.min.is_finite() {
-                            points.push([bucket_x, bucket.min]);
+                            // Between two empty columns, nothing joins it
+                            // (issue #207): the larger marker.
+                            if gap_at(index.checked_sub(1)) && gap_at(Some(index + 1)) {
+                                isolated.push([bucket_x, bucket.min]);
+                            } else {
+                                points.push([bucket_x, bucket.min]);
+                            }
                         }
                     } else {
                         bars.push(bucket_x, bucket.min, bucket.max);
@@ -753,6 +789,14 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                         Points::new(PlotPoints::new(points))
                             .name(series.name())
                             .radius(2.0_f32)
+                            .color(color),
+                    );
+                }
+                if !isolated.is_empty() {
+                    plot_ui.points(
+                        Points::new(PlotPoints::new(isolated))
+                            .name(series.name())
+                            .radius(ISOLATED_MARKER_RADIUS)
                             .color(color),
                     );
                 }
@@ -838,6 +882,11 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     visible
 }
 
+/// The radius, in points, of the marker for a sample with no neighbour to
+/// connect to (issue #207): a lone sample between NaNs or gaps, or a
+/// one-row file. Twice the ordinary sample dot, so it cannot be missed.
+const ISOLATED_MARKER_RADIUS: f32 = 4.0;
+
 /// SPEC §2.3's `N gaps detected ·`, in the singular for one gap.
 fn gap_count_label(count: usize) -> String {
     let noun = if count == 1 { "gap" } else { "gaps" };
@@ -897,6 +946,10 @@ pub struct FitBounds {
     /// SPEC §2.3's compressed axis, present only when its affordance is
     /// offered: gaps account for more than half the span ([`compressible`]).
     compress: Option<Arc<BrokenAxis>>,
+    /// `dataset.columns`-parallel: a numeric column with samples, every one
+    /// of them NaN (issue #207). Nothing of it can be drawn, so the legend
+    /// says it is entirely missing instead of listing it like the others.
+    all_missing: Vec<bool>,
 }
 
 /// SPEC §2.3's gap threshold of `ticks` (`10 × median Δt`), as the plot uses
@@ -1029,6 +1082,7 @@ impl FitBounds {
         level0_caches: &[Option<Arc<Level0Cache>>],
         sorted: bool,
     ) -> Self {
+        let mut all_missing = vec![false; dataset.columns.len()];
         let y = dataset
             .columns
             .iter()
@@ -1045,10 +1099,20 @@ impl FitBounds {
                 let pyramid = pyramids.get(index).and_then(Option::as_ref);
                 let kept = pyramid.and_then(Pyramid::samples);
                 let samples = column_f64_samples(series.values(), cached, level0, kept);
-                match pyramid {
+                let range = match pyramid {
                     Some(pyramid) => pyramid.finite_range(samples),
                     None => finite_range::<Vec<Bucket>>(&[], samples),
+                };
+                // Read only for a column with no finite value at all, and
+                // stopped at its first non-NaN sample.
+                if range.is_none() && !samples.is_empty() && samples.iter().all(|v| v.is_nan()) {
+                    tracing::info!(
+                        column = series.name(),
+                        "every sample of this column is missing (NaN): said in the legend"
+                    );
+                    all_missing[index] = true;
                 }
+                range
             })
             .collect();
         let x = fit_range(ticks, sorted, &dataset.time);
@@ -1061,6 +1125,7 @@ impl FitBounds {
             gap_threshold,
             gaps: gaps.unwrap_or_default().into(),
             compress,
+            all_missing,
         }
     }
 
@@ -3899,6 +3964,49 @@ mod render_tests {
             inked[1].iter().any(|&(_, y)| (y as f32) < top + 6.0),
             "+∞ is marked at the top edge"
         );
+    }
+
+    // Issue #207: a sample with no neighbour to connect to (here, between
+    // NaNs, as in a short sensor recovery inside a dropout) was a ~2 px dot.
+    // It is a clearly visible marker, 8 pt across.
+    #[test]
+    fn an_isolated_sample_is_a_clearly_visible_marker() {
+        let nan = f64::NAN;
+        let values = vec![1.0, 2.0, 1.5, nan, nan, 5.0, nan, nan, 1.0, 2.0];
+        let (inked, bounds, frame) = ink_after_opening(dataset_of(vec![("value", values)]), 1);
+        let x =
+            frame.left() + (5.0 - bounds.min()[0]) as f32 / bounds.width() as f32 * frame.width();
+        let y = frame.bottom()
+            - (5.0 - bounds.min()[1]) as f32 / bounds.height() as f32 * frame.height();
+        let around: Vec<(i32, i32)> = inked[0]
+            .iter()
+            .copied()
+            .filter(|&(px, py)| (px as f32 - x).abs() <= 6.0 && (py as f32 - y).abs() <= 6.0)
+            .collect();
+        let width = around.iter().map(|p| p.0).max().unwrap_or(0)
+            - around.iter().map(|p| p.0).min().unwrap_or(0)
+            + 1;
+        // The ordinary 2 pt-radius dot inks 7 px across (42 px); the
+        // isolated marker is twice its radius.
+        assert!(
+            width >= 9 && around.len() >= 80,
+            "the isolated sample is {width} px wide ({} px inked)",
+            around.len()
+        );
+    }
+
+    // Issue #207: a series with no value at all said nothing; the legend now
+    // says it is entirely missing.
+    #[test]
+    fn an_all_missing_series_says_so_in_the_legend() {
+        let dataset = dataset_of(vec![
+            ("value", vec![f64::NAN; 5]),
+            ("ok", vec![1.0, 2.0, 3.0, 2.0, 1.0]),
+        ]);
+        let mut state = TimeViewState::default();
+        let shapes = run_frames(&dataset, &mut state, 3);
+        assert!(has_text(&shapes, "value — all missing"), "labelled");
+        assert!(has_text(&shapes, "ok"), "the other series keeps its name");
     }
 
     // Issue #203, the corpus file (`case-44-infinities.csv`): converged

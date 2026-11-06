@@ -52,6 +52,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
     change.
 
 ### Fixed
+- **A lone reading can no longer be missed, and an empty channel says so
+  (issue #207).** A reading with nothing to connect to (a file with a single
+  row, or one good value between missing ones, such as a sensor that comes
+  back for a moment during a dropout) used to be a tiny dot that was easy
+  to overlook. It is now drawn as a marker twice as large, in the channel's
+  color. A channel whose values are all missing used to be listed in the
+  channel picker like any other while nothing appeared on the plot; it is
+  now listed as `name — all missing`. Try
+  `testdata/corpus/case-19-single-data-row.csv` and
+  `testdata/corpus/case-52-all-nan-series.csv`.
 - **Channels no longer get near-identical colors (issue #199).** Colors
   used to be picked by stepping around the color wheel, which put some
   channels almost on top of each other (in the engine test-bench file,
