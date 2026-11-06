@@ -556,7 +556,12 @@ fn field_looks_like_data(field: &str) -> bool {
     if field.is_empty() {
         return false;
     }
-    if field.parse::<f64>().is_ok() {
+    // A comma-decimal number (`0,5`, `-1,25`) is data too (issue #216):
+    // within one field already split on the delimiter, a comma can only be
+    // a decimal mark, the same test the decimal-separator inference votes
+    // with. Without it, a `;` file of comma decimals only had every row
+    // taken for a header label, and no column at all.
+    if field.parse::<f64>().is_ok() || looks_like_decimal(field, ',') {
         return true;
     }
     // A crude but sufficient ISO-8601-leaning check: a 4-digit year followed
@@ -1553,6 +1558,31 @@ mod tests {
         assert_eq!(header.skipped_preamble_rows, 1);
         assert_eq!(header.column_names, vec!["column_0", "column_1"]);
         assert!(header.ambiguous);
+    }
+
+    // Issue #216: a `;` file whose cells are all comma-decimal numbers had
+    // every row taken for a header label (`0,5` is not an `f64` literal),
+    // so no data row, no column, and the file failed to open.
+    #[test]
+    fn infer_header_reads_comma_decimal_rows_as_data() {
+        let sample = "c0;c1;c2\n0,0;0,5;0,25\n1,0;-1,5;1,25\n";
+
+        let header = infer_header(sample, Delimiter::Semicolon);
+
+        assert_eq!(header.header_row_index, Some(0));
+        assert_eq!(header.skipped_preamble_rows, 0);
+        assert_eq!(header.column_names, vec!["c0", "c1", "c2"]);
+        assert!(!header.ambiguous);
+    }
+
+    #[test]
+    fn infer_header_on_a_headerless_comma_decimal_file_is_not_ambiguous() {
+        let header = infer_header("0,0;0,5\n1,0;1,5\n", Delimiter::Semicolon);
+
+        assert_eq!(header.header_row_index, None);
+        assert_eq!(header.skipped_preamble_rows, 0);
+        assert_eq!(header.column_names, vec!["column_0", "column_1"]);
+        assert!(!header.ambiguous);
     }
 
     #[test]
