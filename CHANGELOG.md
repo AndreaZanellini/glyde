@@ -52,6 +52,21 @@ Versioning: [Semantic Versioning](https://semver.org/).
     change.
 
 ### Fixed
+- **A single `Infinity` value no longer blanks the whole plot (issue #203).**
+  One `Infinity` or `-Infinity` reading in one channel (a common way for a
+  logger to write an overflow) used to make the time plot empty: every
+  channel disappeared, the clean ones included, and the vertical axis lost
+  its labels. Now the vertical range follows the real (finite) values only,
+  every channel is drawn, and each infinite reading is shown where it
+  happened as a small triangle at the top edge of the plot (`+Infinity`) or
+  the bottom edge (`-Infinity`), in the channel's color. The line breaks at
+  an infinite reading, as it already did at a missing (NaN) one. The data
+  is unchanged; the cursor readout still shows the exact value. Try
+  `testdata/corpus/case-44-infinities.csv`.
+  - Assumption made: the issue asks for "a marker at the plot edge"; I drew
+    a triangle pointing out of the plot. When zoomed out so that one pixel
+    column holds both normal values and an infinite one, that column's bar
+    is drawn up to the edge, next to the triangle.
 - **Updated the Parquet reader to close four published security advisories
   in its compression library.** The zstd decompressor that Parquet files use
   had four advisories published against it (RUSTSEC-2026-0391, -0398, -0403,

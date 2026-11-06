@@ -633,6 +633,19 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             // consistent color.
             let color = series_color(color_index);
 
+            let marks = off_scale_marks(buckets);
+            if !marks.is_empty() {
+                plot_ui.add(OffScaleMarks {
+                    name: series.name().to_owned(),
+                    color,
+                    marks: marks
+                        .into_iter()
+                        .map(|(tick, above)| (to_x(tick_to_seconds(&dataset.time, tick)), above))
+                        .collect(),
+                    highlighted: false,
+                });
+            }
+
             if cached.converged {
                 // SPEC §3.1's raw-samples regime (docs/ROADMAP.md M2): a
                 // connected line through consecutive raw samples, broken at
@@ -684,7 +697,10 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                         (bucket.first_ts + bucket.last_ts) / 2,
                     ));
                     if bucket.min == bucket.max {
-                        points.push([bucket_x, bucket.min]);
+                        // A lone ±∞ is only marked at the edge (issue #203).
+                        if bucket.min.is_finite() {
+                            points.push([bucket_x, bucket.min]);
+                        }
                     } else {
                         bars.push(bucket_x, bucket.min, bucket.max);
                     }
@@ -692,7 +708,11 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 let at = |(tick, value): (i128, f64)| {
                     [to_x(tick_to_seconds(&dataset.time, tick)), value]
                 };
-                for connector in connectors_across_gaps(buckets, fit_bounds.gap_threshold) {
+                // Never a connector to an infinite sample: like NaN, it
+                // breaks the trace (issue #203).
+                for connector in connectors_across_gaps(buckets, fit_bounds.gap_threshold)
+                    .filter(|c| c.from.1.is_finite() && c.to.1.is_finite())
+                {
                     bars.connect(at(connector.from), at(connector.to));
                 }
                 if !bars.is_empty() {
@@ -1175,12 +1195,15 @@ impl MinMaxBars {
         }
     }
 
+    /// An extent from `min` to `max`. Either may be infinite (a column
+    /// holding `±∞`, issue #203): that end is drawn to the plot's edge and
+    /// never widens the bounds, which only ever see finite values.
     fn push(&mut self, x: f64, min: f64, max: f64) {
         let extent = [
             egui_plot::PlotPoint::new(x, min),
             egui_plot::PlotPoint::new(x, max),
         ];
-        for end in &extent {
+        for end in extent.iter().filter(|end| end.y.is_finite()) {
             self.bounds.extend_with(end);
         }
         self.extents.push(extent);
@@ -1214,13 +1237,22 @@ impl egui_plot::PlotItem for MinMaxBars {
             Self::STROKE_WIDTH
         };
         let stroke = egui::Stroke::new(width, self.color);
+        // An infinite end is drawn to the edge of the view (issue #203).
+        let (view_min, view_max) = (transform.bounds().min()[1], transform.bounds().max()[1]);
+        let on_screen = |point: &egui_plot::PlotPoint| {
+            let y = match point.y {
+                f64::INFINITY => view_max,
+                f64::NEG_INFINITY => view_min,
+                y => y,
+            };
+            transform.position_from_point(&egui_plot::PlotPoint::new(point.x, y))
+        };
         // Every extent, then every connector: the order they are painted in.
-        let extents = self.extents.iter().chain(&self.connectors).map(|extent| {
-            [
-                transform.position_from_point(&extent[0]),
-                transform.position_from_point(&extent[1]),
-            ]
-        });
+        let extents = self
+            .extents
+            .iter()
+            .chain(&self.connectors)
+            .map(|extent| [on_screen(&extent[0]), on_screen(&extent[1])]);
         // Two-point paths, exactly what each `egui_plot::Line` drew: never
         // line segments, whose tessellation snaps both ends to pixel
         // centres and so erases a bar shorter than about a pixel. A stroke
@@ -1299,6 +1331,112 @@ impl egui_plot::PlotItem for MinMaxBars {
 
     fn bounds(&self) -> PlotBounds {
         self.bounds
+    }
+
+    fn id(&self) -> Option<egui::Id> {
+        None
+    }
+}
+
+/// Where `buckets` hold an infinite sample, as `(tick, above)`: `above`
+/// for `+∞`, not for `-∞`; a bucket holding both gives both (issue #203).
+/// The tick is the bucket's midpoint, the sample's own tick once one bucket
+/// is one sample. ±∞ has no place on a finite y axis, so these are drawn at
+/// the plot's top or bottom edge ([`OffScaleMarks`]) rather than dropped.
+fn off_scale_marks(buckets: &[Bucket]) -> Vec<(i128, bool)> {
+    let mut marks = Vec::new();
+    for bucket in buckets.iter().filter(|bucket| !bucket_is_gap(bucket)) {
+        let tick = (bucket.first_ts + bucket.last_ts) / 2;
+        if bucket.max == f64::INFINITY {
+            marks.push((tick, true));
+        }
+        if bucket.min == f64::NEG_INFINITY {
+            marks.push((tick, false));
+        }
+    }
+    marks
+}
+
+/// One channel's infinite samples (issue #203), as small triangles in its
+/// color at the plot's top edge (`+∞`, pointing up) or bottom edge (`-∞`,
+/// pointing down), at their x. An item with no bounds of its own: a value
+/// off any finite scale never stretches the y axis, which is what blanked
+/// every series before.
+struct OffScaleMarks {
+    name: String,
+    color: egui::Color32,
+    /// `(x, above)` per mark, in plot coordinates.
+    marks: Vec<(f64, bool)>,
+    highlighted: bool,
+}
+
+impl OffScaleMarks {
+    /// Half the triangle's base and its height, in points.
+    const HALF_WIDTH: f32 = 4.0;
+    const HEIGHT: f32 = 7.0;
+}
+
+impl egui_plot::PlotItem for OffScaleMarks {
+    fn shapes(
+        &self,
+        _ui: &egui::Ui,
+        transform: &egui_plot::PlotTransform,
+        shapes: &mut Vec<egui::Shape>,
+    ) {
+        let frame = transform.frame();
+        let mid_y = transform.bounds().center().y;
+        for &(x, above) in &self.marks {
+            let at = transform
+                .position_from_point(&egui_plot::PlotPoint::new(x, mid_y))
+                .x;
+            if !(frame.left()..=frame.right()).contains(&at) {
+                continue;
+            }
+            let (tip, base) = if above {
+                (frame.top(), frame.top() + Self::HEIGHT)
+            } else {
+                (frame.bottom(), frame.bottom() - Self::HEIGHT)
+            };
+            shapes.push(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(at, tip),
+                    egui::pos2(at + Self::HALF_WIDTH, base),
+                    egui::pos2(at - Self::HALF_WIDTH, base),
+                ],
+                self.color,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
+
+    fn initialize(&mut self, _x_range: std::ops::RangeInclusive<f64>) {}
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn color(&self) -> egui::Color32 {
+        self.color
+    }
+
+    fn highlight(&mut self) {
+        self.highlighted = true;
+    }
+
+    fn highlighted(&self) -> bool {
+        self.highlighted
+    }
+
+    fn allow_hover(&self) -> bool {
+        false
+    }
+
+    fn geometry(&self) -> egui_plot::PlotGeometry<'_> {
+        egui_plot::PlotGeometry::None
+    }
+
+    fn bounds(&self) -> PlotBounds {
+        PlotBounds::NOTHING
     }
 
     fn id(&self) -> Option<egui::Id> {
@@ -1517,6 +1655,9 @@ fn bucket_is_gap(bucket: &Bucket) -> bool {
 /// directly. Each run is drawn as its own connected `Line` by [`show`], so a
 /// gap can never be bridged by a single continuous line.
 ///
+/// A run is also split at an infinite sample (issue #203), which
+/// [`off_scale_marks`] marks at the plot's edge instead.
+///
 /// A run is also split where two consecutive samples are more than
 /// `gap_threshold` ticks apart (SPEC §2.3, a time gap): the linear axis then
 /// shows the hole instead of a line through it. No sample is dropped.
@@ -1529,7 +1670,10 @@ fn bucket_segments(
     let mut current: Vec<[f64; 2]> = Vec::new();
     let mut previous_ts: Option<i128> = None;
     for bucket in buckets {
-        if bucket_is_gap(bucket) {
+        // An infinite sample breaks the run like NaN (issue #203): it has
+        // no place on a finite axis, and is marked at the plot's edge
+        // instead ([`off_scale_marks`]).
+        if bucket_is_gap(bucket) || !bucket.min.is_finite() {
             if !current.is_empty() {
                 segments.push(std::mem::take(&mut current));
             }
@@ -3363,6 +3507,147 @@ mod render_tests {
         let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
         let inked = inked_pixels(&primitives, series_color(0), pixels_per_point);
         (state, inked, transform)
+    }
+
+    /// `dataset` on an 800×600-point screen, left to `egui_plot`'s own
+    /// automatic bounds (as a freshly opened file is): the device pixels
+    /// each of its first `channels` channels inks, the plot's bounds and its
+    /// frame, after a few frames.
+    fn ink_after_opening(
+        dataset: Dataset,
+        channels: usize,
+    ) -> (
+        Vec<std::collections::HashSet<(i32, i32)>>,
+        PlotBounds,
+        egui::Rect,
+    ) {
+        let fixture = ViewFixture::new(dataset);
+        let plot_id = std::cell::Cell::new(None);
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        let mut output = None;
+        for _ in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            output = Some(ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    plot_id.set(Some(
+                        ui.make_persistent_id(egui::Id::new("time_domain_view")),
+                    ));
+                    show(
+                        ui,
+                        &fixture.dataset,
+                        &fixture.pyramids,
+                        &fixture.ticks,
+                        &fixture.sample_cache,
+                        &[],
+                        &CursorLookup::for_time(&fixture.dataset.time),
+                        &fixture.fit,
+                        &mut state,
+                    );
+                });
+            }));
+        }
+        let output = output.expect("frames ran");
+        let memory = egui_plot::PlotMemory::load(&ctx, plot_id.get().expect("a frame ran"))
+            .expect("plot memory");
+        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let inked = (0..channels)
+            .map(|channel| inked_pixels(&primitives, series_color(channel), 1.0))
+            .collect();
+        (inked, *memory.bounds(), *memory.transform().frame())
+    }
+
+    /// One-second-spaced `columns` (same length) as an absolute dataset.
+    fn dataset_of(columns: Vec<(&str, Vec<f64>)>) -> Dataset {
+        let rows = columns[0].1.len() as i128;
+        let mut dataset = sample_dataset();
+        dataset.time = TimeAxis::Absolute {
+            timestamps: (0..rows)
+                .map(|i| Timestamp::new(i, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        dataset.columns = columns
+            .into_iter()
+            .map(|(name, values)| Series::new(name, SeriesValues::F64(values)))
+            .collect();
+        dataset
+    }
+
+    // Issue #203: one `Infinity` in one series blanked the whole plot, the
+    // clean series included, because ±∞ reached `egui_plot`'s bounds. An
+    // infinite sample never takes part in the bounds, and every finite
+    // sample of every series is still drawn. Aggregated regime: 1,000
+    // samples over ~780 pixel columns.
+    #[test]
+    fn an_infinite_sample_does_not_blank_the_other_series_or_its_own() {
+        let n = 1_000;
+        let clean = (0..n).map(|i| (i as f64 / 50.0).cos()).collect();
+        let mut with_inf: Vec<f64> = (0..n).map(|i| (i as f64 / 50.0).sin()).collect();
+        with_inf[500] = f64::INFINITY;
+        let (inked, bounds, frame) = ink_after_opening(
+            dataset_of(vec![("clean", clean), ("with_inf", with_inf)]),
+            2,
+        );
+        assert!(bounds.is_finite(), "finite plot bounds: {bounds:?}");
+        assert!(
+            bounds.min()[1] > -2.0 && bounds.max()[1] < 2.0,
+            "y bounds follow the finite samples only: {bounds:?}"
+        );
+        assert!(inked[0].len() > 500, "the clean series is drawn");
+        assert!(
+            inked[1].len() > 500,
+            "the finite part of `with_inf` is drawn"
+        );
+        // The +∞ sample is marked at the top edge of the plot.
+        let top = frame.top();
+        assert!(
+            inked[1].iter().any(|&(_, y)| (y as f32) < top + 6.0),
+            "+∞ is marked at the top edge"
+        );
+    }
+
+    // Issue #203, the corpus file (`case-44-infinities.csv`): converged
+    // regime, five samples. The three finite ones are drawn; +∞ is marked
+    // at the top edge and -∞ at the bottom edge, at their own times.
+    #[test]
+    fn infinities_are_marked_at_the_plot_edges_in_the_raw_sample_regime() {
+        let values = vec![10.0, f64::INFINITY, f64::NEG_INFINITY, 10.3, 10.4];
+        let (inked, bounds, frame) = ink_after_opening(dataset_of(vec![("value", values)]), 1);
+        assert!(bounds.is_finite(), "finite plot bounds: {bounds:?}");
+        assert!(
+            bounds.min()[1] > 9.0 && bounds.max()[1] < 11.0,
+            "y bounds follow the finite samples only: {bounds:?}"
+        );
+        let x_of = |seconds: f64| {
+            frame.left()
+                + (seconds - bounds.min()[0]) as f32 / bounds.width() as f32 * frame.width()
+        };
+        let marked_near = |seconds: f64, edge_y: f32| {
+            let x = x_of(seconds);
+            inked[0]
+                .iter()
+                .any(|&(px, py)| (px as f32 - x).abs() < 6.0 && (py as f32 - edge_y).abs() < 6.0)
+        };
+        assert!(marked_near(1.0, frame.top()), "+∞ at t = 1 s, top edge");
+        assert!(
+            marked_near(2.0, frame.bottom()),
+            "-∞ at t = 2 s, bottom edge"
+        );
+        assert!(!marked_near(1.0, frame.bottom()), "+∞ is not at the bottom");
+        // The finite samples are inked away from the edges.
+        let middle = inked[0]
+            .iter()
+            .filter(|&&(_, y)| (y as f32) > frame.top() + 8.0 && (y as f32) < frame.bottom() - 8.0)
+            .count();
+        assert!(middle > 20, "the finite samples are drawn: {middle} px");
     }
 
     // SPEC §3.1: every aggregated bucket stays visible however small its
