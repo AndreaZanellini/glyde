@@ -46,12 +46,14 @@ use super::dataset::{
 };
 use super::infer::Confidence;
 use super::{IngestOverrides, Reader, Registry};
+use crate::series::{SeriesValues, SpilledValues};
 use crate::time::{
     detect_monotonicity, detect_monotonicity_from, infer_timestamp_format, parse_timestamp,
     summarize_ticks, summarize_ticks_with_median, TimestampFormat,
 };
 use crate::{GlydeError, Result};
 use std::path::Path;
+use tracing::info;
 
 /// docs/QUALITY.md §1's "sampling class" field, extended with
 /// [`SamplingClass::ProgressiveIndex`] for SPEC §2.1's "progressive numeric"
@@ -647,14 +649,43 @@ pub(crate) fn open_csv_dataset(
     build_summary_and_report(outcome.into(), dataset, time_index)
 }
 
+/// Takes every column with no value at all (every cell empty, e.g. the
+/// phantom column after a trailing delimiter) out of `dataset` and lists it
+/// in `unloaded`, with why (issue #208): it has nothing to draw, so it gets
+/// no lane, and it is never dropped silently either (Golden Rule 2).
+fn set_aside_empty_columns(dataset: &mut Dataset, unloaded: &mut Vec<UnloadedColumn>) {
+    let blank = |text: &str| text.trim().is_empty();
+    dataset.columns.retain(|series| {
+        let empty = match series.values() {
+            SeriesValues::String(values) => !values.is_empty() && values.iter().all(|v| blank(v)),
+            SeriesValues::Spilled(SpilledValues::String(values)) => {
+                !values.is_empty() && values.iter().all(blank)
+            }
+            _ => false,
+        };
+        if empty {
+            info!(
+                column = series.name(),
+                "every cell of this column is empty: not plotted, listed as not loaded (issue #208)"
+            );
+            unloaded.push(UnloadedColumn {
+                name: series.name().to_string(),
+                reason: "every cell is empty: nothing to plot".to_string(),
+            });
+        }
+        !empty
+    });
+}
+
 /// The summary/report-building half of [`open_dataset`], shared with
 /// [`open_dataset_progressive`] so the two never independently (and
 /// possibly divergently) derive the same fields from a parsed [`Dataset`].
 pub(crate) fn build_summary_and_report(
-    source: SourceFacts,
-    dataset: Dataset,
+    mut source: SourceFacts,
+    mut dataset: Dataset,
     time_index: TimeIndexInference,
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
+    set_aside_empty_columns(&mut dataset, &mut source.unloaded_columns);
     let mut median_interval_seconds = None;
     let (
         time_column,
