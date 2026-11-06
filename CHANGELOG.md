@@ -27,8 +27,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   - Assumptions made: a collapsed gap is 2% of the width of the data
     between gaps. The control is not offered when the file also has
     on/off or text channels (their lanes under the plot are not drawn on
-    the compressed axis yet), when the time column is not in order, or
-    when it has more than 100,000 gaps; Glyde logs which of these applied.
+    the compressed axis yet), when the time column is not in order, when
+    it has more than 100,000 gaps, or when most timestamps repeat (then no
+    gap can be measured); Glyde logs which of these applied.
     Clicking a cluster to zoom to it is a separate roadmap item.
 
 ### Changed

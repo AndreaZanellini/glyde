@@ -396,7 +396,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     // cover more than half the span; the linear axis is never overridden.
     if let Some(broken) = &fit_bounds.compress {
         ui.horizontal(|ui| {
-            ui.weak(format!("{} gaps detected ·", broken.gap_count()));
+            ui.weak(gap_count_label(broken.gap_count()));
             let label = if *compressed { "Expand" } else { "Compress" };
             if ui
                 .selectable_label(*compressed, label)
@@ -642,7 +642,8 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 // converged bucket into the point-markers list only, with
                 // no connecting line at all, rendering a small file as
                 // scattered disconnected dots instead of a line plot.
-                let mut segments = bucket_segments(&dataset.time, buckets, fit_bounds.gap_threshold);
+                let mut segments =
+                    bucket_segments(&dataset.time, buckets, fit_bounds.gap_threshold);
                 for point in segments.iter_mut().flatten() {
                     point[0] = to_x(point[0]);
                 }
@@ -787,6 +788,12 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     visible
 }
 
+/// SPEC §2.3's `N gaps detected ·`, in the singular for one gap.
+fn gap_count_label(count: usize) -> String {
+    let noun = if count == 1 { "gap" } else { "gaps" };
+    format!("{count} {noun} detected ·")
+}
+
 /// A gap's real length for its break label: the largest whole unit that keeps
 /// it above 1 (`3.5 h`, `12 d`), in plain seconds below a minute.
 fn format_gap_length(seconds: f64) -> String {
@@ -871,14 +878,6 @@ fn compressible(
     threshold: Option<f64>,
 ) -> Option<Arc<BrokenAxis>> {
     let span = span?;
-    if !sorted
-        || dataset
-            .columns
-            .iter()
-            .any(|series| series.view_kind() != ViewKind::TimeDomain)
-    {
-        return None;
-    }
     let threshold = threshold?;
     let mut gaps: Vec<(f64, f64)> = Vec::new();
     let mut too_many = false;
@@ -902,6 +901,26 @@ fn compressible(
     }
     visited.ok()?;
     if !should_offer_compression(&gaps, span) {
+        return None;
+    }
+    // Checked only once the gaps qualify, so the log names the one reason a
+    // gap-heavy file keeps its linear axis, and says nothing for the rest.
+    if !sorted {
+        tracing::info!(
+            "gaps cover more than 50% of the span, but the time column is not in order: \
+             compressed axis not offered (SPEC §2.3)"
+        );
+        return None;
+    }
+    if dataset
+        .columns
+        .iter()
+        .any(|series| series.view_kind() != ViewKind::TimeDomain)
+    {
+        tracing::info!(
+            "gaps cover more than 50% of the span, but the file has on/off or text lanes, \
+             which are not drawn compressed yet: compressed axis not offered (SPEC §2.3)"
+        );
         return None;
     }
     tracing::info!(
@@ -2039,6 +2058,57 @@ mod render_tests {
         assert!(fit_bounds_of(&mostly_data).compress.is_none());
     }
 
+    /// Repeated timestamps (whole seconds on a faster log) give a median Δt
+    /// of 0, so every step would be a "gap" covering the whole span: no gap
+    /// rule, so no `[Compress]` for a file that has no real gap.
+    #[test]
+    fn compression_is_not_offered_when_the_median_delta_is_zero() {
+        let mut coarse = gap_heavy_dataset();
+        let seconds: Vec<i128> = (0..60).map(|i| i / 10).collect();
+        coarse.time = TimeAxis::Absolute {
+            timestamps: seconds
+                .iter()
+                .map(|&s| Timestamp::new(s, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        coarse.columns = vec![Series::new(
+            "value",
+            SeriesValues::F64(vec![1.0; seconds.len()]),
+        )];
+        assert!(fit_bounds_of(&coarse).compress.is_none());
+    }
+
+    /// The lanes under the plot share its x axis and are not drawn
+    /// compressed yet, so a gap-heavy file with an on/off channel keeps the
+    /// linear axis.
+    #[test]
+    fn compression_is_not_offered_when_the_file_has_a_state_lane() {
+        let mut with_lane = gap_heavy_dataset();
+        let rows = with_lane.columns[0].len();
+        with_lane.columns.push(Series::new(
+            "flag",
+            SeriesValues::Bool((0..rows).map(|i| i % 2 == 0).collect()),
+        ));
+        assert!(fit_bounds_of(&with_lane).compress.is_none());
+    }
+
+    #[test]
+    fn the_gap_count_label_is_singular_for_one_gap() {
+        assert_eq!(gap_count_label(1), "1 gap detected ·");
+        assert_eq!(gap_count_label(3), "3 gaps detected ·");
+    }
+
+    #[test]
+    fn a_gap_length_is_labelled_in_its_largest_whole_unit() {
+        assert_eq!(format_gap_length(10_000.0), "2.8 h");
+        assert_eq!(format_gap_length(3.0 * 86_400.0), "3.0 d");
+        assert_eq!(format_gap_length(90.0), "1.5 min");
+        assert_eq!(format_gap_length(12.0), "12.0 s");
+        assert_eq!(format_gap_length(0.25), "0.250 s");
+    }
+
     /// Runs `frames` frames of the time view over `dataset`; returns the last
     /// frame's shapes.
     fn run_frames(
@@ -2080,7 +2150,7 @@ mod render_tests {
         let dataset = gap_heavy_dataset();
         let mut state = TimeViewState::default();
         let linear = run_frames(&dataset, &mut state, 3);
-        assert!(has_text(&linear, "1 gaps detected ·"), "affordance shown");
+        assert!(has_text(&linear, "1 gap detected ·"), "affordance shown");
         assert!(has_text(&linear, "Compress"));
         assert!(!state.compressed, "never compressed automatically");
         assert!(
