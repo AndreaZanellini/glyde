@@ -130,6 +130,10 @@ pub struct GlydeApp {
     /// must not overwrite the current status (SPEC §6: single file at a
     /// time; see `crate::plumbing` module docs).
     generation: u64,
+    /// The generation whose data the views were last reset for: the first
+    /// message of a newer one is a new file (or a new reading of it), whose
+    /// time view starts fitted (issue #205).
+    fitted_generation: u64,
     /// Cancels the index job of the current `generation` (issue #119):
     /// raised by [`Self::next_generation`] when a newer request supersedes
     /// it, so the old job stops reading the file instead of running to the
@@ -171,6 +175,7 @@ impl Default for GlydeApp {
             tx,
             rx,
             generation: 0,
+            fitted_generation: 0,
             load_cancel: CancelFlag::default(),
             overrides: IngestOverrides::default(),
             psd: PsdPanel::default(),
@@ -285,6 +290,10 @@ impl GlydeApp {
             // Whatever this message carries replaces the data on screen; a
             // decimation of the old data must never be drawn for the new.
             self.time_view.data_changed();
+            if self.fitted_generation != self.generation {
+                self.fitted_generation = self.generation;
+                self.time_view.fit_new_file();
+            }
             self.time_view.set_background(None);
             self.state_timeline.set_refiner(None);
             if matches!(message, IndexingMessage::Completed { .. }) {
@@ -1071,6 +1080,41 @@ mod tests {
             .expect("channel send");
         app.drain_indexing_messages();
         assert!(!app.time_view.decimates_in_background(), "in memory: on it");
+    }
+
+    // Issue #205: the first message of a new open fits the time view (a
+    // pan on the previous file must not carry over); the later messages of
+    // the same open (preview, then completed) keep the user's view.
+    #[test]
+    fn only_the_first_message_of_a_new_open_fits_the_time_view() {
+        let mut app = GlydeApp::new();
+        let progress = |generation| IndexingMessage::Progress {
+            generation,
+            path: PathBuf::from("a.csv"),
+            dataset: sample_dataset(),
+            pyramids: sample_pyramids(),
+            rows_read: 1,
+            spilled: false,
+            prepared: sample_prepared(),
+            time_index: sample_time_index(),
+        };
+        app.generation = 1;
+        app.tx.send(progress(1)).expect("channel send");
+        app.drain_indexing_messages();
+        assert!(app.time_view.fit_requested(), "a new open is fitted");
+
+        app.time_view = Default::default(); // as if drawn: request consumed
+        app.tx.send(progress(1)).expect("channel send");
+        app.drain_indexing_messages();
+        assert!(
+            !app.time_view.fit_requested(),
+            "the same open keeps the user's view"
+        );
+
+        app.generation = 2;
+        app.tx.send(progress(2)).expect("channel send");
+        app.drain_indexing_messages();
+        assert!(app.time_view.fit_requested(), "the next open is fitted");
     }
 
     // docs/ROADMAP.md M4 "One-click correction of each field → triggers a

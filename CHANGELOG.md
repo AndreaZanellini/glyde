@@ -52,6 +52,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
     change.
 
 ### Fixed
+- **A newly opened file is always shown in full (issue #205).** If you had
+  panned or zoomed the previous file, the next file used to open on the
+  previous file's time range; when the two files did not overlap in time,
+  the new one looked empty until you pressed "Fit to data". Now every file
+  you open (and every re-reading after a one-click correction) starts
+  fitted to its whole time span, with the on/off and text lanes aligned to
+  it, and on the true-to-scale axis even if the previous file was shown
+  with its gaps compressed. While one file is loading, the view you pan to
+  is kept when the loading completes.
 - **A single `Infinity` value no longer blanks the whole plot (issue #203).**
   One `Infinity` or `-Infinity` reading in one channel (a common way for a
   logger to write an overflow) used to make the time plot empty: every
