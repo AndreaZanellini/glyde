@@ -171,7 +171,7 @@ pub fn ensure_parquet_fixture(
     let bytes_per_row = 8 * (1 + float_columns + integer_columns) as u64;
     let rows = target_bytes / bytes_per_row;
     let properties = WriterProperties::builder()
-        .set_max_row_group_size(row_group_rows)
+        .set_max_row_group_row_count(Some(row_group_rows))
         .build();
     let tmp = path.with_extension("parquet.tmp");
     let mut writer = ArrowWriter::try_new(File::create(&tmp)?, schema.clone(), Some(properties))
