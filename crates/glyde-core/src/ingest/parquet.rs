@@ -3038,7 +3038,7 @@ mod tests {
             ],
             Some(
                 WriterProperties::builder()
-                    .set_max_row_group_size(1_000)
+                    .set_max_row_group_row_count(Some(1_000))
                     .build(),
             ),
         );
@@ -3443,7 +3443,7 @@ mod tests {
 
     fn small_row_groups(rows: usize) -> WriterProperties {
         WriterProperties::builder()
-            .set_max_row_group_size(rows)
+            .set_max_row_group_row_count(Some(rows))
             .build()
     }
 
@@ -3537,7 +3537,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let counts: ArrayRef = Arc::new(Int32Array::from((0..128).collect::<Vec<i32>>()));
         let properties = WriterProperties::builder()
-            .set_max_row_group_size(64)
+            .set_max_row_group_row_count(Some(64))
             .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
             .build();
         let path = write_with(
@@ -3654,7 +3654,7 @@ mod tests {
     fn spill_row_groups() -> Option<WriterProperties> {
         Some(
             WriterProperties::builder()
-                .set_max_row_group_size(700)
+                .set_max_row_group_row_count(Some(700))
                 .build(),
         )
     }

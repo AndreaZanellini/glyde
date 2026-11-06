@@ -52,6 +52,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
     change.
 
 ### Fixed
+- **Updated the Parquet reader to close four published security advisories
+  in its compression library.** The zstd decompressor that Parquet files use
+  had four advisories published against it (RUSTSEC-2026-0391, -0398, -0403,
+  -0410), and the automatic license-and-advisory check started failing on
+  every change. The fixed version needs a newer Parquet reader, so Glyde now
+  uses it (version 60 instead of 54). Opening Parquet files works as before:
+  every existing test passes unchanged, and opening the 1 GB benchmark file
+  is no slower (about 4% faster on a development Mac).
 - **A file too large for memory no longer copies its whole-number columns
   into memory (issue #178).** When a file is kept on disk because it does
   not fit in memory, the plot still needs each column's values as decimals.
