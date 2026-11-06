@@ -617,6 +617,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                         ticks,
                         sample_cache,
                         level0_caches,
+                        fit_bounds.gaps(),
                         column_index,
                         range,
                         pixel_columns,
@@ -887,6 +888,12 @@ pub struct FitBounds {
     /// ([`drawing_gap_threshold`]); `None` when the axis has no usable one.
     /// The plot draws no line across a Δt above it, so a gap looks like a gap.
     gap_threshold: Option<f64>,
+    /// Every gap of a time-ordered axis against `gap_threshold`, as the
+    /// ticks of the samples either side of it, in time order ([`gap_ticks`]).
+    /// Empty without a threshold, on an unordered axis, and past
+    /// [`MAX_COMPRESSIBLE_GAPS`]. A decimated column is never drawn across
+    /// one ([`split_at_gaps`], issue #192).
+    gaps: Arc<[(i128, i128)]>,
     /// SPEC §2.3's compressed axis, present only when its affordance is
     /// offered: gaps account for more than half the span ([`compressible`]).
     compress: Option<Arc<BrokenAxis>>,
@@ -914,6 +921,35 @@ fn drawing_gap_threshold(ticks: &[i128]) -> Option<f64> {
 /// its truthful linear axis, and the log says why.
 const MAX_COMPRESSIBLE_GAPS: usize = 100_000;
 
+/// The gaps of `ticks` against `threshold` ([`drawing_gap_threshold`]), as
+/// the ticks of the last sample before and the first sample after each, in
+/// time order. `None` past [`MAX_COMPRESSIBLE_GAPS`] (logged), and when the
+/// axis has no threshold or is not in time order, so that there are no gaps
+/// to speak of.
+fn gap_ticks(ticks: &[i128], sorted: bool, threshold: Option<f64>) -> Option<Vec<(i128, i128)>> {
+    let threshold = threshold.filter(|_| sorted)?;
+    let mut gaps: Vec<(i128, i128)> = Vec::new();
+    let mut too_many = false;
+    let visited = visit_gaps(ticks, 0..ticks.len(), threshold, &mut |gap| {
+        if gaps.len() >= MAX_COMPRESSIBLE_GAPS {
+            too_many = true;
+            return Err(glyde_core::GlydeError::Cancelled);
+        }
+        gaps.push((ticks[gap.before_index], ticks[gap.after_index]));
+        Ok(())
+    });
+    if too_many {
+        tracing::info!(
+            limit = MAX_COMPRESSIBLE_GAPS,
+            "too many gaps to list: no compressed axis, and the plot's columns are not \
+             split at gaps (SPEC §2.3)"
+        );
+        return None;
+    }
+    visited.ok()?;
+    Some(gaps)
+}
+
 /// SPEC §2.3's compressed axis for `ticks`, if it is offered: the axis is
 /// time-ordered, the dataset has no state lane (lanes share the plot's x axis
 /// and are not drawn compressed yet), at most [`MAX_COMPRESSIBLE_GAPS`] gaps
@@ -925,30 +961,30 @@ fn compressible(
     sorted: bool,
     span: Option<(f64, f64)>,
     threshold: Option<f64>,
+    listed: Option<&[(i128, i128)]>,
 ) -> Option<Arc<BrokenAxis>> {
     let span = span?;
-    let threshold = threshold?;
-    let mut gaps: Vec<(f64, f64)> = Vec::new();
-    let mut too_many = false;
-    let visited = visit_gaps(ticks, 0..ticks.len(), threshold, &mut |gap| {
-        if gaps.len() >= MAX_COMPRESSIBLE_GAPS {
-            too_many = true;
-            return Err(glyde_core::GlydeError::Cancelled);
+    threshold?;
+    // An unordered axis has no gap list ([`gap_ticks`]); its gaps are still
+    // measured, so the log can say why it keeps the linear axis.
+    let unordered;
+    let listed = match listed {
+        Some(listed) => listed,
+        None if !sorted => {
+            unordered = gap_ticks(ticks, true, threshold)?;
+            &unordered
         }
-        gaps.push((
-            tick_to_seconds(&dataset.time, ticks[gap.before_index]),
-            tick_to_seconds(&dataset.time, ticks[gap.after_index]),
-        ));
-        Ok(())
-    });
-    if too_many {
-        tracing::info!(
-            limit = MAX_COMPRESSIBLE_GAPS,
-            "compressed axis not offered: too many gaps; the linear axis is kept (SPEC §2.3)"
-        );
-        return None;
-    }
-    visited.ok()?;
+        None => return None,
+    };
+    let gaps: Vec<(f64, f64)> = listed
+        .iter()
+        .map(|&(before, after)| {
+            (
+                tick_to_seconds(&dataset.time, before),
+                tick_to_seconds(&dataset.time, after),
+            )
+        })
+        .collect();
     if !should_offer_compression(&gaps, span) {
         return None;
     }
@@ -1017,12 +1053,21 @@ impl FitBounds {
             .collect();
         let x = fit_range(ticks, sorted, &dataset.time);
         let gap_threshold = drawing_gap_threshold(ticks);
+        let gaps = gap_ticks(ticks, sorted, gap_threshold);
+        let compress = compressible(dataset, ticks, sorted, x, gap_threshold, gaps.as_deref());
         Self {
             x,
             y,
             gap_threshold,
-            compress: compressible(dataset, ticks, sorted, x, gap_threshold),
+            gaps: gaps.unwrap_or_default().into(),
+            compress,
         }
+    }
+
+    /// The axis's gaps as `(before, after)` sample ticks, in time order:
+    /// what [`decimate_column`] splits its columns at (issue #192).
+    pub fn gaps(&self) -> &[(i128, i128)] {
+        &self.gaps
     }
 
     /// The whole axis in plot seconds, as a fit shows it; `None` with no
@@ -1484,6 +1529,7 @@ pub fn decimate_column<P: Pyramid>(
     ticks: &[i128],
     sample_cache: &[Option<Vec<f64>>],
     level0_caches: &[Option<Arc<Level0Cache>>],
+    gaps: &[(i128, i128)],
     column_index: usize,
     range: (i128, i128),
     pixel_columns: usize,
@@ -1499,10 +1545,66 @@ pub fn decimate_column<P: Pyramid>(
     let pyramid = pyramids.get(column_index).and_then(Option::as_ref);
     let kept = pyramid.and_then(Pyramid::samples);
     let samples = column_f64_samples(series.values(), cached, level0, kept);
-    match pyramid {
+    let decimate = |range: (i128, i128), pixel_columns: usize| match pyramid {
         Some(pyramid) => pyramid.decimate(samples, ticks, range, pixel_columns),
         None => decimate_viewport(&[], samples, ticks, range, pixel_columns),
+    };
+    let buckets = decimate(range, pixel_columns);
+    split_at_gaps(buckets, gaps, range, pixel_columns, |part| {
+        decimate(part, 1)
+    })
+}
+
+/// `buckets`, one decimated view of `range` at `pixel_columns`, with every
+/// column that holds samples from both sides of a time gap replaced by one
+/// column per side (issue #192). Columns are cut by sample count, so such a
+/// column's first sample is before the gap and its last after it: drawn at
+/// its midpoint, it put a bar inside the gap, where the file has no sample,
+/// mixing values from both sides. Each part is `decimate(part_range)` (one
+/// column over exactly those samples, from the same pyramid), so its
+/// envelope stays exact (SPEC §3.1).
+///
+/// Only gaps at least one pixel column wide are split at: a narrower one
+/// cannot show a mark apart from the data around it, and this bounds the
+/// extra queries by `pixel_columns`, however many gaps the view holds.
+fn split_at_gaps(
+    buckets: Vec<Bucket>,
+    gaps: &[(i128, i128)],
+    range: (i128, i128),
+    pixel_columns: usize,
+    decimate: impl Fn((i128, i128)) -> Vec<Bucket>,
+) -> Vec<Bucket> {
+    let column_ticks = (range.1 - range.0) / pixel_columns.max(1) as i128;
+    let wide = |&&(before, after): &&(i128, i128)| after - before >= column_ticks;
+    let spans_a_gap = |bucket: &Bucket| {
+        let first = gaps.partition_point(|&(before, _)| before < bucket.first_ts);
+        gaps[first..]
+            .iter()
+            .take_while(|&&(_, after)| after <= bucket.last_ts)
+            .any(|gap| wide(&gap))
+    };
+    if gaps.is_empty() || !buckets.iter().any(spans_a_gap) {
+        return buckets;
     }
+    let mut split = Vec::with_capacity(buckets.len() + 8);
+    for bucket in buckets {
+        if !spans_a_gap(&bucket) {
+            split.push(bucket);
+            continue;
+        }
+        let first = gaps.partition_point(|&(before, _)| before < bucket.first_ts);
+        let mut part_start = bucket.first_ts;
+        for &(before, after) in gaps[first..]
+            .iter()
+            .take_while(|&&(_, after)| after <= bucket.last_ts)
+            .filter(wide)
+        {
+            split.extend(decimate((part_start, before)));
+            part_start = after;
+        }
+        split.extend(decimate((part_start, bucket.last_ts)));
+    }
+    split
 }
 
 /// The color for the `index`-th plotted [`ViewKind::TimeDomain`] series
@@ -2919,6 +3021,94 @@ mod render_tests {
         .shapes
     }
 
+    /// Two one-second-spaced clusters, `0..=599` s and `780..=1379` s: one
+    /// three-minute pause, like the engine test bench's (issue #192).
+    fn paused_dataset() -> Dataset {
+        let seconds: Vec<i128> = (0..600).chain(780..1380).collect();
+        let mut dataset = sample_dataset();
+        dataset.time = TimeAxis::Absolute {
+            timestamps: seconds
+                .iter()
+                .map(|&s| Timestamp::new(s, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        dataset.columns = vec![Series::new(
+            "knock",
+            SeriesValues::F64(seconds.iter().map(|&s| (s as f64 / 9.0).sin()).collect()),
+        )];
+        dataset
+    }
+
+    // Issue #192: a column of the aggregated regime that holds samples from
+    // both sides of a time gap was drawn at its midpoint, inside the gap,
+    // where the file has no sample, with an extent mixing both sides. At any
+    // zoom, no column spans the gap, and every sample is still in a column.
+    // (Down to a gap one pixel column wide: 8 px over the whole file is
+    // 172 s per column for this 181 s gap. A narrower one cannot show a mark
+    // apart from the data either side of it.)
+    #[test]
+    fn no_aggregated_column_spans_a_time_gap_at_any_zoom() {
+        let fixture = ViewFixture::new(paused_dataset());
+        let (before, after) = (599, 780);
+        for (range, pixel_columns) in [
+            ((0, 1379), 8),
+            ((0, 1379), 50),
+            ((0, 1379), 301),
+            ((0, 1379), 799),
+            ((300, 1000), 13),
+            ((550, 830), 40),
+        ] {
+            let buckets = decimate_column(
+                &fixture.dataset,
+                &fixture.pyramids,
+                &fixture.ticks,
+                &fixture.sample_cache,
+                &[],
+                fixture.fit.gaps(),
+                0,
+                range,
+                pixel_columns,
+            );
+            assert!(!buckets.is_empty());
+            for bucket in &buckets {
+                assert!(
+                    bucket.last_ts <= before || bucket.first_ts >= after,
+                    "{range:?} at {pixel_columns} px: a column spans the gap: {bucket:?}"
+                );
+                let middle = (bucket.first_ts + bucket.last_ts) / 2;
+                assert!(
+                    !(before < middle && middle < after),
+                    "{range:?} at {pixel_columns} px: drawn inside the gap"
+                );
+            }
+            // Nothing is lost: the columns still cover the range's first and
+            // last sample, and its exact envelope.
+            let SeriesValues::F64(values) = fixture.dataset.columns[0].values() else {
+                unreachable!()
+            };
+            let in_range: Vec<f64> = fixture
+                .ticks
+                .iter()
+                .zip(values)
+                .filter(|&(&t, _)| range.0 <= t && t <= range.1)
+                .map(|(_, &v)| v)
+                .collect();
+            let min = buckets.iter().map(|b| b.min).fold(f64::INFINITY, f64::min);
+            let max = buckets
+                .iter()
+                .map(|b| b.max)
+                .fold(f64::NEG_INFINITY, f64::max);
+            assert_eq!(min, in_range.iter().copied().fold(f64::INFINITY, f64::min));
+            assert_eq!(
+                max,
+                in_range.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+            );
+            assert!(buckets.windows(2).all(|w| w[0].last_ts < w[1].first_ts));
+        }
+    }
+
     // Issue #205: after a pan on one file, the next file opened with the
     // previous file's x range; two files that do not overlap in time made
     // the new one look empty. A new file always starts from its fitted full
@@ -3002,6 +3192,7 @@ mod render_tests {
                 &pyramids,
                 &ticks,
                 &sample_cache,
+                &[],
                 &[],
                 column,
                 range,

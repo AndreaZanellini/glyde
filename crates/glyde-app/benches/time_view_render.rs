@@ -551,6 +551,7 @@ fn bench_background_pan(c: &mut Criterion, fixture: &Fixture) {
                 ticks,
                 sample_cache,
                 &[],
+                &[],
                 column,
                 range,
                 pixel_columns,
