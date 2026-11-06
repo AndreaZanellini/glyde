@@ -705,6 +705,23 @@ pub struct FitBounds {
     gap_threshold: Option<f64>,
 }
 
+/// SPEC §2.3's gap threshold of `ticks` (`10 × median Δt`), as the plot uses
+/// it to stop drawing a line across a gap. `None` when there is none to use:
+/// fewer than two ticks, or a median Δt of 0 (timestamps coarser than the
+/// sampling, so most consecutive rows share one), where the rule would call
+/// every real step a gap and break the line at each of them.
+fn drawing_gap_threshold(ticks: &[i128]) -> Option<f64> {
+    let threshold = glyde_core::time::gap_threshold(ticks).ok().flatten()?;
+    if threshold > 0.0 {
+        Some(threshold)
+    } else {
+        tracing::info!(
+            "median Δt is 0 (repeated timestamps): the plot line is not broken at time gaps (SPEC §2.3)"
+        );
+        None
+    }
+}
+
 impl FitBounds {
     /// Reads `dataset`'s bounds from `pyramids` (`dataset.columns`-parallel,
     /// as [`show`] takes them), scanning the samples of a column that has
@@ -744,7 +761,7 @@ impl FitBounds {
         Self {
             x: fit_range(ticks, sorted, &dataset.time),
             y,
-            gap_threshold: glyde_core::time::gap_threshold(ticks).ok().flatten(),
+            gap_threshold: drawing_gap_threshold(ticks),
         }
     }
 
@@ -4042,6 +4059,21 @@ mod tests {
         // Δt exactly at the threshold is not a gap; no threshold, no break.
         assert_eq!(bucket_segments(&time, &buckets, Some(99.0)).len(), 1);
         assert_eq!(bucket_segments(&time, &buckets, None).len(), 1);
+    }
+
+    /// Timestamps coarser than the sampling (e.g. whole seconds on a 10 Hz
+    /// log) repeat, so the median Δt is 0 and `10 × median` is 0: every
+    /// real step would count as a gap and the plot would fall apart into
+    /// isolated runs. Such an axis has no usable gap rule, so nothing is
+    /// broken; a positive threshold is used as is.
+    #[test]
+    fn a_zero_median_delta_gives_no_drawing_gap_threshold() {
+        let coarse: Vec<i128> = (0..30).map(|i| (i / 10) * 1_000).collect();
+        assert_eq!(drawing_gap_threshold(&coarse), None);
+
+        let regular: Vec<i128> = (0..30).map(|i| i * 1_000).collect();
+        assert_eq!(drawing_gap_threshold(&regular), Some(10_000.0));
+        assert_eq!(drawing_gap_threshold(&[0]), None, "no Δt at all");
     }
 
     #[test]

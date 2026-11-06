@@ -23,6 +23,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   **Assumptions made (please veto by testing the app):**
   - SPEC §2.3 says "a gap looks like a gap" without saying how; I read it as
     "break the line", the same way a missing (NaN) value already breaks it.
+  - When most timestamps repeat (e.g. whole seconds on a 10 Hz log), the
+    typical spacing is zero and the rule would break the line at every step;
+    in that case the line is not broken at all, and the log says so.
   - The compressed-axis `[Compress]` button, clicking a cluster to fit it,
     and the anomaly gutter are separate roadmap items and are not in this
     change.
