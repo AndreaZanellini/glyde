@@ -11,6 +11,27 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Compress the gaps in a file that is mostly gaps (SPEC §2.3).** When the
+  gaps in a file's time column cover more than half of its time span, a
+  discreet `N gaps detected · Compress` control appears above the plot.
+  Clicking it collapses every gap to the same narrow width, marked by a
+  dashed break line labelled with the real length of the gap (`⫽ 2.8 h
+  gap`), so the clusters of data between gaps become readable. Axis labels
+  inside a collapsed gap read `⫽` instead of a time. `Expand` goes back.
+  The plot never switches by itself: the true-to-scale axis stays the
+  default. This changes only how the plot is drawn; the data, the cursor
+  readout (still the real timestamp and value) and the analysis (PSD uses
+  the real timestamps) are untouched. Toggling keeps the part of the file
+  you were looking at.
+  - Assumptions made: a collapsed gap is 2% of the width of the data
+    between gaps. The control is not offered when the file also has
+    on/off or text channels (their lanes under the plot are not drawn on
+    the compressed axis yet), when the time column is not in order, when
+    it has more than 100,000 gaps, or when most timestamps repeat (then no
+    gap can be measured); Glyde logs which of these applied.
+    Clicking a cluster to zoom to it is a separate roadmap item.
+
 ### Changed
 - **A gap in the data now looks like a gap on the plot.** The time axis was
   already truthful (a pause in recording takes up its real width), but the

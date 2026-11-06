@@ -45,7 +45,7 @@
 
 use std::sync::Arc;
 
-use egui_plot::{GridMark, Line, Plot, PlotBounds, PlotPoints, Points};
+use egui_plot::{GridMark, Line, Plot, PlotBounds, PlotPoint, PlotPoints, Points};
 use glyde_core::dsp::decimation::{
     connectors_across_gaps, decimate_viewport, finite_range, Bucket, Pyramid,
 };
@@ -53,7 +53,9 @@ use glyde_core::ingest::{
     progressive_tick_to_value, progressive_value_to_tick, Dataset, Level0Cache, TimeAxis,
 };
 use glyde_core::series::{Series, SeriesValues, ViewKind};
-use glyde_core::time::{format_timestamp, Timestamp};
+use glyde_core::time::{
+    format_timestamp, should_offer_compression, visit_gaps, BrokenAxis, Timestamp,
+};
 
 use crate::views::channels::{self, ChannelVisibility};
 
@@ -159,6 +161,12 @@ pub struct TimeViewState {
     pending: Option<PendingDecimation>,
     /// Where this frame's plot put its x axis, for the lanes below it.
     shared_axis: Option<SharedAxis>,
+    /// SPEC §2.3's compressed axis is on. View state only: off by default,
+    /// never turned on automatically.
+    compressed: bool,
+    /// Whether the plot's bounds are currently in compressed coordinates, so
+    /// a toggle re-maps them instead of jumping the view.
+    bounds_compressed: bool,
     /// How aggregated bars are handed to egui; the tests switch it to the
     /// reference encoding to compare the two.
     #[cfg(test)]
@@ -369,7 +377,6 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         state.ticks_identity = ticks_identity;
     }
     state.collect_background_results(ticks, dataset.columns.len());
-    let fit = fit_bounds.x;
     #[cfg(test)]
     let bar_encoding = state.bar_encoding;
     #[cfg(not(test))]
@@ -380,9 +387,38 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         background,
         pending,
         shared_axis,
+        compressed,
+        bounds_compressed,
         ..
     } = state;
     let fit_clicked = ui.button("Fit to data").clicked();
+    // SPEC §2.3: a discreet `N gaps detected · [Compress]`, only when gaps
+    // cover more than half the span; the linear axis is never overridden.
+    if let Some(broken) = &fit_bounds.compress {
+        ui.horizontal(|ui| {
+            ui.weak(gap_count_label(broken.gap_count()));
+            let label = if *compressed { "Expand" } else { "Compress" };
+            if ui
+                .selectable_label(*compressed, label)
+                .on_hover_text(
+                    "View only: collapses the gaps so the clusters between them are readable. \
+                     Data and analysis keep the real timestamps.",
+                )
+                .clicked()
+            {
+                *compressed = !*compressed;
+                tracing::info!(
+                    compressed = *compressed,
+                    "compressed axis toggled (SPEC §2.3)"
+                );
+            }
+        });
+    }
+    // The compressed map in force this frame, if on.
+    let broken: Option<&BrokenAxis> = fit_bounds.compress.as_deref().filter(|_| *compressed);
+    let to_x = |seconds: f64| broken.map_or(seconds, |b| b.compress(seconds));
+    let from_x = |x: f64| broken.map_or(x, |b| b.expand(x));
+    let fit = fit_bounds.x.map(|(lo, hi)| (to_x(lo), to_x(hi)));
 
     // Every numeric column is a channel; its index here picks its color, so
     // a channel keeps its color whatever else is hidden. Only the shown ones
@@ -411,7 +447,20 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         // exactly `fit`, the span every linked lane fits to as well, so a
         // fit never leaves the plot and the lanes on different spans.
         .set_margin_fraction(egui::vec2(0.0, 0.05))
-        .x_axis_formatter(|mark, _range| format_x_axis_tick(ticks, mark, &dataset.time));
+        .x_axis_formatter(|mark, _range| match broken {
+            // A mark inside a collapsed gap says so, instead of a time it
+            // does not have (SPEC §2.3: labels make the discontinuity
+            // explicit).
+            Some(b) if b.gap_at(mark.value).is_some() => "⫽".to_string(),
+            _ => format_x_axis_tick(
+                ticks,
+                GridMark {
+                    value: from_x(mark.value),
+                    ..mark
+                },
+                &dataset.time,
+            ),
+        });
     if let Some((x_min, x_max)) = fit {
         plot = plot.include_x(x_min).include_x(x_max);
     }
@@ -424,15 +473,38 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             // seconds on a spilled file.
             let shown = plotted.iter().map(|&(_, column_index, _)| column_index);
             if let Some(bounds) = fit_bounds.frame(shown) {
-                plot_ui.set_plot_bounds(bounds);
+                plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                    [to_x(bounds.min()[0]), bounds.min()[1]],
+                    [to_x(bounds.max()[0]), bounds.max()[1]],
+                ));
             }
+        }
+
+        if *bounds_compressed != broken.is_some() {
+            // The compress toggle: the same view, re-expressed in the other
+            // coordinates, so it neither jumps nor re-fits.
+            let current = plot_ui.plot_bounds();
+            if let (true, Some(axis)) = (current.is_valid_x(), fit_bounds.compress.as_deref()) {
+                let seconds = |x: f64| {
+                    if *bounds_compressed {
+                        axis.expand(x)
+                    } else {
+                        x
+                    }
+                };
+                plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                    [to_x(seconds(current.min()[0])), current.min()[1]],
+                    [to_x(seconds(current.max()[0])), current.max()[1]],
+                ));
+            }
+            *bounds_compressed = broken.is_some();
         }
 
         if let Some((x_min, x_max)) = focus {
             let current = plot_ui.plot_bounds();
             plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                [x_min, current.min()[1]],
-                [x_max, current.max()[1]],
+                [to_x(x_min), current.min()[1]],
+                [to_x(x_max), current.max()[1]],
             ));
             plot_ui.ctx().request_repaint();
         }
@@ -442,6 +514,16 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         // matches exactly what is about to be drawn — never a fixed,
         // once-per-open resampling (docs/ROADMAP.md M3, issue #80).
         let plot_bounds = plot_ui.plot_bounds();
+        let view_x = (plot_bounds.min()[0], plot_bounds.max()[0]);
+        // The view range is a real time range, whatever the axis coordinates.
+        let plot_bounds = if broken.is_some() && plot_bounds.is_valid_x() {
+            PlotBounds::from_min_max(
+                [from_x(plot_bounds.min()[0]), plot_bounds.min()[1]],
+                [from_x(plot_bounds.max()[0]), plot_bounds.max()[1]],
+            )
+        } else {
+            plot_bounds
+        };
         let pixel_columns = plot_ui.transform().frame().width().round().max(1.0) as usize;
         let range = query_range(&plot_bounds, ticks, &dataset.time);
         // `egui_plot` computes axis gridlines from the *previous* frame's
@@ -560,7 +642,11 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 // converged bucket into the point-markers list only, with
                 // no connecting line at all, rendering a small file as
                 // scattered disconnected dots instead of a line plot.
-                let segments = bucket_segments(&dataset.time, buckets, fit_bounds.gap_threshold);
+                let mut segments =
+                    bucket_segments(&dataset.time, buckets, fit_bounds.gap_threshold);
+                for point in segments.iter_mut().flatten() {
+                    point[0] = to_x(point[0]);
+                }
                 for segment in &segments {
                     plot_ui.line(
                         Line::new(PlotPoints::new(segment.clone()))
@@ -593,15 +679,19 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                     if bucket_is_gap(bucket) {
                         continue;
                     }
-                    let bucket_x =
-                        tick_to_seconds(&dataset.time, (bucket.first_ts + bucket.last_ts) / 2);
+                    let bucket_x = to_x(tick_to_seconds(
+                        &dataset.time,
+                        (bucket.first_ts + bucket.last_ts) / 2,
+                    ));
                     if bucket.min == bucket.max {
                         points.push([bucket_x, bucket.min]);
                     } else {
                         bars.push(bucket_x, bucket.min, bucket.max);
                     }
                 }
-                let at = |(tick, value): (i128, f64)| [tick_to_seconds(&dataset.time, tick), value];
+                let at = |(tick, value): (i128, f64)| {
+                    [to_x(tick_to_seconds(&dataset.time, tick)), value]
+                };
                 for connector in connectors_across_gaps(buckets, fit_bounds.gap_threshold) {
                     bars.connect(at(connector.from), at(connector.to));
                 }
@@ -619,6 +709,33 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             }
         }
 
+        // SPEC §2.3: an unmistakable break glyph at every collapsed gap,
+        // naming how long the real gap was.
+        if let Some(b) = broken {
+            for (lo, hi) in b
+                .collapsed_extents()
+                .filter(|&(lo, hi)| hi >= view_x.0 && lo <= view_x.1)
+            {
+                let middle = (lo + hi) / 2.0;
+                plot_ui.vline(
+                    egui_plot::VLine::new(middle)
+                        .color(egui::Color32::GRAY)
+                        .style(egui_plot::LineStyle::dashed_dense())
+                        .width(2.0_f32),
+                );
+                if let Some((start, end)) = b.gap_at(middle) {
+                    plot_ui.text(
+                        egui_plot::Text::new(
+                            PlotPoint::new(middle, plot_ui.plot_bounds().max()[1]),
+                            format!("⫽ {} gap", format_gap_length(end - start)),
+                        )
+                        .anchor(egui::Align2::CENTER_TOP)
+                        .color(egui::Color32::GRAY),
+                    );
+                }
+            }
+        }
+
         // Only while the pointer actually hovers the plot: SPEC §4.1's "exact
         // raw value" cursor readout needs the exact (not
         // decimation-approximated) nearest sample. `cursor` finds it in
@@ -627,7 +744,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         // the whole axis as `f64` every hovered frame, as this used to.
         let hovered = plot_ui
             .pointer_coordinate()
-            .and_then(|pointer| cursor.nearest(&dataset.time, pointer.x));
+            .and_then(|pointer| cursor.nearest(&dataset.time, from_x(pointer.x)));
         (
             hovered,
             range,
@@ -671,6 +788,24 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     visible
 }
 
+/// SPEC §2.3's `N gaps detected ·`, in the singular for one gap.
+fn gap_count_label(count: usize) -> String {
+    let noun = if count == 1 { "gap" } else { "gaps" };
+    format!("{count} {noun} detected ·")
+}
+
+/// A gap's real length for its break label: the largest whole unit that keeps
+/// it above 1 (`3.5 h`, `12 d`), in plain seconds below a minute.
+fn format_gap_length(seconds: f64) -> String {
+    const UNITS: [(f64, &str); 4] = [(86_400.0, "d"), (3_600.0, "h"), (60.0, "min"), (1.0, "s")];
+    for &(size, name) in &UNITS {
+        if seconds >= size {
+            return format!("{:.1} {name}", seconds / size);
+        }
+    }
+    format!("{seconds:.3} s")
+}
+
 /// What a fit shows of an axis whose pyramid ticks are `ticks`: its
 /// earliest to its latest sample in plot seconds ([`tick_to_seconds`]) —
 /// the first and last tick when `sorted`, a scan otherwise — padded by a
@@ -699,10 +834,13 @@ pub struct FitBounds {
     /// one with no finite value (NaN and ±∞ are flagged anomalies, never a
     /// fit target, SPEC §1.3).
     y: Vec<Option<(f64, f64)>>,
-    /// SPEC §2.3's gap threshold (`10 × median Δt`) in ticks; `None` when
-    /// the axis has too few samples to have one. The plot draws no line
-    /// across a Δt above it, so a gap looks like a gap.
+    /// SPEC §2.3's gap threshold (`10 × median Δt`) in ticks
+    /// ([`drawing_gap_threshold`]); `None` when the axis has no usable one.
+    /// The plot draws no line across a Δt above it, so a gap looks like a gap.
     gap_threshold: Option<f64>,
+    /// SPEC §2.3's compressed axis, present only when its affordance is
+    /// offered: gaps account for more than half the span ([`compressible`]).
+    compress: Option<Arc<BrokenAxis>>,
 }
 
 /// SPEC §2.3's gap threshold of `ticks` (`10 × median Δt`), as the plot uses
@@ -720,6 +858,76 @@ fn drawing_gap_threshold(ticks: &[i128]) -> Option<f64> {
         );
         None
     }
+}
+
+/// The most gaps a compressed axis is built for. A gap list is memory
+/// proportional to the gap count (issue #103), so beyond this the file keeps
+/// its truthful linear axis, and the log says why.
+const MAX_COMPRESSIBLE_GAPS: usize = 100_000;
+
+/// SPEC §2.3's compressed axis for `ticks`, if it is offered: the axis is
+/// time-ordered, the dataset has no state lane (lanes share the plot's x axis
+/// and are not drawn compressed yet), at most [`MAX_COMPRESSIBLE_GAPS`] gaps
+/// were detected against `threshold` ([`drawing_gap_threshold`], so an axis
+/// without a usable gap rule has none), and they cover more than 50% of `span`.
+fn compressible(
+    dataset: &Dataset,
+    ticks: &[i128],
+    sorted: bool,
+    span: Option<(f64, f64)>,
+    threshold: Option<f64>,
+) -> Option<Arc<BrokenAxis>> {
+    let span = span?;
+    let threshold = threshold?;
+    let mut gaps: Vec<(f64, f64)> = Vec::new();
+    let mut too_many = false;
+    let visited = visit_gaps(ticks, 0..ticks.len(), threshold, &mut |gap| {
+        if gaps.len() >= MAX_COMPRESSIBLE_GAPS {
+            too_many = true;
+            return Err(glyde_core::GlydeError::Cancelled);
+        }
+        gaps.push((
+            tick_to_seconds(&dataset.time, ticks[gap.before_index]),
+            tick_to_seconds(&dataset.time, ticks[gap.after_index]),
+        ));
+        Ok(())
+    });
+    if too_many {
+        tracing::info!(
+            limit = MAX_COMPRESSIBLE_GAPS,
+            "compressed axis not offered: too many gaps; the linear axis is kept (SPEC §2.3)"
+        );
+        return None;
+    }
+    visited.ok()?;
+    if !should_offer_compression(&gaps, span) {
+        return None;
+    }
+    // Checked only once the gaps qualify, so the log names the one reason a
+    // gap-heavy file keeps its linear axis, and says nothing for the rest.
+    if !sorted {
+        tracing::info!(
+            "gaps cover more than 50% of the span, but the time column is not in order: \
+             compressed axis not offered (SPEC §2.3)"
+        );
+        return None;
+    }
+    if dataset
+        .columns
+        .iter()
+        .any(|series| series.view_kind() != ViewKind::TimeDomain)
+    {
+        tracing::info!(
+            "gaps cover more than 50% of the span, but the file has on/off or text lanes, \
+             which are not drawn compressed yet: compressed axis not offered (SPEC §2.3)"
+        );
+        return None;
+    }
+    tracing::info!(
+        gap_count = gaps.len(),
+        "gaps cover more than 50% of the span: compressed axis offered (SPEC §2.3)"
+    );
+    BrokenAxis::new(&gaps, span).map(Arc::new)
 }
 
 impl FitBounds {
@@ -758,10 +966,13 @@ impl FitBounds {
                 }
             })
             .collect();
+        let x = fit_range(ticks, sorted, &dataset.time);
+        let gap_threshold = drawing_gap_threshold(ticks);
         Self {
-            x: fit_range(ticks, sorted, &dataset.time),
+            x,
             y,
-            gap_threshold: drawing_gap_threshold(ticks),
+            gap_threshold,
+            compress: compressible(dataset, ticks, sorted, x, gap_threshold),
         }
     }
 
@@ -1789,6 +2000,171 @@ mod render_tests {
             time_column_name: "timestamp".to_string(),
             columns: vec![Series::new("value", SeriesValues::F64(vec![1.0, 2.0, 1.5]))],
         }
+    }
+
+    /// Two 50-sample clusters one second apart, separated by one 10 000 s
+    /// gap: the gap is 99% of the span (SPEC §2.3).
+    fn gap_heavy_dataset() -> Dataset {
+        let seconds: Vec<i128> = (0..50).chain(10_050..10_100).collect();
+        let mut dataset = sample_dataset();
+        dataset.time = TimeAxis::Absolute {
+            timestamps: seconds
+                .iter()
+                .map(|&s| Timestamp::new(s, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        dataset.columns = vec![Series::new(
+            "value",
+            SeriesValues::F64(seconds.iter().map(|&s| (s % 7) as f64).collect()),
+        )];
+        dataset
+    }
+
+    fn fit_bounds_of(dataset: &Dataset) -> FitBounds {
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(dataset);
+        let ticks = dataset.time.to_pyramid_ticks();
+        let sample_cache = cache_column_samples(dataset);
+        FitBounds::for_dataset(
+            dataset,
+            &pyramids,
+            &ticks,
+            &sample_cache,
+            &[],
+            CursorLookup::for_time(&dataset.time).is_sorted(),
+        )
+    }
+
+    #[test]
+    fn compression_is_offered_only_when_gaps_cover_over_half_the_span() {
+        assert!(fit_bounds_of(&gap_heavy_dataset()).compress.is_some());
+        // No gap at all, and a file whose only gap is a sliver of the span.
+        assert!(fit_bounds_of(&sample_dataset()).compress.is_none());
+        let mut mostly_data = gap_heavy_dataset();
+        let seconds: Vec<i128> = (0..5_000).chain(5_100..5_110).collect();
+        mostly_data.time = TimeAxis::Absolute {
+            timestamps: seconds
+                .iter()
+                .map(|&s| Timestamp::new(s, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        mostly_data.columns = vec![Series::new(
+            "value",
+            SeriesValues::F64(vec![0.0; seconds.len()]),
+        )];
+        assert!(fit_bounds_of(&mostly_data).compress.is_none());
+    }
+
+    /// Repeated timestamps (whole seconds on a faster log) give a median Δt
+    /// of 0, so every step would be a "gap" covering the whole span: no gap
+    /// rule, so no `[Compress]` for a file that has no real gap.
+    #[test]
+    fn compression_is_not_offered_when_the_median_delta_is_zero() {
+        let mut coarse = gap_heavy_dataset();
+        let seconds: Vec<i128> = (0..60).map(|i| i / 10).collect();
+        coarse.time = TimeAxis::Absolute {
+            timestamps: seconds
+                .iter()
+                .map(|&s| Timestamp::new(s, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        coarse.columns = vec![Series::new(
+            "value",
+            SeriesValues::F64(vec![1.0; seconds.len()]),
+        )];
+        assert!(fit_bounds_of(&coarse).compress.is_none());
+    }
+
+    /// The lanes under the plot share its x axis and are not drawn
+    /// compressed yet, so a gap-heavy file with an on/off channel keeps the
+    /// linear axis.
+    #[test]
+    fn compression_is_not_offered_when_the_file_has_a_state_lane() {
+        let mut with_lane = gap_heavy_dataset();
+        let rows = with_lane.columns[0].len();
+        with_lane.columns.push(Series::new(
+            "flag",
+            SeriesValues::Bool((0..rows).map(|i| i % 2 == 0).collect()),
+        ));
+        assert!(fit_bounds_of(&with_lane).compress.is_none());
+    }
+
+    #[test]
+    fn the_gap_count_label_is_singular_for_one_gap() {
+        assert_eq!(gap_count_label(1), "1 gap detected ·");
+        assert_eq!(gap_count_label(3), "3 gaps detected ·");
+    }
+
+    #[test]
+    fn a_gap_length_is_labelled_in_its_largest_whole_unit() {
+        assert_eq!(format_gap_length(10_000.0), "2.8 h");
+        assert_eq!(format_gap_length(3.0 * 86_400.0), "3.0 d");
+        assert_eq!(format_gap_length(90.0), "1.5 min");
+        assert_eq!(format_gap_length(12.0), "12.0 s");
+        assert_eq!(format_gap_length(0.25), "0.250 s");
+    }
+
+    /// Runs `frames` frames of the time view over `dataset`; returns the last
+    /// frame's shapes.
+    fn run_frames(
+        dataset: &Dataset,
+        state: &mut TimeViewState,
+        frames: usize,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(dataset);
+        let ticks = dataset.time.to_pyramid_ticks();
+        let sample_cache = cache_column_samples(dataset);
+        let cursor = CursorLookup::for_time(&dataset.time);
+        let fit = fit_bounds_of(dataset);
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        for _ in 0..frames {
+            shapes = ctx
+                .run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show(
+                            ui,
+                            dataset,
+                            &pyramids,
+                            &ticks,
+                            &sample_cache,
+                            &[],
+                            &cursor,
+                            &fit,
+                            state,
+                        );
+                    });
+                })
+                .shapes;
+        }
+        shapes
+    }
+
+    #[test]
+    fn the_affordance_is_shown_and_off_by_default_then_compressed_view_marks_the_break() {
+        let dataset = gap_heavy_dataset();
+        let mut state = TimeViewState::default();
+        let linear = run_frames(&dataset, &mut state, 3);
+        assert!(has_text(&linear, "1 gap detected ·"), "affordance shown");
+        assert!(has_text(&linear, "Compress"));
+        assert!(!state.compressed, "never compressed automatically");
+        assert!(
+            !has_text(&linear, "⫽ 2.8 h gap"),
+            "linear axis has no break"
+        );
+
+        state.compressed = true;
+        let compressed = run_frames(&dataset, &mut state, 4);
+        assert!(has_text(&compressed, "Expand"));
+        assert!(
+            has_text(&compressed, "⫽ 2.8 h gap"),
+            "the break glyph names the real gap length"
+        );
     }
 
     // Crash-free rendering is SPEC §6's "crash-free target"/CLAUDE.md's
