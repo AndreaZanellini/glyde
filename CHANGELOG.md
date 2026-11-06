@@ -52,6 +52,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
     change.
 
 ### Fixed
+- **The bar under the toolbar now shows the sampling rate (issue #202).**
+  Next to how the time column was classified it now says how fast the file
+  was sampled, e.g. `sampling: Uniform · 25 kHz`, or `median 1 kHz` when
+  the file is made of separate bursts. For slow logs it says `every 15 min`,
+  and for irregular data the typical spacing (`median Δt 1.5 s`). This is
+  the quickest check that the time column was read correctly: a wrong unit
+  shows up as a rate 1000 times too high or too low. Before, the rate only
+  appeared after computing a spectrum.
 - **Glyde now tells you when it had to replace unreadable characters (issue
   #209).** When some bytes of a text file are not valid in its encoding,
   Glyde replaces them with the `�` symbol so the file still opens. That

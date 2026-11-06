@@ -691,6 +691,7 @@ mod tests {
             column_names: vec!["timestamp".to_string(), "value".to_string()],
             unloaded_columns: Vec::new(),
             replaced_sequences: 0,
+            median_interval_seconds: Some(1.0),
         })
     }
 

@@ -76,7 +76,7 @@
 
 use glyde_core::ingest::{
     Confidence, DecimalSeparator, Delimiter, EncodingChoice, GeneratedIndexReason, InferenceReport,
-    InferredField, TimeColumnChoice, TimeIndexSource, TimezoneLabel,
+    InferredField, SamplingClass, TimeColumnChoice, TimeIndexSource, TimezoneLabel,
 };
 use glyde_core::time::TimestampFormat;
 use std::path::Path;
@@ -146,7 +146,10 @@ pub fn show(
                     ui.label(text);
                 }
                 ui.label(format!("{} samples", report.sample_count));
-                ui.label(format!("sampling: {:?}", report.sampling_class));
+                ui.label(sampling_text(
+                    report.sampling_class,
+                    report.median_interval_seconds,
+                ));
                 if let Some(picked) = monotonicity_affordance(ui, report) {
                     correction = Some(picked);
                 }
@@ -557,6 +560,70 @@ fn encoding_control(
     picked
 }
 
+/// SPEC §2.2's "classification and the estimated sampling rate" (issue
+/// #202): `sampling: Uniform · 25 kHz`, `median` for segmented data (each
+/// burst has its own rate), the median Δt instead for irregular data, and
+/// `every …` below 1 Hz, where an interval reads better than a rate.
+fn sampling_text(class: SamplingClass, median_interval_seconds: Option<f64>) -> String {
+    let label = format!("sampling: {class:?}");
+    let Some(interval) = median_interval_seconds.filter(|s| s.is_finite() && *s > 0.0) else {
+        return label;
+    };
+    let estimate = match class {
+        SamplingClass::Irregular => format!("median Δt {}", format_interval(interval)),
+        _ if interval > 1.0 => format!("every {}", format_interval(interval)),
+        _ => {
+            let rate = format_rate(1.0 / interval);
+            if class == SamplingClass::SegmentedUniform {
+                format!("median {rate}")
+            } else {
+                rate
+            }
+        }
+    };
+    format!("{label} · {estimate}")
+}
+
+/// `value` with four significant digits at most, trailing zeros dropped.
+fn four_significant(value: f64) -> String {
+    let decimals = (3 - value.abs().log10().floor() as i32).clamp(0, 9) as usize;
+    let text = format!("{value:.decimals$}");
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    }
+}
+
+/// A rate of at least 1 Hz with an engineering prefix: `25 kHz`.
+fn format_rate(hertz: f64) -> String {
+    const PREFIXES: [(f64, &str); 4] = [(1e9, "GHz"), (1e6, "MHz"), (1e3, "kHz"), (1.0, "Hz")];
+    let (scale, unit) = PREFIXES
+        .into_iter()
+        .find(|&(scale, _)| hertz >= scale * 0.99995)
+        .unwrap_or((1.0, "Hz"));
+    format!("{} {unit}", four_significant(hertz / scale))
+}
+
+/// An interval in its largest unit that keeps it at least 1: `1.5 s`, `15 min`.
+fn format_interval(seconds: f64) -> String {
+    const UNITS: [(f64, &str); 8] = [
+        (86_400.0, "d"),
+        (3_600.0, "h"),
+        (60.0, "min"),
+        (1.0, "s"),
+        (1e-3, "ms"),
+        (1e-6, "µs"),
+        (1e-9, "ns"),
+        (1e-12, "ps"),
+    ];
+    let (scale, unit) = UNITS
+        .into_iter()
+        .find(|&(scale, _)| seconds >= scale * 0.99995)
+        .unwrap_or((1e-12, "ps"));
+    format!("{} {unit}", four_significant(seconds / scale))
+}
+
 /// Issue #209's note next to the encoding: `1 invalid character replaced
 /// with \u{FFFD}`.
 fn replaced_text(replaced: u64) -> String {
@@ -736,6 +803,7 @@ mod tests {
             column_names: vec!["timestamp".to_string(), "value".to_string()],
             unloaded_columns: Vec::new(),
             replaced_sequences: 0,
+            median_interval_seconds: Some(1.0),
         }
     }
 
@@ -824,6 +892,48 @@ mod tests {
             "{unsure}"
         );
         assert_eq!(unsure.matches("Correct…").count(), 1, "{unsure}");
+    }
+
+    // Issue #202: the estimated rate is shown with the classification.
+    #[test]
+    fn the_sampling_label_states_the_estimated_rate() {
+        use SamplingClass::*;
+        assert_eq!(
+            sampling_text(Uniform, Some(1.0 / 25_000.0)),
+            "sampling: Uniform · 25 kHz"
+        );
+        assert_eq!(
+            sampling_text(SegmentedUniform, Some(1e-3)),
+            "sampling: SegmentedUniform · median 1 kHz"
+        );
+        assert_eq!(
+            sampling_text(Uniform, Some(1.0 / 44_100.0)),
+            "sampling: Uniform · 44.1 kHz"
+        );
+        assert_eq!(
+            sampling_text(Uniform, Some(1.0)),
+            "sampling: Uniform · 1 Hz"
+        );
+        assert_eq!(
+            sampling_text(Uniform, Some(4e-8)),
+            "sampling: Uniform · 25 MHz"
+        );
+        assert_eq!(
+            sampling_text(Uniform, Some(900.0)),
+            "sampling: Uniform · every 15 min"
+        );
+        assert_eq!(
+            sampling_text(Irregular, Some(1.5)),
+            "sampling: Irregular · median Δt 1.5 s"
+        );
+        assert_eq!(
+            sampling_text(Irregular, Some(0.0025)),
+            "sampling: Irregular · median Δt 2.5 ms"
+        );
+        assert_eq!(
+            sampling_text(ProgressiveIndex, None),
+            "sampling: ProgressiveIndex"
+        );
     }
 
     // Issue #209: bytes replaced with U+FFFD are reported next to the

@@ -48,7 +48,7 @@ use super::infer::Confidence;
 use super::{IngestOverrides, Reader, Registry};
 use crate::time::{
     detect_monotonicity, detect_monotonicity_from, infer_timestamp_format, parse_timestamp,
-    summarize_ticks, TimestampFormat,
+    summarize_ticks, summarize_ticks_with_median, TimestampFormat,
 };
 use crate::{GlydeError, Result};
 use std::path::Path;
@@ -199,6 +199,12 @@ pub struct InferenceReport {
     /// "replaced, never fatal"): never silent (Golden Rule 1), shown next
     /// to the encoding. Always 0 for a format with no text encoding.
     pub replaced_sequences: u64,
+    /// The median interval between consecutive samples, in seconds: the
+    /// estimated sampling rate's inverse, which SPEC §2.2 says the bar always
+    /// shows with the classification (issue #202). `None` without an
+    /// absolute time axis, or when it has no positive median (fewer than two
+    /// samples, or mostly repeated timestamps).
+    pub median_interval_seconds: Option<f64>,
 }
 
 /// A column the reader found but did not load (see
@@ -649,6 +655,7 @@ pub(crate) fn build_summary_and_report(
     dataset: Dataset,
     time_index: TimeIndexInference,
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
+    let mut median_interval_seconds = None;
     let (
         time_column,
         timestamp_format,
@@ -664,7 +671,13 @@ pub(crate) fn build_summary_and_report(
             // summary of a 10 GB file costs the same memory as the summary of a
             // 10 MB one — SPEC §5's peak-RSS cap is a flat number, not a
             // fraction of file size.
-            let stats = summarize_ticks(timestamps)?;
+            let scan = summarize_ticks_with_median(timestamps)?;
+            let stats = scan.stats;
+            median_interval_seconds = scan
+                .median_delta
+                .filter(|&median| median > 0.0)
+                .zip(timestamps.get(0))
+                .map(|(median, first)| median / first.unit.ticks_per_second() as f64);
             (
                 Some(dataset.time_column_name.clone()),
                 Some(timestamp_format_label(*format).to_string()),
@@ -767,6 +780,7 @@ pub(crate) fn build_summary_and_report(
         column_names: source.column_names,
         unloaded_columns: source.unloaded_columns,
         replaced_sequences: source.replaced_sequences,
+        median_interval_seconds,
     };
 
     Ok((summary, report, dataset))

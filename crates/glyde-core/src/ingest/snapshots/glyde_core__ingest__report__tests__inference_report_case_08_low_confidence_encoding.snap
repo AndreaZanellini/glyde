@@ -53,4 +53,7 @@ InferenceReport {
     ],
     unloaded_columns: [],
     replaced_sequences: 0,
+    median_interval_seconds: Some(
+        1.0,
+    ),
 }

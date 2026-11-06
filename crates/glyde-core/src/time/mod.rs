@@ -50,7 +50,8 @@ pub use format::{
 };
 pub use gap::{
     classify_sampling, detect_gaps, for_each_segment, gap_threshold, is_uniform_range, scan_range,
-    summarize_ticks, visit_gaps, Gap, RangeScan, SamplingClass, TimeAxisStats,
+    summarize_ticks, summarize_ticks_with_median, visit_gaps, Gap, RangeScan, SamplingClass,
+    TimeAxisStats,
 };
 pub use monotonic::{detect_monotonicity, detect_monotonicity_from, MonotonicityReport};
 pub use ticks::{TickSource, TICK_CHUNK_LEN};
