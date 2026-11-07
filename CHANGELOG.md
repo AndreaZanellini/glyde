@@ -65,6 +65,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
     change.
 
 ### Fixed
+- **The delimiter of a large CSV is no longer flagged as a guess (issue
+  #190).** On every CSV larger than 1 MB (in practice, almost every real
+  file) the bar under the toolbar used to open by itself with "low
+  confidence — review below" on the delimiter, even when every line was
+  perfectly consistent. Glyde reads the first 1 MB of the file to work out
+  its format, and that 1 MB usually ends in the middle of a line; that
+  half line was counted as a row with too few columns. It is now left out
+  of the check, so a clean file reports its delimiter at high confidence
+  whatever its size, and the bar only opens when something really is
+  uncertain. Nothing changes in how the file is read.
 - **A newly opened file is always shown in full (issue #205).** If you had
   panned or zoomed the previous file, the next file used to open on the
   previous file's time range; when the two files did not overlap in time,

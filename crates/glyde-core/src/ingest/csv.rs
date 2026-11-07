@@ -31,7 +31,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Recognizes the delimited-text inputs SPEC §1.1 groups together.
 pub struct CsvReader;
@@ -409,11 +409,33 @@ fn sniff_bytes(bytes: &[u8], overrides: super::IngestOverrides) -> Result<Sniff>
     };
     let head_bytes = &bytes[..bytes.len().min(infer::HEAD_SAMPLE_BYTES)];
     let head_text = infer::decode(head_bytes, &encoding);
-    Ok(sniff_from_head(
-        encoding,
-        bounded_head_sample(&head_text),
-        overrides,
-    ))
+    // Cut short of the file's end, the decoded head ends inside a line
+    // (issue #190): that partial record has fewer fields than the others
+    // and would make every large file's delimiter look like a guess.
+    let cut_short = bytes.len() > infer::HEAD_SAMPLE_BYTES;
+    let sample = if cut_short {
+        whole_lines(&head_text)
+    } else {
+        bounded_head_sample(&head_text)
+    };
+    if cut_short && sample.len() < head_text.len() {
+        debug!(
+            dropped_bytes = head_text.len() - sample.len(),
+            "head sample cut mid-line: its partial last line is left out of inference"
+        );
+    }
+    Ok(sniff_from_head(encoding, sample, overrides))
+}
+
+/// `text` up to and including its last line break: a head sample cut short
+/// of the file's end without its partial last record (issue #190). The
+/// whole text when it holds no line break at all (a single line longer than
+/// the sample), as [`bounded_head_sample`] does.
+fn whole_lines(text: &str) -> &str {
+    match text.rfind('\n') {
+        Some(last_newline) => &text[..=last_newline],
+        None => bounded_head_sample(text),
+    }
 }
 
 /// Sniffs the file at `path` by reading only its head sample — never the
@@ -425,7 +447,9 @@ pub(crate) fn sniff_path(path: &Path, overrides: super::IngestOverrides) -> Resu
         path: path.to_path_buf(),
         source,
     })?;
-    let mut head = vec![0u8; infer::HEAD_SAMPLE_BYTES];
+    // One byte past the sample: whether the file goes on after it, so a
+    // partial last line is known for what it is (issue #190).
+    let mut head = vec![0u8; infer::HEAD_SAMPLE_BYTES + 1];
     let mut filled = 0usize;
     while filled < head.len() {
         let read = file
@@ -1475,6 +1499,80 @@ mod tests {
             sample.ends_with('\n'),
             "cut must land after a full line, not mid-record"
         );
+    }
+
+    /// A clean `;`-delimited, 17-column file of at least `bytes` bytes, every
+    /// line complete and consistent, whose length does not end on a line
+    /// boundary at [`infer::HEAD_SAMPLE_BYTES`].
+    fn consistent_semicolon_csv(bytes: usize) -> String {
+        let header: Vec<String> = (0..17).map(|i| format!("c{i}")).collect();
+        let mut text = header.join(";") + "\n";
+        let mut row = 0u64;
+        while text.len() < bytes {
+            // An integer index first, then comma-decimal values.
+            let fields: Vec<String> = std::iter::once(row.to_string())
+                .chain((1..17).map(|i| format!("{row},{i}")))
+                .collect();
+            text.push_str(&fields.join(";"));
+            text.push('\n');
+            row += 1;
+        }
+        text
+    }
+
+    // Issue #190: every CSV larger than the head sample reported its
+    // delimiter at `Low`, because the raw bytes were cut at
+    // `HEAD_SAMPLE_BYTES` before decoding and the partial last line (fewer
+    // fields) was kept in the sample. A file whose lines all agree is
+    // `High`, whatever its size, through both entry points.
+    #[test]
+    fn a_consistent_csv_larger_than_the_head_sample_has_a_high_confidence_delimiter() {
+        let text = consistent_semicolon_csv(3 * infer::HEAD_SAMPLE_BYTES / 2);
+        let boundary = text.as_bytes()[..infer::HEAD_SAMPLE_BYTES]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .expect("many lines");
+        assert_ne!(
+            boundary + 1,
+            infer::HEAD_SAMPLE_BYTES,
+            "the fixture must put a partial line at the cutoff"
+        );
+
+        let from_bytes =
+            sniff_bytes(text.as_bytes(), super::super::IngestOverrides::default()).expect("sniffs");
+        assert_eq!(from_bytes.delimiter, Delimiter::Semicolon);
+        assert_eq!(from_bytes.delimiter_confidence, Confidence::High);
+        assert!(from_bytes.head_sample_bytes <= infer::HEAD_SAMPLE_BYTES);
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("large.csv");
+        std::fs::write(&path, &text).expect("write fixture");
+        let from_path =
+            sniff_path(&path, super::super::IngestOverrides::default()).expect("sniffs");
+        assert_eq!(from_path.delimiter_confidence, Confidence::High);
+        assert_eq!(
+            from_path.head_sample_bytes, from_bytes.head_sample_bytes,
+            "both entry points see the same sample"
+        );
+        assert_eq!(
+            from_path.head_sample_data_rows, from_bytes.head_sample_data_rows,
+            "no partial record is counted"
+        );
+
+        let (_, report, _) = crate::ingest::open_dataset(&path).expect("opens");
+        assert_eq!(report.delimiter.confidence, Confidence::High);
+    }
+
+    // The other side of #190: a file that ends inside the head sample keeps
+    // its last line even without a trailing newline (it is the file's real
+    // last record, not a cut).
+    #[test]
+    fn a_small_file_keeps_its_last_line_without_a_trailing_newline() {
+        let text = "a;b\n1;2\n3;4";
+        let sniff =
+            sniff_bytes(text.as_bytes(), super::super::IngestOverrides::default()).expect("sniffs");
+        assert_eq!(sniff.head_sample_bytes, text.len());
+        assert_eq!(sniff.head_sample_data_rows, 2);
     }
 
     #[test]
