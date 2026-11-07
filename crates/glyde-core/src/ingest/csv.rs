@@ -370,7 +370,8 @@ fn sniff_from_head(
             (inference.separator, inference.confidence())
         }
     };
-    let header = infer::infer_header(head_text, delimiter);
+    let mut header = infer::infer_header(head_text, delimiter);
+    header.column_names = distinct_column_names(&header.column_names);
     let data_start_row = header
         .header_row_index
         .map_or(header.skipped_preamble_rows, |header_row_index| {
@@ -390,6 +391,50 @@ fn sniff_from_head(
         head_sample_data_rows: head_text.lines().skip(data_start_row).count(),
         header,
     }
+}
+
+/// Every column's name as shown (issue #208): a header that is empty (or
+/// only spaces) becomes `column_<i>`, its 0-based position, as a file
+/// without a header already names every column; a name already taken
+/// becomes `<name> (2)`, `(3)`… in header order, never colliding with
+/// another column's own header. Each renaming is logged: the header text is
+/// the file's, the name is Glyde's.
+fn distinct_column_names(header: &[String]) -> Vec<String> {
+    let mut taken: std::collections::HashSet<String> = header
+        .iter()
+        .filter(|name| !name.trim().is_empty())
+        .cloned()
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    header
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            if name.trim().is_empty() {
+                let mut named = format!("column_{index}");
+                let mut n = 2;
+                while taken.contains(&named) {
+                    named = format!("column_{index} ({n})");
+                    n += 1;
+                }
+                info!(column = index, name = %named, "column has no header: named after its position (issue #208)");
+                taken.insert(named.clone());
+                return named;
+            }
+            if seen.insert(name.clone()) {
+                return name.clone();
+            }
+            let mut n = 2;
+            let mut named = format!("{name} ({n})");
+            while taken.contains(&named) {
+                n += 1;
+                named = format!("{name} ({n})");
+            }
+            info!(column = index, header = %name, name = %named, "duplicate column name: told apart (issue #208)");
+            taken.insert(named.clone());
+            named
+        })
+        .collect()
 }
 
 /// Sniffs `bytes` (SPEC §1.2), decoding only as much of it as the head
@@ -1331,9 +1376,11 @@ mod tests {
 
         let outcome = parse(&bytes).expect("case 20 must parse");
 
+        // The trailing field's empty header is named after its position
+        // (issue #208).
         assert_eq!(
             outcome.column_names,
-            vec!["timestamp", "value", "pressure", ""]
+            vec!["timestamp", "value", "pressure", "column_3"]
         );
         assert_eq!(outcome.row_count, 4);
         assert_eq!(outcome.skipped_row_count, 0);
@@ -1619,6 +1666,29 @@ mod tests {
             sniff_bytes(text.as_bytes(), super::super::IngestOverrides::default()).expect("sniffs");
         assert_eq!(sniff.head_sample_bytes, text.len());
         assert_eq!(sniff.head_sample_data_rows, 2);
+    }
+
+    // Issue #208: names are made visible and distinct, header order kept.
+    #[test]
+    fn column_names_are_made_visible_and_distinct() {
+        let owned = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            distinct_column_names(&owned(&["t", "", " ", "v"])),
+            ["t", "column_1", "column_2", "v"]
+        );
+        assert_eq!(
+            distinct_column_names(&owned(&["t", "a", "a", "a"])),
+            ["t", "a", "a (2)", "a (3)"]
+        );
+        // Never a collision with a real header.
+        assert_eq!(
+            distinct_column_names(&owned(&["a", "a", "a (2)", "column_3", ""])),
+            ["a", "a (3)", "a (2)", "column_3", "column_4"]
+        );
+        assert_eq!(
+            distinct_column_names(&owned(&["column_1", ""])),
+            ["column_1", "column_1 (2)"]
+        );
     }
 
     #[test]

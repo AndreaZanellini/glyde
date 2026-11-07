@@ -65,6 +65,22 @@ Versioning: [Semantic Versioning](https://semver.org/).
     change.
 
 ### Fixed
+- **Every column now has a name you can tell apart (issue #208).** A
+  column whose header is empty used to appear as a colored dot with no
+  name, and its readout as `: 1.1`; it is now named after its position
+  (`column_1`), as columns of a file without a header already are. Two
+  columns with the same header (`value`, `value`) are now shown as `value`
+  and `value (2)` everywhere: legend, readout, spectrum, time-column picker.
+  A column in which every cell is empty, typically the phantom column a
+  line-ending delimiter creates, used to be drawn as an empty, unlabelled
+  lane. It is now left out of the plot and listed under "1 column not
+  loaded — view details", with the reason. Try `testdata/corpus/` cases
+  16, 17 and 20.
+  - Assumptions made: the issue mentioned keeping the original header text
+    in a tooltip; the original is only in the log for now. A column whose
+    cells are all empty is left out whether or not it has a name (for
+    example "Body temperature deviation" in a sleep-tracker export), since
+    it has nothing to draw; it is always listed as not loaded.
 - **A lone reading can no longer be missed, and an empty channel says so
   (issue #207).** A reading with nothing to connect to (a file with a single
   row, or one good value between missing ones, such as a sensor that comes
