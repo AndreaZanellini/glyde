@@ -1452,6 +1452,12 @@ fn load_spilled(
 ) -> Result<(CsvParseOutcome, Dataset, TimeIndexInference)> {
     let column_names = sniff.column_names().to_vec();
     let column_count = column_names.len();
+    if column_count == 0 {
+        // No data row in the head sample, so no column (issue #216): the
+        // in-memory path's answer, never an index into an empty batch.
+        warn!("no column found in the head sample: nothing to plot (SPEC §1.3)");
+        return Err(GlydeError::SingleColumnFile);
+    }
     let decimal_separator = sniff.decimal_separator;
     let candidate = time_column_candidate(overrides, column_count);
     let check_monotonic = checks_monotonicity(overrides, column_count);

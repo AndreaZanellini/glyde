@@ -65,6 +65,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
     change.
 
 ### Fixed
+- **A `;`-separated file written with decimal commas now opens even when it
+  has no date column (issue #216).** A file such as
+  `time;pressure` / `0,5;1,25` / `1,0;1,30`, typical of a European export
+  with a time column in seconds, used to fail with "single-column file":
+  Glyde did not recognise `0,5` as a number when looking for the header
+  line, so it took every line for a header and found no data. Such a file
+  now opens with its header and its numbers. Separately, a file in which no
+  line looks like data at all could crash Glyde when it was too large to
+  fit in memory; it now shows the same "nothing to plot" message as a small
+  one.
 - **The delimiter of a large CSV is no longer flagged as a guess (issue
   #190).** On every CSV larger than 1 MB (in practice, almost every real
   file) the bar under the toolbar used to open by itself with "low
