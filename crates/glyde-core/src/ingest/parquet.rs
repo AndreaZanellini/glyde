@@ -378,6 +378,7 @@ fn finish_open(
         decimal_separator: settled(None),
         header_ambiguous: false,
         unloaded_columns,
+        replaced_sequences: 0,
     };
     build_summary_and_report(facts, dataset, time_index)
 }

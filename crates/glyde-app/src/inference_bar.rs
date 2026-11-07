@@ -112,11 +112,17 @@ pub fn show(
     let low_confidence = report.has_low_confidence_field();
     let response = egui::CollapsingHeader::new(header_text(report, low_confidence))
         .id_salt(open_id_source)
-        .default_open(low_confidence || report.non_monotonic_count > 0)
+        // Altered text is never behind a collapsed header (issue #209),
+        // even under an encoding the user picked.
+        .default_open(
+            low_confidence || report.non_monotonic_count > 0 || report.replaced_sequences > 0,
+        )
         .show(ui, |ui| {
             let mut correction = None;
             ui.horizontal_wrapped(|ui| {
-                if let Some(picked) = encoding_control(ui, &report.encoding) {
+                if let Some(picked) =
+                    encoding_control(ui, &report.encoding, report.replaced_sequences)
+                {
                     correction = Some(Correction::Encoding(picked));
                 }
                 if let Some(picked) = delimiter_control(ui, &report.delimiter) {
@@ -508,15 +514,30 @@ fn encoding_display(choice: EncodingChoice) -> &'static str {
 }
 
 /// The encoding field, with a correction dropdown when it is low
-/// confidence (same gating as [`delimiter_control`]). Returns the newly
-/// picked encoding, if the user chose one different from the current one
-/// this frame.
-fn encoding_control(ui: &mut egui::Ui, field: &InferredField<String>) -> Option<EncodingChoice> {
+/// confidence (same gating as [`delimiter_control`]) or when decoding had to
+/// replace `replaced` invalid characters (issue #209), which are then said
+/// next to it. Returns the newly picked encoding, if the user chose one
+/// different from the current one this frame.
+fn encoding_control(
+    ui: &mut egui::Ui,
+    field: &InferredField<String>,
+    replaced: u64,
+) -> Option<EncodingChoice> {
     let current = EncodingChoice::from_label(&field.value);
     let mut picked = None;
     ui.horizontal(|ui| {
         ui.label(field_text("encoding", &field.value, field.confidence));
-        if field.confidence == Confidence::Low {
+        if replaced > 0 {
+            ui.colored_label(ui.visuals().warn_fg_color, replaced_text(replaced))
+                .on_hover_text(format!(
+                    "Some bytes of this file are not valid {}, so they were replaced with \
+                     \u{FFFD} in column names and text values. Numbers are not affected \
+                     unless they contain such a byte. This often means the encoding was \
+                     guessed wrong: try another one.",
+                    field.value
+                ));
+        }
+        if field.confidence == Confidence::Low || replaced > 0 {
             egui::ComboBox::from_id_salt("inference-bar-encoding-correction")
                 .selected_text("Correct…")
                 .show_ui(ui, |ui| {
@@ -534,6 +555,17 @@ fn encoding_control(ui: &mut egui::Ui, field: &InferredField<String>) -> Option<
         }
     });
     picked
+}
+
+/// Issue #209's note next to the encoding: `1 invalid character replaced
+/// with \u{FFFD}`.
+fn replaced_text(replaced: u64) -> String {
+    let noun = if replaced == 1 {
+        "character"
+    } else {
+        "characters"
+    };
+    format!("{replaced} invalid {noun} replaced with \u{FFFD}")
 }
 
 fn decimal_separator_display(separator: DecimalSeparator) -> &'static str {
@@ -703,6 +735,7 @@ mod tests {
             },
             column_names: vec!["timestamp".to_string(), "value".to_string()],
             unloaded_columns: Vec::new(),
+            replaced_sequences: 0,
         }
     }
 
@@ -791,6 +824,31 @@ mod tests {
             "{unsure}"
         );
         assert_eq!(unsure.matches("Correct…").count(), 1, "{unsure}");
+    }
+
+    // Issue #209: bytes replaced with U+FFFD are reported next to the
+    // encoding, with the correction offered, even when the encoding was the
+    // user's own pick (high confidence, but text was still altered).
+    #[test]
+    fn replaced_bytes_are_shown_next_to_the_encoding_with_a_correction() {
+        let mut report = sample_report(Confidence::High);
+        report.replaced_sequences = 1;
+        report.encoding.confidence = Confidence::Low;
+        let inferred = rendered_texts(&report);
+        assert!(
+            inferred.contains("1 invalid character replaced with \u{FFFD}"),
+            "{inferred}"
+        );
+        assert_eq!(inferred.matches("Correct…").count(), 1, "{inferred}");
+
+        report.encoding.confidence = Confidence::High; // the user's pick
+        report.replaced_sequences = 3;
+        let picked = rendered_texts(&report);
+        assert!(
+            picked.contains("3 invalid characters replaced with \u{FFFD}"),
+            "the bar opens and says so: {picked}"
+        );
+        assert_eq!(picked.matches("Correct…").count(), 1, "{picked}");
     }
 
     #[test]

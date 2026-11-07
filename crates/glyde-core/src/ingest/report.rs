@@ -194,6 +194,11 @@ pub struct InferenceReport {
     /// dropped silently (Golden Rule 2), always listed here with why.
     /// Always empty for delimited text, where every column is typed.
     pub unloaded_columns: Vec<UnloadedColumn>,
+    /// How many places in the source text had invalid bytes for its
+    /// encoding and were replaced with U+FFFD (issue #209; SPEC §1.3
+    /// "replaced, never fatal"): never silent (Golden Rule 1), shown next
+    /// to the encoding. Always 0 for a format with no text encoding.
+    pub replaced_sequences: u64,
 }
 
 /// A column the reader found but did not load (see
@@ -225,6 +230,8 @@ pub(crate) struct SourceFacts {
     /// [`CsvParseOutcome::header_ambiguous`]).
     pub(crate) header_ambiguous: bool,
     pub(crate) unloaded_columns: Vec<UnloadedColumn>,
+    /// [`InferenceReport::replaced_sequences`].
+    pub(crate) replaced_sequences: u64,
 }
 
 impl From<CsvParseOutcome> for SourceFacts {
@@ -248,6 +255,7 @@ impl From<CsvParseOutcome> for SourceFacts {
             },
             header_ambiguous: outcome.header_ambiguous,
             unloaded_columns: Vec::new(),
+            replaced_sequences: outcome.replaced_sequences,
         }
     }
 }
@@ -758,6 +766,7 @@ pub(crate) fn build_summary_and_report(
         time_index: time_index_source,
         column_names: source.column_names,
         unloaded_columns: source.unloaded_columns,
+        replaced_sequences: source.replaced_sequences,
     };
 
     Ok((summary, report, dataset))
