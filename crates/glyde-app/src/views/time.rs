@@ -167,6 +167,9 @@ pub struct TimeViewState {
     /// Whether the plot's bounds are currently in compressed coordinates, so
     /// a toggle re-maps them instead of jumping the view.
     bounds_compressed: bool,
+    /// The next frame forgets the plot's (and the linked lanes') stored
+    /// bounds and fits the data ([`Self::fit_new_file`]).
+    fit_requested: bool,
     /// How aggregated bars are handed to egui; the tests switch it to the
     /// reference encoding to compare the two.
     #[cfg(test)]
@@ -290,6 +293,22 @@ impl TimeViewState {
         self.pending = None;
     }
 
+    /// The data on screen is a newly opened file (or a new reading of one,
+    /// after a correction): its first frame shows it fitted, on the
+    /// true-to-scale axis, whatever the previous file was panned, zoomed or
+    /// compressed to (issue #205). Within one reading, the progressive
+    /// preview and the completed file keep the user's view.
+    pub fn fit_new_file(&mut self) {
+        self.fit_requested = true;
+        self.compressed = false;
+    }
+
+    /// Whether the next frame resets the view to the fit.
+    #[cfg(test)]
+    pub(crate) fn fit_requested(&self) -> bool {
+        self.fit_requested
+    }
+
     /// Where the last frame's plot put its x axis; `None` before the first
     /// frame or when the file has no samples.
     pub fn shared_axis(&self) -> Option<SharedAxis> {
@@ -389,6 +408,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         shared_axis,
         compressed,
         bounds_compressed,
+        fit_requested,
         ..
     } = state;
     let fit_clicked = ui.button("Fit to data").clicked();
@@ -463,6 +483,15 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         });
     if let Some((x_min, x_max)) = fit {
         plot = plot.include_x(x_min).include_x(x_max);
+    }
+    if std::mem::take(fit_requested) {
+        // A new file (issue #205): `egui_plot` would keep the previous
+        // file's bounds once a pan or zoom turned its auto-bounds off, and
+        // so would the lanes through their link group, which `reset` also
+        // clears. Fresh bounds are in linear coordinates.
+        plot = plot.reset();
+        *bounds_compressed = false;
+        tracing::debug!("new data on screen: the time view starts fitted");
     }
 
     let response = plot.show(ui, |plot_ui| {
@@ -2888,6 +2917,58 @@ mod render_tests {
             });
         })
         .shapes
+    }
+
+    // Issue #205: after a pan on one file, the next file opened with the
+    // previous file's x range; two files that do not overlap in time made
+    // the new one look empty. A new file always starts from its fitted full
+    // view, and from the true-to-scale axis.
+    #[test]
+    fn a_new_file_opens_fitted_whatever_the_previous_one_was_panned_to() {
+        let first = ViewFixture::new(dataset_of(vec![(
+            "a",
+            (0..100).map(|i| (i % 7) as f64).collect(),
+        )]));
+        let mut later = dataset_of(vec![("b", (0..100).map(|i| (i % 5) as f64).collect())]);
+        later.time = TimeAxis::Absolute {
+            timestamps: (10_000..10_100)
+                .map(|s| Timestamp::new(s, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        let second = ViewFixture::new(later);
+        let second_fit = second.fit.x.expect("the second file has an extent");
+
+        let open_second_after_a_pan = |fit_requested: bool| {
+            let ctx = egui::Context::default();
+            let mut state = TimeViewState::default();
+            for _ in 0..3 {
+                state_frame(&ctx, &first, &mut state, None);
+            }
+            // A pan: the view moves away from the fit, auto-bounds off.
+            state_frame(&ctx, &first, &mut state, Some((20.0, 30.0)));
+            state_frame(&ctx, &first, &mut state, None);
+            state.compressed = true;
+            state.data_changed();
+            if fit_requested {
+                state.fit_new_file();
+            }
+            for _ in 0..3 {
+                state_frame(&ctx, &second, &mut state, None);
+            }
+            let shown = state.shared_axis().expect("drawn").x_range;
+            (shown, state.compressed)
+        };
+
+        let (stale, _) = open_second_after_a_pan(false);
+        assert_ne!(
+            stale, second_fit,
+            "precondition: egui_plot alone keeps the old range"
+        );
+        let (shown, compressed) = open_second_after_a_pan(true);
+        assert_eq!(shown, second_fit, "the new file is shown fitted");
+        assert!(!compressed, "the new file starts on the linear axis");
     }
 
     /// Runs frames until `done(state)` holds, failing after a few seconds.
