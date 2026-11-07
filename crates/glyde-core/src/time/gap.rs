@@ -410,7 +410,7 @@ fn for_each_gap<S: TickSource + ?Sized>(
 ///
 /// Does not log the monotonicity anomalies it counted; that is the caller's
 /// choice (see [`summarize_ticks`]).
-fn scan_distribution<S: TickSource + ?Sized>(source: &S) -> Result<TimeAxisStats> {
+fn scan_distribution<S: TickSource + ?Sized>(source: &S) -> Result<RangeScan> {
     let scan = scan_range(source, 0..source.tick_count(), &mut |_| Ok(()))?;
     if scan.stats.gap_count > 0 {
         info!(
@@ -424,7 +424,7 @@ fn scan_distribution<S: TickSource + ?Sized>(source: &S) -> Result<TimeAxisStats
         gap_count = scan.stats.gap_count,
         "sampling classified (SPEC §2.2)"
     );
-    Ok(scan.stats)
+    Ok(scan)
 }
 
 /// SPEC §2.2's classification of one sub-range of a time axis — e.g. the
@@ -574,9 +574,16 @@ pub fn is_uniform_range<S: TickSource + ?Sized>(source: &S, range: Range<usize>)
 /// [`detect_gaps`]/[`classify_sampling`]/[`super::detect_monotonicity`]
 /// entry points do.
 pub fn summarize_ticks<S: TickSource + ?Sized>(source: &S) -> Result<TimeAxisStats> {
-    let stats = scan_distribution(source)?;
-    stats.monotonicity.log_anomalies();
-    Ok(stats)
+    summarize_ticks_with_median(source).map(|scan| scan.stats)
+}
+
+/// [`summarize_ticks`], with the median Δt the classification was measured
+/// against: the estimated sampling interval SPEC §2.2 says the inference
+/// bar always shows (issue #202).
+pub fn summarize_ticks_with_median<S: TickSource + ?Sized>(source: &S) -> Result<RangeScan> {
+    let scan = scan_distribution(source)?;
+    scan.stats.monotonicity.log_anomalies();
+    Ok(scan)
 }
 
 /// Scans consecutive Δt in `timestamps` (non-decreasing, all in the same tick
@@ -646,6 +653,7 @@ pub fn visit_gaps<S: TickSource + ?Sized>(
 pub fn classify_sampling(timestamps: &[i128]) -> SamplingClass {
     scan_distribution(timestamps)
         .expect(SLICE_SCAN_IS_INFALLIBLE)
+        .stats
         .sampling_class
 }
 
