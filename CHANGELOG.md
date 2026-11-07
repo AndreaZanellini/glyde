@@ -65,6 +65,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
     change.
 
 ### Fixed
+- **No more stray marks in the middle of a pause in recording (issue
+  #192).** Zoomed out, the plot used to draw a short vertical bar in the
+  middle of a time gap, at a time where the file has no sample (for
+  example halfway through the two 3-minute pauses of the engine test-bench
+  showcase file). That bar mixed values from before and after the pause.
+  Now the readings on each side of a gap are drawn on their own side, so a
+  gap stays empty at every zoom level, and every reading is still shown.
+  Gaps narrower than one pixel on screen are left as they are (there is no
+  room to show anything inside them).
 - **A `;`-separated file written with decimal commas now opens even when it
   has no date column (issue #216).** A file such as
   `time;pressure` / `0,5;1,25` / `1,0;1,30`, typical of a European export
