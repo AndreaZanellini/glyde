@@ -65,6 +65,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
     change.
 
 ### Fixed
+- **Channels no longer get near-identical colors (issue #199).** Colors
+  used to be picked by stepping around the color wheel, which put some
+  channels almost on top of each other (in the engine test-bench file,
+  `Coolant temp` and `Combustion cycles` were both magenta). Channels now
+  take their color from a fixed set of nine clearly different colors (blue,
+  orange, green, red, purple, brown, pink, cyan, olive), in order. From the
+  tenth channel on, the same nine repeat lighter, then darker. Every
+  channel's color changes once with this update; the spectrum view and the
+  channel picker use the same colors as the time plot.
 - **The bar under the toolbar now shows the sampling rate (issue #202).**
   Next to how the time column was classified it now says how fast the file
   was sampled, e.g. `sampling: Uniform · 25 kHz`, or `median 1 kHz` when
