@@ -12,6 +12,19 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Showcase files: see the whole app in three opens.** `testdata/showcase/`
+  holds a generator for three realistic synthetic logs, plus a guide that says
+  what to look at and when:
+  - an engine test bench CSV that opens in memory,
+  - a 1.2 GB PV inverter CSV that spills to disk,
+  - a Parquet file of periodic 25 kHz vibration captures with a gearbox
+    bearing fault growing through the day.
+
+  Together they cover booleans, states, markers, long and short holes, gaps
+  (with and without `Compress`), steep and slow signals, outliers and known
+  PSD peaks. The data files are generated locally and are not committed. Run
+  `python3 testdata/showcase/generate.py` (needs `numpy` and `pyarrow`). This
+  is a developer tool only and changes nothing in the app.
 - **Compress the gaps in a file that is mostly gaps (SPEC §2.3).** When the
   gaps in a file's time column cover more than half of its time span, a
   discreet `N gaps detected · Compress` control appears above the plot.
