@@ -54,7 +54,7 @@ use glyde_core::ingest::{
 };
 use glyde_core::series::{Series, SeriesValues, ViewKind};
 use glyde_core::time::{
-    format_timestamp, should_offer_compression, visit_gaps, BrokenAxis, Timestamp,
+    cluster_at, format_timestamp, should_offer_compression, visit_gaps, BrokenAxis, Timestamp,
 };
 
 use crate::views::channels::{self, ChannelVisibility};
@@ -170,6 +170,9 @@ pub struct TimeViewState {
     /// The next frame forgets the plot's (and the linked lanes') stored
     /// bounds and fits the data ([`Self::fit_new_file`]).
     fit_requested: bool,
+    /// A clicked cluster's span in plot seconds (SPEC §2.3), applied to the
+    /// plot's x bounds on the next frame. View state only.
+    cluster_fit: Option<(f64, f64)>,
     /// How aggregated bars are handed to egui; the tests switch it to the
     /// reference encoding to compare the two.
     #[cfg(test)]
@@ -409,6 +412,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         compressed,
         bounds_compressed,
         fit_requested,
+        cluster_fit,
         ..
     } = state;
     let fit_clicked = ui.button("Fit to data").clicked();
@@ -540,7 +544,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             *bounds_compressed = broken.is_some();
         }
 
-        if let Some((x_min, x_max)) = focus {
+        if let Some((x_min, x_max)) = focus.or_else(|| cluster_fit.take()) {
             let current = plot_ui.plot_bounds();
             plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                 [to_x(x_min), current.min()[1]],
@@ -846,6 +850,22 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         )
     });
     let (hovered, visible, updating) = response.inner;
+    // SPEC §2.3: a click on a cluster next to a gap fits it to the viewport.
+    // A double click is egui_plot's own reset to the full fit, so it wins.
+    if response.response.clicked() && !response.response.double_clicked() {
+        if let Some(pointer) = response.response.interact_pointer_pos() {
+            let x = response.transform.value_from_position(pointer).x;
+            if let Some(span) = cluster_span_at(fit_bounds, &dataset.time, from_x(x)) {
+                tracing::info!(
+                    from_seconds = span.0,
+                    to_seconds = span.1,
+                    "cluster fitted to the viewport (SPEC §2.3)"
+                );
+                *cluster_fit = Some((to_x(span.0), to_x(span.1)));
+                ui.ctx().request_repaint();
+            }
+        }
+    }
     let frame = response.transform.frame();
     let bounds = response.transform.bounds();
     *shared_axis = fit.map(|fit| SharedAxis {
@@ -888,6 +908,19 @@ pub fn show_with_selection<P: Pyramid + Sync>(
 const ISOLATED_MARKER_RADIUS: f32 = 4.0;
 
 /// SPEC §2.3's `N gaps detected ·`, in the singular for one gap.
+/// The cluster under plot-seconds `seconds`, as the plot-seconds span to fit
+/// (SPEC §2.3); `None` inside a gap, off the axis, or on a gapless file.
+fn cluster_span_at(fit_bounds: &FitBounds, time: &TimeAxis, seconds: f64) -> Option<(f64, f64)> {
+    let (first, last) = fit_bounds.ticks_span?;
+    let (start, end) = cluster_at(
+        fit_bounds.gaps(),
+        first,
+        last,
+        seconds_to_tick(time, seconds),
+    )?;
+    Some((tick_to_seconds(time, start), tick_to_seconds(time, end)))
+}
+
 fn gap_count_label(count: usize) -> String {
     let noun = if count == 1 { "gap" } else { "gaps" };
     format!("{count} {noun} detected ·")
@@ -943,6 +976,9 @@ pub struct FitBounds {
     /// [`MAX_COMPRESSIBLE_GAPS`]. A decimated column is never drawn across
     /// one ([`split_at_gaps`], issue #192).
     gaps: Arc<[(i128, i128)]>,
+    /// The first and last tick of a time-ordered axis (what the clusters
+    /// between `gaps` run from and to); `None` otherwise.
+    ticks_span: Option<(i128, i128)>,
     /// SPEC §2.3's compressed axis, present only when its affordance is
     /// offered: gaps account for more than half the span ([`compressible`]).
     compress: Option<Arc<BrokenAxis>>,
@@ -1124,6 +1160,10 @@ impl FitBounds {
             y,
             gap_threshold,
             gaps: gaps.unwrap_or_default().into(),
+            ticks_span: sorted
+                .then(|| ticks.first().zip(ticks.last()))
+                .flatten()
+                .map(|(&a, &b)| (a, b)),
             compress,
             all_missing,
         }
@@ -2389,6 +2429,28 @@ mod render_tests {
             &[],
             CursorLookup::for_time(&dataset.time).is_sorted(),
         )
+    }
+
+    #[test]
+    fn clicking_next_to_a_gap_fits_the_cluster_under_the_pointer() {
+        let dataset = gap_heavy_dataset();
+        let bounds = fit_bounds_of(&dataset);
+        // Clusters are 0..=49 s and 10_050..=10_099 s.
+        assert_eq!(
+            cluster_span_at(&bounds, &dataset.time, 20.0),
+            Some((0.0, 49.0))
+        );
+        assert_eq!(
+            cluster_span_at(&bounds, &dataset.time, 10_070.0),
+            Some((10_050.0, 10_099.0))
+        );
+        // Inside the gap there is no cluster; nor on a file without gaps.
+        assert_eq!(cluster_span_at(&bounds, &dataset.time, 5_000.0), None);
+        let plain = sample_dataset();
+        assert_eq!(
+            cluster_span_at(&fit_bounds_of(&plain), &plain.time, 1.0),
+            None
+        );
     }
 
     #[test]
