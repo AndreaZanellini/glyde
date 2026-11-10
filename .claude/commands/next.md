@@ -8,9 +8,9 @@ Read `docs/ROADMAP.md` and CLAUDE.md.
 
 ## Step 0 — one PR at a time
 
-Run `gh pr list --state open`. If any PR is open, stop: say which one is waiting on me and do
-nothing else. Exception: I explicitly asked for a batch in this session — then stack the PRs in
-merge order and state that order.
+Run `gh pr list --state open`. If any PR is open, stop: say which one is waiting on me and for
+how many days, and do nothing else. Exception: I explicitly asked for a batch in this session —
+then stack the PRs in merge order and state that order.
 
 ## Step 1 — triage open issues first
 
@@ -70,5 +70,8 @@ behaviours → `blocking-decision`. Pure technical prerequisite, no denied file 
 `blocking-autonomous`. Neither → `backlog`. Unsure → `blocking-decision`.
 Never apply `ready` yourself: only I do, when I record a decision.
 Then keep going; do not widen this PR.
+
+Never change `.claude/**` or `docs/ROUTINES.md` as part of a task: they are the rules you run by.
+If one looks wrong, open a `blocking-decision` issue.
 
 One item per PR. Do not merge — CI and I decide.

@@ -42,6 +42,9 @@ A review that skips these is not a review. Put the results in the comment.
 7. Did this PR resolve a `blocking-decision` issue, or edit `.github/workflows/**`, `deny.toml`,
    `docs/SPEC.md`, `docs/PRODUCT.md`, `docs/QUALITY.md` or `CLAUDE.md`? Those are
    maintainer-only. If an agent PR touched them, that is a red flag — request changes.
+   Also flag, in the first line, any change under `.claude/**` or to `docs/ROUTINES.md`: these
+   are the rules the agents and this review run by. Such a change is legitimate only when the
+   maintainer asked for it; say what it loosens.
    (Implementing a `ready` issue is fine: check the code does what the decision comment says, and
    that any spec change is a patch in the PR description, not an edit.)
 8. Is the CHANGELOG entry honest and readable by a non-programmer? Assumptions listed?
