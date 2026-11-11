@@ -1,4 +1,4 @@
-# Glyde — Roadmap to v0.1.0 (colleague preview)
+# Glyde — Roadmap to v0.1.0
 
 **Goal:** the shortest path to a release an external user (the maintainer's colleagues) can
 download and use. Re-planned on 2026-11-11 with the maintainer; it replaces the M0–M9
@@ -7,7 +7,7 @@ roadmap, which is archived unchanged in [`history/ROADMAP-M0-M9.md`](history/ROA
 "docs/ROADMAP.md M*n*" refer to that archived file.
 
 Each item is one PR and links its issue. Work them **in order**, one PR at a time. GitHub
-milestones: `v0.1 — colleague preview` and `v0.2`.
+milestones: `v0.1` and `v0.2`.
 
 ## Maintainer decisions behind this plan (2026-11-11)
 
