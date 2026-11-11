@@ -25,6 +25,17 @@ Versioning: [Semantic Versioning](https://semver.org/).
     enough for v0.1 and the measured budget misses become known limitations
     in the release notes; outlier flagging and the anomaly gutter move to
     v0.2; measurement cursors enter v1; v0.1 ships unsigned.
+- **The "first plot" speed check in CI no longer fails by chance (issue
+  #184).** This check opens a 1 GB CSV on GitHub's shared machines and
+  fails the build if the first plot takes more than 10 s. It timed a single
+  open, which landed right around 10 s, so builds failed now and then on
+  changes that had nothing to do with opening files (2 of 13 runs on
+  `main` on 6–7 November). It now times three opens and judges the
+  fastest, and it always prints the three times so the margin is visible
+  in the CI log. The 10 s limit is unchanged. Nothing changes in the app.
+  - Known limit: on a slow day for GitHub's machines even the fastest open
+    can land near 10 s, so a rare false failure is still possible until the
+    first plot itself gets faster (issue #194).
 
 ### Added
 - **Click a cluster to zoom into it.** On a file with gaps, a single click on
