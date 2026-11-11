@@ -11,6 +11,21 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **New plan: a first release for colleagues (v0.1.0) in three steps.**
+  `docs/ROADMAP.md` now holds only the work left before v0.1.0: (1) a
+  handful of correctness and stability fixes, (2) a redesign of the look,
+  the layout of the time view (state channels included), measurement
+  cursors and the icon, mockup first, (3) a security review, user
+  documentation and the release itself. Each item links its GitHub issue,
+  grouped in the `v0.1` and `v0.2` milestones. The old
+  M0–M9 roadmap is kept unchanged in `docs/history/ROADMAP-M0-M9.md`.
+  Nothing changes in the app.
+  - Decisions recorded from the maintainer (2026-11-11): performance is
+    enough for v0.1 and the measured budget misses become known limitations
+    in the release notes; outlier flagging and the anomaly gutter move to
+    v0.2; measurement cursors enter v1; v0.1 ships unsigned.
+
 ### Added
 - **Click a cluster to zoom into it.** On a file with gaps, a single click on
   the plot where data exists fits the time axis to that stretch of data (the

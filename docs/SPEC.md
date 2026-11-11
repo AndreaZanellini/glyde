@@ -142,6 +142,7 @@ Resampling to force uniformity is forbidden in v1.
 - One or many numeric series; either overlaid on one plot or stacked on multiple plots **sharing a single, synchronized time axis**.
 - Pan, zoom (wheel/pinch, box-select), fit-to-data.
 - Cursor readout showing exact raw value(s) and timestamp at the cursor.
+- **Measurement cursors** (issue #231): two vertical cursors A and B show `Δt`, `1/Δt`, and for each visible numeric series its value at A and at B, `ΔY` and the slope `ΔY/Δt`; optional horizontal cursors measure a vertical distance. Every value comes from the raw sample nearest to the cursor (never from the pyramid), a NaN is shown as missing (never interpolated), and `Δt` is always real time, also on a compressed axis.
 - Anomaly gutter: a thin strip under the plot marking NaN runs, skipped rows, and flagged outliers, clickable to jump to them.
 - Per-series unit label taken from the header if present (`°C`, `m/s²`), never parsed into a unit system — displayed verbatim.
 
@@ -167,6 +168,8 @@ Decimation rule for this view: a band or marker **never disappears** because of 
 ## 5. Performance (contract, enforced by CI)
 
 Reference machine: **MacBook Air M1 (2020), 16 GB**. Budgets are enforced by benchmarks in CI (`QUALITY.md` §Benchmarks); breaching one fails the build.
+
+**v0.1 exception (maintainer decision 2026-11-11):** breaches measured by hand on the reference machine (first plot #194, CSV index build #195, spilled Parquet #181) do not block the v0.1.0 release; they are listed in its release notes as known limitations and remain v0.2 work. The peak-RSS cap is not relaxed.
 
 | Metric | Budget |
 |---|---|
@@ -203,5 +206,5 @@ Reference machine: **MacBook Air M1 (2020), 16 GB**. Budgets are enforced by ben
 - CI produces, for every tagged release: macOS arm64 `.dmg`, Windows x64 installer + portable `.exe`, Linux x64 `AppImage` + tarball.
 - The Linux build targets **both X11 and Wayland**: a single binary links both winit backends and picks one at runtime, so it runs unmodified under either display server.
 - Binaries must run with **no runtime, no toolchain, no dependencies** to install.
-- **Signing:** required before the repo goes public — macOS signing + notarization (Apple Developer account), Windows code signing (or, at minimum, winget distribution to soften SmartScreen). Until then, release notes must include the exact "unsigned build" workaround steps for macOS and Windows. A first-run security warning is a product bug, tracked as a release blocker for going public.
+- **Signing:** required for v1.0 (maintainer decision 2026-11-11; v0.1.x previews ship unsigned) — macOS signing + notarization (Apple Developer account), Windows code signing (or, at minimum, winget distribution to soften SmartScreen). Until then, release notes must include the exact "unsigned build" workaround steps for macOS and Windows. A first-run security warning is a product bug, tracked as a release blocker for v1.0.
 - No auto-update in v1 (tracked as post-v1 issue).
