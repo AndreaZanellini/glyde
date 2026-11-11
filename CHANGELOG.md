@@ -27,6 +27,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
     v0.2; measurement cursors enter v1; v0.1 ships unsigned.
 
 ### Added
+- **Click a cluster to zoom into it.** On a file with gaps, a single click on
+  the plot where data exists fits the time axis to that stretch of data (the
+  samples between the neighbouring gaps). A click inside a gap, or on a file
+  without gaps, does nothing; double-click still resets to the full view. It
+  only moves the view: data and analysis are untouched, and it works on the
+  compressed axis too.
+  - Assumptions made: a single click is the trigger (no modifier key), only the
+    time axis moves (the vertical range is left as it is), and "cluster" means
+    the run of samples between two detected gaps (Δt > 10× median).
 - **Showcase files: see the whole app in three opens.** `testdata/showcase/`
   holds a generator for three realistic synthetic logs, plus a guide that says
   what to look at and when:

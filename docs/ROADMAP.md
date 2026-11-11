@@ -92,7 +92,7 @@ Design first. Nothing is implemented before the maintainer approves the mockup.
 
 ---
 
-## Already done, waiting for merge
+## Done since the re-plan
 
 - PR #225 — click a cluster next to a gap to fit it to the viewport (last open M8 view item).
 
