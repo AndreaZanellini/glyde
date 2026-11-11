@@ -38,12 +38,14 @@
 //! never taking a pyramid type.
 
 mod broken_axis;
+mod cluster;
 mod format;
 mod gap;
 mod monotonic;
 mod ticks;
 
 pub use broken_axis::{gap_share, should_offer_compression, BrokenAxis, OFFER_GAP_SHARE};
+pub use cluster::cluster_at;
 pub use format::{
     format_timestamp, infer_timestamp_format, parse_timestamp, TimeUnit, Timestamp,
     TimestampFormat, TimestampFormatInference, TimestampFormatScan,
