@@ -29,13 +29,14 @@ Engineers and scientists who routinely inspect measurement data: vibration, acou
 **Visualizations (exactly three):**
 1. **Time domain** — one or more numeric series over time; multiple series on one plot or on stacked plots sharing the time axis.
 2. **PSD (frequency domain)** — Welch PSD of a whole signal or of a selected time interval; multiple spectra on one plot or on stacked plots sharing the frequency axis.
-3. **State timeline** — boolean flags, categorical/string series, and sparse markers rendered as horizontal state bands / event ticks, time-aligned with the numeric plots.
+3. **State timeline** — boolean flags, categorical/string series, and sparse markers rendered as horizontal state bands / event ticks, time-aligned with the numeric plots, as compact tracks that never squash the numeric plot (layout decision 2026-11-11, issue #230).
 
 **Core capabilities:**
 - Automatic detection of the time index (numeric progressive or timestamp in common formats), with visible, correctable inference.
 - Gap-aware time axis (see SPEC §Gaps).
-- NaN/outlier flagging with markers; they never block rendering.
+- NaN/outlier flagging with markers; they never block rendering. *(Outlier flagging and the anomaly gutter ship in v0.2, not v0.1: maintainer decision 2026-11-11, issue #236.)*
 - Interval selection for both zooming and PSD computation.
+- Measurement cursors on the time view: time distance, vertical distance and slope between two cursors, read from raw samples (added 2026-11-11, issue #231).
 - Resource-aware operation: the app monitors its memory use and never exceeds its budget (see SPEC §Performance).
 
 **Platforms:** macOS (Apple Silicon), Windows 11 (x64), Linux (x64). Identical behavior on all three.
