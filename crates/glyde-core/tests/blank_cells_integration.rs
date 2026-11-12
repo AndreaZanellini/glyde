@@ -80,6 +80,27 @@ fn assert_blank_cells_are_gaps(dataset: &Dataset) {
     );
     assert_eq!(count.anomalies().nan_runs, vec![2..3]);
 
+    // Integers beyond ±2^53 with a blank (PR #242 review, Golden Rule 1 /
+    // SPEC §1.4): promoting them to f64 would round them silently, so the
+    // column keeps its behavior from before issue #189, exact text.
+    let id = column(dataset, "id");
+    assert_eq!(id.dtype(), Dtype::String);
+    assert_eq!(
+        id.values(),
+        &SeriesValues::String(
+            [
+                "9007199254740993",
+                "",
+                "9007199254740995",
+                "9007199254740997",
+                "9007199254740999"
+            ]
+            .map(str::to_string)
+            .to_vec()
+        ),
+        "the raw digits must come back exactly"
+    );
+
     // A column that is blank on every row has no numeric evidence at all, so
     // it keeps its behavior from before issue #189.
     let unused = column(dataset, "unused");

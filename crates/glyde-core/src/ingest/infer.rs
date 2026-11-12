@@ -688,6 +688,10 @@ pub struct ColumnDtypeChoice {
     /// How many blank cells were read as missing samples (NaN) — nonzero
     /// only for an `F64` column (issue #189, SPEC §1.3).
     pub missing_count: usize,
+    /// The column has blank cells and a whole number beyond ±2^53, so it
+    /// was kept as exact text instead of being promoted to `f64`, which
+    /// would round those numbers silently (Golden Rule 1, SPEC §1.4).
+    pub kept_large_integers_as_text: bool,
 }
 
 /// [`infer_column`]'s dtype *decision* as an incremental scan, for the
@@ -710,6 +714,9 @@ pub struct ColumnDtypeScan {
     /// of the dtype vote: a blank in a numeric column is a missing sample,
     /// not evidence that the column is text.
     blank_count: usize,
+    /// Whether some field is an integer that `f64` cannot hold exactly
+    /// (beyond ±2^53). Only consulted when the column has blanks.
+    integer_beyond_exact_f64: bool,
     bool_matches_every_field: bool,
     i64_matches_every_field: bool,
     f64_matches_every_field: bool,
@@ -725,6 +732,7 @@ impl Default for ColumnDtypeScan {
         Self {
             field_count: 0,
             blank_count: 0,
+            integer_beyond_exact_f64: false,
             bool_matches_every_field: true,
             i64_matches_every_field: true,
             f64_matches_every_field: true,
@@ -773,6 +781,13 @@ impl ColumnDtypeScan {
                 ObservedNumber::None
             };
         }
+        // 2^53 has 16 digits, so a shorter text can never be beyond it:
+        // this extra parse only runs on long fields.
+        if !self.integer_beyond_exact_f64 && trimmed.len() > 15 {
+            if let Ok(value) = trimmed.parse::<i64>() {
+                self.integer_beyond_exact_f64 = value.unsigned_abs() > F64_EXACT_INTEGER_LIMIT;
+            }
+        }
         self.bool_matches_every_field &= parse_bool_field(trimmed).is_some();
         self.numeric_bool_convention_only &= matches!(trimmed, "0" | "1");
         if self.i64_matches_every_field {
@@ -798,7 +813,11 @@ impl ColumnDtypeScan {
     /// `F64` with a NaN for each blank. Two cases keep the behavior from
     /// before #189 and become `String`: a column with no non-blank field
     /// (no numeric evidence), and a boolean column with blanks (whether it
-    /// should have gaps instead is the open decision in issue #240).
+    /// should have gaps instead is the open decision in issue #240). A
+    /// third does too, to protect the raw data: a column with blanks and
+    /// a whole number beyond ±2^53, which `f64` would round silently
+    /// (Golden Rule 1, SPEC §1.4). Its flags only ever go one way, so a
+    /// progressive load never sees it narrow from `String` back to `F64`.
     pub fn finish(&self) -> ColumnDtypeChoice {
         let has_blanks = self.blank_count > 0;
         let all_blank = has_blanks && self.blank_count == self.field_count;
@@ -806,9 +825,16 @@ impl ColumnDtypeScan {
             dtype: Dtype::String,
             ambiguous: false,
             missing_count: 0,
+            kept_large_integers_as_text: false,
         };
         if all_blank {
             return text;
+        }
+        if has_blanks && self.integer_beyond_exact_f64 {
+            return ColumnDtypeChoice {
+                kept_large_integers_as_text: true,
+                ..text
+            };
         }
         if self.bool_matches_every_field {
             if has_blanks {
@@ -818,6 +844,7 @@ impl ColumnDtypeScan {
                 dtype: Dtype::Bool,
                 ambiguous: self.field_count > 0 && self.numeric_bool_convention_only,
                 missing_count: 0,
+                kept_large_integers_as_text: false,
             };
         }
         if self.i64_matches_every_field {
@@ -825,12 +852,14 @@ impl ColumnDtypeScan {
                 dtype: Dtype::I64,
                 ambiguous: false,
                 missing_count: 0,
+                kept_large_integers_as_text: false,
             }
         } else if self.f64_matches_every_field {
             ColumnDtypeChoice {
                 dtype: Dtype::F64,
                 ambiguous: false,
                 missing_count: self.blank_count,
+                kept_large_integers_as_text: false,
             }
         } else {
             text
@@ -862,6 +891,14 @@ pub(crate) fn log_dtype_choice(choice: ColumnDtypeChoice, field_count: usize) {
             "column dtype inferred (SPEC §1.4)"
         ),
     }
+    if choice.kept_large_integers_as_text {
+        warn!(
+            field_count,
+            "column has blank cells and whole numbers beyond ±2^53: kept as exact text \
+             instead of a float column with gaps, because f64 would round those numbers \
+             (Golden Rule 1, SPEC §1.4, issue #189)"
+        );
+    }
     if choice.missing_count > 0 {
         info!(
             missing_count = choice.missing_count,
@@ -871,6 +908,9 @@ pub(crate) fn log_dtype_choice(choice: ColumnDtypeChoice, field_count: usize) {
         );
     }
 }
+
+/// The largest magnitude up to which every integer is exact in `f64`: 2^53.
+const F64_EXACT_INTEGER_LIMIT: u64 = 1 << 53;
 
 /// A field of a column whose dtype was decided as `F64`, as its value: a
 /// blank field (empty once trimmed) is a missing sample, NaN (issue #189).
@@ -1789,6 +1829,29 @@ mod tests {
         assert_eq!(choice.missing_count, 2);
     }
 
+    // PR #242 review, Golden Rule 1 / SPEC §1.4: a blank must not be what
+    // silently converts integers beyond ±2^53 to f64. Such a column keeps
+    // its behavior from before issue #189 (exact text), until #228 flags
+    // the precision loss.
+    #[test]
+    fn blanks_never_promote_integers_beyond_2_pow_53_to_float() {
+        for fields in [
+            ["9007199254740993", "", "9007199254740995"],
+            ["", "-9007199254740993", "1"],
+        ] {
+            let inference = infer_column("id", &fields);
+            assert_eq!(inference.series.dtype(), Dtype::String, "{fields:?}");
+            assert_eq!(
+                inference.series.values(),
+                &SeriesValues::String(fields.iter().map(|f| f.to_string()).collect()),
+                "the raw text must be kept exactly"
+            );
+        }
+        // ±2^53 itself is exact in f64, so it is promoted like any integer.
+        let at_limit = infer_column("id", &["9007199254740992", "", "-9007199254740992"]);
+        assert_eq!(at_limit.series.dtype(), Dtype::F64);
+    }
+
     // A column with no non-blank cell has no numeric evidence. It keeps its
     // behavior from before issue #189: a text column.
     #[test]
@@ -1964,6 +2027,7 @@ mod tests {
         let mut i64_ok = true;
         let mut f64_ok = true;
         let mut blanks = 0;
+        let mut beyond_2_53 = false;
         for field in fields {
             let trimmed = field.trim();
             if trimmed.is_empty() {
@@ -1971,12 +2035,16 @@ mod tests {
                 i64_ok = false;
                 continue;
             }
+            beyond_2_53 |= trimmed
+                .parse::<i64>()
+                .is_ok_and(|v| v.unsigned_abs() > 1 << 53);
             bool_ok &= parse_bool_field(field).is_some();
             numeric_bool_only &= matches!(trimmed, "0" | "1");
             i64_ok &= trimmed.parse::<i64>().is_ok();
             f64_ok &= trimmed.parse::<f64>().is_ok();
         }
-        let (dtype, ambiguous) = if blanks > 0 && (blanks == fields.len() || bool_ok) {
+        let (dtype, ambiguous) = if blanks > 0 && (blanks == fields.len() || bool_ok || beyond_2_53)
+        {
             (Dtype::String, false)
         } else if bool_ok {
             (Dtype::Bool, !fields.is_empty() && numeric_bool_only)
