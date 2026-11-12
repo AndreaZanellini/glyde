@@ -103,5 +103,7 @@ Design first. Nothing is implemented before the maintainer approves the mockup.
 - Anomaly gutter + MAD outlier flagging → #236 · per-series unit label → #237
 - Performance: #194, #195, #181, #226, #210, #211, #204, #175
 - State timeline follow-ups: Compress with state lanes (#201), value-like text columns (#212)
+- Ingestion follow-ups to #189: blank cells in a bool column as "no data" stretches (#240),
+  occasional text tokens (`ERR`, `OK`) in a numeric column as flagged gaps (#241)
 - Signing (macOS notarization, Windows code signing; SignPath Foundation is a free option
   for Windows)
