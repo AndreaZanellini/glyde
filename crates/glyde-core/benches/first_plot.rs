@@ -74,6 +74,16 @@ mod support;
 /// actually proves.
 const FIRST_PLOT_CEILING: Duration = Duration::from_secs(10);
 
+/// How many cold opens the gate times; it asserts on the fastest (issue
+/// #184, maintainer decision 2026-11-10). A single timed run sat right on
+/// the ceiling on shared CI runners (criterion medians of 8–12 s), so the
+/// build failed by chance on changes that never touched the open path. The
+/// fastest of several runs measures what the code can do on that machine;
+/// a slow run is the runner's noise, not a regression. The ceiling itself is
+/// unchanged, and is to be recalibrated when #194 brings the real first-plot
+/// time down.
+const GATE_RUNS: usize = 3;
+
 const FIXTURE_BYTES: u64 = 1024 * 1024 * 1024;
 const FIXTURE_COLUMNS: usize = 8;
 const FIXTURE_SEED: u64 = 0xF1257;
@@ -83,15 +93,32 @@ fn bench_first_plot(c: &mut Criterion) {
     support::ensure_csv_fixture(&fixture, FIXTURE_BYTES, FIXTURE_COLUMNS, FIXTURE_SEED)
         .expect("failed to generate the first_plot bench fixture");
 
-    // Absolute-ceiling gate: one clean timed run to the first checkpoint,
-    // asserted directly against the SPEC §5 budget (docs/QUALITY.md §3:
-    // "exceeding a budget fails the build").
-    let elapsed = time_to_first_checkpoint(&fixture, &cold_cache_dir());
+    // Absolute-ceiling gate: the fastest of `GATE_RUNS` cold timed runs to
+    // the first checkpoint, asserted directly against the ceiling
+    // (docs/QUALITY.md §3: "exceeding a budget fails the build"). Every
+    // time is printed, on success too, so the margin shows in the CI log.
+    let runs: Vec<Duration> = (0..GATE_RUNS)
+        .map(|_| time_to_first_checkpoint(&fixture, &cold_cache_dir()))
+        .collect();
+    let fastest = runs
+        .iter()
+        .copied()
+        .min()
+        .expect("GATE_RUNS is at least one");
+    let verdict = if fastest <= FIRST_PLOT_CEILING {
+        "pass"
+    } else {
+        "FAIL"
+    };
+    println!(
+        "first_plot gate: runs {runs:?}, fastest {fastest:?}, ceiling \
+         {FIRST_PLOT_CEILING:?}: {verdict}"
+    );
     assert!(
-        elapsed <= FIRST_PLOT_CEILING,
-        "first progress checkpoint on a 1 GB CSV took {elapsed:?}, exceeding the \
-         {FIRST_PLOT_CEILING:?} build-blocking ceiling (SPEC §5: first meaningful \
-         plot, any file size, ≤2s)"
+        fastest <= FIRST_PLOT_CEILING,
+        "first progress checkpoint on a 1 GB CSV took {fastest:?} at best over \
+         {GATE_RUNS} cold runs ({runs:?}), exceeding the {FIRST_PLOT_CEILING:?} \
+         build-blocking ceiling (SPEC §5: first meaningful plot, any file size, ≤2s)"
     );
 
     // Statistical measurement, for local regression comparisons only (see
