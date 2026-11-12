@@ -95,6 +95,8 @@ Design first. Nothing is implemented before the maintainer approves the mockup.
 ## Done since the re-plan
 
 - PR #225 — click a cluster next to a gap to fit it to the viewport (last open M8 view item).
+- #243 — CI: the Parquet `index_build` gate judges the fastest of 3 opens, like #184
+  (it blocked PR #242 by chance).
 
 ## v0.2 (not before v0.1 ships)
 

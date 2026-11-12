@@ -63,6 +63,10 @@ const CSV_1GB_CEILING: Duration = Duration::from_secs(45);
 /// issue #163.
 const PARQUET_1GB_CEILING: Duration = Duration::from_secs(10);
 
+/// Timed opens behind the Parquet gate; the fastest one is asserted
+/// (issue #243).
+const PARQUET_GATE_RUNS: usize = 3;
+
 /// pyarrow's default row-group size (2^20 rows): it lines up with pyramid
 /// level 6 (8^7 = 2^21 rows), so the statistics path is exercised.
 const PARQUET_ROW_GROUP_ROWS: usize = 1 << 20;
@@ -127,14 +131,37 @@ fn bench_parquet_index_build(c: &mut Criterion) {
         (dataset, pyramids)
     };
 
-    let start = Instant::now();
-    drop(build(&fixture));
-    let elapsed = start.elapsed();
+    // Absolute-ceiling gate: the fastest of `PARQUET_GATE_RUNS` timed opens
+    // against the unchanged ceiling (issue #243, the same fix #184 applied
+    // to the `first_plot` gate). One open on a shared CI runner sometimes
+    // takes 3× its usual time; a real regression slows every run, so the
+    // fastest still catches it. All runs are printed, pass or fail.
+    let runs: Vec<Duration> = (0..PARQUET_GATE_RUNS)
+        .map(|_| {
+            let start = Instant::now();
+            drop(build(&fixture));
+            start.elapsed()
+        })
+        .collect();
+    let fastest = runs
+        .iter()
+        .copied()
+        .min()
+        .expect("PARQUET_GATE_RUNS is at least one");
+    let verdict = if fastest <= PARQUET_1GB_CEILING {
+        "pass"
+    } else {
+        "FAIL"
+    };
+    println!(
+        "parquet_1gb gate: runs {runs:?}, fastest {fastest:?}, ceiling {PARQUET_1GB_CEILING:?}: \
+         {verdict}"
+    );
     assert!(
-        elapsed <= PARQUET_1GB_CEILING,
-        "index build on a 1 GB Parquet file took {elapsed:?}, exceeding the \
-         {PARQUET_1GB_CEILING:?} build-blocking ceiling (SPEC §5: full index build, Parquet, \
-         ≤10s per 10GB)"
+        fastest <= PARQUET_1GB_CEILING,
+        "index build on a 1 GB Parquet file took {fastest:?} at best over {PARQUET_GATE_RUNS} \
+         runs ({runs:?}), exceeding the {PARQUET_1GB_CEILING:?} build-blocking ceiling \
+         (SPEC §5: full index build, Parquet, ≤10s per 10GB)"
     );
 
     let mut group = c.benchmark_group("index_build");
