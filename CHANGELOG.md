@@ -68,6 +68,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
   - Known limit: on a slow day for GitHub's machines even the fastest open
     can land near 10 s, so a rare false failure is still possible until the
     first plot itself gets faster (issue #194).
+- **The Parquet "index build" speed check in CI no longer fails by chance
+  (issue #243).** Same problem and same fix as the first-plot check above.
+  This check opens a 1 GB Parquet file and fails the build if it takes more
+  than 10 s. It timed one open: usually about 3 s, but on a slow GitHub
+  machine it took 10.7 s and 10.8 s, and it blocked PR #242, which does not
+  touch Parquet at all. It now times three opens, judges the fastest and
+  always prints the three times. The 10 s limit is unchanged. Nothing
+  changes in the app.
 
 ### Added
 - **Click a cluster to zoom into it.** On a file with gaps, a single click on

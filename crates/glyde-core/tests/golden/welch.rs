@@ -266,6 +266,8 @@ fn detrend_removes_the_leakage_skirt_from_a_large_dc_offset() {
     };
     let psd = welch(&samples, SAMPLE_RATE_HZ, &config);
 
+    // The index is also the bin number named in the assertion message.
+    #[allow(clippy::needless_range_loop)]
     for bin in 1..=20 {
         assert!(
             psd.power[bin] < LEAKAGE_THRESHOLD,

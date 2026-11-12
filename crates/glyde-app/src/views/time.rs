@@ -3500,6 +3500,8 @@ mod render_tests {
         frames_until(&ctx, &fixture, &mut state, focus, |state| {
             state.pending.is_none() && (0..3).all(|c| cached_view(state, c).is_some())
         });
+        // The index is also the column number named in the assertion message.
+        #[allow(clippy::needless_range_loop)]
         for column in 0..3 {
             let cached = state.decimated[column].as_ref().unwrap();
             assert!(
@@ -3697,6 +3699,8 @@ mod render_tests {
         let (state, shapes, _) = frame(BarEncoding::Strokes, 1.0);
 
         let mut transform: Option<[f64; 4]> = None;
+        // The index is also the column number named in the assertion message.
+        #[allow(clippy::needless_range_loop)]
         for column in 0..2 {
             let cached = state.decimated[column].as_ref().expect("decimated");
             assert!(!cached.converged, "this view must be aggregated");
