@@ -685,6 +685,9 @@ pub struct ColumnDtypeChoice {
     pub dtype: Dtype,
     /// See [`DtypeInference::ambiguous`].
     pub ambiguous: bool,
+    /// How many blank cells were read as missing samples (NaN) — nonzero
+    /// only for an `F64` column (issue #189, SPEC §1.3).
+    pub missing_count: usize,
 }
 
 /// [`infer_column`]'s dtype *decision* as an incremental scan, for the
@@ -703,6 +706,10 @@ pub struct ColumnDtypeChoice {
 #[derive(Debug, Clone)]
 pub struct ColumnDtypeScan {
     field_count: usize,
+    /// Fields that are empty once trimmed (issue #189). They are left out
+    /// of the dtype vote: a blank in a numeric column is a missing sample,
+    /// not evidence that the column is text.
+    blank_count: usize,
     bool_matches_every_field: bool,
     i64_matches_every_field: bool,
     f64_matches_every_field: bool,
@@ -717,6 +724,7 @@ impl Default for ColumnDtypeScan {
     fn default() -> Self {
         Self {
             field_count: 0,
+            blank_count: 0,
             bool_matches_every_field: true,
             i64_matches_every_field: true,
             f64_matches_every_field: true,
@@ -747,9 +755,24 @@ impl ColumnDtypeScan {
     /// `tests::every_i64_text_is_also_f64_text`). The resulting flags are
     /// therefore exactly the ones the four unconditional checks this used to
     /// run would have produced.
+    ///
+    /// A blank field (empty once trimmed, issue #189) is a missing sample:
+    /// it rules out `i64`, which has no missing value (the same promotion a
+    /// `NaN` cell causes), and parses as NaN while `f64` is still a
+    /// candidate. It casts no vote on bool or `f64`; [`Self::finish`]
+    /// decides what a column with blanks becomes.
     pub(crate) fn observe_number(&mut self, field: &str) -> ObservedNumber {
         self.field_count += 1;
         let trimmed = field.trim();
+        if trimmed.is_empty() {
+            self.blank_count += 1;
+            self.i64_matches_every_field = false;
+            return if self.f64_matches_every_field {
+                ObservedNumber::F64(f64::NAN)
+            } else {
+                ObservedNumber::None
+            };
+        }
         self.bool_matches_every_field &= parse_bool_field(trimmed).is_some();
         self.numeric_bool_convention_only &= matches!(trimmed, "0" | "1");
         if self.i64_matches_every_field {
@@ -770,23 +793,47 @@ impl ColumnDtypeScan {
     /// The dtype every observed field agreed on, tried bool → integer →
     /// float → string, the same order and the same "every field must agree"
     /// rule [`infer_column`] documents.
+    ///
+    /// Blank fields do not vote (issue #189). A float column with blanks is
+    /// `F64` with a NaN for each blank. Two cases keep the behavior from
+    /// before #189 and become `String`: a column with no non-blank field
+    /// (no numeric evidence), and a boolean column with blanks (whether it
+    /// should have gaps instead is the open decision in issue #240).
     pub fn finish(&self) -> ColumnDtypeChoice {
+        let has_blanks = self.blank_count > 0;
+        let all_blank = has_blanks && self.blank_count == self.field_count;
+        let text = ColumnDtypeChoice {
+            dtype: Dtype::String,
+            ambiguous: false,
+            missing_count: 0,
+        };
+        if all_blank {
+            return text;
+        }
         if self.bool_matches_every_field {
+            if has_blanks {
+                return text;
+            }
             return ColumnDtypeChoice {
                 dtype: Dtype::Bool,
                 ambiguous: self.field_count > 0 && self.numeric_bool_convention_only,
+                missing_count: 0,
             };
         }
-        let dtype = if self.i64_matches_every_field {
-            Dtype::I64
+        if self.i64_matches_every_field {
+            ColumnDtypeChoice {
+                dtype: Dtype::I64,
+                ambiguous: false,
+                missing_count: 0,
+            }
         } else if self.f64_matches_every_field {
-            Dtype::F64
+            ColumnDtypeChoice {
+                dtype: Dtype::F64,
+                ambiguous: false,
+                missing_count: self.blank_count,
+            }
         } else {
-            Dtype::String
-        };
-        ColumnDtypeChoice {
-            dtype,
-            ambiguous: false,
+            text
         }
     }
 }
@@ -815,6 +862,27 @@ pub(crate) fn log_dtype_choice(choice: ColumnDtypeChoice, field_count: usize) {
             "column dtype inferred (SPEC §1.4)"
         ),
     }
+    if choice.missing_count > 0 {
+        info!(
+            missing_count = choice.missing_count,
+            field_count,
+            "blank cells in a numeric column read as missing samples (NaN gaps), \
+             never as 0 and never interpolated (SPEC §1.3, issue #189)"
+        );
+    }
+}
+
+/// A field of a column whose dtype was decided as `F64`, as its value: a
+/// blank field (empty once trimmed) is a missing sample, NaN (issue #189).
+/// Every path that types a float field goes through this, so the in-memory
+/// and spilled paths agree (docs/ARCHITECTURE.md Hard rule 4).
+pub(crate) fn parse_f64_field(field: &str) -> f64 {
+    let trimmed = field.trim();
+    if trimmed.is_empty() {
+        f64::NAN
+    } else {
+        trimmed.parse::<f64>().unwrap_or_default()
+    }
 }
 
 /// Infers a column's dtype from its raw source-text fields (SPEC §1.4) and
@@ -828,6 +896,11 @@ pub(crate) fn log_dtype_choice(choice: ColumnDtypeChoice, field_count: usize) {
 /// source text: SPEC §1.4 has no "mostly numeric" dtype, and silently
 /// parsing the numeric cells while dropping the rest would degrade the raw
 /// data (Golden Rule 1).
+///
+/// A *blank* cell (empty or whitespace only) is different: it is a missing
+/// sample, not text (issue #189, SPEC §1.3). Blanks do not vote on the dtype,
+/// so a float or integer column with blanks becomes `f64` with a NaN gap for
+/// each blank. See [`ColumnDtypeScan::finish`] for the two exceptions.
 ///
 /// Integer columns always parse to `i64` and float columns always to `f64`.
 /// CSV text carries no dtype of its own to "preserve" the way a typed
@@ -908,13 +981,7 @@ impl ColumnInference {
                         self.ints = Vec::new();
                         self.floats.reserve_exact(total);
                         for earlier in 0..index {
-                            self.floats.push(
-                                field(earlier)
-                                    .as_ref()
-                                    .trim()
-                                    .parse::<f64>()
-                                    .unwrap_or_default(),
-                            );
+                            self.floats.push(parse_f64_field(field(earlier).as_ref()));
                         }
                     }
                     self.floats.push(value);
@@ -1665,6 +1732,91 @@ mod tests {
         assert!(!inference.ambiguous);
     }
 
+    // Issue #189, SPEC §1.3: a blank (empty or whitespace-only) cell in a
+    // numeric column is a missing sample. It is read as NaN and flagged as a
+    // NaN run. It does not turn the column into text.
+    #[test]
+    fn blank_cells_in_a_float_column_are_nan_gaps() {
+        let fields = ["10.0", "", " ", "10.5", "10.6"];
+
+        let inference = infer_column("value", &fields);
+        let series = inference.series;
+
+        assert_eq!(series.dtype(), Dtype::F64);
+        let SeriesValues::F64(values) = series.values() else {
+            panic!("expected F64 values, got {:?}", series.values());
+        };
+        assert_eq!(values[0], 10.0);
+        assert!(values[1].is_nan() && values[2].is_nan());
+        assert_eq!(values[3..], [10.5, 10.6]);
+        assert_eq!(series.anomalies().nan_runs, vec![1..3]);
+        assert!(!inference.ambiguous);
+    }
+
+    // An integer has no missing value, so a blank promotes the column to
+    // float, exactly as a `NaN` cell does, wherever the blank falls.
+    #[test]
+    fn blank_cells_promote_an_integer_column_to_float() {
+        for fields in [["", "1", "2"], ["1", "", "2"], ["1", "2", ""]] {
+            let series = infer_column("count", &fields).series;
+            assert_eq!(series.dtype(), Dtype::F64, "{fields:?}");
+            let SeriesValues::F64(values) = series.values() else {
+                panic!("expected F64 values, got {:?}", series.values());
+            };
+            let blank = fields.iter().position(|f| f.is_empty()).unwrap();
+            let present: Vec<f64> = values
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != blank)
+                .map(|(_, &v)| v)
+                .collect();
+            assert!(values[blank].is_nan(), "{fields:?}");
+            assert_eq!(present, [1.0, 2.0], "{fields:?}");
+            assert_eq!(series.anomalies().nan_runs, vec![blank..blank + 1]);
+        }
+    }
+
+    // The scan reports how many blanks it read as missing, so the decision
+    // can be logged (CLAUDE.md: every ingestion decision is logged).
+    #[test]
+    fn the_dtype_choice_counts_blank_cells_read_as_missing() {
+        let mut scan = ColumnDtypeScan::default();
+        for field in ["1.5", "", "2.5", "  "] {
+            scan.observe(field);
+        }
+        let choice = scan.finish();
+        assert_eq!(choice.dtype, Dtype::F64);
+        assert_eq!(choice.missing_count, 2);
+    }
+
+    // A column with no non-blank cell has no numeric evidence. It keeps its
+    // behavior from before issue #189: a text column.
+    #[test]
+    fn an_all_blank_column_stays_a_string_column() {
+        let series = infer_column("unused", &["", " ", ""]).series;
+        assert_eq!(series.dtype(), Dtype::String);
+    }
+
+    // Issue #189 leaves open whether a boolean column with blanks should
+    // have gaps (decision: issue #240). Until the maintainer decides, it keeps its behavior from
+    // before #189 (a text column), and blanks are not read as NaN in it.
+    #[test]
+    fn a_bool_column_with_blank_cells_keeps_its_previous_behavior() {
+        for fields in [["true", "", "false"], ["1", "", "0"]] {
+            let inference = infer_column("flag", &fields);
+            assert_eq!(inference.series.dtype(), Dtype::String, "{fields:?}");
+            assert!(!inference.ambiguous);
+        }
+    }
+
+    // Non-numeric tokens are not blanks: corpus case 46 still becomes text
+    // (whether it should is issue #241).
+    #[test]
+    fn a_text_token_in_a_numeric_column_still_makes_it_text() {
+        let series = infer_column("value", &["10.0", "", "ERR", "10.2"]).series;
+        assert_eq!(series.dtype(), Dtype::String);
+    }
+
     // Corpus case 44: `Infinity`/`-Infinity` are valid float values, not a
     // reason to fall back to string and not a NaN anomaly.
     #[test]
@@ -1802,20 +1954,31 @@ mod tests {
     // decide-then-convert form exactly. ------------------------------------
 
     /// The pre-#114 `infer_column`, verbatim in behavior: decide the dtype
-    /// over every field, then parse every field again under it.
+    /// over every field, then parse every field again under it. Blank
+    /// fields follow issue #189: they do not vote, rule out `i64`, and read
+    /// as NaN in an `f64` column; an all-blank or a bool-with-blanks column
+    /// is `String`.
     fn reference_infer_column(fields: &[String]) -> (Dtype, bool, SeriesValues) {
         let mut bool_ok = true;
         let mut numeric_bool_only = true;
         let mut i64_ok = true;
         let mut f64_ok = true;
+        let mut blanks = 0;
         for field in fields {
             let trimmed = field.trim();
+            if trimmed.is_empty() {
+                blanks += 1;
+                i64_ok = false;
+                continue;
+            }
             bool_ok &= parse_bool_field(field).is_some();
             numeric_bool_only &= matches!(trimmed, "0" | "1");
             i64_ok &= trimmed.parse::<i64>().is_ok();
             f64_ok &= trimmed.parse::<f64>().is_ok();
         }
-        let (dtype, ambiguous) = if bool_ok {
+        let (dtype, ambiguous) = if blanks > 0 && (blanks == fields.len() || bool_ok) {
+            (Dtype::String, false)
+        } else if bool_ok {
             (Dtype::Bool, !fields.is_empty() && numeric_bool_only)
         } else if i64_ok {
             (Dtype::I64, false)
@@ -1840,7 +2003,10 @@ mod tests {
             Dtype::F64 => SeriesValues::F64(
                 fields
                     .iter()
-                    .map(|f| f.trim().parse::<f64>().unwrap_or_default())
+                    .map(|f| match f.trim() {
+                        "" => f64::NAN,
+                        text => text.parse::<f64>().unwrap_or_default(),
+                    })
                     .collect(),
             ),
             _ => SeriesValues::String(fields.to_vec()),

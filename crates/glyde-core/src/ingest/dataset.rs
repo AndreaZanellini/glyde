@@ -2037,7 +2037,7 @@ impl ColumnSpillWriter {
                 )),
             }),
             ColumnSpillWriter::F64(values, nan_runs) => {
-                let value = field.trim().parse::<f64>().unwrap_or_default();
+                let value = super::infer::parse_f64_field(field);
                 nan_runs.observe(value);
                 values.push(value)?;
                 Ok(ColumnValue::F64(value))

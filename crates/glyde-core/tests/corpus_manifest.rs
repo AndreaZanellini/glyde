@@ -15,12 +15,13 @@
 //! Corpus manifest gate (docs/QUALITY.md §1, docs/ROADMAP.md M1).
 //!
 //! `every_committed_case_has_a_well_formed_expected_json` runs on every PR
-//! and covers whatever cases are committed so far. `corpus_has_all_61_cases`
+//! and covers whatever cases are committed so far. `corpus_has_all_62_cases`
 //! is the milestone-complete gate. Cases 57 (`YYYY-MM-DD HH:MM:SS`
 //! space-separated datetime, issue #82), 58 (a time column in a format Glyde
 //! does not recognize at all, issue #94), 59 (no time column at all), 60
-//! (pathological gap median, issue #103) and 61 (a Parquet epoch-milliseconds
-//! number time column, issue #166) were added after M1's original 56-case
+//! (pathological gap median, issue #103), 61 (a Parquet epoch-milliseconds
+//! number time column, issue #166) and 62 (blank cells in numeric columns,
+//! issue #189) were added after M1's original 56-case
 //! batch, per QUALITY.md §1's growth rule
 //! ("every `file-wont-open` issue must add its file to the corpus with the
 //! fix in the same PR").
@@ -29,7 +30,7 @@ mod support;
 
 use support::{corpus_dir, discover_cases, load_expected};
 
-const EXPECTED_CORPUS_SIZE: usize = 61;
+const EXPECTED_CORPUS_SIZE: usize = 62;
 
 #[test]
 fn every_committed_case_has_a_well_formed_expected_json() {
@@ -50,7 +51,7 @@ fn every_committed_case_has_a_well_formed_expected_json() {
 }
 
 #[test]
-fn corpus_has_all_61_cases() {
+fn corpus_has_all_62_cases() {
     let dir = corpus_dir();
     let cases = discover_cases(&dir).expect("read testdata/corpus");
 
