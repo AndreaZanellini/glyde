@@ -76,7 +76,8 @@
 
 use glyde_core::ingest::{
     Confidence, DecimalSeparator, Delimiter, EncodingChoice, GeneratedIndexReason, InferenceReport,
-    InferredField, SamplingClass, TimeColumnChoice, TimeIndexSource, TimezoneLabel,
+    InferredField, PrecisionLossColumn, SamplingClass, TimeColumnChoice, TimeIndexSource,
+    TimezoneLabel,
 };
 use glyde_core::time::TimestampFormat;
 use std::path::Path;
@@ -169,7 +170,7 @@ pub fn show(
     unloaded_columns_detail(ui, report);
     // Same reasoning: SPEC §1.4 forbids rounding an i64 beyond ±2⁵³ for the
     // plot without saying so in the bar (issue #228).
-    for notice in precision_loss_notices(report) {
+    for notice in precision_loss_notices(&report.precision_loss_columns, false) {
         ui.colored_label(ui.visuals().warn_fg_color, notice);
     }
     // A sibling of the header for the same reason as the skipped-rows line:
@@ -183,8 +184,10 @@ pub fn show(
 
 /// The part of the bar that is already known while a file is still loading
 /// (issue #119): the time-column picker and, if Glyde generated a row
-/// index, why. Everything else in the bar describes the whole file and
-/// waits for the open to complete. `is_final` is `false` while a later row
+/// index, why — plus SPEC §1.4's precision flag over the rows read so far
+/// (issue #247), since the partial plot already rounds them. Everything
+/// else in the bar describes the whole file and waits for the open to
+/// complete. `is_final` is `false` while a later row
 /// can still change the decision, which is then said next to the picker.
 /// Returns the column the user picked this frame, if any.
 pub fn show_loading(
@@ -192,6 +195,7 @@ pub fn show_loading(
     source: &TimeIndexSource,
     column_names: &[String],
     is_final: bool,
+    precision_loss: &[PrecisionLossColumn],
 ) -> Option<TimeColumnChoice> {
     let low_confidence = matches!(
         source,
@@ -207,6 +211,9 @@ pub fn show_loading(
         })
         .inner;
     if let Some(notice) = generated_index_text(source, None) {
+        ui.colored_label(ui.visuals().warn_fg_color, notice);
+    }
+    for notice in precision_loss_notices(precision_loss, true) {
         ui.colored_label(ui.visuals().warn_fg_color, notice);
     }
     picked
@@ -382,9 +389,15 @@ fn unloaded_columns_detail(ui: &mut egui::Ui, report: &InferenceReport) {
 /// One plain-language line per column whose integers `f64` rounds for the
 /// plot (SPEC §1.4, issue #228): which column, how many values, and that the
 /// raw value is still readable exactly. Empty for the common file.
-fn precision_loss_notices(report: &InferenceReport) -> Vec<String> {
-    report
-        .precision_loss_columns
+/// `so_far` words the counts as covering only the rows read so far, while
+/// the file is still loading (issue #247).
+fn precision_loss_notices(columns: &[PrecisionLossColumn], so_far: bool) -> Vec<String> {
+    let prefix = if so_far {
+        "Precision (rows read so far)"
+    } else {
+        "Precision"
+    };
+    columns
         .iter()
         .map(|column| {
             let (values, exceed, are) = if column.value_count == 1 {
@@ -393,7 +406,7 @@ fn precision_loss_notices(report: &InferenceReport) -> Vec<String> {
                 ("values", "exceed", "are")
             };
             format!(
-                "Precision: {} {values} in \"{}\" {exceed} ±2⁵³ and {are} rounded in the plot; \
+                "{prefix}: {} {values} in \"{}\" {exceed} ±2⁵³ and {are} rounded in the plot; \
                  the cursor readout shows them exactly.",
                 column.value_count, column.name
             )
@@ -1452,11 +1465,20 @@ mod tests {
 
     /// Every text `show_loading` painted in one headless frame.
     fn loading_texts(source: &TimeIndexSource, is_final: bool) -> String {
+        loading_texts_with_precision_loss(source, is_final, &[])
+    }
+
+    /// [`loading_texts`] for a load whose rows so far hold `precision_loss`.
+    fn loading_texts_with_precision_loss(
+        source: &TimeIndexSource,
+        is_final: bool,
+        precision_loss: &[PrecisionLossColumn],
+    ) -> String {
         let column_names = vec!["ax".to_string(), "ay".to_string()];
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show_loading(ui, source, &column_names, is_final);
+                show_loading(ui, source, &column_names, is_final, precision_loss);
             });
         });
         let mut texts = String::new();
@@ -1513,5 +1535,34 @@ mod tests {
         let texts = loading_texts(&requested, true);
         assert!(!texts.contains("No time column"), "{texts}");
         assert!(!texts.contains("(low confidence)"), "{texts}");
+    }
+
+    // Issue #247 / SPEC §1.4: the partial plot already rounds an i64 beyond
+    // ±2⁵³, so the loading bar flags it too, worded as provisional because
+    // more such values may still be read.
+    #[test]
+    fn the_loading_view_flags_precision_loss_in_the_rows_read_so_far() {
+        let column = TimeIndexSource::Column {
+            index: 0,
+            name: "ax".to_string(),
+        };
+        let clean = loading_texts(&column, true);
+        assert!(!clean.contains("2⁵³"), "{clean}");
+
+        let texts = loading_texts_with_precision_loss(
+            &column,
+            true,
+            &[PrecisionLossColumn {
+                name: "ay".to_string(),
+                value_count: 2,
+            }],
+        );
+        assert!(
+            texts.contains(
+                "Precision (rows read so far): 2 values in \"ay\" exceed ±2⁵³ and are rounded \
+                 in the plot; the cursor readout shows them exactly."
+            ),
+            "{texts}"
+        );
     }
 }

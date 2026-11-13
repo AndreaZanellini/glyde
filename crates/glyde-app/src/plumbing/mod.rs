@@ -53,7 +53,8 @@ use glyde_core::dsp::decimation::{Bucket, Pyramid};
 use glyde_core::index::disk_pyramid::ColumnPyramid;
 use glyde_core::index::spill::SweepReport;
 use glyde_core::ingest::{
-    Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary, TimeIndexSource,
+    Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary, PrecisionLossColumn,
+    TimeIndexSource,
 };
 use glyde_core::series::{BoolLane, StateLane};
 use glyde_core::GlydeError;
@@ -157,6 +158,9 @@ pub enum IndexingMessage {
         /// Issue #119: the time-index decision so far, so the time-column
         /// picker can be offered before the open completes.
         time_index: TimeIndexPreview,
+        /// Issue #247: SPEC §1.4's precision flag over the rows read so far
+        /// (`glyde_core::ingest::Checkpoint::precision_loss_columns`).
+        precision_loss_columns: Vec<PrecisionLossColumn>,
     },
     /// `path` opened successfully; `summary` is what was inferred, `report`
     /// is the same inference surfaced as SPEC §1.2's mandatory UX fields
@@ -459,6 +463,7 @@ fn run_index_job(
                     source: checkpoint.time_index,
                     is_final: checkpoint.time_index_final,
                 },
+                precision_loss_columns: checkpoint.precision_loss_columns,
             });
         },
     ) {
@@ -845,8 +850,12 @@ mod tests {
                     spilled,
                     prepared,
                     time_index,
+                    precision_loss_columns,
                 } => {
                     assert_eq!(generation, 3);
+                    // Issue #247: forwarded from the checkpoint; this
+                    // fixture's values are all within ±2⁵³.
+                    assert!(precision_loss_columns.is_empty());
                     // Issue #119: the picker shown while loading needs the
                     // header and a decision; in memory it is provisional.
                     assert!(!time_index.column_names.is_empty());
@@ -995,6 +1004,7 @@ mod tests {
                     ),
                     is_final: true,
                 },
+                precision_loss_columns: Vec::new(),
             }
             .generation(),
             5
