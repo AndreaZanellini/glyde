@@ -890,7 +890,8 @@ const DICTIONARY_LABEL_BYTES: u64 = 32;
 /// a column that may hold nulls, and the time axis at one [`Timestamp`] per
 /// row whichever column becomes it. A column whose nulls promote it to `f64`
 /// (see [`SourceColumn::settle_missing`]) briefly holds both widths, so its
-/// `f64` copy is budgeted too.
+/// `f64` copy is budgeted too. On top: the derived caches built from the
+/// result (issue #193, see [`super::dataset::derived_caches_bytes`]).
 fn estimated_bytes(columns: &[SourceColumn], metadata: &ParquetMetaData, rows: u64) -> u64 {
     let schema = metadata.file_metadata().schema_descr();
     let mut text_bytes = vec![0u64; columns.len()];
@@ -903,6 +904,28 @@ fn estimated_bytes(columns: &[SourceColumn], metadata: &ParquetMetaData, rows: u
         }
     }
     let axis = rows * std::mem::size_of::<Timestamp>() as u64;
+    // Issue #193: the pyramids and Level-0 caches the app builds right after
+    // the open. Every column that is neither a flag nor text is counted as
+    // plotted, the one that becomes the time axis included, which errs on
+    // the safe side.
+    let loading = || {
+        columns.iter().filter_map(|column| match &column.state {
+            ColumnState::Loading(values) => Some(values),
+            _ => None,
+        })
+    };
+    let plotted = loading()
+        .filter(|values| !matches!(values, ColumnValues::Bool(_) | ColumnValues::String(_)))
+        .count() as u64;
+    let converted = loading()
+        .filter(|values| {
+            !matches!(
+                values,
+                ColumnValues::Bool(_) | ColumnValues::String(_) | ColumnValues::F64(_)
+            )
+        })
+        .count() as u64;
+    let derived = super::dataset::derived_caches_bytes(rows, plotted, converted);
     columns
         .iter()
         .zip(text_bytes)
@@ -922,7 +945,7 @@ fn estimated_bytes(columns: &[SourceColumn], metadata: &ParquetMetaData, rows: u
             };
             values_bytes + if column.nullable { rows } else { 0 }
         })
-        .fold(axis, u64::saturating_add)
+        .fold(axis.saturating_add(derived), u64::saturating_add)
 }
 
 /// One top-level column of the file's schema, in schema order.

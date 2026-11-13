@@ -87,6 +87,9 @@ fn main() -> Result<()> {
     }
     let file_bytes = std::fs::metadata(&fixture)?.len();
     println!("RESULT fixture_bytes={file_bytes}");
+    if let Some(estimate) = in_memory_estimate_bytes(&fixture) {
+        println!("RESULT estimated_mb={:.1}", estimate as f64 / 1e6);
+    }
 
     let rss = PeakRssSampler::start(Duration::from_millis(10));
 
@@ -132,6 +135,12 @@ fn main() -> Result<()> {
     .context("opening the fixture")?;
     let open_elapsed = start.elapsed();
     println!("RESULT rows={}", summary.row_count);
+    // Issue #193: each phase's peak, to read against `estimated_mb`, the
+    // figure the in-memory decision was taken on.
+    println!(
+        "RESULT open_peak_rss_mb={:.1}",
+        rss.peak_so_far() as f64 / 1e6
+    );
     println!("RESULT checkpoints={checkpoints}");
     println!(
         "RESULT first_plot_ms={:.1}",
@@ -153,6 +162,10 @@ fn main() -> Result<()> {
         Default::default(),
     );
     let cold = start.elapsed();
+    println!(
+        "RESULT derived_peak_rss_mb={:.1}",
+        rss.peak_so_far() as f64 / 1e6
+    );
     drop((pyramids, level0));
     let start = Instant::now();
     let (pyramids, level0) = ingest::derived_caches_for_dataset_cached_with_cache_dir(
@@ -233,6 +246,29 @@ fn main() -> Result<()> {
     println!("RESULT peak_rss_mb={:.1}", rss.stop() as f64 / 1e6);
     let _ = std::fs::remove_dir_all(&cache_dir);
     Ok(())
+}
+
+/// The RAM the reader for `path` estimates an in-memory open costs — the
+/// figure SPEC §5.1's in-memory/spill decision compares against the cap
+/// (issue #193). Asked with a zero budget and nowhere to spill, a reader
+/// refuses with exactly that estimate. `None` if the file fails otherwise.
+fn in_memory_estimate_bytes(path: &std::path::Path) -> Option<u64> {
+    let registry = ingest::Registry::default_registry();
+    let reader = registry.find(path).unwrap_or(&ingest::CsvReader);
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let request = ingest::OpenRequest {
+        overrides: Default::default(),
+        budget: RamBudget::from_total_ram_bytes(0),
+        cache_dir: None,
+        cancelled: &never,
+        on_checkpoint: None,
+    };
+    match reader.open_dataset(path, request) {
+        Err(glyde_core::GlydeError::BudgetExceeded {
+            requested_bytes, ..
+        }) => Some(requested_bytes),
+        _ => None,
+    }
 }
 
 /// A fresh, empty cache directory under the OS temp dir, so the "cold"

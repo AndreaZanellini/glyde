@@ -271,6 +271,22 @@ const TYPED_TIMESTAMP_BYTES: u64 = std::mem::size_of::<crate::time::Timestamp>()
 /// case worth sizing the budget check against).
 const TYPED_SAMPLE_BYTES: u64 = 8;
 
+/// Bytes per row a progressive in-memory open adds for the checkpoint it
+/// hands the app while it reads (issue #193), on top of its own typed
+/// columns: the checkpoint's copy of the time axis, and the `i128` tick copy
+/// its pyramids are built from.
+const CHECKPOINT_AXIS_BYTES_PER_ROW: u64 =
+    TYPED_TIMESTAMP_BYTES + std::mem::size_of::<i128>() as u64;
+
+/// Bytes per sample of one data column a progressive in-memory open adds for
+/// its checkpoints (issue #193): the checkpoint's copy of the typed sample;
+/// the incremental pyramid, held twice (the cursor's and the checkpoint's
+/// clone); and the running `f64` conversion a non-`f64` column's pyramid is
+/// extended from, which is cloned at each checkpoint.
+const CHECKPOINT_SAMPLE_BYTES: u64 = TYPED_SAMPLE_BYTES
+    + 2 * super::dataset::PYRAMID_BYTES_PER_SAMPLE
+    + 2 * std::mem::size_of::<f64>() as u64;
+
 /// Bytes one row of a spilled absolute time axis costs on disk: an `i128`
 /// tick, a one-byte unit and an `i64` UTC offset, each in its own file
 /// (`ingest::dataset`'s `AbsoluteAxisSpillWriter`). A progressive or
@@ -287,7 +303,9 @@ const SPILLED_SAMPLE_BYTES: u64 = 8;
 impl Sniff {
     /// Estimates what [`parse_capturing_all_columns`] plus
     /// [`super::dataset::load`]'s typed conversion would hold in memory at
-    /// once for a `file_bytes`-long file of this shape.
+    /// once for a `file_bytes`-long file of this shape, plus what a
+    /// progressive open's checkpoints and the derived caches built from the
+    /// result add (issue #193, see [`super::dataset::derived_caches_bytes`]).
     ///
     /// The arena holds every field's source text, so it is bounded by the
     /// file itself; on top of that sits one offset-table entry per captured
@@ -311,15 +329,27 @@ impl Sniff {
             (file_bytes as f64 / mean_row_bytes) as u64
         };
 
+        let data_columns = column_count.saturating_sub(1) as u64;
         let per_row_bytes = CAPTURED_FIELD_OVERHEAD_BYTES * column_count as u64
             + TYPED_TIMESTAMP_BYTES
-            + TYPED_SAMPLE_BYTES * column_count.saturating_sub(1) as u64;
+            + TYPED_SAMPLE_BYTES * data_columns
+            + CHECKPOINT_AXIS_BYTES_PER_ROW
+            + CHECKPOINT_SAMPLE_BYTES * data_columns;
+        // Issue #193: the pyramids and Level-0 caches the app builds right
+        // after the open, sized as if every column but the time column were
+        // numeric and not yet `f64` — a head sample cannot promise a column's
+        // dtype for the whole file, and this errs on the safe side. Added to
+        // the open's own peak rather than compared with it, because the app
+        // still holds the last checkpoint while it builds them.
+        let derived_bytes =
+            super::dataset::derived_caches_bytes(estimated_row_count, data_columns, data_columns);
 
         Footprint {
             column_count,
             estimated_row_count,
             estimated_bytes: file_bytes
-                .saturating_add(estimated_row_count.saturating_mul(per_row_bytes)),
+                .saturating_add(estimated_row_count.saturating_mul(per_row_bytes))
+                .saturating_add(derived_bytes),
             estimated_spill_bytes: estimated_row_count.saturating_mul(
                 SPILLED_TIME_BYTES_PER_ROW
                     + SPILLED_SAMPLE_BYTES * column_count.saturating_sub(1) as u64,

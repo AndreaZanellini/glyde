@@ -3109,6 +3109,48 @@ pub fn pyramids_for_dataset_cached_with_cache_dir(
         .collect()
 }
 
+/// Bytes per row [`derived_caches_for_dataset_cached`] holds for the time
+/// axis, whatever the column count (issue #193): the `i128` tick copy
+/// [`TimeAxis::to_pyramid_ticks`] makes, plus the shared Level-0 timestamps
+/// file, mapped once and made resident by the pyramid build reading it.
+const DERIVED_AXIS_BYTES_PER_ROW: u64 = 2 * std::mem::size_of::<i128>() as u64;
+
+/// Bytes per sample of one numeric column's min/max pyramid, every level
+/// together: level 1 holds one [`Bucket`] per `PYRAMID_FACTOR` samples, each
+/// level above it `PYRAMID_FACTOR` times fewer, so the levels sum to one
+/// bucket per `PYRAMID_FACTOR - 1` samples. Rounded up.
+pub(crate) const PYRAMID_BYTES_PER_SAMPLE: u64 = (std::mem::size_of::<Bucket>() as u64)
+    .div_ceil(crate::dsp::decimation::PYRAMID_FACTOR as u64 - 1);
+
+/// Bytes per sample of one numeric column's Level-0 values file, mapped and
+/// made resident by the pyramid build reading it.
+const LEVEL0_SAMPLE_BYTES: u64 = std::mem::size_of::<f64>() as u64;
+
+/// Bytes per sample of the whole-column `f64` copy a column that is not
+/// already `f64` is converted to while its caches are built.
+const F64_CONVERSION_BYTES: u64 = std::mem::size_of::<f64>() as u64;
+
+/// What [`derived_caches_for_dataset_cached`] adds on top of an in-memory
+/// dataset of `rows` rows, at its peak (issue #193): `plotted_columns`
+/// numeric columns each get a Level-0 cache and a pyramid, and
+/// `converted_columns` of them are first copied to `f64`.
+///
+/// The app builds these right after every in-memory open and keeps them for
+/// as long as the file is open, so SPEC §5.1's affordability check must size
+/// them with the dataset: before issue #193 it did not, and a file estimated
+/// at 1.76 GB peaked at 4.0 GB. The conversions are budgeted as if every
+/// column held its copy at once, although at most one per compute thread
+/// does: over-estimating costs a file the slower spill path, under-estimating
+/// costs the user a freeze.
+pub(crate) fn derived_caches_bytes(rows: u64, plotted_columns: u64, converted_columns: u64) -> u64 {
+    let per_row = DERIVED_AXIS_BYTES_PER_ROW
+        .saturating_add(
+            plotted_columns.saturating_mul(LEVEL0_SAMPLE_BYTES + PYRAMID_BYTES_PER_SAMPLE),
+        )
+        .saturating_add(converted_columns.saturating_mul(F64_CONVERSION_BYTES));
+    rows.saturating_mul(per_row)
+}
+
 /// One entry per column in `Dataset::columns` order: that column's min/max
 /// pyramid, or `None` when it is non-numeric (see [`Checkpoint::pyramids`]).
 pub type ColumnPyramids = Vec<Option<Vec<Vec<Bucket>>>>;
@@ -3210,15 +3252,22 @@ pub fn derived_caches_for_dataset_cached_with_cache_dir(
 
     let ticks = dataset.time.to_pyramid_ticks();
     // Issue #115: the time axis is the same for every column, so its
-    // Level-0 file is written once here, before the columns run in parallel
-    // and each finds it, instead of once per column. A failure only costs
-    // that saving: each column then writes it itself.
-    if let Err(err) = level0::build_or_open_shared_timestamps(cache_dir, &key, &ticks) {
-        warn!(
-            error = %err,
-            "could not write the shared Level-0 timestamps; each column writes its own"
-        );
-    }
+    // Level-0 file is written once here, before the columns run in parallel,
+    // instead of once per column. Issue #193: it is also *mapped* once here
+    // and that one mapping handed to every column, since each mapping of the
+    // same file counts in resident memory on its own. A failure only costs
+    // those savings: each column then writes and maps it itself.
+    let shared = match level0::build_or_open_shared_timestamps(cache_dir, &key, &ticks) {
+        Ok(shared) => Some(shared),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "could not write the shared Level-0 timestamps; each column writes and maps its \
+                 own"
+            );
+            None
+        }
+    };
     // Columns are independent — each has its own cache files — so they are
     // built on the `rayon` compute pool (issue #114). The result keeps
     // `dataset.columns` order.
@@ -3235,6 +3284,7 @@ pub fn derived_caches_for_dataset_cached_with_cache_dir(
                 index,
                 series,
                 &ticks,
+                shared.as_ref(),
             )
         })
         .collect();
@@ -3251,9 +3301,14 @@ fn derived_caches_for_column(
     index: usize,
     series: &Series,
     ticks: &[i128],
+    shared: Option<&level0::SharedTimestamps>,
 ) -> (Option<Vec<Vec<Bucket>>>, Option<Level0Cache>) {
     // Step 1: Level 0, without converting anything if it is already cached.
-    let level0 = match level0::try_open(cache_dir, column_key) {
+    let reopened = match shared {
+        Some(shared) => level0::try_open_sharing(cache_dir, column_key, shared),
+        None => level0::try_open(cache_dir, column_key),
+    };
+    let level0 = match reopened {
         Ok(Some(cache)) => Some(cache),
         Ok(None) => None,
         Err(err) => {
@@ -3294,7 +3349,11 @@ fn derived_caches_for_column(
         },
     };
 
-    match level0::build(cache_dir, column_key, &samples, ticks) {
+    let built = match shared {
+        Some(shared) => level0::build_sharing(cache_dir, column_key, &samples, shared),
+        None => level0::build(cache_dir, column_key, &samples, ticks),
+    };
+    match built {
         Ok(level0) => {
             let pyramid = build_or_open_pyramid(
                 path,
@@ -3528,6 +3587,47 @@ mod tests {
         assert!(
             (0.9..=1.1).contains(&ratio),
             "estimate {estimate} vs {written} bytes written"
+        );
+    }
+
+    // Issue #193: per row, the tick copy and the shared Level-0 timestamps
+    // (16 + 16); per plotted column, its Level-0 values (8) and its pyramid
+    // (an 80-byte bucket per 7 samples, rounded up to 12); per converted
+    // column, its `f64` copy (8).
+    #[test]
+    fn derived_caches_are_sized_per_row_per_plotted_and_per_converted_column() {
+        assert_eq!(std::mem::size_of::<Bucket>(), 80);
+        assert_eq!(PYRAMID_BYTES_PER_SAMPLE, 12);
+        assert_eq!(derived_caches_bytes(1000, 0, 0), 32_000);
+        assert_eq!(derived_caches_bytes(1000, 3, 0), 1000 * (32 + 3 * 20));
+        assert_eq!(
+            derived_caches_bytes(1000, 3, 2),
+            1000 * (32 + 3 * 20 + 2 * 8)
+        );
+        assert_eq!(derived_caches_bytes(u64::MAX, 3, 2), u64::MAX);
+    }
+
+    // Issue #193: sizing what is held after an open must never make the
+    // in-memory estimate smaller than it was — only the derived caches and
+    // the checkpoints are added on top of the parse and the typed columns.
+    #[test]
+    fn the_in_memory_estimate_covers_the_derived_caches_of_every_data_column() {
+        let (_dir, path, _cache) = spill_candidate();
+        let file_bytes = std::fs::metadata(&path).expect("metadata").len();
+        let footprint = super::super::csv::sniff_path(&path, IngestOverrides::default())
+            .expect("sniff")
+            .footprint(file_bytes);
+        let data_columns = footprint.column_count as u64 - 1;
+
+        assert!(
+            footprint.estimated_bytes
+                >= file_bytes
+                    + derived_caches_bytes(
+                        footprint.estimated_row_count,
+                        data_columns,
+                        data_columns
+                    ),
+            "{footprint:?}"
         );
     }
 
