@@ -64,6 +64,7 @@ pub fn compare(actual: &OpenSummary, expected: &OpenSummary) -> Vec<Mismatch> {
     check!(gap_count);
     check!(non_monotonic_count);
     check!(duplicate_timestamp_count);
+    check!(precision_loss_columns);
 
     mismatches
 }
@@ -167,6 +168,7 @@ mod tests {
             gap_count: 0,
             non_monotonic_count: 0,
             duplicate_timestamp_count: 0,
+            precision_loss_columns: Vec::new(),
         }
     }
 

@@ -167,6 +167,11 @@ pub fn show(
     // Same reasoning: a column the file has but the plot does not must be
     // visible without expanding anything (Golden Rule 2).
     unloaded_columns_detail(ui, report);
+    // Same reasoning: SPEC §1.4 forbids rounding an i64 beyond ±2⁵³ for the
+    // plot without saying so in the bar (issue #228).
+    for notice in precision_loss_notices(report) {
+        ui.colored_label(ui.visuals().warn_fg_color, notice);
+    }
     // A sibling of the header for the same reason as the skipped-rows line:
     // plotting against an index the file does not contain must be stated
     // where it cannot be collapsed away (Golden Rule 2).
@@ -372,6 +377,28 @@ fn unloaded_columns_detail(ui: &mut egui::Ui, report: &InferenceReport) {
                 ui.label(format!("\"{}\": {}", column.name, column.reason));
             }
         });
+}
+
+/// One plain-language line per column whose integers `f64` rounds for the
+/// plot (SPEC §1.4, issue #228): which column, how many values, and that the
+/// raw value is still readable exactly. Empty for the common file.
+fn precision_loss_notices(report: &InferenceReport) -> Vec<String> {
+    report
+        .precision_loss_columns
+        .iter()
+        .map(|column| {
+            let (values, exceed, are) = if column.value_count == 1 {
+                ("value", "exceeds", "is")
+            } else {
+                ("values", "exceed", "are")
+            };
+            format!(
+                "Precision: {} {values} in \"{}\" {exceed} ±2⁵³ and {are} rounded in the plot; \
+                 the cursor readout shows them exactly.",
+                column.value_count, column.name
+            )
+        })
+        .collect()
 }
 
 /// [`unloaded_columns_detail`]'s heading, `None` when every column loaded.
@@ -764,7 +791,8 @@ fn field_text(name: &str, value: &str, confidence: Confidence) -> String {
 mod tests {
     use super::*;
     use glyde_core::ingest::{
-        InferredField, SamplingClass, SkipReason, SkippedRowDetail, UnloadedColumn,
+        InferredField, PrecisionLossColumn, SamplingClass, SkipReason, SkippedRowDetail,
+        UnloadedColumn,
     };
 
     fn sample_report(timestamp_format_confidence: Confidence) -> InferenceReport {
@@ -804,6 +832,7 @@ mod tests {
             unloaded_columns: Vec::new(),
             replaced_sequences: 0,
             median_interval_seconds: Some(1.0),
+            precision_loss_columns: Vec::new(),
         }
     }
 
@@ -1241,6 +1270,40 @@ mod tests {
         let texts = rendered_texts(&report);
         assert!(
             texts.contains("2 columns not loaded — view details"),
+            "{texts}"
+        );
+    }
+
+    // SPEC §1.4 / issue #228: an i64 column beyond ±2⁵³ is flagged by name,
+    // outside the collapsible body (visible with the bar collapsed), and a
+    // clean file shows nothing.
+    #[test]
+    fn precision_loss_is_announced_by_column_with_the_bar_collapsed() {
+        let clean = rendered_texts(&sample_report(Confidence::High));
+        assert!(!clean.contains("2⁵³"), "{clean}");
+
+        let mut report = sample_report(Confidence::High);
+        assert!(!report.has_low_confidence_field());
+        report.precision_loss_columns = vec![
+            PrecisionLossColumn {
+                name: "value".to_string(),
+                value_count: 3,
+            },
+            PrecisionLossColumn {
+                name: "id".to_string(),
+                value_count: 1,
+            },
+        ];
+        let texts = rendered_texts(&report);
+        assert!(
+            texts.contains(
+                "Precision: 3 values in \"value\" exceed ±2⁵³ and are rounded in the plot; \
+                 the cursor readout shows them exactly."
+            ),
+            "{texts}"
+        );
+        assert!(
+            texts.contains("Precision: 1 value in \"id\" exceeds ±2⁵³ and is rounded in the plot"),
             "{texts}"
         );
     }

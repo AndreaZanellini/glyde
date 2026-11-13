@@ -56,4 +56,5 @@ InferenceReport {
     median_interval_seconds: Some(
         1.0,
     ),
+    precision_loss_columns: [],
 }

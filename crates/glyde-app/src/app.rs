@@ -652,6 +652,7 @@ mod tests {
             gap_count: 0,
             non_monotonic_count: 0,
             duplicate_timestamp_count: 0,
+            precision_loss_columns: Vec::new(),
         })
     }
 
@@ -692,6 +693,7 @@ mod tests {
             unloaded_columns: Vec::new(),
             replaced_sequences: 0,
             median_interval_seconds: Some(1.0),
+            precision_loss_columns: Vec::new(),
         })
     }
 

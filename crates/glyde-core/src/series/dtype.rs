@@ -210,8 +210,8 @@ pub(super) fn warn_if_precision_loss(magnitude: u128, original: impl std::fmt::D
         tracing::warn!(
             value = %original,
             "integer value exceeds f64's exact range (±2^53); converting to f64 \
-             for plotting/pyramid building loses precision (SPEC §1.4, \
-             docs/ROADMAP.md M8 owns surfacing this in the inference bar too)"
+             for plotting/pyramid building loses precision (SPEC §1.4; the \
+             inference bar names the column, issue #228)"
         );
     }
 }
@@ -499,6 +499,28 @@ impl SeriesValues {
             SeriesValues::Spilled(SpilledValues::F64(v)) => v.get(index),
             SeriesValues::Bool(_) | SeriesValues::String(_) => None,
             SeriesValues::Spilled(SpilledValues::Bool(_) | SpilledValues::String(_)) => None,
+        }
+    }
+
+    /// How many samples of this column `f64` cannot hold exactly: `i64`/`u64`
+    /// values whose magnitude exceeds 2⁵³ (SPEC §1.4, issue #228). Always 0
+    /// for every other dtype — narrower integers and floats convert to `f64`
+    /// losslessly, and `bool`/`string` are never plotted as numbers.
+    pub fn values_beyond_exact_f64(&self) -> u64 {
+        fn count<T: Copy>(values: &[T], magnitude: impl Fn(T) -> u128) -> u64 {
+            values
+                .iter()
+                .filter(|&&value| magnitude(value) > MAX_EXACT_F64_MAGNITUDE)
+                .count() as u64
+        }
+        let signed = |n: i64| n.unsigned_abs() as u128;
+        let unsigned = |n: u64| n as u128;
+        match self {
+            SeriesValues::I64(v) => count(v, signed),
+            SeriesValues::U64(v) => count(v, unsigned),
+            SeriesValues::Spilled(SpilledValues::I64(v)) => count(v.as_slice(), signed),
+            SeriesValues::Spilled(SpilledValues::U64(v)) => count(v.as_slice(), unsigned),
+            _ => 0,
         }
     }
 

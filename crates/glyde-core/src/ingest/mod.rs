@@ -56,7 +56,7 @@ pub use report::{
     inspect, open_dataset, open_dataset_progressive, open_dataset_progressive_cancellable,
     open_dataset_progressive_in, open_dataset_progressive_with_overrides, open_dataset_with_budget,
     open_dataset_with_overrides, InferenceReport, InferredField, OpenRequest, OpenSummary,
-    SamplingClass, TimeIndexSource, TimezoneLabel, UnloadedColumn,
+    PrecisionLossColumn, SamplingClass, TimeIndexSource, TimezoneLabel, UnloadedColumn,
 };
 
 use crate::time::TimestampFormat;
