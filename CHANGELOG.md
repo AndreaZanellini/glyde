@@ -12,6 +12,23 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Very large whole numbers are now flagged when the plot rounds them
+  (issue #228).** A plot line can hold whole numbers exactly only up to
+  9,007,199,254,740,992 (2⁵³). Larger ones (IDs, counters, nanosecond
+  timestamps stored as a data column) are drawn slightly rounded. Before,
+  this was only in the log, once per value. Now the inference bar shows one
+  line per affected column, always visible even when the bar is collapsed,
+  for example: *Precision: 3 values in "value" exceed ±2⁵³ and are rounded
+  in the plot; the cursor readout shows them exactly.* The log has one
+  warning per column with the exact count. The data itself is not changed:
+  the cursor readout still shows each number digit for digit.
+  - Works the same for CSV and Parquet, and for files too large for memory.
+  - To try it: open `testdata/corpus/case-50-i64-beyond-2-53.csv` → the
+    precision line names `value`. Hover a point → the readout shows the full
+    number (e.g. `9223372036854775807`).
+  - Not covered here: a whole-number column with **blank cells and** very
+    large numbers is still a text column (see the #189 entry below). Making
+    it plottable needs a decision from you (issue #245).
 - **Blank cells in a numeric CSV column are now gaps, not a reason to turn
   the column into text (issue #189).** Before, a single empty cell (a sensor
   dropout, a channel that starts late) moved the whole column off the plot
@@ -28,7 +45,7 @@ Versioning: [Semantic Versioning](https://semver.org/).
     IDs, counters or nanosecond timestamps) stays a text column, as before.
     A decimal column could not hold those numbers exactly and would round
     them without telling you. The log says why (a warning). Making such a
-    column plottable with a precision warning is issue #228.
+    column plottable is your decision (issue #245).
   - Assumption to veto by testing: a true/false (or 0/1) column with blank
     cells still becomes a text lane, as before. Whether it should get gaps
     instead is your decision (issue #240).

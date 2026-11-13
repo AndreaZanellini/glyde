@@ -53,7 +53,7 @@ use crate::time::{
 };
 use crate::{GlydeError, Result};
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 /// docs/QUALITY.md §1's "sampling class" field, extended with
 /// [`SamplingClass::ProgressiveIndex`] for SPEC §2.1's "progressive numeric"
@@ -102,6 +102,12 @@ pub struct OpenSummary {
     /// for the same reason as `non_monotonic_count`.
     #[serde(default)]
     pub duplicate_timestamp_count: u64,
+    /// SPEC §1.4: the series columns holding an `i64`/`u64` value beyond
+    /// ±2⁵³, which the plot's `f64` rounds — in header order (issue #228,
+    /// corpus case 50). Defaults to empty for the same reason as
+    /// `non_monotonic_count`.
+    #[serde(default)]
+    pub precision_loss_columns: Vec<String>,
 }
 
 /// SPEC §1.2 "Confidence is tracked per inference": one inferred value,
@@ -207,6 +213,21 @@ pub struct InferenceReport {
     /// absolute time axis, or when it has no positive median (fewer than two
     /// samples, or mostly repeated timestamps).
     pub median_interval_seconds: Option<f64>,
+    /// SPEC §1.4: "`i64` values beyond ±2⁵³ must not be converted to `f64`
+    /// for rendering without being flagged ... in the inference bar" (issue
+    /// #228). One entry per series column holding such a value, in header
+    /// order; empty for the common file. The raw samples are untouched —
+    /// only the plotted line rounds them; the cursor readout stays exact.
+    pub precision_loss_columns: Vec<PrecisionLossColumn>,
+}
+
+/// A series column whose integer values `f64` cannot all hold exactly (see
+/// [`InferenceReport::precision_loss_columns`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrecisionLossColumn {
+    pub name: String,
+    /// How many of its values exceed ±2⁵³ (exact, not a sample).
+    pub value_count: u64,
 }
 
 /// A column the reader found but did not load (see
@@ -374,10 +395,13 @@ fn timestamp_format_label(format: TimestampFormat) -> &'static str {
 /// to plot, and is rejected as [`GlydeError::SingleColumnFile`] (corpus case
 /// 18) rather than silently "succeeding" with nothing to show.
 ///
-/// This parses `path` on its own, independently of [`super::dataset::load`].
-/// A caller that also needs the materialized [`Dataset`] (as
-/// `glyde-app`'s indexer does) should call [`open_dataset`] instead, which
-/// produces both from a single parse (issue #58).
+/// For delimited text this parses `path` twice: once for the time column,
+/// and once through [`super::dataset::load`] for the per-column dtypes that
+/// [`OpenSummary::precision_loss_columns`] depends on (issue #228). That is
+/// acceptable for the corpus gate, its only caller. A caller that needs the
+/// summary or the materialized [`Dataset`] (as `glyde-app`'s indexer does)
+/// should call [`open_dataset`] instead, which produces both from a single
+/// parse (issue #58).
 pub fn inspect(path: &Path) -> Result<OpenSummary> {
     with_reader(path, |reader| reader.inspect(path))
 }
@@ -470,7 +494,45 @@ pub(crate) fn inspect_csv(path: &Path) -> Result<OpenSummary> {
         gap_count,
         non_monotonic_count,
         duplicate_timestamp_count,
+        // The time-axis half above reads column 0 alone; which *series* lose
+        // precision depends on every column's inferred dtype, which only
+        // the full typing pass knows. Reusing it (rather than re-deciding
+        // dtypes here) keeps one implementation of that rule (ARCH hard rule
+        // 4); `inspect` is the corpus gate's entry point, not the app's, so
+        // the second parse costs nothing a user waits for.
+        precision_loss_columns: precision_loss_columns(&dataset::load(path)?)
+            .into_iter()
+            .map(|column| column.name)
+            .collect(),
     })
+}
+
+/// SPEC §1.4: every series column of `dataset` holding an `i64`/`u64` value
+/// beyond ±2⁵³, which plotting through `f64` rounds (issue #228), each
+/// logged once at `warn` with its exact count — the per-column summary the
+/// inference bar shows, next to the per-value `warn` the conversion itself
+/// emits.
+fn precision_loss_columns(dataset: &Dataset) -> Vec<PrecisionLossColumn> {
+    dataset
+        .columns
+        .iter()
+        .filter_map(|series| {
+            let value_count = series.values().values_beyond_exact_f64();
+            (value_count > 0).then(|| {
+                warn!(
+                    column = series.name(),
+                    value_count,
+                    "integer values beyond ±2^53 are rounded when plotted as f64; \
+                     the raw values are kept and the cursor readout stays exact \
+                     (SPEC §1.4)"
+                );
+                PrecisionLossColumn {
+                    name: series.name().to_string(),
+                    value_count,
+                }
+            })
+        })
+        .collect()
 }
 
 /// Parses `path` once and returns the [`OpenSummary`] [`inspect`] reports,
@@ -686,6 +748,7 @@ pub(crate) fn build_summary_and_report(
     time_index: TimeIndexInference,
 ) -> Result<(OpenSummary, InferenceReport, Dataset)> {
     set_aside_empty_columns(&mut dataset, &mut source.unloaded_columns);
+    let precision_loss = precision_loss_columns(&dataset);
     let mut median_interval_seconds = None;
     let (
         time_column,
@@ -753,6 +816,10 @@ pub(crate) fn build_summary_and_report(
         gap_count,
         non_monotonic_count,
         duplicate_timestamp_count,
+        precision_loss_columns: precision_loss
+            .iter()
+            .map(|column| column.name.clone())
+            .collect(),
     };
 
     // SPEC §2.1: a column's *name* is only as trustworthy as the header
@@ -812,6 +879,7 @@ pub(crate) fn build_summary_and_report(
         unloaded_columns: source.unloaded_columns,
         replaced_sequences: source.replaced_sequences,
         median_interval_seconds,
+        precision_loss_columns: precision_loss,
     };
 
     Ok((summary, report, dataset))

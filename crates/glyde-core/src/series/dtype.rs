@@ -210,8 +210,8 @@ pub(super) fn warn_if_precision_loss(magnitude: u128, original: impl std::fmt::D
         tracing::warn!(
             value = %original,
             "integer value exceeds f64's exact range (±2^53); converting to f64 \
-             for plotting/pyramid building loses precision (SPEC §1.4, \
-             docs/ROADMAP.md M8 owns surfacing this in the inference bar too)"
+             for plotting/pyramid building loses precision (SPEC §1.4; the \
+             inference bar names the column, issue #228)"
         );
     }
 }
@@ -499,6 +499,33 @@ impl SeriesValues {
             SeriesValues::Spilled(SpilledValues::F64(v)) => v.get(index),
             SeriesValues::Bool(_) | SeriesValues::String(_) => None,
             SeriesValues::Spilled(SpilledValues::Bool(_) | SpilledValues::String(_)) => None,
+        }
+    }
+
+    /// How many samples of this column `f64` cannot hold exactly: `i64`/`u64`
+    /// values whose magnitude exceeds 2⁵³ (SPEC §1.4, issue #228). Always 0
+    /// for every other dtype — narrower integers and floats convert to `f64`
+    /// losslessly, and `bool`/`string` are never plotted as numbers.
+    pub fn values_beyond_exact_f64(&self) -> u64 {
+        // A branchless `u64` comparison summed over the slice, so the
+        // compiler can vectorize it: this runs over every integer sample on
+        // every open (issue #228), and a `u128` widening or a filtering
+        // branch measurably slowed the Parquet index-build bench.
+        fn count<T: Copy>(values: &[T], magnitude: impl Fn(T) -> u64) -> u64 {
+            const EXACT: u64 = MAX_EXACT_F64_MAGNITUDE as u64;
+            values
+                .iter()
+                .map(|&value| u64::from(magnitude(value) > EXACT))
+                .sum()
+        }
+        let signed = |n: i64| n.unsigned_abs();
+        let unsigned = |n: u64| n;
+        match self {
+            SeriesValues::I64(v) => count(v, signed),
+            SeriesValues::U64(v) => count(v, unsigned),
+            SeriesValues::Spilled(SpilledValues::I64(v)) => count(v.as_slice(), signed),
+            SeriesValues::Spilled(SpilledValues::U64(v)) => count(v.as_slice(), unsigned),
+            _ => 0,
         }
     }
 

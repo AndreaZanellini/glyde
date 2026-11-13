@@ -2124,6 +2124,50 @@ mod tests {
         );
     }
 
+    // SPEC §1.4 / issue #228: a Parquet int64/uint64 column beyond ±2⁵³ is
+    // flagged by name like a CSV one (corpus 50); narrower integers and an
+    // int64 column within range are not.
+    #[test]
+    fn int64_and_uint64_beyond_2_pow_53_are_flagged_as_precision_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            vec![
+                ("t", seconds(3)),
+                (
+                    "small",
+                    Arc::new(Int64Array::from(vec![0, 1 << 53, -(1 << 53)])),
+                ),
+                (
+                    "i32",
+                    Arc::new(Int32Array::from(vec![i32::MIN, 0, i32::MAX])),
+                ),
+                (
+                    "id",
+                    Arc::new(Int64Array::from(vec![(1 << 53) + 1, 0, i64::MIN])),
+                ),
+                ("count", Arc::new(UInt64Array::from(vec![0, 1, u64::MAX]))),
+            ],
+        );
+
+        let (summary, report, _dataset) = open_default(&path);
+
+        assert_eq!(
+            report.precision_loss_columns,
+            vec![
+                super::super::PrecisionLossColumn {
+                    name: "id".to_string(),
+                    value_count: 2,
+                },
+                super::super::PrecisionLossColumn {
+                    name: "count".to_string(),
+                    value_count: 1,
+                },
+            ]
+        );
+        assert_eq!(summary.precision_loss_columns, vec!["id", "count"]);
+    }
+
     #[test]
     fn every_supported_arrow_type_keeps_its_own_dtype_and_exact_values() {
         let dir = tempfile::tempdir().unwrap();

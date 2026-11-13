@@ -7,5 +7,8 @@
   "row_count": 3,
   "skipped_row_count": 0,
   "sampling_class": "uniform",
-  "gap_count": 0
+  "gap_count": 0,
+  "precision_loss_columns": [
+    "value"
+  ]
 }
