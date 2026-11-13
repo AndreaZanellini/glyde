@@ -28,7 +28,7 @@ Versioning: [Semantic Versioning](https://semver.org/).
     number (e.g. `9223372036854775807`).
   - Not covered here: a whole-number column with **blank cells and** very
     large numbers is still a text column (see the #189 entry below). Making
-    it plottable needs a decision from you; see the issue linked in the PR.
+    it plottable needs a decision from you (issue #245).
 - **Blank cells in a numeric CSV column are now gaps, not a reason to turn
   the column into text (issue #189).** Before, a single empty cell (a sensor
   dropout, a channel that starts late) moved the whole column off the plot
@@ -45,7 +45,7 @@ Versioning: [Semantic Versioning](https://semver.org/).
     IDs, counters or nanosecond timestamps) stays a text column, as before.
     A decimal column could not hold those numbers exactly and would round
     them without telling you. The log says why (a warning). Making such a
-    column plottable is a separate decision (not part of #228).
+    column plottable is your decision (issue #245).
   - Assumption to veto by testing: a true/false (or 0/1) column with blank
     cells still becomes a text lane, as before. Whether it should get gaps
     instead is your decision (issue #240).
