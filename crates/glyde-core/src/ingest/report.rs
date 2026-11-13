@@ -513,23 +513,31 @@ pub(crate) fn inspect_csv(path: &Path) -> Result<OpenSummary> {
 /// inference bar shows, next to the per-value `warn` the conversion itself
 /// emits.
 fn precision_loss_columns(dataset: &Dataset) -> Vec<PrecisionLossColumn> {
+    let columns = count_precision_loss(dataset);
+    for column in &columns {
+        warn!(
+            column = column.name.as_str(),
+            value_count = column.value_count,
+            "integer values beyond ±2^53 are rounded when plotted as f64; \
+             the raw values are kept and the cursor readout stays exact \
+             (SPEC §1.4)"
+        );
+    }
+    columns
+}
+
+/// [`precision_loss_columns`] without the log: what a progress
+/// [`Checkpoint`] carries over the rows it has typed so far (issue #247),
+/// which would otherwise repeat the same `warn` at every checkpoint.
+pub(crate) fn count_precision_loss(dataset: &Dataset) -> Vec<PrecisionLossColumn> {
     dataset
         .columns
         .iter()
         .filter_map(|series| {
             let value_count = series.values().values_beyond_exact_f64();
-            (value_count > 0).then(|| {
-                warn!(
-                    column = series.name(),
-                    value_count,
-                    "integer values beyond ±2^53 are rounded when plotted as f64; \
-                     the raw values are kept and the cursor readout stays exact \
-                     (SPEC §1.4)"
-                );
-                PrecisionLossColumn {
-                    name: series.name().to_string(),
-                    value_count,
-                }
+            (value_count > 0).then(|| PrecisionLossColumn {
+                name: series.name().to_string(),
+                value_count,
             })
         })
         .collect()

@@ -133,3 +133,78 @@ fn a_file_within_the_exact_range_flags_nothing() {
     assert!(report.precision_loss_columns.is_empty());
     assert!(summary.precision_loss_columns.is_empty());
 }
+
+// Issue #247: a progressive open draws the partial plot for as long as a
+// large file takes to load, so SPEC §1.4's flag cannot wait for the open to
+// complete. Every checkpoint carries the columns holding a value beyond
+// ±2⁵³ among the rows it already typed, with the exact count so far.
+
+const PROGRESSIVE_ROWS: usize = 50_000;
+
+/// Whether row `i` of [`progressive_fixture`]'s `big` column is beyond ±2⁵³.
+/// Row 3 is one, well before the first checkpoint.
+fn is_big_row(i: usize) -> bool {
+    i % 1000 == 3
+}
+
+fn progressive_fixture(dir: &Path) -> PathBuf {
+    use std::io::Write as _;
+    let path = dir.join("big-ids.csv");
+    let mut text = String::from("timestamp,big,small\n");
+    for i in 0..PROGRESSIVE_ROWS {
+        let big = if is_big_row(i) {
+            EXACT + 1 + i as i64
+        } else {
+            i as i64
+        };
+        text.push_str(&format!(
+            "2026-01-01T{:02}:{:02}:{:02}Z,{big},{}\n",
+            i / 3600,
+            (i / 60) % 60,
+            i % 60,
+            i as i64 - 7
+        ));
+    }
+    std::fs::File::create(&path)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .expect("write fixture");
+    path
+}
+
+fn assert_checkpoints_flag_the_column(budget: RamBudget, storage: &str) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = progressive_fixture(dir.path());
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let mut checkpoints = Vec::new();
+    glyde_core::ingest::load_progressive_with_budget(&path, budget, cache.path(), |checkpoint| {
+        checkpoints.push(checkpoint)
+    })
+    .expect("open");
+    assert!(
+        !checkpoints.is_empty(),
+        "{storage}: the file must checkpoint"
+    );
+
+    for checkpoint in &checkpoints {
+        let rows = checkpoint.dataset.time.len();
+        let expected = (0..rows).filter(|&i| is_big_row(i)).count() as u64;
+        assert_eq!(
+            checkpoint.precision_loss_columns,
+            vec![PrecisionLossColumn {
+                name: "big".to_string(),
+                value_count: expected,
+            }],
+            "{storage}: checkpoint over {rows} rows"
+        );
+    }
+}
+
+#[test]
+fn every_in_memory_checkpoint_flags_the_column_so_far() {
+    assert_checkpoints_flag_the_column(RamBudget::from_total_ram_bytes(u64::MAX), "in memory");
+}
+
+#[test]
+fn every_spilled_checkpoint_flags_the_column_so_far() {
+    assert_checkpoints_flag_the_column(RamBudget::from_total_ram_bytes(0), "spilled");
+}

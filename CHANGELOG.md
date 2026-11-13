@@ -12,6 +12,21 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **The very-large-number warning now appears while a big file is still
+  loading (issue #247).** Before, the *Precision: …* line from #228 only
+  showed up once the whole file had been read, although the partial plot
+  drawn during the load was already rounding those numbers. Now the
+  loading bar (under the time-column picker) shows it as soon as such a
+  number has been read, worded *Precision (rows read so far): …* because
+  the count can still grow. When the load finishes, the usual line with the
+  whole file's count replaces it.
+  - To try it: open a large CSV (a few hundred MB or more, so the load
+    takes a few seconds) with a column holding a number above
+    9,007,199,254,740,992 in its first rows → the line appears during the
+    load.
+  - Files too large for memory: the partial plot during the load only shows
+    the first 200,000 rows, so the count during the load covers those rows;
+    the final count covers the whole file.
 - **Very large whole numbers are now flagged when the plot rounds them
   (issue #228).** A plot line can hold whole numbers exactly only up to
   9,007,199,254,740,992 (2⁵³). Larger ones (IDs, counters, nanosecond

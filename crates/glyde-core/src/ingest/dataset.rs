@@ -48,7 +48,7 @@ use super::csv::{
 use super::infer::{
     log_dtype_choice, normalize_decimal_field, ColumnDtypeChoice, ColumnDtypeScan, ColumnInference,
 };
-use super::report::TimeIndexSource;
+use super::report::{count_precision_loss, PrecisionLossColumn, TimeIndexSource};
 use super::{IngestOverrides, TimeColumnChoice};
 use crate::budget::RamBudget;
 use crate::dsp::decimation::{build_pyramid, build_pyramid_streaming, extend_pyramid, Bucket};
@@ -65,7 +65,7 @@ use crate::{GlydeError, Result};
 use std::borrow::Cow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// An [`TimeAxis::Absolute`] axis's timestamps, either on the heap (the
 /// in-memory path) or memory-mapped from the spill cache (issue #75). Both
@@ -2353,6 +2353,7 @@ impl<'a> SpillPreview<'a> {
         let pyramids = self.pyramid_cursor.update(&dataset);
         if let Some(on_checkpoint) = self.on_checkpoint.as_deref_mut() {
             on_checkpoint(Checkpoint {
+                precision_loss_columns: Checkpoint::precision_loss_of(&dataset, rows as u64),
                 dataset,
                 pyramids,
                 rows_read: rows as u64,
@@ -2426,6 +2427,30 @@ pub struct Checkpoint {
     /// checkpoint); in memory it is provisional, since a later row running
     /// backwards can still demote the time column to a series.
     pub time_index_final: bool,
+    /// SPEC §1.4 over the rows this checkpoint has typed (issue #247): every
+    /// series column holding an `i64`/`u64` value beyond ±2⁵³, with how many
+    /// so far, in header order. The partial plot already rounds them, so the
+    /// loading view flags them before the open completes; the completed
+    /// open's [`super::InferenceReport::precision_loss_columns`] then gives
+    /// the whole file's count.
+    pub precision_loss_columns: Vec<PrecisionLossColumn>,
+}
+
+impl Checkpoint {
+    /// Logs and returns [`Checkpoint::precision_loss_columns`] for `dataset`.
+    fn precision_loss_of(dataset: &Dataset, rows_read: u64) -> Vec<PrecisionLossColumn> {
+        let columns = count_precision_loss(dataset);
+        for column in &columns {
+            debug!(
+                column = column.name.as_str(),
+                value_count = column.value_count,
+                rows_read,
+                "checkpoint: integer values beyond ±2^53 so far are rounded in the partial \
+                 plot (SPEC §1.4)"
+            );
+        }
+        columns
+    }
 }
 
 /// [`load_with_outcome`], additionally invoking `on_checkpoint` with a
@@ -2542,6 +2567,10 @@ pub(crate) fn load_with_outcome_progressive_in(
                         on_checkpoint(Checkpoint {
                             rows_read: partial_outcome.row_count,
                             pyramids,
+                            precision_loss_columns: Checkpoint::precision_loss_of(
+                                &dataset,
+                                partial_outcome.row_count,
+                            ),
                             dataset,
                             spilled: false,
                             column_names: partial_outcome.column_names.clone(),
@@ -2635,6 +2664,10 @@ pub fn load_progressive_with_budget_cancellable(
                         on_checkpoint(Checkpoint {
                             rows_read: partial.row_count,
                             pyramids,
+                            precision_loss_columns: Checkpoint::precision_loss_of(
+                                &dataset,
+                                partial.row_count,
+                            ),
                             dataset,
                             spilled: false,
                             column_names: partial.column_names.clone(),

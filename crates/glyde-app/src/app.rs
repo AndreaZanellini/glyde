@@ -30,7 +30,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glyde_core::dsp::decimation::Bucket;
-use glyde_core::ingest::{Dataset, InferenceReport, IngestOverrides, Level0Cache};
+use glyde_core::ingest::{
+    Dataset, InferenceReport, IngestOverrides, Level0Cache, PrecisionLossColumn,
+};
 
 use crate::inference_bar::Correction;
 use crate::plumbing::{
@@ -83,6 +85,8 @@ struct PartialLoad {
     /// Issue #119: the time-index decision so far, for the time-column
     /// picker shown while the file loads.
     time_index: TimeIndexPreview,
+    /// Issue #247: SPEC §1.4's precision flag over the rows read so far.
+    precision_loss_columns: Vec<PrecisionLossColumn>,
 }
 
 /// What the central panel currently shows, driven by [`IndexingMessage`]s
@@ -314,6 +318,7 @@ impl GlydeApp {
                     spilled,
                     prepared,
                     time_index,
+                    precision_loss_columns,
                     ..
                 } => Status::Loading {
                     path,
@@ -324,6 +329,7 @@ impl GlydeApp {
                         rows_read,
                         spilled,
                         time_index,
+                        precision_loss_columns,
                     }),
                 },
                 IndexingMessage::Completed {
@@ -480,6 +486,7 @@ impl eframe::App for GlydeApp {
                             &time_index.source,
                             &time_index.column_names,
                             time_index.is_final,
+                            &partial.precision_loss_columns,
                         ) {
                             pending_correction =
                                 Some((path.clone(), Correction::TimeColumn(picked)));
@@ -806,6 +813,7 @@ mod tests {
                 spilled: false,
                 prepared: sample_prepared(),
                 time_index: sample_time_index(),
+                precision_loss_columns: Vec::new(),
             })
             .expect("channel send");
 
@@ -861,6 +869,7 @@ mod tests {
                 spilled: false,
                 prepared: sample_prepared(),
                 time_index: sample_time_index(),
+                precision_loss_columns: Vec::new(),
             })
             .expect("channel send");
         app.drain_indexing_messages();
@@ -887,6 +896,7 @@ mod tests {
                 spilled: true,
                 prepared: sample_prepared(),
                 time_index: sample_time_index(),
+                precision_loss_columns: Vec::new(),
             })
             .expect("channel send");
 
@@ -953,6 +963,7 @@ mod tests {
                 spilled: false,
                 prepared: sample_prepared(),
                 time_index: sample_time_index(),
+                precision_loss_columns: Vec::new(),
             })
             .expect("channel send");
 
@@ -1069,6 +1080,7 @@ mod tests {
                 spilled: false,
                 prepared: sample_prepared(),
                 time_index: sample_time_index(),
+                precision_loss_columns: Vec::new(),
             })
             .expect("channel send");
         app.drain_indexing_messages();
@@ -1101,6 +1113,7 @@ mod tests {
             spilled: false,
             prepared: sample_prepared(),
             time_index: sample_time_index(),
+            precision_loss_columns: Vec::new(),
         };
         app.generation = 1;
         app.tx.send(progress(1)).expect("channel send");
