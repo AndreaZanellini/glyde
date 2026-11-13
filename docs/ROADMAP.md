@@ -37,7 +37,7 @@ introduced this roadmap, for the maintainer to apply.
 Small, independent PRs. Nothing here changes the look of the app.
 
 - [x] CI: make the `first_plot` gate stop failing by chance (it also gates `release.yml`) → #184
-- [ ] Blank cells in a numeric CSV column become gaps, not a text column → #189
+- [x] Blank cells in a numeric CSV column become gaps, not a text column → #189
 - [ ] Gap count is meaningful when the median Δt is 0 (repeated timestamps) → #188
 - [ ] Flag `i64` values beyond ±2⁵³ as precision loss (corpus 50) → #228
 - [ ] In-memory open: calibrate the RAM estimate to the measured peak (2.3× low today) → #193
@@ -103,5 +103,7 @@ Design first. Nothing is implemented before the maintainer approves the mockup.
 - Anomaly gutter + MAD outlier flagging → #236 · per-series unit label → #237
 - Performance: #194, #195, #181, #226, #210, #211, #204, #175
 - State timeline follow-ups: Compress with state lanes (#201), value-like text columns (#212)
+- Ingestion follow-ups to #189: blank cells in a bool column as "no data" stretches (#240),
+  occasional text tokens (`ERR`, `OK`) in a numeric column as flagged gaps (#241)
 - Signing (macOS notarization, Windows code signing; SignPath Foundation is a free option
   for Windows)

@@ -11,6 +11,38 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Blank cells in a numeric CSV column are now gaps, not a reason to turn
+  the column into text (issue #189).** Before, a single empty cell (a sensor
+  dropout, a channel that starts late) moved the whole column off the plot
+  and into a text lane, without saying why. Now an empty or whitespace-only
+  cell is read as a missing sample: the column is plotted, with a hole where
+  each blank is, exactly as if the file said `NaN` there. The holes are
+  listed with the other NaN runs, and the log says how many blank cells
+  were read as missing in each column. Nothing is filled in or interpolated.
+  - A whole-number column with blanks is now shown as a decimal column,
+    the same as a column with `NaN` cells, because whole numbers have no
+    "missing" value.
+  - Exception, to protect exact values: a whole-number column with blanks
+    and at least one very large number (beyond 9,007,199,254,740,992, e.g.
+    IDs, counters or nanosecond timestamps) stays a text column, as before.
+    A decimal column could not hold those numbers exactly and would round
+    them without telling you. The log says why (a warning). Making such a
+    column plottable with a precision warning is issue #228.
+  - Assumption to veto by testing: a true/false (or 0/1) column with blank
+    cells still becomes a text lane, as before. Whether it should get gaps
+    instead is your decision (issue #240).
+  - Unchanged: a column that is blank on every row is still a text column,
+    and a numeric column with text such as `ERR` (corpus case 46) is still
+    text. Whether such text should become flagged gaps too is your
+    decision (issue #241).
+  - To try it: open `testdata/corpus/case-62-blank-cells-numeric-column.csv`
+    → `value` and `count` are plotted with holes, not shown as text; `id`
+    (very large whole numbers) and `unused` (all blank) stay text. The
+    automated check that locks this is `tests/blank_cells_integration.rs`;
+    the corpus file's own expectation checks only the general open result
+    (delimiter, rows, sampling), not column types.
+
 ### Changed
 - **New plan: a first release for colleagues (v0.1.0) in three steps.**
   `docs/ROADMAP.md` now holds only the work left before v0.1.0: (1) a

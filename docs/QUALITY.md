@@ -83,6 +83,7 @@ Build it *before* the features it protects. Minimum set for v1:
 59. No time column at all — every column is a signal (`ax,ay,az`); the numeric first column runs backwards, so it must stay a series and the file must plot against a generated row index, reported low-confidence (SPEC §2.1 "Files without a time column")
 60. Pathological gap median (issue #103) — 51% of the time steps are 1 s and 49% are 1000 s, so the median step is 1 s and the 1000 s steps all count as gaps (98 of 199): far more gaps than a normal file, which is what any gap listing must handle without holding one entry per gap in memory (SPEC §2.2–2.3)
 61. Parquet whose time column is a plain `INT64` of epoch milliseconds (no `TIMESTAMP` type) — must become an absolute `epoch_ms` time axis, the same decision as the same numbers in a CSV (SPEC §2.1, issue #166)
+62. Blank (empty or whitespace-only) cells in numeric columns — a float column with blanks stays `f64` with one NaN gap per blank, an integer column with a blank is promoted to `f64`, an integer column with a blank and values beyond ±2⁵³ stays exact text, and a column blank on every row stays text (SPEC §1.3, §1.4, issue #189)
 
 **Growth rule:** every `file-wont-open` issue must add its (anonymized) file to the corpus *with the fix in the same PR*. This is the product's growth engine.
 
