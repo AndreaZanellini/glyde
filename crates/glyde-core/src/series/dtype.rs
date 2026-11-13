@@ -507,14 +507,19 @@ impl SeriesValues {
     /// for every other dtype — narrower integers and floats convert to `f64`
     /// losslessly, and `bool`/`string` are never plotted as numbers.
     pub fn values_beyond_exact_f64(&self) -> u64 {
-        fn count<T: Copy>(values: &[T], magnitude: impl Fn(T) -> u128) -> u64 {
+        // A branchless `u64` comparison summed over the slice, so the
+        // compiler can vectorize it: this runs over every integer sample on
+        // every open (issue #228), and a `u128` widening or a filtering
+        // branch measurably slowed the Parquet index-build bench.
+        fn count<T: Copy>(values: &[T], magnitude: impl Fn(T) -> u64) -> u64 {
+            const EXACT: u64 = MAX_EXACT_F64_MAGNITUDE as u64;
             values
                 .iter()
-                .filter(|&&value| magnitude(value) > MAX_EXACT_F64_MAGNITUDE)
-                .count() as u64
+                .map(|&value| u64::from(magnitude(value) > EXACT))
+                .sum()
         }
-        let signed = |n: i64| n.unsigned_abs() as u128;
-        let unsigned = |n: u64| n as u128;
+        let signed = |n: i64| n.unsigned_abs();
+        let unsigned = |n: u64| n;
         match self {
             SeriesValues::I64(v) => count(v, signed),
             SeriesValues::U64(v) => count(v, unsigned),
