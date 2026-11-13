@@ -395,10 +395,13 @@ fn timestamp_format_label(format: TimestampFormat) -> &'static str {
 /// to plot, and is rejected as [`GlydeError::SingleColumnFile`] (corpus case
 /// 18) rather than silently "succeeding" with nothing to show.
 ///
-/// This parses `path` on its own, independently of [`super::dataset::load`].
-/// A caller that also needs the materialized [`Dataset`] (as
-/// `glyde-app`'s indexer does) should call [`open_dataset`] instead, which
-/// produces both from a single parse (issue #58).
+/// For delimited text this parses `path` twice: once for the time column,
+/// and once through [`super::dataset::load`] for the per-column dtypes that
+/// [`OpenSummary::precision_loss_columns`] depends on (issue #228). That is
+/// acceptable for the corpus gate, its only caller. A caller that needs the
+/// summary or the materialized [`Dataset`] (as `glyde-app`'s indexer does)
+/// should call [`open_dataset`] instead, which produces both from a single
+/// parse (issue #58).
 pub fn inspect(path: &Path) -> Result<OpenSummary> {
     with_reader(path, |reader| reader.inspect(path))
 }
