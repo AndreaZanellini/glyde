@@ -38,7 +38,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   - **What you will notice:** a 1 GB CSV with 8 numeric columns now uses
     the disk cache on a 16 GB machine. Its first plot appears after about
     2.9 s instead of 0.25 s (the known slowness of that path, issue #194).
-    Opening it in memory used to peak at 4.2 GB, above the budget. A 1 GB
+    Opening it in memory used to peak at 4.2 GB (Linux measurement), within
+    about 1% of the 4 GB cap on a 16 GB machine, with no room left for the
+    window. A 1 GB
     Parquet file of the same shape now takes about 4.2 s to open instead of
     1.6 s, for the same reason.
   - To try it: open `03_gearbox_cms_bursts.parquet` (see

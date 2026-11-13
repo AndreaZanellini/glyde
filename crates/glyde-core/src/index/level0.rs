@@ -398,21 +398,6 @@ impl Level0CacheWriter {
     /// in-memory bytes), but as two bulk writes instead of two per sample
     /// (issue #114: per-sample writes dominated building the cache for an
     /// already-materialized column).
-    /// Appends `samples` to a writer whose timestamps are already shared
-    /// ([`Self::create_sharing`]), so there are none to write. [`Self::finish`]
-    /// refuses the cache if they do not end up the same length.
-    fn push_values(&mut self, samples: &[f64]) -> Result<()> {
-        debug_assert!(matches!(self.timestamps, TimestampsSink::Shared { .. }));
-        self.values_writer
-            .write_all(bytemuck::cast_slice(samples))
-            .map_err(|source| GlydeError::Io {
-                path: self.values_tmp_path.clone(),
-                source,
-            })?;
-        self.sample_count += samples.len() as u64;
-        Ok(())
-    }
-
     pub fn push_slices(&mut self, timestamps: &[i128], samples: &[f64]) -> Result<()> {
         debug_assert_eq!(
             samples.len(),
@@ -438,6 +423,21 @@ impl Level0CacheWriter {
                 source,
             })?;
         self.sample_count += count as u64;
+        Ok(())
+    }
+
+    /// Appends `samples` to a writer whose timestamps are already shared
+    /// ([`Self::create_sharing`]), so there are none to write. [`Self::finish`]
+    /// refuses the cache if they do not end up the same length.
+    fn push_values(&mut self, samples: &[f64]) -> Result<()> {
+        debug_assert!(matches!(self.timestamps, TimestampsSink::Shared { .. }));
+        self.values_writer
+            .write_all(bytemuck::cast_slice(samples))
+            .map_err(|source| GlydeError::Io {
+                path: self.values_tmp_path.clone(),
+                source,
+            })?;
+        self.sample_count += samples.len() as u64;
         Ok(())
     }
 
