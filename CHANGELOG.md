@@ -35,6 +35,12 @@ Versioning: [Semantic Versioning](https://semver.org/).
     gearbox Parquet) still open in memory. On an 8 GB machine (2 GB budget),
     the engine CSV now uses the disk cache. Before, it opened in memory and
     could peak near or above the budget.
+  - **What you will notice:** a 1 GB CSV with 8 numeric columns now uses
+    the disk cache on a 16 GB machine. Its first plot appears after about
+    2.9 s instead of 0.25 s (the known slowness of that path, issue #194).
+    Opening it in memory used to peak at 4.2 GB, above the budget. A 1 GB
+    Parquet file of the same shape now takes about 4.2 s to open instead of
+    1.6 s, for the same reason.
   - To try it: open `03_gearbox_cms_bursts.parquet` (see
     `testdata/showcase/README.md`) → Activity Monitor stays well under 4 GB.
     Developers can compare estimate and measured peak for any file with
