@@ -224,10 +224,16 @@ Resolved as follows:
   files of earlier versions. Before spilling, the estimated spill size plus
   1 GB of headroom must fit in the cache disk's free space, or the open is
   refused with an explanation (`GlydeError::DiskSpaceExceeded`).
-- **Deferred, tracked separately:** cache eviction for the *reused* caches
-  (the cache directory still only grows for Level 0 and the pyramid);
-  and the size of an owned pyramid itself — ~11 bytes per sample per column
-  across all levels, which is proportional to file size and is what a
+- **The reused caches are capped** (`glyde_core::index::eviction`, issue
+  #213): Level 0, pyramid and dataset caches together may hold a tenth of
+  free disk plus their own size, at most 10 GB. Every cache hit sets the
+  files' modification time to now; at startup, after the spill sweep, the
+  least recently used entries (all files sharing a cache stem) are deleted
+  until the cache fits. Entries used in the last minute and `.tmp` files
+  still being written are never touched; `.tmp` files older than an hour
+  are interrupted writes and always deleted.
+- **Deferred, tracked separately:** the size of an owned pyramid itself —
+  ~11 bytes per sample per column across all levels, which is proportional to file size and is what a
   pyramid-accelerated view of a *spilled* file would hit first (issue #102).
 
 ### Where the raw `Dataset` lives (decision, issue #75)

@@ -95,6 +95,7 @@ pub(crate) fn try_load(cache_dir: &Path, key: &CacheKey, budget: RamBudget) -> O
                 rows = parsed.0.row_count,
                 "dataset cache hit: reopening without reading the source file (issue #106)"
             );
+            crate::index::eviction::mark_used(&path);
             Some(parsed)
         }
         Err(reason) => {

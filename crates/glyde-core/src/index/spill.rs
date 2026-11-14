@@ -60,7 +60,7 @@
 //! Glyde's live set. The sweep also removes the loose `*.glysp` and
 //! `*.glysp.tmp` files earlier versions wrote straight into the cache
 //! directory and never deleted. Level-0 and pyramid caches are *reused*
-//! caches, not backing stores, and their eviction is still deferred.
+//! caches, not backing stores: [`super::eviction`] caps them (issue #213).
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};

@@ -12,6 +12,32 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **The cache folder no longer grows forever (issue #213).** To reopen files
+  instantly, Glyde keeps a copy of their samples and overviews in its cache
+  folder. Before, nothing was ever removed: 7.5 GB after three weeks on your
+  machine. Now, each time Glyde starts, it trims that folder in the
+  background to **a tenth of your free disk space plus what the cache already
+  holds, never more than 10 GB**. The files you have not opened for the
+  longest time go first; reopening a file counts as using it. Caches of files
+  you have since edited, moved or deleted are never used again, so they age
+  out first. Half-written cache files left by a crash are deleted too. Each
+  start writes the cap and what it deleted to the log.
+  - **Where the folder is:** macOS `~/Library/Caches/com.glyde.Glyde/index`,
+    Linux `~/.cache/glyde/index`, Windows
+    `%LOCALAPPDATA%\glyde\Glyde\cache\index`. Deleting it by hand is always
+    safe.
+  - **How to test:** with the cache folder over its cap (on your machine,
+    with 13 GB free, the cap is about 2 GB), start Glyde and wait a few
+    seconds → the folder shrinks to the cap. Open a file you used before →
+    it still opens from the cache.
+  - **Assumptions, for you to veto:** the numbers (one tenth, 10 GB) are
+    mine; the issue only suggested "min(10% of free disk, N GB)". I count the
+    cache's own size as usable space, otherwise a full cache on a nearly full
+    disk would shrink its own cap to almost nothing. Trimming happens only at
+    startup, as the issue asked, so one long session can go over the cap
+    until the next start. Files used in the last minute are never deleted,
+    even over the cap, so an open in progress (or another running Glyde)
+    keeps its caches.
 - **Glyde no longer underestimates how much memory a file needs (issue
   #193).** Before opening a file, Glyde estimates its memory use and opens it
   in memory only if the estimate fits the budget (25% of RAM, at most 4 GB).

@@ -51,6 +51,7 @@ use std::thread;
 
 use glyde_core::dsp::decimation::{Bucket, Pyramid};
 use glyde_core::index::disk_pyramid::ColumnPyramid;
+use glyde_core::index::eviction::EvictionReport;
 use glyde_core::index::spill::SweepReport;
 use glyde_core::ingest::{
     Dataset, InferenceReport, IngestOverrides, Level0Cache, OpenSummary, PrecisionLossColumn,
@@ -377,17 +378,26 @@ fn spawn_dialog(
         .expect("failed to spawn the file dialog thread");
 }
 
-/// Spawns a thread that deletes the spill files under `cache_dir` no running
-/// Glyde is using (issue #118): what a previous run that crashed or was
-/// force-quit left behind, and the loose files versions before #118 never
-/// deleted. Called once at startup, off the UI thread because it can be
-/// gigabytes of deletion. A failure to start it is logged and otherwise
-/// harmless — the next spilled open sweeps too.
-pub fn spawn_spill_sweep(cache_dir: PathBuf) -> Option<thread::JoinHandle<SweepReport>> {
+/// Spawns a thread that gives back the disk space Glyde's cache directory
+/// no longer needs. First the spill files under `cache_dir` no running Glyde
+/// is using (issue #118): what a previous run that crashed or was force-quit
+/// left behind, and the loose files versions before #118 never deleted.
+/// Then the reused caches are trimmed to their size cap, least recently used
+/// first (issue #213, `glyde_core::index::eviction`). Called once at
+/// startup, off the UI thread because it can be gigabytes of deletion. A
+/// failure to start it is logged and otherwise harmless — the next spilled
+/// open sweeps spill files too, and the next start trims the caches.
+pub fn spawn_startup_cache_sweep(
+    cache_dir: PathBuf,
+) -> Option<thread::JoinHandle<(SweepReport, EvictionReport)>> {
     thread::Builder::new()
-        .name("glyde-spill-sweep".to_string())
-        .spawn(move || glyde_core::index::spill::sweep_orphaned_spill_files(&cache_dir))
-        .map_err(|err| tracing::warn!(error = %err, "could not start the spill sweep thread"))
+        .name("glyde-cache-sweep".to_string())
+        .spawn(move || {
+            let spill = glyde_core::index::spill::sweep_orphaned_spill_files(&cache_dir);
+            let eviction = glyde_core::index::eviction::enforce_cache_cap(&cache_dir);
+            (spill, eviction)
+        })
+        .map_err(|err| tracing::warn!(error = %err, "could not start the cache sweep thread"))
         .ok()
 }
 
@@ -934,7 +944,7 @@ mod tests {
         let legacy = cache.path().join("0123456789abcdef.c0.glysp");
         std::fs::write(&legacy, [0u8; 128]).expect("write");
 
-        let report = spawn_spill_sweep(cache.path().to_path_buf())
+        let (report, _eviction) = spawn_startup_cache_sweep(cache.path().to_path_buf())
             .expect("sweep thread")
             .join()
             .expect("sweep must not panic");
@@ -942,6 +952,32 @@ mod tests {
         assert_eq!(report.legacy_files, 1);
         assert_eq!(report.bytes_freed, 128);
         assert!(!legacy.exists());
+    }
+
+    // Issue #213: the same startup sweep then trims the reused caches —
+    // here, an interrupted cache write (a `.tmp` untouched for a day),
+    // which nothing ever reads and which is always deleted.
+    #[test]
+    fn the_startup_sweep_also_trims_the_reused_caches() {
+        let cache = tempfile::tempdir().expect("temp cache dir");
+        let interrupted = cache.path().join("0123456789abcdef.pyramid.glypy.tmp");
+        std::fs::write(&interrupted, [0u8; 64]).expect("write");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&interrupted)
+            .and_then(|file| {
+                file.set_modified(std::time::SystemTime::now() - Duration::from_secs(86_400))
+            })
+            .expect("backdate");
+
+        let (_spill, eviction) = spawn_startup_cache_sweep(cache.path().to_path_buf())
+            .expect("sweep thread")
+            .join()
+            .expect("sweep must not panic");
+
+        assert_eq!(eviction.stale_tmp_files, 1);
+        assert_eq!(eviction.bytes_freed, 64);
+        assert!(!interrupted.exists());
     }
 
     #[test]

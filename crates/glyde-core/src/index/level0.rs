@@ -32,9 +32,9 @@
 //!
 //! **Disk cost.** Roughly the size of the raw numeric data again per opened
 //! file (16 bytes/sample for timestamps, 8 bytes/sample for values), on top
-//! of the source file. **Cache eviction is not implemented** — this module
-//! only ever adds cache files, never removes stale ones; tracked as a
-//! follow-up (see the PR that introduced this module for the issue link).
+//! of the source file. Bounded by [`super::eviction`]'s size cap (issue
+//! #213): every hit marks the files it maps as used, and the least recently
+//! used entries are evicted at startup.
 //!
 //! **Streaming write.** [`Level0CacheWriter::push`] appends one sample at a
 //! time, so a future chunked CSV reader can feed it row-by-row without ever
@@ -534,6 +534,7 @@ fn open_shared_timestamps(path: &Path) -> Result<Option<Arc<Mmap>>> {
         tracing::warn!(path = %path.display(), "Level-0 timestamps header invalid, rebuilding");
         return Ok(None);
     }
+    super::eviction::mark_used(path);
     Ok(Some(Arc::new(mmap)))
 }
 
@@ -729,6 +730,7 @@ fn try_open_with(
         sample_count = ts_sample_count,
         "Level-0 cache hit: reopening without re-parsing the source file"
     );
+    super::eviction::mark_used(&values_path);
     Ok(Some(Level0Cache {
         timestamps_mmap,
         values_mmap,
