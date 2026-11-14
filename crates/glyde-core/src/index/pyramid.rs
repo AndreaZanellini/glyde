@@ -36,8 +36,9 @@
 //! **Disk cost.** Each bucket record is a fixed 72 bytes; the total bucket
 //! count across all levels sums to roughly `n / (PYRAMID_FACTOR - 1)`, i.e.
 //! about 10 bytes per raw sample on top of Level 0's 24 bytes/sample.
-//! **Cache eviction is not implemented**, same as Level 0 (the cache
-//! directory only ever grows).
+//! Bounded by [`super::eviction`]'s size cap, like Level 0 (issue #213): a
+//! hit marks the file as used, and the least recently used entries are
+//! evicted at startup.
 //!
 //! **Byte order.** Every multi-byte field is written native-endian
 //! (`to_ne_bytes`/`from_ne_bytes`), the same choice [`crate::index::level0`]
@@ -80,10 +81,9 @@ const HEADER_LEN: usize = 16;
 const BUCKET_RECORD_LEN: usize = 72;
 
 fn cache_paths(cache_dir: &Path, key: &CacheKey) -> (PathBuf, PathBuf) {
-    let stem = key.cache_stem();
     (
-        cache_dir.join(format!("{stem}.pyramid.glypy")),
-        cache_dir.join(format!("{stem}.pyramid.glypy.tmp")),
+        cache_dir.join(key.column_file_name("pyramid.glypy")),
+        cache_dir.join(key.column_file_name("pyramid.glypy.tmp")),
     )
 }
 
@@ -288,6 +288,7 @@ pub fn try_open(cache_dir: &Path, key: &CacheKey) -> Result<Option<Vec<Vec<Bucke
         level_count = levels.len(),
         "pyramid cache hit: reopening without rebuilding"
     );
+    super::eviction::mark_used(&final_path);
     Ok(Some(levels))
 }
 

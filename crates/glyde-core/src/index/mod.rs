@@ -18,6 +18,7 @@
 //! #59).
 
 pub mod disk_pyramid;
+pub mod eviction;
 pub mod level0;
 pub mod pyramid;
 pub mod row_groups;

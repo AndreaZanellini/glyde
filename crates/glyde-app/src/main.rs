@@ -26,13 +26,14 @@ fn main() -> anyhow::Result<()> {
     let _logging_guard = glyde_app::logging::init()?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "glyde starting");
 
-    // Issue #118: give back the disk space a previous run's spill files
-    // still hold, in the background.
+    // Issues #118 and #213: give back the disk space a previous run's spill
+    // files still hold, then trim the reused caches to their size cap, in the
+    // background.
     match glyde_core::index::level0::os_cache_dir() {
         Ok(cache_dir) => {
-            glyde_app::plumbing::spawn_spill_sweep(cache_dir);
+            glyde_app::plumbing::spawn_startup_cache_sweep(cache_dir);
         }
-        Err(err) => tracing::warn!(error = %err, "no cache directory; skipping the spill sweep"),
+        Err(err) => tracing::warn!(error = %err, "no cache directory; skipping the cache sweep"),
     }
 
     // Plan the PSD's FFTs now, off the UI thread, while memory is
