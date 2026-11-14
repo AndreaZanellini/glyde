@@ -327,6 +327,24 @@ impl Level0CacheWriter {
     /// atomically on [`Self::finish`] so a reader can never observe a
     /// half-written cache) and writes their headers.
     pub fn create(cache_dir: &Path, key: &CacheKey) -> Result<Self> {
+        Self::create_with(cache_dir, key, None)
+    }
+
+    /// [`Self::create`], reusing `shared`'s mapping of the file's timestamps
+    /// instead of mapping them again (issue #193, see [`SharedTimestamps`]).
+    pub fn create_sharing(
+        cache_dir: &Path,
+        key: &CacheKey,
+        shared: &SharedTimestamps,
+    ) -> Result<Self> {
+        Self::create_with(cache_dir, key, Some(shared))
+    }
+
+    fn create_with(
+        cache_dir: &Path,
+        key: &CacheKey,
+        shared: Option<&SharedTimestamps>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(cache_dir).map_err(|source| GlydeError::Io {
             path: cache_dir.to_path_buf(),
             source,
@@ -336,7 +354,11 @@ impl Level0CacheWriter {
         let values_final_path = key.values_path(cache_dir);
         let values_tmp_path = unique_tmp(&values_final_path);
 
-        let timestamps = match open_shared_timestamps(&timestamps_final_path)? {
+        let mapped = match shared {
+            Some(shared) => Some(Arc::clone(&shared.0)),
+            None => open_shared_timestamps(&timestamps_final_path)?,
+        };
+        let timestamps = match mapped {
             Some(mmap) => TimestampsSink::Shared {
                 mmap,
                 path: timestamps_final_path,
@@ -401,6 +423,21 @@ impl Level0CacheWriter {
                 source,
             })?;
         self.sample_count += count as u64;
+        Ok(())
+    }
+
+    /// Appends `samples` to a writer whose timestamps are already shared
+    /// ([`Self::create_sharing`]), so there are none to write. [`Self::finish`]
+    /// refuses the cache if they do not end up the same length.
+    fn push_values(&mut self, samples: &[f64]) -> Result<()> {
+        debug_assert!(matches!(self.timestamps, TimestampsSink::Shared { .. }));
+        self.values_writer
+            .write_all(bytemuck::cast_slice(samples))
+            .map_err(|source| GlydeError::Io {
+                path: self.values_tmp_path.clone(),
+                source,
+            })?;
+        self.sample_count += samples.len() as u64;
         Ok(())
     }
 
@@ -507,11 +544,11 @@ pub fn build_or_open_shared_timestamps(
     cache_dir: &Path,
     key: &CacheKey,
     timestamps: &[i128],
-) -> Result<()> {
+) -> Result<SharedTimestamps> {
     let path = key.timestamps_path(cache_dir);
     if let Some(mmap) = open_shared_timestamps(&path)? {
         if (mmap.len() - HEADER_LEN) / size_of::<i128>() == timestamps.len() {
-            return Ok(());
+            return Ok(SharedTimestamps(mmap));
         }
     }
     std::fs::create_dir_all(cache_dir).map_err(|source| GlydeError::Io {
@@ -542,7 +579,47 @@ pub fn build_or_open_shared_timestamps(
         samples = timestamps.len(),
         "Level-0 timestamps written once, shared by every column (issue #115)"
     );
-    Ok(())
+    open_shared_timestamps(&path)?
+        .map(SharedTimestamps)
+        .ok_or_else(|| GlydeError::CorruptCache {
+            path,
+            reason: "cache file disappeared immediately after being written".to_string(),
+        })
+}
+
+/// One file's Level-0 timestamps (issue #115), mapped **once** and handed to
+/// every column's cache (issue #193).
+///
+/// Every column reads the same axis, but mapping the file once per column
+/// made each mapping count in the process's resident memory as soon as it
+/// was read through: a file with N numeric columns paid N times its axis
+/// (16 bytes per row each) for one file on disk, which SPEC §5's RSS cap
+/// counts in full. Cloning this shares the one mapping.
+#[derive(Clone)]
+pub struct SharedTimestamps(Arc<Mmap>);
+
+/// [`build`], with the timestamps taken from `shared` — mapped once for all
+/// of the file's columns — instead of written or mapped again (issue #193).
+/// `samples` must hold as many values as `shared` holds timestamps.
+pub fn build_sharing(
+    cache_dir: &Path,
+    key: &CacheKey,
+    samples: &[f64],
+    shared: &SharedTimestamps,
+) -> Result<Level0Cache> {
+    let mut writer = Level0CacheWriter::create_sharing(cache_dir, key, shared)?;
+    writer.push_values(samples)?;
+    writer.finish()
+}
+
+/// [`try_open`], reusing `shared`'s mapping of the file's timestamps instead
+/// of mapping them again (issue #193).
+pub fn try_open_sharing(
+    cache_dir: &Path,
+    key: &CacheKey,
+    shared: &SharedTimestamps,
+) -> Result<Option<Level0Cache>> {
+    try_open_with(cache_dir, key, Some(shared))
 }
 
 fn create_file(path: &Path) -> Result<File> {
@@ -611,10 +688,21 @@ pub fn build_or_open(
 /// absorbed anomalies are logged, never silently ignored, but also never
 /// escalated to a hard failure over what is only a cache).
 pub fn try_open(cache_dir: &Path, key: &CacheKey) -> Result<Option<Level0Cache>> {
-    let timestamps_path = key.timestamps_path(cache_dir);
+    try_open_with(cache_dir, key, None)
+}
+
+fn try_open_with(
+    cache_dir: &Path,
+    key: &CacheKey,
+    shared: Option<&SharedTimestamps>,
+) -> Result<Option<Level0Cache>> {
     let values_path = key.values_path(cache_dir);
 
-    let Some(timestamps_mmap) = open_shared_timestamps(&timestamps_path)? else {
+    let mapped = match shared {
+        Some(shared) => Some(Arc::clone(&shared.0)),
+        None => open_shared_timestamps(&key.timestamps_path(cache_dir))?,
+    };
+    let Some(timestamps_mmap) = mapped else {
         return Ok(None);
     };
     let Some(values_mmap) = map_file(&values_path)? else {
@@ -840,6 +928,55 @@ mod tests {
 
         assert_eq!(via_writer.timestamps(), via_build.timestamps());
         assert_eq!(via_writer.samples(), via_build.samples());
+    }
+
+    /// Issue #193: every column of a file reads the same timestamps, but each
+    /// used to map that file on its own, and RSS counts a page once per
+    /// mapping that touched it — a 9-numeric-column, 7.2M-row file paid
+    /// 9 × 115 MB for one 115 MB axis. Built or reopened through one
+    /// [`SharedTimestamps`], every column must see the very same bytes.
+    #[test]
+    fn columns_built_or_reopened_through_shared_timestamps_map_the_axis_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key = temp_key(dir.path(), 5);
+        let timestamps: Vec<i128> = (0..5).map(|i| i * 10).collect();
+
+        let shared = build_or_open_shared_timestamps(dir.path(), &key, &timestamps)
+            .expect("shared timestamps must be written");
+        let first = build_sharing(
+            dir.path(),
+            &key.with_column(0),
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            &shared,
+        )
+        .expect("first column must build");
+        let second = build_sharing(
+            dir.path(),
+            &key.with_column(1),
+            &[5.0, 4.0, 3.0, 2.0, 1.0],
+            &shared,
+        )
+        .expect("second column must build");
+        let reopened = try_open_sharing(dir.path(), &key.with_column(1), &shared)
+            .expect("reopen must not error")
+            .expect("the second column was just built");
+
+        assert_eq!(first.timestamps(), timestamps.as_slice());
+        assert_eq!(reopened.samples(), &[5.0, 4.0, 3.0, 2.0, 1.0]);
+        assert_eq!(first.timestamps().as_ptr(), second.timestamps().as_ptr());
+        assert_eq!(first.timestamps().as_ptr(), reopened.timestamps().as_ptr());
+    }
+
+    #[test]
+    fn building_against_shared_timestamps_of_another_length_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key = temp_key(dir.path(), 6);
+        let shared = build_or_open_shared_timestamps(dir.path(), &key, &[0, 1, 2])
+            .expect("shared timestamps must be written");
+
+        let result = build_sharing(dir.path(), &key.with_column(0), &[1.0, 2.0], &shared);
+
+        assert!(matches!(result, Err(GlydeError::CorruptCache { .. })));
     }
 
     #[test]

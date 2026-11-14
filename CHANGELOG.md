@@ -12,6 +12,44 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Glyde no longer underestimates how much memory a file needs (issue
+  #193).** Before opening a file, Glyde estimates its memory use and opens it
+  in memory only if the estimate fits the budget (25% of RAM, at most 4 GB).
+  Larger files go to the disk cache instead. The estimate left out the
+  overview of each channel and the second copy of the samples that Glyde
+  builds just after loading. As a result, real use was about twice the
+  estimate, and the 269 MB gearbox Parquet file peaked at 98% of the 4 GB
+  cap. Two changes:
+  - **Less memory:** every channel of a file now shares one copy of the time
+    axis instead of each loading its own. On the gearbox file the peak drops
+    from about 3.5 GB to about 2.6 GB (Linux measurement).
+  - **An honest estimate:** it now includes everything Glyde holds after an
+    open, and for CSV also the partial plots shown while loading. A test now
+    fails if the measured peak goes above the estimate, for a CSV and a
+    Parquet file with mixed columns (numbers, integers, true/false, states).
+  - **Assumption, for you to veto:** the estimate is deliberately generous.
+    For CSV it is about 2–3× the measured peak, for Parquet about 1.5×. A
+    file near the limit therefore uses the disk cache a little earlier than
+    strictly needed. That path is slower to open but cannot freeze the
+    machine. On a 16 GB machine both showcase files (155 MB engine CSV, 269 MB
+    gearbox Parquet) still open in memory. On an 8 GB machine (2 GB budget),
+    the engine CSV now uses the disk cache. Before, it opened in memory and
+    could peak near or above the budget.
+  - **What you will notice:** a 1 GB CSV with 8 numeric columns now uses
+    the disk cache on a 16 GB machine. Its first plot appears after about
+    2.9 s instead of 0.25 s (the known slowness of that path, issue #194).
+    Opening it in memory used to peak at 4.2 GB (Linux measurement), within
+    about 1% of the 4 GB cap on a 16 GB machine, with no room left for the
+    window. A 1 GB
+    Parquet file of the same shape now takes about 4.2 s to open instead of
+    1.6 s, for the same reason.
+  - To try it: open `03_gearbox_cms_bursts.parquet` (see
+    `testdata/showcase/README.md`) → Activity Monitor stays well under 4 GB.
+    Developers can compare estimate and measured peak for any file with
+    `open_perf --fixture <file>`, which now prints `estimated_mb`,
+    `open_peak_rss_mb` and `derived_peak_rss_mb`.
+  - Not covered yet: memory the app keeps from earlier files and the window
+    itself are outside the estimate, as before.
 - **The very-large-number warning now appears while a big file is still
   loading (issue #247).** Before, the *Precision: …* line from #228 only
   showed up once the whole file had been read, although the partial plot

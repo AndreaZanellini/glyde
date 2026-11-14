@@ -40,7 +40,7 @@ Small, independent PRs. Nothing here changes the look of the app.
 - [x] Blank cells in a numeric CSV column become gaps, not a text column → #189
 - [ ] Gap count is meaningful when the median Δt is 0 (repeated timestamps) → #188
 - [x] Flag `i64` values beyond ±2⁵³ as precision loss (corpus 50) → #228
-- [ ] In-memory open: calibrate the RAM estimate to the measured peak (2.3× low today) → #193
+- [x] In-memory open: calibrate the RAM estimate to the measured peak (2.3× low today) → #193
 - [ ] Bound the cache directory (size cap, oldest-first eviction, logged) → #213
 
 > **MAINTAINER TEST — Step 1**

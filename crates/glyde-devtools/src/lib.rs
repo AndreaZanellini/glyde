@@ -173,6 +173,11 @@ impl PeakRssSampler {
         }
     }
 
+    /// The peak RSS observed so far, in bytes, while sampling continues.
+    pub fn peak_so_far(&self) -> u64 {
+        self.peak_bytes.load(Ordering::Relaxed)
+    }
+
     /// Stops sampling and returns the peak RSS observed, in bytes.
     pub fn stop(mut self) -> u64 {
         self.stop.store(true, Ordering::Relaxed);
