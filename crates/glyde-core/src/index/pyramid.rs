@@ -81,10 +81,9 @@ const HEADER_LEN: usize = 16;
 const BUCKET_RECORD_LEN: usize = 72;
 
 fn cache_paths(cache_dir: &Path, key: &CacheKey) -> (PathBuf, PathBuf) {
-    let stem = key.cache_stem();
     (
-        cache_dir.join(format!("{stem}.pyramid.glypy")),
-        cache_dir.join(format!("{stem}.pyramid.glypy.tmp")),
+        cache_dir.join(key.column_file_name("pyramid.glypy")),
+        cache_dir.join(key.column_file_name("pyramid.glypy.tmp")),
     )
 }
 

@@ -181,12 +181,22 @@ impl CacheKey {
         .cache_stem()
     }
 
+    /// The file name of one of this key's per-column cache files (Level-0
+    /// values, pyramid): `<file stem>.<column stem>.<suffix>`. Leading with
+    /// the stem of the file's shared timestamps and dataset cache makes every
+    /// cache of one source file share its first name segment, which is what
+    /// `index::eviction` groups an entry by — so a file's caches are evicted
+    /// together, never column by column (review of PR #251, issue #213).
+    pub(crate) fn column_file_name(&self, suffix: &str) -> String {
+        format!("{}.{}.{suffix}", self.timestamps_stem(), self.cache_stem())
+    }
+
     fn timestamps_path(&self, cache_dir: &Path) -> PathBuf {
         cache_dir.join(format!("{}.ts.glyc0", self.timestamps_stem()))
     }
 
     fn values_path(&self, cache_dir: &Path) -> PathBuf {
-        cache_dir.join(format!("{}.val.glyc0", self.cache_stem()))
+        cache_dir.join(self.column_file_name("val.glyc0"))
     }
 }
 
@@ -1063,9 +1073,7 @@ mod tests {
         let key = temp_key(dir.path(), 1);
         build(dir.path(), &key, &[1.0], &[0]).expect("build v1 cache");
 
-        let stem = key.cache_stem();
-        for suffix in ["ts", "val"] {
-            let path = dir.path().join(format!("{stem}.{suffix}.glyc0"));
+        for path in [key.timestamps_path(dir.path()), key.values_path(dir.path())] {
             let mut bytes = std::fs::read(&path).expect("read cache file");
             bytes[8..12].copy_from_slice(&(FORMAT_VERSION + 1).to_ne_bytes());
             std::fs::write(&path, bytes).expect("rewrite cache file with a future version");
@@ -1150,9 +1158,7 @@ mod tests {
             &[0, 1, 2],
         )
         .expect("build");
-        let values = dir
-            .path()
-            .join(format!("{}.val.glyc0", key.with_column(0).cache_stem()));
+        let values = key.with_column(0).values_path(dir.path());
         let mut bytes = std::fs::read(&values).expect("read values");
         bytes.truncate(bytes.len() - 8);
         std::fs::write(&values, bytes).expect("truncate values");

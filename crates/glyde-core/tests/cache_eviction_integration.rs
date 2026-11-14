@@ -144,6 +144,21 @@ fn a_reopened_file_keeps_its_caches_over_one_not_used_since() {
         "the reopen must be served from the caches, not write new ones"
     );
 
+    // Every hit path marks its own file: the Level-0 values and shared
+    // timestamps, the pyramid, the dataset cache.
+    for path in &reopened_files {
+        let age = std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .expect("mtime")
+            .elapsed()
+            .unwrap_or_default();
+        assert!(
+            age < eviction::RECENT_USE_GUARD,
+            "{} was not marked as used by the reopen",
+            path.display()
+        );
+    }
+
     // Room for one file's caches only.
     let (reopened_bytes, forgotten_bytes) =
         (total_bytes(&reopened_files), total_bytes(&forgotten_files));
@@ -159,4 +174,36 @@ fn a_reopened_file_keeps_its_caches_over_one_not_used_since() {
         forgotten_files.iter().all(|path| !path.exists()),
         "the file not used for two days loses every one of its caches"
     );
+}
+
+/// Review of PR #251: a file with several columns has one Level-0 values
+/// file and one pyramid per column, plus one shared timestamps file and one
+/// dataset cache. Evicting only some of them would keep files that save
+/// nothing on the next open (without its timestamps and dataset cache, the
+/// file is parsed again anyway) while still counting against the cap. One
+/// file's caches go together.
+#[test]
+fn a_files_caches_are_evicted_all_together_never_in_part() {
+    let sources = tempfile::tempdir().expect("sources");
+    let cache = tempfile::tempdir().expect("cache");
+    let file = write_csv(sources.path(), "two_columns.csv", 1.0);
+
+    open(&file, cache.path());
+    let files = cache_files(cache.path());
+    let value_files = files
+        .iter()
+        .filter(|path| path.to_string_lossy().ends_with(".val.glyc0"))
+        .count();
+    assert_eq!(
+        value_files, 2,
+        "the fixture must have two cached columns: {files:?}"
+    );
+    set_age(&files, DAY);
+
+    // One byte over the cap: something must go, and it must be everything.
+    let report = eviction::evict_to_cap(cache.path(), total_bytes(&files) - 1);
+
+    assert_eq!(report.evicted_entries, 1, "one file, one entry");
+    let left = cache_files(cache.path());
+    assert!(left.is_empty(), "left behind: {left:?}");
 }

@@ -20,8 +20,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
   holds, never more than 10 GB**. The files you have not opened for the
   longest time go first; reopening a file counts as using it. Caches of files
   you have since edited, moved or deleted are never used again, so they age
-  out first. Half-written cache files left by a crash are deleted too. Each
+  out first. A file's caches are always deleted together, never one channel
+  at a time. Half-written cache files left by a crash are deleted too. Each
   start writes the cap and what it deleted to the log.
+  - **One-time effect:** the cache files of multi-channel files got new
+    names, so the first reopen of each file after this update rebuilds its
+    cache once (as fast as a first open). The old files are never used again
+    and are trimmed like any other unused cache.
   - **Where the folder is:** macOS `~/Library/Caches/com.glyde.Glyde/index`,
     Linux `~/.cache/glyde/index`, Windows
     `%LOCALAPPDATA%\glyde\Glyde\cache\index`. Deleting it by hand is always
@@ -35,9 +40,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
     cache's own size as usable space, otherwise a full cache on a nearly full
     disk would shrink its own cap to almost nothing. Trimming happens only at
     startup, as the issue asked, so one long session can go over the cap
-    until the next start. Files used in the last minute are never deleted,
-    even over the cap, so an open in progress (or another running Glyde)
-    keeps its caches.
+    until the next start. To know what you used recently, Glyde sets the
+    "modified" date of a cache file to now each time it reuses it (you can
+    see this in Finder); access dates are not reliable on most systems.
+    Files used in the last minute are never deleted, even over the cap, so
+    an open in progress keeps its caches. A file that a *second* running
+    Glyde opened more than a minute ago is not protected: on macOS and Linux
+    that window keeps working (the space comes back when it closes the
+    file), on Windows the deletion fails and is retried at the next start.
 - **Glyde no longer underestimates how much memory a file needs (issue
   #193).** Before opening a file, Glyde estimates its memory use and opens it
   in memory only if the estimate fits the budget (25% of RAM, at most 4 GB).

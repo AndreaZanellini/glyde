@@ -28,9 +28,12 @@
 //! every cache hit marks the files it read ([`mark_used`] sets their
 //! modification time to now — access times are unreliable, most systems
 //! mount with `relatime` or `noatime`). An entry is every file that shares
-//! a cache stem (a column's Level-0 values and its pyramid; a file's shared
-//! timestamps and its dataset cache), evicted together and dated by its
-//! newest file, so a half-evicted entry never lingers. The caches of a file
+//! a cache stem (one source file's shared timestamps, dataset cache, and
+//! each column's Level-0 values and pyramid), evicted together and dated by
+//! its newest file, so a half-evicted entry never lingers. A stem is a file
+//! name's first segment, and every cache of one source file starts with the
+//! same one (`CacheKey::column_file_name`): a file's caches are one entry,
+//! whatever its column count. The caches of a file
 //! that was edited, moved or deleted are never hit again (their key no
 //! longer matches anything), so they age into the front of the line without
 //! the cache having to record the source path.
@@ -326,12 +329,20 @@ fn evict(cache_dir: &Path, scan: Scan, cap_bytes: u64) -> EvictionReport {
     report
 }
 
-/// Whether `modified` is at least `age` ago. An unreadable time, or one in
-/// the future, counts as "too young": what cannot be judged is kept.
+/// Whether `modified` is at least `age` ago. An unreadable time counts as
+/// "too young": what cannot be judged is kept. A time in the future is
+/// young only within [`RECENT_USE_GUARD`] of now (clock jitter between a
+/// write and this check); further ahead it cannot be a recent use (a wrong
+/// clock, a file copied from another machine), and counting it as young
+/// would keep the entry forever (review of PR #251).
 fn is_older_than(modified: Option<SystemTime>, age: Duration) -> bool {
-    modified
-        .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|elapsed| elapsed >= age)
+    let Some(modified) = modified else {
+        return false;
+    };
+    match modified.elapsed() {
+        Ok(elapsed) => elapsed >= age,
+        Err(ahead) => ahead.duration() > RECENT_USE_GUARD,
+    }
 }
 
 /// Whether an open hit one of `entry`'s files between the scan and now —
@@ -521,6 +532,27 @@ mod tests {
             just_written.exists(),
             "an open in progress keeps its caches"
         );
+    }
+
+    /// Review of PR #251: a modification time far in the future (a clock
+    /// that was wrong, a file copied from another machine) must not make an
+    /// entry look "just used" forever.
+    #[test]
+    fn an_entry_dated_far_in_the_future_is_still_evictable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("aaaaaaaaaaaaaaaa.val.glyc0");
+        std::fs::write(&path, [0u8; 100]).expect("write");
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(SystemTime::now() + 30 * DAY)
+            .expect("set mtime");
+
+        let report = evict_to_cap(dir.path(), 0);
+
+        assert_eq!(report.evicted_entries, 1);
+        assert!(!path.exists());
     }
 
     #[test]
