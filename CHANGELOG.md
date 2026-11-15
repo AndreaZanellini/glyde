@@ -30,6 +30,26 @@ Versioning: [Semantic Versioning](https://semver.org/).
   view; Inter and JetBrains Mono embedded in the app.
 
 ### Fixed
+- **Files whose timestamps repeat no longer report a "gap" every second
+  (issue #188).** A log sampled faster than its timestamps change (whole
+  seconds on a 10 Hz recorder, for example) has most rows sharing a
+  timestamp. Before, Glyde then counted every real one-second step as a gap,
+  and the bar under the toolbar said "89 gaps detected" for a file with one
+  hole. Now the gap rule ("a step more than 10 times the usual step") ignores
+  the repeated timestamps when it works out the usual step, so only the real
+  hole counts. When more than half the timestamps repeat, the inference bar
+  says so: **"gap rule uses the median of non-zero steps (N repeated
+  timestamps)"**. If every timestamp is the same, there are no gaps. The plot
+  now breaks its line at exactly the gaps the count reports (before, such a
+  file was drawn with no break at all). Repeated timestamps are still
+  counted and flagged as before. To try it: open
+  `testdata/corpus/case-63-repeated-timestamps-gap-median.csv` (900 rows, one
+  61-second hole): it should say "1 gap detected" and show the line above
+  next to the sampling class. **What else changes, by your decision:** on any
+  file with *some* repeated timestamps (but fewer than half), the gap rule
+  now uses the step without them too, so a few gap counts may go down
+  slightly. The sampling class and the estimated sampling rate are
+  unchanged: they still use every step.
 - **The cache folder no longer grows forever (issue #213).** To reopen files
   instantly, Glyde keeps a copy of their samples and overviews in its cache
   folder. Before, nothing was ever removed: 7.5 GB after three weeks on your

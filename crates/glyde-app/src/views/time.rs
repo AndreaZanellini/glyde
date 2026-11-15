@@ -988,18 +988,21 @@ pub struct FitBounds {
     all_missing: Vec<bool>,
 }
 
-/// SPEC §2.3's gap threshold of `ticks` (`10 × median Δt`), as the plot uses
-/// it to stop drawing a line across a gap. `None` when there is none to use:
-/// fewer than two ticks, or a median Δt of 0 (timestamps coarser than the
-/// sampling, so most consecutive rows share one), where the rule would call
-/// every real step a gap and break the line at each of them.
+/// SPEC §2.3's gap threshold of `ticks`, as the plot uses it to stop drawing
+/// a line across a gap: the very rule the ingestion report counts gaps with
+/// (`10 ×` the median of the non-zero Δt, issue #188), so the plot breaks
+/// exactly where the inference bar's gap count says. `None` when there is
+/// none to use: fewer than two ticks, every timestamp equal, or a threshold
+/// that is not positive (an axis whose non-zero Δt mostly run backwards),
+/// where every forward step would break the line.
 fn drawing_gap_threshold(ticks: &[i128]) -> Option<f64> {
     let threshold = glyde_core::time::gap_threshold(ticks).ok().flatten()?;
     if threshold > 0.0 {
         Some(threshold)
     } else {
         tracing::info!(
-            "median Δt is 0 (repeated timestamps): the plot line is not broken at time gaps (SPEC §2.3)"
+            threshold_ticks = threshold,
+            "gap threshold is not positive: the plot line is not broken at time gaps (SPEC §2.3)"
         );
         None
     }
@@ -5240,14 +5243,15 @@ mod tests {
     }
 
     /// Timestamps coarser than the sampling (e.g. whole seconds on a 10 Hz
-    /// log) repeat, so the median Δt is 0 and `10 × median` is 0: every
-    /// real step would count as a gap and the plot would fall apart into
-    /// isolated runs. Such an axis has no usable gap rule, so nothing is
-    /// broken; a positive threshold is used as is.
+    /// log) repeat, so the median of every Δt is 0. The plot uses the same
+    /// rule as the ingestion report (issue #188): `10 × median` of the
+    /// non-zero Δt, so a one-second step is not a gap. With every Δt zero
+    /// there is no rule, and nothing is broken.
     #[test]
-    fn a_zero_median_delta_gives_no_drawing_gap_threshold() {
+    fn repeated_timestamps_draw_against_the_median_of_non_zero_steps() {
         let coarse: Vec<i128> = (0..30).map(|i| (i / 10) * 1_000).collect();
-        assert_eq!(drawing_gap_threshold(&coarse), None);
+        assert_eq!(drawing_gap_threshold(&coarse), Some(10_000.0));
+        assert_eq!(drawing_gap_threshold(&[7, 7, 7]), None, "every Δt zero");
 
         let regular: Vec<i128> = (0..30).map(|i| i * 1_000).collect();
         assert_eq!(drawing_gap_threshold(&regular), Some(10_000.0));

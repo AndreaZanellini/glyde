@@ -19,7 +19,7 @@
 //! distribution, and every one of them is computed in bounded memory over a
 //! [`TickSource`] (issue #85) rather than over a materialized `Vec` of deltas:
 //! on a multi-GB file those `Vec`s were themselves proportional to file size,
-//! which SPEC §5's flat peak-RSS cap does not allow. See [`select_kth_key`]
+//! which SPEC §5's flat peak-RSS cap does not allow. See [`select_kth`]
 //! for how an *exact* median is obtained without holding the distribution.
 
 use std::ops::Range;
@@ -80,7 +80,7 @@ const UNIFORM_JITTER_TOLERANCE: f64 = 0.01;
 /// SPEC §2.2–2.3: `gap = Δt > 10 × median Δt`.
 const GAP_MULTIPLE_OF_MEDIAN: f64 = 10.0;
 
-/// Buckets per refinement pass of [`select_kth_key`]. 2¹⁶ narrows the
+/// Buckets per refinement pass of [`select_kth`]. 2¹⁶ narrows the
 /// surviving key range by a factor of 65536 per pass, so the full `u128` key
 /// space is exhausted in at most eight passes, and a realistic Δt distribution
 /// (whose whole spread is a few million ticks) in two or three.
@@ -90,7 +90,7 @@ const GAP_MULTIPLE_OF_MEDIAN: f64 = 10.0;
 const SELECT_BUCKETS: usize = 1 << 16;
 
 /// A key sequence that can be replayed once per refinement pass of
-/// [`select_kth_key`], never materialized. Keys are `u128` and ordered by
+/// [`select_kth`], never materialized. Keys are `u128` and ordered by
 /// plain unsigned comparison, so a statistic over a signed or floating-point
 /// distribution encodes its values order-preservingly first (see
 /// [`delta_key`] and [`deviation_key`]).
@@ -141,6 +141,27 @@ impl<S: TickSource + ?Sized> KeyStream for DeltaKeys<'_, S> {
 }
 
 /// Every consecutive Δt of `range` as its absolute deviation from
+/// Every **non-zero** consecutive Δt of `range`, keyed for ordering: the
+/// distribution the gap rule's median is taken over (issue #188). A zero Δt
+/// is a repeated timestamp — counted and flagged by SPEC §2.1 — not a
+/// sampling step, and timestamps coarser than the sampling make most Δt
+/// zero, which would pull the median to 0 and make every real step a gap.
+struct NonZeroDeltaKeys<'a, S: ?Sized> {
+    source: &'a S,
+    range: Range<usize>,
+}
+
+impl<S: TickSource + ?Sized> KeyStream for NonZeroDeltaKeys<'_, S> {
+    fn for_each(&self, visit: &mut impl FnMut(u128)) -> Result<()> {
+        for_each_delta(self.source, self.range.clone(), &mut |delta| {
+            if delta != 0 {
+                visit(delta_key(delta));
+            }
+            Ok(())
+        })
+    }
+}
+
 /// `median_delta` — the distribution the MAD is the median of — keyed for
 /// ordering.
 struct DeviationKeys<'a, S: ?Sized> {
@@ -159,6 +180,17 @@ impl<S: TickSource + ?Sized> KeyStream for DeviationKeys<'_, S> {
     }
 }
 
+/// What [`select_kth`] found: the `k`-th smallest key, how many keys rank
+/// strictly below it, how many are equal to it, and how many are equal to
+/// the `probe` key it was given.
+#[derive(Debug, Clone, Copy)]
+struct Selected {
+    key: u128,
+    rank_below: usize,
+    equal: usize,
+    probe_count: usize,
+}
+
 /// The `k`-th smallest key (0-based) `keys` yields, **exactly**, in
 /// `O(SELECT_BUCKETS)` memory and a bounded number of passes over the stream.
 ///
@@ -171,35 +203,28 @@ impl<S: TickSource + ?Sized> KeyStream for DeviationKeys<'_, S> {
 /// answer is reached when it holds one key value, so the result is the same
 /// value a full sort would have selected — not an approximation of it.
 ///
+/// It also counts the keys below and equal to the one it finds: the
+/// surviving range is one key value when the selection ends, and its last
+/// histogram already counted the keys in it. Its first pass reads every key
+/// anyway, so it also counts the keys equal to `probe` — how a median Δt
+/// learns how many Δt are zero without another pass over the axis (issues
+/// #163, #188).
+///
 /// `k` must be less than the number of keys the stream yields.
-fn select_kth_key(keys: &impl KeyStream, k: usize) -> Result<u128> {
-    Ok(select_kth(keys, k)?.key)
-}
-
-/// What [`select_kth`] found: the `k`-th smallest key, how many keys rank
-/// strictly below it, and how many are equal to it.
-#[derive(Debug, Clone, Copy)]
-struct Selected {
-    key: u128,
-    rank_below: usize,
-    equal: usize,
-}
-
-/// [`select_kth_key`], also counting the keys below and equal to the one it
-/// finds: the surviving range is one key value when the selection ends, and
-/// its last histogram already counted the keys in it.
-fn select_kth(keys: &impl KeyStream, k: usize) -> Result<Selected> {
+fn select_kth(keys: &impl KeyStream, k: usize, probe: u128) -> Result<Selected> {
     let mut lo = u128::MAX;
     let mut hi = 0u128;
     let mut count = 0usize;
+    let mut probe_count = 0usize;
     keys.for_each(&mut |key| {
         lo = lo.min(key);
         hi = hi.max(key);
         count += 1;
+        probe_count += usize::from(key == probe);
     })?;
     debug_assert!(
         k < count,
-        "select_kth_key: rank {k} is outside a {count}-key distribution"
+        "select_kth: rank {k} is outside a {count}-key distribution"
     );
 
     // Reused across passes so the whole selection allocates exactly once.
@@ -238,10 +263,7 @@ fn select_kth(keys: &impl KeyStream, k: usize) -> Result<Selected> {
         // Unreachable: `rank_below` plus the keys inside the surviving range is
         // the whole distribution, and `k` indexes into it. Bail out rather than
         // spin if that invariant is ever broken.
-        debug_assert!(
-            narrowed,
-            "select_kth_key: rank {k} fell outside every bucket"
-        );
+        debug_assert!(narrowed, "select_kth: rank {k} fell outside every bucket");
         if !narrowed {
             break;
         }
@@ -254,6 +276,7 @@ fn select_kth(keys: &impl KeyStream, k: usize) -> Result<Selected> {
         // above leaves a wider range, counted as no equal key so the caller
         // looks further rather than trusting it.
         equal: if lo == hi { in_range } else { 0 },
+        probe_count,
     })
 }
 
@@ -281,16 +304,28 @@ fn smallest_key_above(keys: &impl KeyStream, key: u128) -> Result<u128> {
 /// enough keys equal it — nearly always on a time axis, whose Δt take few
 /// distinct values — or else the smallest key above it, one more pass.
 fn median_key(keys: &impl KeyStream, count: usize, decode: fn(u128) -> f64) -> Result<f64> {
+    median_key_counting(keys, count, decode, 0).map(|(median, _)| median)
+}
+
+/// [`median_key`], also returning how many keys equal `probe` (see
+/// [`select_kth`]), at no extra pass.
+fn median_key_counting(
+    keys: &impl KeyStream,
+    count: usize,
+    decode: fn(u128) -> f64,
+    probe: u128,
+) -> Result<(f64, usize)> {
     if count % 2 == 1 {
-        return Ok(decode(select_kth_key(keys, count / 2)?));
+        let middle = select_kth(keys, count / 2, probe)?;
+        return Ok((decode(middle.key), middle.probe_count));
     }
-    let lower = select_kth(keys, count / 2 - 1)?;
+    let lower = select_kth(keys, count / 2 - 1, probe)?;
     let upper = if lower.rank_below + lower.equal > count / 2 {
         lower.key
     } else {
         smallest_key_above(keys, lower.key)?
     };
-    Ok((decode(lower.key) + decode(upper)) / 2.0)
+    Ok(((decode(lower.key) + decode(upper)) / 2.0, lower.probe_count))
 }
 
 /// Decodes a Δt key into the `f64` the statistics are computed in. `i128 as
@@ -306,12 +341,44 @@ fn delta_key_as_f64(key: u128) -> f64 {
 /// SPEC §2.2's "median Δt" over `range`, or `None` when `range` holds fewer
 /// than two ticks and so has no Δt at all.
 fn median_delta<S: TickSource + ?Sized>(source: &S, range: Range<usize>) -> Result<Option<f64>> {
+    Ok(median_delta_and_zeros(source, range)?.map(|(median, _)| median))
+}
+
+/// [`median_delta`], together with how many Δt of `range` are zero
+/// (repeated timestamps), counted by the same selection (issue #188).
+fn median_delta_and_zeros<S: TickSource + ?Sized>(
+    source: &S,
+    range: Range<usize>,
+) -> Result<Option<(f64, usize)>> {
     let count = delta_count(&range, source.tick_count());
     if count == 0 {
         return Ok(None);
     }
     let keys = DeltaKeys { source, range };
-    median_key(&keys, count, delta_key_as_f64).map(Some)
+    median_key_counting(&keys, count, delta_key_as_f64, delta_key(0)).map(Some)
+}
+
+/// The gap rule's median over `range` (issue #188, maintainer decision
+/// Option A): the median of the **non-zero** Δt only, or `None` when there
+/// is none (fewer than two ticks, or every timestamp equal — no gaps).
+/// `all_median` and `zeros` are the range's [`median_delta_and_zeros`]:
+/// with no zero Δt the non-zero median *is* `all_median`, so an axis without
+/// repeated timestamps pays no extra pass for the rule (issue #163).
+fn gap_median_delta<S: TickSource + ?Sized>(
+    source: &S,
+    range: Range<usize>,
+    all_median: f64,
+    zeros: usize,
+) -> Result<Option<f64>> {
+    let non_zero = delta_count(&range, source.tick_count()) - zeros;
+    if non_zero == 0 {
+        return Ok(None);
+    }
+    if zeros == 0 {
+        return Ok(Some(all_median));
+    }
+    let keys = NonZeroDeltaKeys { source, range };
+    median_key(&keys, non_zero, delta_key_as_f64).map(Some)
 }
 
 /// Robust CV of `range`'s Δt (SPEC §2.2: MAD / median) is at most 1% of the
@@ -359,7 +426,7 @@ fn is_uniform_around<S: TickSource + ?Sized>(
 
 /// SPEC §2.2–2.3's gap rule itself, in one place: is this Δt more than ten
 /// times the median? `threshold` is always [`GAP_MULTIPLE_OF_MEDIAN`] × the
-/// median Δt of the series the Δt came from.
+/// median of the non-zero Δt of the series the Δt came from (issue #188).
 fn is_gap(delta: i128, threshold: f64) -> bool {
     delta_as_f64(delta) > threshold
 }
@@ -412,11 +479,18 @@ fn for_each_gap<S: TickSource + ?Sized>(
 /// choice (see [`summarize_ticks`]).
 fn scan_distribution<S: TickSource + ?Sized>(source: &S) -> Result<RangeScan> {
     let scan = scan_range(source, 0..source.tick_count(), &mut |_| Ok(()))?;
+    if scan.mostly_repeated {
+        info!(
+            repeated_timestamps = scan.stats.monotonicity.duplicate_count,
+            gap_threshold_ticks = scan.gap_threshold(),
+            "more than half the Δt are zero: the gap rule uses the median of non-zero steps (issue #188)"
+        );
+    }
     if scan.stats.gap_count > 0 {
         info!(
             gap_count = scan.stats.gap_count,
-            threshold_ticks = scan.median_delta.unwrap_or(0.0) * GAP_MULTIPLE_OF_MEDIAN,
-            "gaps detected (Δt > 10× median Δt, SPEC §2.2–2.3)"
+            threshold_ticks = scan.gap_threshold().unwrap_or(f64::INFINITY),
+            "gaps detected (Δt > 10× median of non-zero Δt, SPEC §2.2–2.3)"
         );
     }
     info!(
@@ -435,8 +509,17 @@ pub struct RangeScan {
     /// Gap count, sampling class and monotonicity of the range alone.
     pub stats: TimeAxisStats,
     /// The range's median Δt in ticks, or `None` when it holds fewer than two
-    /// ticks.
+    /// ticks. SPEC §2.2's estimated sampling interval and uniformity test
+    /// are measured against it.
     pub median_delta: Option<f64>,
+    /// The median of the range's **non-zero** Δt in ticks — what the gap
+    /// rule is ten times (issue #188) — or `None` when it has none: fewer
+    /// than two ticks, or every timestamp equal, so no gap at all.
+    pub gap_median_delta: Option<f64>,
+    /// More than half of the range's Δt are zero (timestamps coarser than
+    /// the sampling): the inference bar then says the gap rule used the
+    /// median of the non-zero steps (issue #188).
+    pub mostly_repeated: bool,
 }
 
 /// [`summarize_ticks`] restricted to `range`, additionally handing every
@@ -466,12 +549,18 @@ pub fn scan_range<S: TickSource + ?Sized>(
                 monotonicity,
             },
             median_delta: None,
+            gap_median_delta: None,
+            mostly_repeated: false,
         });
     }
 
-    let median_delta =
-        median_delta(source, start..end)?.expect("two or more ticks always have at least one Δt");
-    let threshold = GAP_MULTIPLE_OF_MEDIAN * median_delta;
+    let (median_delta, zeros) = median_delta_and_zeros(source, start..end)?
+        .expect("two or more ticks always have at least one Δt");
+    let gap_median_delta = gap_median_delta(source, start..end, median_delta, zeros)?;
+    // Every Δt zero: no non-zero step to compare against, so nothing is a gap.
+    let threshold =
+        gap_median_delta.map_or(f64::INFINITY, |median| GAP_MULTIPLE_OF_MEDIAN * median);
+    let mostly_repeated = zeros * 2 > end - start - 1;
 
     // One pass over Δt answers all three questions: how many gaps, whether
     // each gap-delimited segment is uniform (checked the moment the segment
@@ -524,14 +613,17 @@ pub fn scan_range<S: TickSource + ?Sized>(
             monotonicity,
         },
         median_delta: Some(median_delta),
+        gap_median_delta,
+        mostly_repeated,
     })
 }
 
 impl RangeScan {
-    /// SPEC §2.2–2.3's gap threshold for this range, in ticks (`10 × median
-    /// Δt`), or `None` when the range has no Δt.
+    /// SPEC §2.2–2.3's gap threshold for this range, in ticks (`10 ×` the
+    /// median of the non-zero Δt, issue #188), or `None` when the range has
+    /// no non-zero Δt — and so no gap.
     pub fn gap_threshold(&self) -> Option<f64> {
-        self.median_delta
+        self.gap_median_delta
             .map(|median| GAP_MULTIPLE_OF_MEDIAN * median)
     }
 }
@@ -613,7 +705,7 @@ pub fn detect_gaps(timestamps: &[i128]) -> Vec<Gap> {
         info!(
             gap_count = gaps.len(),
             threshold_ticks = threshold,
-            "gaps detected (Δt > 10× median Δt, SPEC §2.2–2.3)"
+            "gaps detected (Δt > 10× median of non-zero Δt, SPEC §2.2–2.3)"
         );
     }
 
@@ -621,13 +713,18 @@ pub fn detect_gaps(timestamps: &[i128]) -> Vec<Gap> {
 }
 
 /// SPEC §2.2–2.3's gap threshold for the whole of `source`, in ticks: a step
-/// longer than this (`Δt > 10 × median Δt`) is a gap. `None` with fewer than
-/// two samples. Computed in bounded memory over any [`TickSource`], spilled
+/// longer than this (`Δt > 10 ×` the median of the non-zero Δt, issue #188)
+/// is a gap. `None` with fewer than two samples, or when every timestamp is
+/// equal (no non-zero step, so no gap). Computed in bounded memory over any [`TickSource`], spilled
 /// included. A gap is a property of the whole axis, so a caller scanning a
 /// window ([`visit_gaps`]) passes this, never a window's own median.
 pub fn gap_threshold<S: TickSource + ?Sized>(source: &S) -> Result<Option<f64>> {
-    Ok(median_delta(source, 0..source.tick_count())?
-        .map(|median_delta| GAP_MULTIPLE_OF_MEDIAN * median_delta))
+    let whole = 0..source.tick_count();
+    let Some((median, zeros)) = median_delta_and_zeros(source, whole.clone())? else {
+        return Ok(None);
+    };
+    Ok(gap_median_delta(source, whole, median, zeros)?
+        .map(|median| GAP_MULTIPLE_OF_MEDIAN * median))
 }
 
 /// Streams every gap between consecutive rows of `range` (a gap whose two
@@ -783,6 +880,107 @@ mod tests {
 
         assert!(is_uniform(uniform, 0..uniform.len()).expect(SLICE_SCAN_IS_INFALLIBLE));
         assert!(!is_uniform(not_uniform, 0..not_uniform.len()).expect(SLICE_SCAN_IS_INFALLIBLE));
+    }
+
+    fn scan_whole(ticks: &[i128]) -> RangeScan {
+        scan_range(ticks, 0..ticks.len(), &mut |_| Ok(())).expect(SLICE_SCAN_IS_INFALLIBLE)
+    }
+
+    // Issue #188 (maintainer decision, Option A): whole-second timestamps on
+    // a 10 Hz log repeat, so most Δt are 0 and the median of *every* Δt is 0
+    // — which made every real one-second step a "gap". The gap rule takes
+    // the median of the non-zero Δt instead: 1 s here, so only the 18 s
+    // hole is a gap.
+    #[test]
+    fn whole_second_timestamps_on_a_faster_log_use_the_median_of_non_zero_steps() {
+        let mut ticks: Vec<i128> = (0..30).map(|i| (i / 10) * 1_000).collect();
+        ticks.extend(std::iter::repeat_n(20_000, 10));
+
+        assert_eq!(
+            gap_threshold(&ticks[..]).expect(SLICE_SCAN_IS_INFALLIBLE),
+            Some(10_000.0)
+        );
+        assert_eq!(
+            detect_gaps(&ticks),
+            vec![Gap {
+                before_index: 29,
+                after_index: 30,
+                delta: 18_000,
+            }]
+        );
+
+        let scan = scan_whole(&ticks);
+        assert_eq!(scan.stats.gap_count, 1);
+        assert_eq!(scan.gap_median_delta, Some(1_000.0));
+        assert_eq!(scan.gap_threshold(), Some(10_000.0));
+        assert!(scan.mostly_repeated, "36 of 39 Δt are zero");
+        // The sampling interval is still the median of every Δt (SPEC §2.2).
+        assert_eq!(scan.median_delta, Some(0.0));
+    }
+
+    // Issue #188: when every Δt is zero there is no non-zero step to take a
+    // median of, and so no gap at all.
+    #[test]
+    fn every_timestamp_equal_has_no_gaps() {
+        let ticks: &[i128] = &[5, 5, 5, 5];
+
+        assert_eq!(gap_threshold(ticks).expect(SLICE_SCAN_IS_INFALLIBLE), None);
+        assert_eq!(detect_gaps(ticks), Vec::new());
+        let scan = scan_whole(ticks);
+        assert_eq!(scan.stats.gap_count, 0);
+        assert_eq!(scan.gap_median_delta, None);
+        assert_eq!(scan.gap_threshold(), None);
+        assert!(scan.mostly_repeated);
+        assert_eq!(scan.stats.monotonicity.duplicate_count, 3);
+    }
+
+    // Issue #188: the non-zero median is the gap rule's median on every
+    // axis, not only on a mostly-repeated one. Δt = 0, 0, 0, 6, 10, 10, 80:
+    // the median of all of them is 6 (so 80 > 60 would be a gap), the median
+    // of the non-zero ones is 10 (80 ≤ 100 is not). Three zeros out of seven
+    // is not "more than half", so the inference bar has nothing to explain.
+    #[test]
+    fn a_few_repeated_timestamps_still_use_the_median_of_non_zero_steps() {
+        let ticks: &[i128] = &[0, 0, 0, 0, 6, 16, 26, 106];
+
+        assert_eq!(
+            gap_threshold(ticks).expect(SLICE_SCAN_IS_INFALLIBLE),
+            Some(100.0)
+        );
+        assert_eq!(detect_gaps(ticks), Vec::new());
+        let scan = scan_whole(ticks);
+        assert_eq!(scan.stats.gap_count, 0);
+        assert_eq!(scan.median_delta, Some(6.0));
+        assert_eq!(scan.gap_median_delta, Some(10.0));
+        assert!(!scan.mostly_repeated);
+    }
+
+    // Exactly half the Δt zero is not "more than half".
+    #[test]
+    fn exactly_half_repeated_is_not_mostly_repeated() {
+        assert!(!scan_whole(&[0, 0, 0, 10, 20]).mostly_repeated);
+        assert!(scan_whole(&[0, 0, 0, 0, 10]).mostly_repeated);
+    }
+
+    // The non-zero median comes from the same bounded selection as every
+    // other median here, over a chunked (spilled-like) source too.
+    #[test]
+    fn the_non_zero_median_is_the_same_over_a_chunked_source() {
+        let mut ticks: Vec<i128> = (0..300).map(|i| (i / 7) * 1_000).collect();
+        ticks.extend(std::iter::repeat_n(500_000, 5));
+        let chunked = ChunkedTicks {
+            ticks: ticks.clone(),
+            chunk_len: 4,
+        };
+
+        assert_eq!(
+            gap_threshold(&chunked).expect("chunked source"),
+            gap_threshold(&ticks[..]).expect(SLICE_SCAN_IS_INFALLIBLE)
+        );
+        assert_eq!(
+            gap_threshold(&ticks[..]).expect(SLICE_SCAN_IS_INFALLIBLE),
+            Some(10_000.0)
+        );
     }
 
     // Issue #85: the whole point of the bounded selection is that it is

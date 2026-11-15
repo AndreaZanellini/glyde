@@ -79,7 +79,7 @@ At index time, per series, compute the distribution of Δt and classify:
 | Class | Rule | Consequence |
 |---|---|---|
 | `Uniform` | jitter (robust CV of Δt) ≤ 1% of median Δt | Full DSP available |
-| `SegmentedUniform` | uniform within contiguous segments separated by gaps (gap = Δt > 10× median Δt) | DSP available per segment (§3.3) |
+| `SegmentedUniform` | uniform within contiguous segments separated by gaps (gap = Δt > 10× median Δt; see §2.3 for repeated timestamps) | DSP available per segment (§3.3) |
 | `Irregular` | neither of the above | PSD disabled with explanation (§3.3) |
 
 The classification and the estimated sampling rate are always shown in the inference bar.
@@ -88,6 +88,7 @@ The classification and the estimated sampling rate are always shown in the infer
 
 Gaps are detected at index time (`Δt > 10 × median Δt`).
 
+- **Repeated timestamps.** The median is taken over the **non-zero** Δt only. When more than half of the Δt are zero (timestamps coarser than the sampling), the inference bar says so: "gap rule uses the median of non-zero steps (N repeated timestamps)". If every Δt is zero, there are no gaps.
 - **Default: truthful linear time axis.** A gap looks like a gap. This is the fidelity-first default and it is never overridden automatically.
 - **One-click escape hatch:** when detected gaps account for > 50% of the total time span, a discreet affordance appears — `N gaps detected · [Compress]`. Toggling it switches to a **compressed (broken) axis** where gap regions are collapsed to a fixed narrow width marked with an unmistakable break glyph, and the axis labels make the discontinuity explicit.
 - Compressed mode is a **view state only**. It never affects data, selections in real time, or DSP. PSD always uses real timestamps.
