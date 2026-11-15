@@ -369,16 +369,17 @@ button:focus-visible, select:focus-visible, input:focus-visible, [tabindex]:focu
     <li><b>At most 8 numeric channels on screen</b>, one per palette color. On open, the first 8 in file order are shown; the rest are hidden and the inference bar says how many. Enabling a ninth asks you to hide one first.</li>
     <li><b>State channels take at most 32 % of the time view.</b> Beyond that the group scrolls inside itself; it can be collapsed to one row. Text states are 22 px bands, booleans 12 px strips, markers ticks with a label when there is room.</li>
     <li><b>Gaps are hatched across every track</b>, with their length on the axis.</li>
+    <li><b>The anomaly gutter has its row now</b>: a 12 px strip under the numeric tracks. Today it marks the missing samples of the shown channels, in their color, at least 2 px wide so a 5 ms hole never disappears. Outliers and skipped rows join it in v0.2 (#236).</li>
     <li><b>The spectrum lives in a bottom split</b>, 40 % of the height by default and resizable. Its controls do not move, its legend sits outside the plot.</li>
   </ol>
   <h3>Reading values (#196, #197, #231)</h3>
-  <ol start="7">
+  <ol start="8">
     <li><b>Hover:</b> where one sample covers the pointer, its exact value and timestamp. Where a pixel holds many samples, the min–max range of those samples and how many there are, never one arbitrary sample.</li>
     <li><b>Zoom acts on time only.</b> Every y range follows the visible data. You cannot zoom out past the file.</li>
     <li><b>Cursors A and B</b> run across every track. The panel on the right shows Δt, 1/Δt and, per channel, the value at A and B, ΔY and ΔY/Δt. Each cursor snaps to the nearest sample and shows that sample's timestamp.</li>
   </ol>
   <h3>Look (#229)</h3>
-  <ol start="10">
+  <ol start="11">
     <li><b>Palette:</b> cool graphite neutrals, a petrol accent used only for UI state, and an 8-color data palette checked for color-blind separation in both themes. Text states use soft tints with ink labels so they never look like a numeric series.</li>
     <li><b>Type:</b> Inter for the interface, JetBrains Mono for timestamps and values so digits line up. Both are SIL Open Font License; embedding them should add under 1 MB to the binary.</li>
     <li><b>Light and dark follow the OS.</b> The switch in the mockup bar is only here so you can compare; the app has no theme setting.</li>
@@ -640,6 +641,7 @@ const RPAD = 14;
 const AXIS_H = 40;
 const LANE_H = { state: 22, marker: 22, bool: 12 };
 const GROUP_HEAD = 22;
+const GUTTER_H = 12;    // anomaly gutter (SPEC §4.1): space reserved now, outliers arrive in v0.2 (#236)
 const STATE_CAP = 0.32;
 function layout(W, H) {
   const top = S.cursors ? 22 : 8;
@@ -649,15 +651,16 @@ function layout(W, H) {
   const capH = Math.floor(inner * STATE_CAP);
   const groupBody = S.groupOpen ? Math.min(lanesH, capH - GROUP_HEAD) : 0;
   const groupH = S.lanes.length ? GROUP_HEAD + groupBody : 0;
-  const numH = inner - groupH - (groupH ? 8 : 0);
+  const numH = inner - groupH - (groupH ? 8 : 0) - GUTTER_H - 4;
   const tracks = [];
   const list = S.stacked ? S.visible.map(i => [i]) : (S.visible.length ? [S.visible.slice()] : []);
   const gapY = 6;
   const th = list.length ? (numH - gapY * (list.length - 1)) / list.length : 0;
   list.forEach((members, k) => tracks.push({ members, y: top + k * (th + gapY), h: th }));
-  const gy = top + numH + 8;
+  const anomY = top + numH + 4;
+  const gy = anomY + GUTTER_H + 8;
   S.groupScroll = Math.max(0, Math.min(S.groupScroll, lanesH - groupBody));
-  return { top, px0, px1, pw: px1 - px0, tracks, numH, group: { y: gy, h: groupH, body: groupBody, content: lanesH }, axisY: H - AXIS_H };
+  return { top, px0, px1, pw: px1 - px0, tracks, numH, anom: { y: anomY, h: GUTTER_H }, group: { y: gy, h: groupH, body: groupBody, content: lanesH }, axisY: H - AXIS_H };
 }
 const X = (L, t) => L.px0 + (t - S.t0) / (S.t1 - S.t0) * L.pw;
 const T = (L, x) => S.t0 + (x - L.px0) / L.pw * (S.t1 - S.t0);
@@ -742,6 +745,9 @@ function renderTime() {
     ctx.fillText("No numeric channel shown. Choose some under Channels.", L.px0 + L.pw / 2, L.top + L.numH / 2);
     ctx.textAlign = "left";
   }
+
+  // anomaly gutter: NaN runs of the shown channels (outliers and skipped rows: v0.2, #236)
+  drawAnomalies(ctx, L);
 
   // state group
   if (L.group.h) drawGroup(ctx, L);
@@ -828,6 +834,25 @@ function drawSeries(ctx, L, col, yOf, color) {
     ctx.fillRect(L.px0 + c, y0, 1, Math.max(1.5, y1 - y0));
     pl = ol; ph = oh;
   }
+}
+function anomalyRuns() {
+  const out = [];
+  for (const idx of S.visible) for (const [a, b] of NUM[idx].nan) out.push([a, b, idx]);
+  return out;
+}
+function drawAnomalies(ctx, L) {
+  const a = L.anom;
+  ctx.font = `10.5px ${TOK.fontUi}`; ctx.fillStyle = TOK.ink3; ctx.textAlign = "left";
+  ctx.fillText("Anomalies", 10, a.y + a.h / 2);
+  ctx.fillStyle = TOK.sunk; ctx.fillRect(L.px0, a.y, L.pw, a.h);
+  ctx.save(); ctx.beginPath(); ctx.rect(L.px0, a.y, L.pw, a.h); ctx.clip();
+  for (const [t0, t1, idx] of anomalyRuns()) {
+    if (t1 < S.t0 || t0 > S.t1) continue;
+    const x0 = X(L, t0), x1 = X(L, t1);
+    // Never smaller than 2 px: a 5 ms hole stays visible at every zoom level.
+    ctx.fillStyle = colorOf(idx); ctx.fillRect(x0, a.y + 2, Math.max(2, x1 - x0), a.h - 4);
+  }
+  ctx.restore();
 }
 function drawGroup(ctx, L) {
   const g = L.group;
@@ -967,6 +992,22 @@ function updateHover() {
   } else {
     // lane under pointer?
     const g = L.group;
+    if (y >= L.anom.y && y < L.anom.y + L.anom.h) {
+      const hits = anomalyRuns().filter(([a, b]) => X(L, b) >= x - 3 && X(L, a) <= x + 3);
+      tip.append(el("div", "when", `${DATE} ${clock(t)}`));
+      if (!hits.length) tip.append(el("div", null, "No anomaly here"));
+      for (const [a, b, idx] of hits.slice(0, 6)) {
+        const row = el("div", "row"); const key = el("i", "key"); key.style.background = colorOf(idx);
+        row.append(key, el("span", "name", NUM[idx].name), el("span", "val", `missing ${fmtDuration(b - a)}`));
+        tip.append(row);
+      }
+      if (hits.length) tip.append(el("div", "note", `from ${clock(hits[0][0])} · click to jump (in the app)`));
+      tip.append(el("div", "note", "Outliers and skipped rows join this strip in v0.2 (#236)."));
+      tip.hidden = false;
+      const box = tv.getBoundingClientRect();
+      tip.style.left = `${Math.min(x + 16, box.width - tip.offsetWidth - 8)}px`; tip.style.top = `${y + 14}px`;
+      return;
+    }
     const lr = g.laneRects && y >= g.y + GROUP_HEAD && y < g.y + g.h ? g.laneRects.find(r => y >= r.y && y < r.y + r.h + 4) : null;
     if (lr) {
       const lane = lr.lane;

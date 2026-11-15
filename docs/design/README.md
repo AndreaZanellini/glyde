@@ -20,6 +20,7 @@ test, and pin the window to 1440 × 900. **What to review** lists every decision
 | How many | At most 8 numeric channels on screen, one per palette color. First 8 in file order on open; the inference bar counts the hidden ones | #230 |
 | State channels | At most 32 % of the time view; the group scrolls beyond that and collapses to one row. Text states 22 px, booleans 12 px, markers 22 px | #230 |
 | Gaps | Hatched across every track, length written on the axis | #230 |
+| Anomaly gutter | Its 12 px row is reserved now, under the numeric tracks. It marks the missing samples of the shown channels (at least 2 px wide); outliers and skipped rows join it in v0.2 | #236 |
 | Hover | One sample under the pointer: its exact value and timestamp. Many samples per pixel: their min–max range and how many | #196 |
 | Navigation | Zoom and pan act on time only; you cannot zoom out past the file | #197 |
 | Cursors | A and B across every track; right panel with Δt, 1/Δt and, per channel, A, B, ΔY, ΔY/Δt; each cursor snaps to the nearest sample | #231 |
@@ -51,6 +52,13 @@ carries its name, and the tooltip and cursor panel name each value.
 
 Sizes: toolbar 44 px, inference bar 34 px, status bar 26 px, name gutter 184 px, time axis 40 px,
 cursor panel 316 px. Type: 13 px UI, 11–12 px labels, 10.5–11 px monospaced figures.
+
+## What not to port
+
+Only the tokens, sizes and behaviour above are the reference. The page's drawing code is not:
+for example, it joins min/max columns by stretching each one over its neighbour's whole range,
+whereas the app keeps SPEC §3.1's connector from the previous column's last sample to this
+column's first (#147).
 
 ## Fonts
 
