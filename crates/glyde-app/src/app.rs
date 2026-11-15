@@ -700,6 +700,7 @@ mod tests {
             unloaded_columns: Vec::new(),
             replaced_sequences: 0,
             median_interval_seconds: Some(1.0),
+            gap_rule_repeated_timestamps: None,
             precision_loss_columns: Vec::new(),
         })
     }

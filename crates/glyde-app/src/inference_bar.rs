@@ -151,6 +151,9 @@ pub fn show(
                     report.sampling_class,
                     report.median_interval_seconds,
                 ));
+                if let Some(text) = gap_rule_text(report.gap_rule_repeated_timestamps) {
+                    ui.label(text);
+                }
                 if let Some(picked) = monotonicity_affordance(ui, report) {
                     correction = Some(picked);
                 }
@@ -624,6 +627,19 @@ fn sampling_text(class: SamplingClass, median_interval_seconds: Option<f64>) -> 
     format!("{label} · {estimate}")
 }
 
+/// Issue #188: when more than half the Δt are zero, the gap rule took the
+/// median of the non-zero steps, and the bar says so (Golden Rule 2).
+fn gap_rule_text(repeated_timestamps: Option<u64>) -> Option<String> {
+    repeated_timestamps.map(|count| {
+        let noun = if count == 1 {
+            "repeated timestamp"
+        } else {
+            "repeated timestamps"
+        };
+        format!("gap rule uses the median of non-zero steps ({count} {noun})")
+    })
+}
+
 /// `value` with four significant digits at most, trailing zeros dropped.
 fn four_significant(value: f64) -> String {
     let decimals = (3 - value.abs().log10().floor() as i32).clamp(0, 9) as usize;
@@ -845,6 +861,7 @@ mod tests {
             unloaded_columns: Vec::new(),
             replaced_sequences: 0,
             median_interval_seconds: Some(1.0),
+            gap_rule_repeated_timestamps: None,
             precision_loss_columns: Vec::new(),
         }
     }
@@ -976,6 +993,27 @@ mod tests {
             sampling_text(ProgressiveIndex, None),
             "sampling: ProgressiveIndex"
         );
+    }
+
+    // Issue #188: when more than half the Δt are zero, the gap rule took the
+    // median of the non-zero steps, and the bar says so.
+    #[test]
+    fn the_bar_says_when_the_gap_rule_skipped_repeated_timestamps() {
+        let mut report = sample_report(Confidence::High);
+        report.time_column.confidence = Confidence::Low; // keep the bar open
+        assert!(!rendered_texts(&report).contains("gap rule"));
+
+        report.gap_rule_repeated_timestamps = Some(810);
+        let texts = rendered_texts(&report);
+        assert!(
+            texts.contains("gap rule uses the median of non-zero steps (810 repeated timestamps)"),
+            "{texts}"
+        );
+        assert_eq!(
+            gap_rule_text(Some(1)).as_deref(),
+            Some("gap rule uses the median of non-zero steps (1 repeated timestamp)")
+        );
+        assert_eq!(gap_rule_text(None), None);
     }
 
     // Issue #209: bytes replaced with U+FFFD are reported next to the

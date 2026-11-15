@@ -213,6 +213,12 @@ pub struct InferenceReport {
     /// absolute time axis, or when it has no positive median (fewer than two
     /// samples, or mostly repeated timestamps).
     pub median_interval_seconds: Option<f64>,
+    /// Issue #188: `Some(N)` when more than half the Δt are zero (timestamps
+    /// coarser than the sampling, `N` repeated timestamps), so the gap rule
+    /// took the median of the non-zero steps instead of the median of all
+    /// of them, which would be 0 — the inference bar says so. `None` for
+    /// every other axis, and without an absolute time axis.
+    pub gap_rule_repeated_timestamps: Option<u64>,
     /// SPEC §1.4: "`i64` values beyond ±2⁵³ must not be converted to `f64`
     /// for rendering without being flagged ... in the inference bar" (issue
     /// #228). One entry per series column holding such a value, in header
@@ -758,6 +764,7 @@ pub(crate) fn build_summary_and_report(
     set_aside_empty_columns(&mut dataset, &mut source.unloaded_columns);
     let precision_loss = precision_loss_columns(&dataset);
     let mut median_interval_seconds = None;
+    let mut gap_rule_repeated_timestamps = None;
     let (
         time_column,
         timestamp_format,
@@ -780,6 +787,9 @@ pub(crate) fn build_summary_and_report(
                 .filter(|&median| median > 0.0)
                 .zip(timestamps.get(0))
                 .map(|(median, first)| median / first.unit.ticks_per_second() as f64);
+            gap_rule_repeated_timestamps = scan
+                .mostly_repeated
+                .then_some(stats.monotonicity.duplicate_count as u64);
             (
                 Some(dataset.time_column_name.clone()),
                 Some(timestamp_format_label(*format).to_string()),
@@ -887,6 +897,7 @@ pub(crate) fn build_summary_and_report(
         unloaded_columns: source.unloaded_columns,
         replaced_sequences: source.replaced_sequences,
         median_interval_seconds,
+        gap_rule_repeated_timestamps,
         precision_loss_columns: precision_loss,
     };
 
@@ -1135,6 +1146,25 @@ mod tests {
 
         assert_eq!(report.non_monotonic_count, 0);
         assert_eq!(report.duplicate_timestamp_count, 1);
+    }
+
+    // Issue #188: corpus case 63 has whole-second timestamps on a 10 Hz log,
+    // so 810 of its 899 Δt are zero. The bar must say the gap rule took the
+    // median of the non-zero steps instead; a file whose Δt are mostly
+    // non-zero (case 60) has nothing to explain.
+    #[test]
+    fn inference_report_says_when_repeated_timestamps_set_the_gap_rule() {
+        let (summary, report, _dataset) =
+            open_dataset(&corpus_path("case-63-repeated-timestamps-gap-median.csv"))
+                .expect("case 63 must open");
+        assert_eq!(summary.gap_count, 1);
+        assert_eq!(report.duplicate_timestamp_count, 810);
+        assert_eq!(report.gap_rule_repeated_timestamps, Some(810));
+
+        let (_summary, report, _dataset) =
+            open_dataset(&corpus_path("case-60-pathological-gap-median.csv"))
+                .expect("case 60 must open");
+        assert_eq!(report.gap_rule_repeated_timestamps, None);
     }
 
     // SPEC §2.1: "if the source carries [a timezone], honor it and display
