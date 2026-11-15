@@ -36,7 +36,7 @@
 //! column, render a 'multiple states' glyph that expands on zoom"): every
 //! lane is drawn one screen column at a time from
 //! [`glyde_core::series::ColumnGrid`] — a column touched by two or more
-//! states, or two or more events, is drawn as an orange "multiple" block or
+//! states, or two or more events, is drawn as a gray "multiple" block or
 //! tick whose tooltip says so, never as whichever state happened to be drawn
 //! last. Zooming in spreads the same states over more columns until each
 //! shows on its own. A lane
@@ -64,33 +64,32 @@ use glyde_core::series::{
 };
 
 use super::time::{
-    axis_bounds, format_x_axis_tick, seconds_to_tick, tick_to_seconds, SharedAxis,
-    TIME_AXIS_LINK_GROUP,
+    axis_bounds, seconds_to_tick, tick_to_seconds, SharedAxis, TIME_AXIS_LINK_GROUP,
 };
 
-/// Height, in points, of one lane.
-const LANE_HEIGHT: f32 = 36.0;
+/// Height, in points, of a text-state lane (issue #230, the approved
+/// mockup's `LANE_H.state`): tall enough for its band labels.
+const STATE_LANE_HEIGHT: f32 = 22.0;
+/// Height, in points, of an on/off lane: a thin strip.
+const BOOL_LANE_HEIGHT: f32 = 12.0;
+/// Height, in points, of an event-marker lane.
+const MARKER_LANE_HEIGHT: f32 = 22.0;
+/// Height, in points, of the state group's header row — all that is left
+/// of the group when it is collapsed.
+const GROUP_HEADER_HEIGHT: f32 = 22.0;
 
-/// Fill color for a `true` band. `egui`'s own default accent blue — matches
-/// nothing else drawn today, so an on/off lane never reads as a numeric
-/// series (`views::time::series_color`'s golden-ratio hue stepping is a
-/// different, per-series palette, deliberately not reused here since bands
-/// only ever need the two states, not N distinct series colors).
-const ON_COLOR: egui::Color32 = egui::Color32::from_rgb(66, 133, 244);
-/// Fill color for a `false` band — a neutral, visibly "off" gray.
-const OFF_COLOR: egui::Color32 = egui::Color32::from_gray(60);
-/// The "multiple states / events in this column" glyph (SPEC §4.3).
-const MIXED_COLOR: egui::Color32 = egui::Color32::from_rgb(205, 130, 45);
+/// The most of the time view the state group (its header and its lanes)
+/// takes from the plot above it (issue #230, the approved mockup's
+/// `STATE_CAP`); more lanes than fit scroll inside the group.
+pub const STATE_GROUP_SHARE: f32 = 0.32;
 
-/// The most of the window the lanes take from the plot above them; more
-/// lanes than fit scroll.
-const MAX_LANES_SHARE: f32 = 0.5;
-
-/// The legend under which the lanes are drawn: what the "multiple" glyph
-/// means and how to expand it.
-const COLLAPSE_LEGEND: &str = "Orange: several states or events share one screen column — \
+/// The state group header's tooltip: what the "multiple" glyph means and how
+/// to expand it. It used to be a permanent line above the lanes (issue
+/// #200).
+const COLLAPSE_LEGEND: &str = "A gray mark: several states or events share one screen column — \
      zoom in to see each one (Ctrl/⌘ + scroll or pinch to zoom, drag to pan). \
-     The lanes move with the plot above. Double-click to show the whole file.";
+     The lanes move with the plot above. Double-click to show the whole file.\n\
+     Click to collapse or expand the state channels.";
 
 /// The most cells a lane is rebuilt with for a zoomed-in window.
 const MAX_REFINE_CELLS: usize = 1 << 15;
@@ -230,9 +229,14 @@ impl LaneSlot {
 pub struct StateTimelineState {
     slots: HashMap<(usize, LaneKind), LaneSlot>,
     refiner: Option<LaneRefiner>,
-    /// How tall the lanes were last frame, in points; `None` before they
-    /// were first drawn.
+    /// How tall the state group was last frame, in points; `None` before
+    /// it was first drawn.
     height: Option<f32>,
+    /// How tall the whole time view was this frame ([`plot_above_lanes`]),
+    /// which the group's share is of.
+    view_height: Option<f32>,
+    /// Whether the user collapsed the group to its header row.
+    collapsed: bool,
 }
 
 impl StateTimelineState {
@@ -251,12 +255,28 @@ impl StateTimelineState {
     }
 
     /// How tall the time plot above the lanes is, out of `available`
-    /// points: what the lanes do not take — as tall as last frame, at most
-    /// [`MAX_LANES_SHARE`] of it — less `readout_row` for the plot's cursor
-    /// readout.
-    pub fn time_plot_height(&self, available: f32, readout_row: f32) -> f32 {
-        let lanes = self.height.unwrap_or(0.0).min(available * MAX_LANES_SHARE);
-        (available - lanes - readout_row).max(0.0)
+    /// points: what the state group does not take — as tall as last frame,
+    /// at most [`STATE_GROUP_SHARE`] of it — less `reserved` for the rows
+    /// that are always there (the time axis at the bottom).
+    pub fn time_plot_height(&self, available: f32, reserved: f32) -> f32 {
+        let lanes = self
+            .height
+            .unwrap_or(0.0)
+            .min(available * STATE_GROUP_SHARE);
+        (available - lanes - reserved).max(0.0)
+    }
+
+    /// Collapses the state group to its header row (`true`) or opens it.
+    pub fn set_collapsed(&mut self, collapsed: bool) {
+        if self.collapsed != collapsed {
+            tracing::info!(collapsed, "state channel group collapsed or expanded");
+        }
+        self.collapsed = collapsed;
+    }
+
+    /// Whether the state group is collapsed to its header row.
+    pub fn is_collapsed(&self) -> bool {
+        self.collapsed
     }
 
     /// How many lanes currently draw a rebuilt view.
@@ -365,18 +385,68 @@ fn spawn_refinement(
     }
 }
 
-/// Lays out `plot` — the time view — in `ui` above the state lanes drawn
-/// next with [`show`], leaving them the room they took last frame
-/// ([`StateTimelineState::time_plot_height`]): stacked, so both are on
-/// screen.
+/// Lays out `plot` — the time view — in `ui` above the state group drawn
+/// next with [`show`] and the time axis drawn last with
+/// [`super::time::show_time_axis`], leaving the group the room it took last
+/// frame ([`StateTimelineState::time_plot_height`]) and the axis its row:
+/// stacked, so all three are on screen, the axis at the bottom.
 pub fn plot_above_lanes<R>(
     ui: &mut egui::Ui,
-    lanes: &StateTimelineState,
+    lanes: &mut StateTimelineState,
     plot: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
-    let height = lanes.time_plot_height(ui.available_height(), ui.spacing().interact_size.y);
-    ui.allocate_ui(egui::vec2(ui.available_width(), height), plot)
-        .inner
+    let available = ui.available_height();
+    lanes.view_height = Some(available);
+    let spacing = ui.spacing().item_spacing.y;
+    let reserved = super::time::TIME_AXIS_HEIGHT + 3.0 * spacing;
+    let height = lanes.time_plot_height(available, reserved);
+    let width = ui.available_width();
+    ui.allocate_ui(egui::vec2(width, height), |ui| {
+        ui.set_min_size(egui::vec2(width, height));
+        plot(ui)
+    })
+    .inner
+}
+
+/// How tall a lane of `kind` is.
+fn lane_height(kind: LaneKind) -> f32 {
+    match kind {
+        LaneKind::Bool => BOOL_LANE_HEIGHT,
+        LaneKind::State => STATE_LANE_HEIGHT,
+        LaneKind::Markers => MARKER_LANE_HEIGHT,
+    }
+}
+
+/// The state group's header row: how many state channels there are, and a
+/// click to collapse the group to this row or open it again. Its tooltip
+/// explains the "multiple" glyph.
+fn group_header(ui: &mut egui::Ui, count: usize, state: &mut StateTimelineState) {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), GROUP_HEADER_HEIGHT),
+        egui::Sense::click(),
+    );
+    let response = response.on_hover_text(COLLAPSE_LEGEND);
+    if response.clicked() {
+        state.set_collapsed(!state.collapsed);
+    }
+    let icon = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        egui::vec2(10.0, 10.0),
+    );
+    let mut icon_ui = ui.new_child(egui::UiBuilder::new().max_rect(icon));
+    egui::collapsing_header::paint_default_icon(
+        &mut icon_ui,
+        if state.collapsed { 0.0 } else { 1.0 },
+        &response,
+    );
+    let plural = if count == 1 { "" } else { "s" };
+    ui.painter().text(
+        egui::pos2(rect.left() + 20.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{count} state channel{plural}"),
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.visuals().text_color(),
+    );
 }
 
 /// Renders `dataset`'s state lanes (SPEC §4.3) into `ui`, one
@@ -398,7 +468,6 @@ pub fn plot_above_lanes<R>(
 pub fn show(
     ui: &mut egui::Ui,
     dataset: &Dataset,
-    ticks: &[i128],
     bool_bands: &[Option<BoolLane>],
     state_lanes: &[Option<StateLane>],
     marker_lanes: &[Option<MarkerColumn>],
@@ -418,24 +487,46 @@ pub fn show(
         return;
     };
     let axis = shared.map_or_else(|| axis_bounds(min_tick, max_tick, time), |s| s.fit);
-    let output = egui::ScrollArea::vertical()
-        .id_salt("state_timeline_lanes")
-        .auto_shrink([false, true])
-        .max_height(ui.available_height())
-        .show(ui, |ui| {
-            show_lanes(
-                ui,
-                dataset,
-                ticks,
-                bool_bands,
-                state_lanes,
-                marker_lanes,
-                axis,
-                shared,
-                state,
-            );
-        });
-    let height = output.content_size.y;
+    let count = (0..dataset.columns.len())
+        .filter(|&index| {
+            [
+                bool_bands.get(index).is_some_and(Option::is_some),
+                state_lanes.get(index).is_some_and(Option::is_some),
+                marker_lanes.get(index).is_some_and(Option::is_some),
+            ]
+            .contains(&true)
+        })
+        .count();
+    let spacing = ui.spacing().item_spacing.y;
+    // At most its share of the time view; this frame, also never over the
+    // time axis under it (the plot above makes the room next frame).
+    let view = state.view_height.unwrap_or_else(|| ui.available_height());
+    let share = (view * STATE_GROUP_SHARE - GROUP_HEADER_HEIGHT - 2.0 * spacing).max(0.0);
+    let room =
+        ui.available_height() - super::time::TIME_AXIS_HEIGHT - GROUP_HEADER_HEIGHT - 3.0 * spacing;
+    group_header(ui, count, state);
+    let mut height = GROUP_HEADER_HEIGHT;
+    if !state.collapsed {
+        let output = egui::ScrollArea::vertical()
+            .id_salt("state_timeline_lanes")
+            .auto_shrink([false, true])
+            .max_height(share.min(room).max(0.0))
+            .show(ui, |ui| {
+                show_lanes(
+                    ui,
+                    dataset,
+                    bool_bands,
+                    state_lanes,
+                    marker_lanes,
+                    axis,
+                    shared,
+                    state,
+                );
+            });
+        // What the group wants, not what fitted this frame: measuring the
+        // clipped height would keep the plot from ever giving room back.
+        height += spacing + output.content_size.y.min(share);
+    }
     if state.height.is_none_or(|last| (last - height).abs() > 0.5) {
         // The plot above takes its room from this: lay it out again.
         state.height = Some(height);
@@ -443,12 +534,12 @@ pub fn show(
     }
 }
 
-/// The legend and every lane, inside [`show`]'s scroll area.
+/// Every lane, inside [`show`]'s scroll area: one row each, its name in
+/// the gutter left of the plot's frame and the lane over exactly that frame.
 #[allow(clippy::too_many_arguments)]
 fn show_lanes(
     ui: &mut egui::Ui,
     dataset: &Dataset,
-    ticks: &[i128],
     bool_bands: &[Option<BoolLane>],
     state_lanes: &[Option<StateLane>],
     marker_lanes: &[Option<MarkerColumn>],
@@ -457,54 +548,58 @@ fn show_lanes(
     state: &mut StateTimelineState,
 ) {
     let time = &dataset.time;
-    ui.weak(COLLAPSE_LEGEND);
-
     for (index, series) in dataset.columns.iter().enumerate() {
         let states = state_lanes.get(index).and_then(Option::as_ref);
         let markers = marker_lanes.get(index).and_then(Option::as_ref);
         let bools = bool_bands.get(index).and_then(Option::as_ref);
-        let lane = match (states, markers, bools) {
-            (Some(states), Some(markers), _) => {
-                ui.label(series.name());
-                if string_lane_toggle(ui, index, series.name(), markers) {
-                    LaneRef::Markers(&markers.lane)
-                } else {
-                    LaneRef::State(states)
-                }
-            }
-            (None, Some(markers), _) => {
-                ui.label(series.name());
-                LaneRef::Markers(&markers.lane)
-            }
-            (Some(states), None, _) => {
-                ui.label(series.name());
-                LaneRef::State(states)
-            }
-            (None, None, Some(bools)) => {
-                ui.label(series.name());
-                LaneRef::Bool(bools)
-            }
-            (None, None, None) => continue,
-        };
-        match shared {
-            // Over exactly the plot's frame: the same x, the same pixel.
-            Some(shared) => {
-                ui.horizontal(|ui| {
-                    ui.add_space((shared.left - ui.cursor().left()).max(0.0));
-                    show_lane(
-                        ui,
-                        index,
-                        lane,
-                        ticks,
-                        time,
-                        axis,
-                        Some(shared.width),
-                        state,
-                    );
-                });
-            }
-            None => show_lane(ui, index, lane, ticks, time, axis, None, state),
+        if states.is_none() && markers.is_none() && bools.is_none() {
+            continue;
         }
+        let row_left = ui.cursor().left();
+        // Over exactly the plot's frame: the same x, the same pixel. With no
+        // plot, the gutter is as wide as the plot's would be.
+        let (left, width) = match shared {
+            Some(shared) => (shared.left, shared.width),
+            None => (
+                row_left + super::time::NAME_GUTTER,
+                (ui.available_width() - super::time::NAME_GUTTER).max(1.0),
+            ),
+        };
+        ui.horizontal(|ui| {
+            let gutter = (left - row_left - ui.spacing().item_spacing.x).max(0.0);
+            let lane = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(gutter, GROUP_HEADER_HEIGHT),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        ui.set_width(gutter);
+                        let lane = match (states, markers, bools) {
+                            (Some(states), Some(markers), _) => {
+                                if string_lane_toggle(ui, index, series.name(), markers) {
+                                    LaneRef::Markers(&markers.lane)
+                                } else {
+                                    LaneRef::State(states)
+                                }
+                            }
+                            (None, Some(markers), _) => LaneRef::Markers(&markers.lane),
+                            (Some(states), None, _) => LaneRef::State(states),
+                            (_, _, bools) => {
+                                LaneRef::Bool(bools.expect("a column with no lane was skipped"))
+                            }
+                        };
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(series.name()).small())
+                                    .truncate(),
+                            );
+                        });
+                        lane
+                    },
+                )
+                .inner;
+            ui.add_space((left - ui.cursor().left()).max(0.0));
+            show_lane(ui, index, lane, time, axis, width, state);
+        });
     }
 }
 
@@ -579,17 +674,16 @@ fn lane_labels(lane: LaneRef<'_>) -> Labels<'_> {
 }
 
 /// Draws one lane as a horizontally zoomable plot sharing the time plot's
-/// x axis, `width` points wide (the available width when `None`),
-/// collapsing it onto this frame's screen columns.
-#[allow(clippy::too_many_arguments)]
+/// x axis, `width` points wide, collapsing it onto this frame's screen
+/// columns. It has no axis of its own: the time axis is the one at the
+/// bottom of the time view ([`super::time::show_time_axis`]).
 fn show_lane(
     ui: &mut egui::Ui,
     index: usize,
     base: LaneRef<'_>,
-    ticks: &[i128],
     time: &TimeAxis,
     axis: (f64, f64),
-    width: Option<f32>,
+    width: f32,
     state: &mut StateTimelineState,
 ) {
     let kind = match base {
@@ -602,12 +696,13 @@ fn show_lane(
         LaneKind::Bool | LaneKind::State => format!("state_timeline_{index}"),
     };
     let mut hover = None;
-    let mut plot = Plot::new(id).height(LANE_HEIGHT);
-    if let Some(width) = width {
-        plot = plot.width(width);
-    }
-    let response = plot
-        .show_axes([true, false])
+    let palette = crate::theme::palette(ui.visuals());
+    let response = Plot::new(id)
+        .height(lane_height(kind))
+        .width(width)
+        .show_axes([false, false])
+        .show_x(false)
+        .show_y(false)
         .show_grid([false, false])
         .allow_zoom([true, false])
         .allow_scroll([true, false])
@@ -623,7 +718,6 @@ fn show_lane(
         .include_y(0.0)
         .include_y(1.0)
         .set_margin_fraction(egui::Vec2::ZERO)
-        .x_axis_formatter(move |mark, _range| format_x_axis_tick(ticks, mark, time))
         .show(ui, |plot_ui| {
             let x_range = if plot_ui.auto_bounds().x {
                 axis
@@ -639,11 +733,13 @@ fn show_lane(
             let drawn = match lane {
                 LaneRef::Bool(lane) => {
                     let cells = lane.collapse(&view.grid);
-                    draw_cells(plot_ui, &view, &cells, |id| {
+                    // The mockup's on/off strip: on is a filled strip, off a
+                    // hairline through the middle.
+                    draw_cells(plot_ui, &view, &cells, palette, |id| {
                         if id == BOOL_ON_ID {
-                            ON_COLOR
+                            Fill::Band(palette.bool_on)
                         } else {
-                            OFF_COLOR
+                            Fill::Hairline(palette.line)
                         }
                     });
                     Drawn::Cells {
@@ -654,13 +750,15 @@ fn show_lane(
                 LaneRef::State(states) => {
                     let cells = states.collapse(&view.grid);
                     let labels = lane_labels(lane);
-                    draw_cells(plot_ui, &view, &cells, label_color);
-                    draw_labels(plot_ui, &view, &cells, &labels, seconds_per_point);
+                    draw_cells(plot_ui, &view, &cells, palette, |id| {
+                        Fill::Band(state_tint(palette, id))
+                    });
+                    draw_labels(plot_ui, &view, &cells, &labels, seconds_per_point, palette);
                     Drawn::Cells { cells, labels }
                 }
                 LaneRef::Markers(markers) => {
                     let counts = markers.collapse(&view.grid);
-                    draw_markers(plot_ui, &view, &counts);
+                    draw_markers(plot_ui, &view, &counts, palette);
                     Drawn::Markers {
                         counts,
                         lane: markers,
@@ -708,20 +806,33 @@ fn is_visibly_different(drawn: (f64, f64), shown: (f64, f64), width: f32) -> boo
     (drawn.0 - shown.0).abs() >= half_column || (drawn.1 - shown.1).abs() >= half_column
 }
 
-/// Fills each run of equal columns, `Mixed` ones in the "multiple" color.
+/// How one state's run is drawn.
+#[derive(Debug, Clone, Copy)]
+enum Fill {
+    /// A band filling the lane's height.
+    Band(egui::Color32),
+    /// A thin line through the lane's middle (an "off" stretch).
+    Hairline(egui::Color32),
+}
+
+/// Fills each run of equal columns, `Mixed` ones as the "multiple" glyph.
 fn draw_cells(
     plot_ui: &mut egui_plot::PlotUi,
     view: &ViewColumns,
     cells: &[StateCell],
-    color: impl Fn(u32) -> egui::Color32,
+    palette: &crate::theme::Palette,
+    fill: impl Fn(u32) -> Fill,
 ) {
     for (first, end, cell) in cell_runs(cells) {
-        let fill = match cell {
-            StateCell::Empty => continue,
-            StateCell::Single(id) => color(id),
-            StateCell::Mixed => MIXED_COLOR,
-        };
-        fill_rect(plot_ui, view.x(first), view.x(end), fill);
+        let (x0, x1) = (view.x(first), view.x(end));
+        match cell {
+            StateCell::Empty => {}
+            StateCell::Single(id) => match fill(id) {
+                Fill::Band(color) => fill_rect(plot_ui, x0, x1, (0.0, 1.0), color),
+                Fill::Hairline(color) => fill_rect(plot_ui, x0, x1, (0.45, 0.55), color),
+            },
+            StateCell::Mixed => fill_rect(plot_ui, x0, x1, (0.0, 1.0), palette.ink_3),
+        }
     }
 }
 
@@ -752,6 +863,7 @@ fn draw_labels(
     cells: &[StateCell],
     labels: &Labels<'_>,
     seconds_per_point: f64,
+    palette: &crate::theme::Palette,
 ) {
     for (first, end, cell) in cell_runs(cells) {
         let StateCell::Single(id) = cell else {
@@ -767,7 +879,7 @@ fn draw_labels(
             plot_ui.text(
                 Text::new(
                     PlotPoint::new((x0 + x1) / 2.0, 0.5),
-                    egui::RichText::new(*label).color(egui::Color32::WHITE),
+                    egui::RichText::new(*label).small().color(palette.ink),
                 )
                 .anchor(egui::Align2::CENTER_CENTER),
             );
@@ -775,22 +887,24 @@ fn draw_labels(
     }
 }
 
-/// Color of a single marker tick.
-const MARKER_COLOR: egui::Color32 = egui::Color32::from_rgb(235, 190, 60);
-
 /// One full-height tick per column holding any event (SPEC §4.3: "always
 /// visible regardless of zoom"), in the "multiple" color and wider where a
 /// column holds several.
-fn draw_markers(plot_ui: &mut egui_plot::PlotUi, view: &ViewColumns, counts: &[u32]) {
+fn draw_markers(
+    plot_ui: &mut egui_plot::PlotUi,
+    view: &ViewColumns,
+    counts: &[u32],
+    palette: &crate::theme::Palette,
+) {
     for (column, &count) in counts.iter().enumerate() {
         if count == 0 {
             continue;
         }
         let x = (view.x(column) + view.x(column + 1)) / 2.0;
         let (color, width) = if count > 1 {
-            (MIXED_COLOR, 3.0_f32)
+            (palette.ink_3, 3.0_f32)
         } else {
-            (MARKER_COLOR, 2.0_f32)
+            (palette.ink, 2.0_f32)
         };
         plot_ui.vline(VLine::new(x).color(color).width(width));
     }
@@ -833,13 +947,21 @@ fn hover_text(
     }
 }
 
-fn fill_rect(plot_ui: &mut egui_plot::PlotUi, x0: f64, x1: f64, color: egui::Color32) {
+/// Fills plot-x `x0..x1` between lane heights `y0..y1` (0 is the lane's
+/// bottom, 1 its top).
+fn fill_rect(
+    plot_ui: &mut egui_plot::PlotUi,
+    x0: f64,
+    x1: f64,
+    (y0, y1): (f64, f64),
+    color: egui::Color32,
+) {
     plot_ui.polygon(
         Polygon::new(PlotPoints::new(vec![
-            [x0, 0.0],
-            [x1, 0.0],
-            [x1, 1.0],
-            [x0, 1.0],
+            [x0, y0],
+            [x1, y0],
+            [x1, y1],
+            [x0, y1],
         ]))
         .fill_color(color)
         .stroke(egui::Stroke::NONE),
@@ -962,33 +1084,52 @@ pub fn refine_lane<'d>(
     }
 }
 
-/// Header line for a `string` column that can be drawn either way, and the
-/// one-click switch between the two; returns whether to draw it as markers.
-/// The choice starts at the inferred view and is remembered per column for
-/// the session (`egui` temp memory).
+/// The switch of a `string` column that can be drawn either way, in its
+/// lane's gutter: it names what is drawn and changes it in one click, and
+/// its tooltip says what was inferred and why. Returns whether to draw the
+/// column as markers. The choice starts at the inferred view and is
+/// remembered per column for the session (`egui` temp memory).
 fn string_lane_toggle(ui: &mut egui::Ui, index: usize, name: &str, markers: &MarkerColumn) -> bool {
     let inferred = markers.inferred_as_markers();
     let id = egui::Id::new(("string_lane_as_markers", index, name, markers.rows));
     let mut as_markers = ui.data_mut(|data| *data.get_temp_mut_or(id, inferred));
-    ui.horizontal(|ui| {
-        ui.weak(string_lane_notice(inferred, as_markers, markers));
-        let button = if as_markers {
-            "Show as state bands"
-        } else {
-            "Show as events"
-        };
-        if ui.small_button(button).clicked() {
-            as_markers = !as_markers;
-            ui.data_mut(|data| data.insert_temp(id, as_markers));
-            tracing::info!(
-                column = name,
-                as_markers,
-                inferred_as_markers = inferred,
-                "user switched how a text column is drawn"
-            );
-        }
-    });
+    let (label, tooltip) = string_lane_switch(inferred, as_markers, markers);
+    if ui
+        .add(egui::Button::new(egui::RichText::new(label).small()).small())
+        .on_hover_text(tooltip)
+        .clicked()
+    {
+        as_markers = !as_markers;
+        ui.data_mut(|data| data.insert_temp(id, as_markers));
+        tracing::info!(
+            column = name,
+            as_markers,
+            inferred_as_markers = inferred,
+            "user switched how a text column is drawn"
+        );
+    }
     as_markers
+}
+
+/// A switchable `string` lane's switch: its label (what is drawn) and its
+/// tooltip ([`string_lane_notice`], then what a click does).
+fn string_lane_switch(
+    inferred: bool,
+    as_markers: bool,
+    markers: &MarkerColumn,
+) -> (&'static str, String) {
+    let (label, other) = if as_markers {
+        ("events", "state bands")
+    } else {
+        ("bands", "events")
+    };
+    (
+        label,
+        format!(
+            "{}\nClick to draw as {other}",
+            string_lane_notice(inferred, as_markers, markers)
+        ),
+    )
 }
 
 /// What the header of a switchable `string` lane says: what is drawn, and
@@ -1154,11 +1295,11 @@ fn bool_bands_from_spilled(
     builder.finish_lane()
 }
 
-/// A stable, readable fill for `label`, so the same state is the same color
-/// everywhere and across files.
-fn label_color(label_id: u32) -> egui::Color32 {
-    let hue = (f64::from(label_id) * 0.618_033_988_75).fract() as f32;
-    egui::ecolor::Hsva::new(hue, 0.55, 0.55, 1.0).into()
+/// The tint under state `label_id`'s bands — one of the theme's six, the
+/// same for the same state everywhere and across files, with an ink label
+/// on top that stays readable on each (checked in `crate::theme`).
+fn state_tint(palette: &crate::theme::Palette, label_id: u32) -> egui::Color32 {
+    palette.state_tints[label_id as usize % palette.state_tints.len()]
 }
 
 /// Builds `state_lanes` for [`show`]: `dataset.columns`-parallel, `Some` for
@@ -1242,18 +1383,52 @@ mod render_tests {
         lanes_state: &mut StateTimelineState,
         focus: Option<(f64, f64)>,
     ) {
+        time_view_frame(
+            ctx,
+            dataset,
+            time_state,
+            lanes_state,
+            focus,
+            egui::vec2(800.0, 600.0),
+            None,
+        );
+    }
+
+    /// One frame of the whole time view — the plot, the state group under
+    /// it and the one time axis at the bottom — laid out the way the app
+    /// does it, in a `size` window, with the pointer at `pointer`.
+    fn time_view_frame(
+        ctx: &egui::Context,
+        dataset: &Dataset,
+        time_state: &mut super::super::time::TimeViewState,
+        lanes_state: &mut StateTimelineState,
+        focus: Option<(f64, f64)>,
+        size: egui::Vec2,
+        pointer: Option<egui::Pos2>,
+    ) -> egui::FullOutput {
         let ticks = dataset.time.to_pyramid_ticks().into_owned();
         let pyramids = glyde_core::ingest::pyramids_for_dataset(dataset);
         let samples = super::super::time::cache_column_samples(dataset);
         let bools = cache_bool_bands(dataset, &ticks);
+        let states = cache_state_lanes(dataset, &ticks);
+        let markers = cache_marker_lanes(dataset, &ticks);
+        let cursor = super::super::time::CursorLookup::for_time(&dataset.time);
+        let fit = super::super::time::FitBounds::for_dataset(
+            dataset,
+            &pyramids,
+            &ticks,
+            &samples,
+            &[],
+            cursor.is_sorted(),
+        );
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(800.0, 600.0),
-            )),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events: pointer
+                .map(|pos| vec![egui::Event::PointerMoved(pos)])
+                .unwrap_or_default(),
             ..Default::default()
         };
-        let _ = ctx.run(input, |ctx| {
+        ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 plot_above_lanes(ui, lanes_state, |ui| {
                     super::super::time::show_with_selection(
@@ -1263,15 +1438,8 @@ mod render_tests {
                         &ticks,
                         &samples,
                         &[],
-                        &super::super::time::CursorLookup::for_time(&dataset.time),
-                        &super::super::time::FitBounds::for_dataset(
-                            dataset,
-                            &pyramids,
-                            &ticks,
-                            &samples,
-                            &[],
-                            super::super::time::CursorLookup::for_time(&dataset.time).is_sorted(),
-                        ),
+                        &cursor,
+                        &fit,
                         time_state,
                         focus,
                     )
@@ -1279,15 +1447,340 @@ mod render_tests {
                 show(
                     ui,
                     dataset,
-                    &ticks,
                     &bools,
-                    &[],
-                    &[],
+                    &states,
+                    &markers,
                     time_state.shared_axis(),
                     lanes_state,
                 );
+                super::super::time::show_time_axis(ui, &dataset.time, &ticks, &fit, time_state);
             });
-        });
+        })
+    }
+
+    /// One numeric column, then `bools` on/off columns and `texts` text
+    /// columns with a state on every row, over 200 one-second rows.
+    fn layout_dataset(bools: usize, texts: usize) -> Dataset {
+        let rows = 200;
+        let mut columns = vec![Series::new(
+            "speed",
+            SeriesValues::F64((0..rows).map(|row| (row % 17) as f64).collect()),
+        )];
+        for lane in 0..bools {
+            columns.push(Series::new(
+                format!("flag{lane}"),
+                SeriesValues::Bool((0..rows).map(|row| (row / (lane + 3)) % 2 == 0).collect()),
+            ));
+        }
+        for lane in 0..texts {
+            columns.push(Series::new(
+                format!("mode{lane}"),
+                SeriesValues::String(
+                    (0..rows)
+                        .map(|row| ["IDLE", "RUNNING", "FAULT"][(row / (lane + 20)) % 3].to_owned())
+                        .collect(),
+                ),
+            ));
+        }
+        Dataset {
+            time: TimeAxis::Absolute {
+                timestamps: (0..rows as i64)
+                    .map(|second| {
+                        Timestamp::new(1_700_000_000 + i128::from(second), TimeUnit::Seconds)
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+                format: TimestampFormat::EpochSeconds,
+            },
+            time_column_name: "timestamp".to_string(),
+            columns,
+        }
+    }
+
+    /// Every text painted in `output`, with where it was painted.
+    fn painted_texts(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::Shape, texts: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, texts)),
+                egui::Shape::Text(text) => texts.push((
+                    text.galley.text().to_owned(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                )),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    const LAPTOP: egui::Vec2 = egui::vec2(1440.0, 900.0);
+
+    /// Issue #230's "done when": at 1440 x 900, with 0, 4 and 20 state
+    /// channels, the numeric plot keeps its share of the time view; the
+    /// state group never takes more than [`STATE_GROUP_SHARE`] of it, and
+    /// the one time axis is the last track, inside the window.
+    #[test]
+    fn the_plot_keeps_its_share_at_1440x900_with_0_4_and_20_state_channels() {
+        for (bools, texts) in [(0, 0), (2, 2), (10, 10)] {
+            let channels = bools + texts;
+            let dataset = layout_dataset(bools, texts);
+            let ctx = egui::Context::default();
+            let mut time_state = super::super::time::TimeViewState::default();
+            let mut lanes_state = StateTimelineState::default();
+            for _ in 0..4 {
+                time_view_frame(
+                    &ctx,
+                    &dataset,
+                    &mut time_state,
+                    &mut lanes_state,
+                    None,
+                    LAPTOP,
+                    None,
+                );
+            }
+
+            let plot = time_state.shared_axis().expect("the plot is drawn").frame;
+            let axis = super::super::time::time_axis_rect(&ctx).expect("the time axis is drawn");
+            let group = lanes_state.height.expect("the group was measured");
+            assert!(
+                group <= STATE_GROUP_SHARE * LAPTOP.y,
+                "{channels} channels: the state group takes {group} points"
+            );
+            let least = if channels == 0 { 0.8 } else { 0.55 };
+            assert!(
+                plot.height() >= least * LAPTOP.y,
+                "{channels} channels: the plot keeps only {} of {} points",
+                plot.height(),
+                LAPTOP.y
+            );
+            assert!(
+                axis.top() >= plot.bottom() + group - 1.0 && axis.bottom() <= LAPTOP.y,
+                "{channels} channels: the axis {axis:?} is the last track (plot {plot:?})"
+            );
+            if channels > 0 {
+                let first = lane_view(&ctx, 1).expect("the first lane is drawn");
+                assert!(first.top >= plot.bottom() && first.bottom <= axis.top());
+            }
+        }
+    }
+
+    // Issue #200: the time-axis labels were repeated under every lane. Now
+    // only the time axis at the bottom has them: no text is painted twice,
+    // and the axis track carries the time labels.
+    #[test]
+    fn the_time_labels_are_painted_once_on_the_bottom_axis() {
+        let dataset = layout_dataset(4, 0);
+        let ctx = egui::Context::default();
+        let mut time_state = super::super::time::TimeViewState::default();
+        let mut lanes_state = StateTimelineState::default();
+        let mut output = None;
+        for _ in 0..4 {
+            output = Some(time_view_frame(
+                &ctx,
+                &dataset,
+                &mut time_state,
+                &mut lanes_state,
+                None,
+                LAPTOP,
+                None,
+            ));
+        }
+        let texts = painted_texts(&output.unwrap());
+        let axis = super::super::time::time_axis_rect(&ctx).expect("the time axis is drawn");
+        let mut seen = std::collections::HashSet::new();
+        for (text, _) in texts.iter().filter(|(text, _)| !text.trim().is_empty()) {
+            assert!(seen.insert(text.as_str()), "{text:?} is painted twice");
+        }
+        for name in ["flag0", "flag1", "flag2", "flag3"] {
+            assert!(seen.contains(name), "{name} is on screen: {texts:?}");
+        }
+        let on_axis = texts
+            .iter()
+            .filter(|(text, rect)| !text.is_empty() && axis.y_range().contains(rect.center().y))
+            .count();
+        assert!(on_axis >= 2, "the axis {axis:?} has its labels: {texts:?}");
+    }
+
+    // Issue #230: compact lanes — text states 22 points, booleans 12 — laid
+    // over exactly the plot's frame, with their names in the gutter to its
+    // left instead of a header row each.
+    #[test]
+    fn lanes_are_compact_with_their_names_in_the_gutter() {
+        let dataset = layout_dataset(1, 1);
+        let ctx = egui::Context::default();
+        let mut time_state = super::super::time::TimeViewState::default();
+        let mut lanes_state = StateTimelineState::default();
+        let mut output = None;
+        for _ in 0..4 {
+            output = Some(time_view_frame(
+                &ctx,
+                &dataset,
+                &mut time_state,
+                &mut lanes_state,
+                None,
+                LAPTOP,
+                None,
+            ));
+        }
+        let shared = time_state.shared_axis().expect("the plot is drawn");
+        assert!(shared.left >= super::super::time::NAME_GUTTER);
+        for (index, name, height) in [
+            (1, "flag0", BOOL_LANE_HEIGHT),
+            (2, "mode0", STATE_LANE_HEIGHT),
+        ] {
+            let lane = lane_view(&ctx, index).expect("the lane is drawn");
+            assert_eq!(lane.bottom - lane.top, height, "{name}");
+            assert_eq!(
+                (lane.left, lane.width),
+                (shared.left, shared.width),
+                "{name}"
+            );
+            let texts = painted_texts(output.as_ref().unwrap());
+            let (_, rect) = texts
+                .iter()
+                .find(|(text, _)| text == name)
+                .unwrap_or_else(|| panic!("{name} is named: {texts:?}"));
+            assert!(rect.right() <= shared.left, "{name} sits in the gutter");
+            assert!(
+                rect.center().y >= lane.top - 4.0 && rect.center().y <= lane.bottom + 4.0,
+                "{name} is on its lane's row"
+            );
+        }
+    }
+
+    /// Every fill color painted in `output`.
+    fn painted_fills(output: &egui::FullOutput) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, fills: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, fills)),
+                egui::Shape::Path(path) => fills.push(path.fill),
+                egui::Shape::Rect(rect) => fills.push(rect.fill),
+                _ => {}
+            }
+        }
+        let mut fills = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut fills);
+        }
+        fills
+    }
+
+    // Issue #230 / #229: the lanes are drawn in the approved mockup's
+    // tokens, in both themes — a strip in `bool_on` for on, pale tints under
+    // text states, which are now tall enough to carry them.
+    #[test]
+    fn lanes_are_drawn_in_the_themes_state_tokens() {
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let dataset = layout_dataset(1, 1);
+            let ctx = egui::Context::default();
+            ctx.set_visuals(crate::theme::visuals(theme));
+            let palette = *crate::theme::palette(&ctx.style().visuals);
+            let mut time_state = super::super::time::TimeViewState::default();
+            let mut lanes_state = StateTimelineState::default();
+            let mut output = None;
+            for _ in 0..4 {
+                output = Some(time_view_frame(
+                    &ctx,
+                    &dataset,
+                    &mut time_state,
+                    &mut lanes_state,
+                    None,
+                    LAPTOP,
+                    None,
+                ));
+            }
+            let fills = painted_fills(output.as_ref().unwrap());
+            assert!(fills.contains(&palette.bool_on), "{theme:?}: on strip");
+            assert!(
+                palette.state_tints.iter().any(|tint| fills.contains(tint)),
+                "{theme:?}: state tints"
+            );
+        }
+    }
+
+    // Issue #230: the group collapses to its one header row, which gives the
+    // room back to the plot. The "multiple" glyph's explanation is the header's
+    // tooltip, no longer a line of its own (issue #200).
+    #[test]
+    fn the_state_group_collapses_to_one_row() {
+        let dataset = layout_dataset(2, 2);
+        let ctx = egui::Context::default();
+        let mut time_state = super::super::time::TimeViewState::default();
+        let mut lanes_state = StateTimelineState::default();
+        let run = |time_state: &mut _, lanes_state: &mut _| {
+            let mut output = None;
+            for _ in 0..4 {
+                output = Some(time_view_frame(
+                    &ctx,
+                    &dataset,
+                    time_state,
+                    lanes_state,
+                    None,
+                    LAPTOP,
+                    None,
+                ));
+            }
+            painted_texts(&output.unwrap())
+        };
+        let texts = run(&mut time_state, &mut lanes_state);
+        let open_plot = time_state.shared_axis().unwrap().frame.height();
+        assert!(
+            texts.iter().any(|(t, _)| t.contains("4 state channels")),
+            "{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|(t, _)| t.contains("gray mark")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|(t, _)| t == "flag0"));
+
+        lanes_state.set_collapsed(true);
+        let texts = run(&mut time_state, &mut lanes_state);
+        let group = lanes_state.height.unwrap();
+        assert!(
+            group <= GROUP_HEADER_HEIGHT + 1.0,
+            "collapsed to {group} points"
+        );
+        assert!(time_state.shared_axis().unwrap().frame.height() > open_plot);
+        assert!(
+            texts.iter().any(|(t, _)| t.contains("4 state channels")),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|(t, _)| t == "flag0"), "{texts:?}");
+    }
+
+    // Issue #200: the cursor readout appearing under the pointer used to
+    // push every lane down a row. Its row is reserved: hovering the plot
+    // moves nothing.
+    #[test]
+    fn hovering_the_plot_moves_no_track() {
+        let dataset = layout_dataset(2, 0);
+        let ctx = egui::Context::default();
+        let mut time_state = super::super::time::TimeViewState::default();
+        let mut lanes_state = StateTimelineState::default();
+        let mut frame = |pointer| {
+            for _ in 0..4 {
+                time_view_frame(
+                    &ctx,
+                    &dataset,
+                    &mut time_state,
+                    &mut lanes_state,
+                    None,
+                    LAPTOP,
+                    pointer,
+                );
+            }
+            (
+                lane_view(&ctx, 1).expect("lane drawn"),
+                super::super::time::time_axis_rect(&ctx).expect("axis drawn"),
+            )
+        };
+        let still = frame(None);
+        let hovered = frame(Some(egui::pos2(700.0, 300.0)));
+        assert_eq!((still.0.top, still.1), (hovered.0.top, hovered.1));
     }
 
     fn assert_close(actual: (f64, f64), expected: (f64, f64)) {
@@ -1378,7 +1871,6 @@ mod render_tests {
                 show(
                     ui,
                     &dataset,
-                    &ticks,
                     &lanes,
                     &[],
                     &[],
@@ -1414,7 +1906,6 @@ mod render_tests {
                 show(
                     ui,
                     &dataset,
-                    &ticks,
                     &bool_bands,
                     &[],
                     &[],
@@ -1456,7 +1947,6 @@ mod render_tests {
                 show(
                     ui,
                     &dataset,
-                    &ticks,
                     &[],
                     &lanes,
                     &[],
@@ -1598,7 +2088,6 @@ mod render_tests {
                 show(
                     ui,
                     dataset,
-                    ticks,
                     &[],
                     &state,
                     &markers,
@@ -1622,16 +2111,49 @@ mod render_tests {
         let dataset = sparse_and_dense_string_dataset();
         let ticks = dataset.time.to_pyramid_ticks().into_owned();
         let texts = rendered_lane_texts(&dataset, &ticks);
-        assert!(
-            texts.contains("Drawn as events (inferred: 1 of 4 rows have text)"),
+        // The compact lane's switch says what is drawn — the inferred view
+        // until the user picks the other one — and is one click.
+        assert_eq!(
+            texts.lines().filter(|t| *t == "events").count(),
+            1,
             "{texts}"
         );
-        assert!(
-            texts.contains("Drawn as state bands (inferred: 4 of 4 rows have text)"),
+        assert_eq!(
+            texts.lines().filter(|t| *t == "bands").count(),
+            1,
             "{texts}"
         );
-        assert_eq!(texts.matches("Show as state bands").count(), 1, "{texts}");
-        assert_eq!(texts.matches("Show as events").count(), 1, "{texts}");
+    }
+
+    // The switch's tooltip carries the evidence the header used to print.
+    #[test]
+    fn the_lane_switch_names_what_is_drawn_and_explains_the_inference() {
+        let column = MarkerColumn {
+            lane: MarkerLane::Exact {
+                markers: Vec::new(),
+                min_tick: 0,
+                max_tick: 1,
+            },
+            non_empty: 2,
+            rows: 9,
+        };
+        assert_eq!(
+            string_lane_switch(true, true, &column),
+            (
+                "events",
+                "Drawn as events (inferred: 2 of 9 rows have text)\nClick to draw as state bands"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            string_lane_switch(true, false, &column),
+            (
+                "bands",
+                "Drawn as state bands (your choice; inferred events: 2 of 9 rows have text)\n\
+                 Click to draw as events"
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -1682,7 +2204,6 @@ mod render_tests {
                 show(
                     ui,
                     &dataset,
-                    &ticks,
                     &bool_bands,
                     &[],
                     &[],
@@ -1718,7 +2239,6 @@ mod render_tests {
                 show(
                     ui,
                     &dataset,
-                    &ticks,
                     &bool_bands,
                     &[],
                     &[],
@@ -1785,23 +2305,26 @@ mod tests {
     }
 
     #[test]
-    fn the_plot_takes_the_window_less_the_lanes_and_a_readout_row() {
+    fn the_plot_takes_the_window_less_the_lanes_and_the_reserved_rows() {
         let state = StateTimelineState {
             height: Some(120.0),
             ..StateTimelineState::default()
         };
 
-        assert_eq!(state.time_plot_height(600.0, 20.0), 460.0);
+        assert_eq!(state.time_plot_height(600.0, 60.0), 420.0);
     }
 
     #[test]
-    fn lanes_never_take_more_than_half_the_window() {
+    fn the_state_group_never_takes_more_than_its_share_of_the_view() {
         let state = StateTimelineState {
             height: Some(2000.0),
             ..StateTimelineState::default()
         };
 
-        assert_eq!(state.time_plot_height(600.0, 20.0), 280.0);
+        assert_eq!(
+            state.time_plot_height(1000.0, 60.0),
+            1000.0 - 1000.0 * STATE_GROUP_SHARE - 60.0
+        );
     }
 
     #[test]
