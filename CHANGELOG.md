@@ -29,6 +29,33 @@ Versioning: [Semantic Versioning](https://semver.org/).
   first 8 in file order shown on open; state lanes capped at 32 % of the time
   view; Inter and JetBrains Mono embedded in the app.
 
+### Changed
+- **The app has its new look, light or dark as your system is set (issue #229).**
+  This is the palette and the fonts of the approved mockup; the layout comes in
+  the next steps. Before, the app always used egui's stock dark gray with blue
+  buttons. Now:
+  - It follows the operating system: switch macOS, Windows or Linux between
+    light and dark and Glyde follows, without a restart. There is no theme
+    setting.
+  - Panels are cool graphite in dark mode and near-white in light mode, with
+    hairline frames and rounded buttons. A toggle that is on (Overlay /
+    Stacked in the spectrum bar) shows in the petrol accent.
+  - Text is set in Inter, numbers in monospaced text in JetBrains Mono. Both
+    are embedded (about 200 KB), so the app looks the same on every machine.
+  - Numeric channels use the mockup's 8 colors, one set per theme, picked to
+    stay apart for color-blind viewers too. Channels 1 to 3 keep their hue
+    (blue, orange, green); channels 4 to 8 change. A channel keeps its color
+    in the time plot, the channel list and the spectrum.
+
+  **Known, temporary:** Inter is a little wider than the old font, so on a
+  time axis that prints full dates (`2026-03-02T09:01:40`) fewer labels fit
+  and some are left out. Showing times instead of full dates (issue #196,
+  later in this step) fixes it. State and marker lanes keep their current
+  colors for now: the mockup's pale state tints are made for the taller
+  bands of the new track layout (issue #230) and arrive with it.
+  **Assumption to veto:** the mockup shows no error text, so error messages
+  use a red picked here (the series red, darkened to read on the panel).
+
 ### Fixed
 - **Files whose timestamps repeat no longer report a "gap" every second
   (issue #188).** A log sampled faster than its timestamps change (whole

@@ -54,11 +54,13 @@ glyde/
 │   │   ├── benches/           # index_build.rs, viewport_query.rs, welch.rs
 │   │   └── tests/             # golden tests, torture corpus, property tests
 │   ├── glyde-app/             # thin egui shell
-│   │   └── src/
-│   │       ├── main.rs
-│   │       ├── views/         # time.rs, psd.rs, state_timeline.rs
-│   │       ├── inference_bar.rs
-│   │       └── plumbing/      # background jobs, channels
+│   │   ├── src/
+│   │   │   ├── main.rs
+│   │   │   ├── views/         # time.rs, psd.rs, state_timeline.rs
+│   │   │   ├── inference_bar.rs
+│   │   │   ├── theme.rs       # palette, fonts, light/dark (docs/design/README.md tokens)
+│   │   │   └── plumbing/      # background jobs, channels
+│   │   └── assets/fonts/      # Inter, JetBrains Mono (OFL 1.1), embedded
 │   └── glyde-devtools/        # CI tooling only, never shipped (publish = false)
 │       └── src/bin/
 │           ├── generate_fixtures.rs   # multi-GB synthetic files for benches

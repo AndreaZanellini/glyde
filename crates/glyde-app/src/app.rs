@@ -592,7 +592,7 @@ impl eframe::App for GlydeApp {
             }
             Status::Failed { path, message } => {
                 ui.colored_label(
-                    egui::Color32::RED,
+                    ui.visuals().error_fg_color,
                     format!("Could not open {}: {message}", path.display()),
                 );
             }

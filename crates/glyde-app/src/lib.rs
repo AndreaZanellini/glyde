@@ -28,6 +28,7 @@ pub mod error_boundary;
 pub mod inference_bar;
 pub mod logging;
 pub mod plumbing;
+pub mod theme;
 pub mod views;
 
 pub use app::GlydeApp;

@@ -509,6 +509,8 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         tracing::debug!("new data on screen: the time view starts fitted");
     }
 
+    let visuals = ui.visuals().clone();
+    let palette = crate::theme::palette(&visuals);
     let response = plot.show(ui, |plot_ui| {
         if fit_clicked {
             // Prepared with the data, off the UI thread (issue #144): this
@@ -676,7 +678,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             // vertical-extent bar (drawn as separate `Line`s below) rendered
             // as several differently-colored segments instead of one
             // consistent color.
-            let color = series_color(color_index);
+            let color = crate::theme::series_color(&visuals, color_index);
 
             let marks = off_scale_marks(buckets);
             if !marks.is_empty() {
@@ -817,7 +819,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 let middle = (lo + hi) / 2.0;
                 plot_ui.vline(
                     egui_plot::VLine::new(middle)
-                        .color(egui::Color32::GRAY)
+                        .color(palette.ink_3)
                         .style(egui_plot::LineStyle::dashed_dense())
                         .width(2.0_f32),
                 );
@@ -828,7 +830,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                             format!("⫽ {} gap", format_gap_length(end - start)),
                         )
                         .anchor(egui::Align2::CENTER_TOP)
-                        .color(egui::Color32::GRAY),
+                        .color(palette.ink_3),
                     );
                 }
             }
@@ -887,7 +889,9 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         );
     }
 
-    channels::show(ui, "time", response.response.rect, channels, series_color);
+    channels::show(ui, "time", response.response.rect, channels, |index| {
+        crate::theme::series_color(&visuals, index)
+    });
 
     if let Some(index) = hovered {
         ui.horizontal(|ui| {
@@ -1715,39 +1719,13 @@ fn split_at_gaps(
     split
 }
 
-/// The color for the `index`-th plotted [`ViewKind::TimeDomain`] series
-/// (issue #55), shared by every `Line` segment and the `Points` overlay
-/// drawn for that series so a NaN-delimited gap never reads as a second
-/// series. Assigned here per *series*, never left to `egui_plot`'s own
-/// per-draw-call auto-assignment, which gave a series' line and points
-/// different colors. Read from [`SERIES_PALETTE`] (issue #199).
+/// The color of the `index`-th plotted series in egui's default (dark)
+/// theme, which every render test's bare `egui::Context` draws with: what
+/// those tests expect [`show`] to have used (`crate::theme::series_color`).
+#[cfg(test)]
 pub(crate) fn series_color(index: usize) -> egui::Color32 {
-    let base = SERIES_PALETTE[index % SERIES_PALETTE.len()];
-    match index / SERIES_PALETTE.len() {
-        0 => base,
-        cycle if cycle % 2 == 1 => base.lerp_to_gamma(egui::Color32::WHITE, 0.45),
-        _ => base.lerp_to_gamma(egui::Color32::BLACK, 0.45),
-    }
+    crate::theme::series_color(&egui::Visuals::dark(), index)
 }
-
-/// The series palette (issue #199): the classic categorical "category10"
-/// colors without its gray, which reads as a disabled or grid element here.
-/// Fixed and used in order, so the first nine channels are always far apart
-/// (CIE76 ΔE ≥ 27) on light and dark backgrounds. The golden-ratio hue steps
-/// this replaces spread hues evenly only in the limit: channels 3 and 11 were
-/// both magenta. Past nine, [`series_color`] repeats them lighter, then
-/// darker: never a near-duplicate hue at the same lightness.
-const SERIES_PALETTE: [egui::Color32; 9] = [
-    egui::Color32::from_rgb(0x1f, 0x77, 0xb4), // blue
-    egui::Color32::from_rgb(0xff, 0x7f, 0x0e), // orange
-    egui::Color32::from_rgb(0x2c, 0xa0, 0x2c), // green
-    egui::Color32::from_rgb(0xd6, 0x27, 0x28), // red
-    egui::Color32::from_rgb(0x94, 0x67, 0xbd), // purple
-    egui::Color32::from_rgb(0x8c, 0x56, 0x4b), // brown
-    egui::Color32::from_rgb(0xe3, 0x77, 0xc2), // pink
-    egui::Color32::from_rgb(0x17, 0xbe, 0xcf), // cyan
-    egui::Color32::from_rgb(0xbc, 0xbd, 0x22), // olive
-];
 
 /// `values` as an `f64` slice for [`decimate_viewport`] (which needs direct
 /// index access over the *whole* column, not just what is on screen):
@@ -3054,6 +3032,62 @@ mod render_tests {
         state.channels.hide_all();
         let (decimated, _) = frame(&mut state);
         assert!(decimated.is_empty(), "nothing shown, nothing decimated");
+    }
+
+    // Issue #229: the series take the active theme's palette, so a channel
+    // keeps its place in the palette when the OS switches light and dark.
+    #[test]
+    fn series_draw_in_the_active_themes_palette() {
+        let dataset = three_channel_dataset();
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
+        let ticks = dataset.time.to_pyramid_ticks();
+        let sample_cache = cache_column_samples(&dataset);
+        let cursor = CursorLookup::for_time(&dataset.time);
+        let fit = fit_bounds_of(&dataset);
+        for (theme, ours, other) in [
+            (
+                egui::Theme::Light,
+                &crate::theme::LIGHT,
+                &crate::theme::DARK,
+            ),
+            (egui::Theme::Dark, &crate::theme::DARK, &crate::theme::LIGHT),
+        ] {
+            let ctx = egui::Context::default();
+            crate::theme::install(&ctx);
+            ctx.set_theme(theme);
+            let mut state = TimeViewState::default();
+            let mut shapes = Vec::new();
+            for _ in 0..3 {
+                shapes = ctx
+                    .run(egui::RawInput::default(), |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            show(
+                                ui,
+                                &dataset,
+                                &pyramids,
+                                &ticks,
+                                &sample_cache,
+                                &[],
+                                &cursor,
+                                &fit,
+                                &mut state,
+                            );
+                        });
+                    })
+                    .shapes;
+            }
+            let colors = shape_colors(&shapes);
+            for channel in 0..3 {
+                assert!(
+                    colors.contains(&ours.series[channel]),
+                    "{theme:?}: channel {channel}"
+                );
+                assert!(
+                    !colors.contains(&other.series[channel]),
+                    "{theme:?}: channel {channel} not in the other palette"
+                );
+            }
+        }
     }
 
     // The cache's backstop: different `ticks` are different data, so a
@@ -4665,85 +4699,6 @@ mod tests {
     use super::*;
     use glyde_core::series::Series;
     use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
-
-    // Issue #55: every segment of a NaN-split series (and its points
-    // overlay) must reuse the same color rather than one per draw call —
-    // this is what `series_color` being a pure function of the series'
-    // index, called once per series in `show`, guarantees.
-    #[test]
-    fn series_color_is_stable_for_the_same_index() {
-        assert_eq!(series_color(0), series_color(0));
-        assert_eq!(series_color(3), series_color(3));
-    }
-
-    /// CIE L*a*b* of an sRGB color (D65), for the ΔE checks below.
-    fn lab(color: egui::Color32) -> [f64; 3] {
-        let linear = |c: u8| {
-            let c = f64::from(c) / 255.0;
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        let (r, g, b) = (linear(color.r()), linear(color.g()), linear(color.b()));
-        let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047;
-        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        let z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883;
-        let f = |t: f64| {
-            if t > 0.008856 {
-                t.cbrt()
-            } else {
-                7.787 * t + 16.0 / 116.0
-            }
-        };
-        let (fx, fy, fz) = (f(x), f(y), f(z));
-        [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
-    }
-
-    /// The smallest CIE76 ΔE between any two of the first `n` series colors.
-    fn min_delta_e(n: usize) -> f64 {
-        let labs: Vec<[f64; 3]> = (0..n).map(series_color).map(lab).collect();
-        let mut min = f64::INFINITY;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let d = (0..3)
-                    .map(|k| (labs[i][k] - labs[j][k]).powi(2))
-                    .sum::<f64>();
-                min = min.min(d.sqrt());
-            }
-        }
-        min
-    }
-
-    // Issue #199: the golden-ratio hue steps put channels 3 and 11 20° apart
-    // (both magenta, ΔE ≈ 15), indistinguishable in an overlay. A fixed
-    // palette keeps the first 9 far apart; past it, lighter then darker
-    // variants never come as close as that pair did.
-    #[test]
-    fn the_first_series_colors_are_perceptually_distinct() {
-        assert!(min_delta_e(9) >= 25.0, "first 9: {}", min_delta_e(9));
-        assert!(min_delta_e(27) >= 14.5, "first 27: {}", min_delta_e(27));
-        let pair = |i: usize, j: usize| {
-            let (a, b) = (lab(series_color(i)), lab(series_color(j)));
-            (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt()
-        };
-        assert!(pair(3, 11) >= 25.0, "the issue's pair: {}", pair(3, 11));
-        assert!(pair(8, 11) >= 25.0, "Lambda vs Combustion cycles");
-    }
-
-    #[test]
-    fn series_color_differs_across_indices() {
-        let colors: Vec<_> = (0..5).map(series_color).collect();
-        for i in 0..colors.len() {
-            for j in (i + 1)..colors.len() {
-                assert_ne!(
-                    colors[i], colors[j],
-                    "series {i} and {j} must not share a color"
-                );
-            }
-        }
-    }
 
     #[test]
     fn x_axis_seconds_converts_nanosecond_ticks_to_seconds() {
