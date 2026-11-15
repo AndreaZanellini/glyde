@@ -11,6 +11,24 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Design preview
+- **A mockup of the new look, to review before anything changes in the app
+  (issues #229, #230, #231).** Open `docs/design/glyde-mockup.html` in a
+  browser: it is an interactive page that draws the real engine test-bench
+  showcase file. It proposes one time axis at the bottom shared by every
+  channel, a plot per numeric channel by default, compact state lanes that
+  never take more than a third of the window, a resizable spectrum panel, two
+  measurement cursors with a readout panel, and a new palette and fonts in
+  light and dark. The app itself is unchanged. **What to review** (top right of
+  the page) lists the 13 decisions it asks you to make. It also reserves the row of the
+  anomaly gutter (outliers arrive in v0.2), which today marks missing samples. You can also
+  **drop your own CSV, TXT or Parquet file on the page** to see it in the
+  new layout. It is read in the browser only, never uploaded, by a
+  simplified reader that shows everything it guessed. **Assumptions to
+  veto:** at most 8 numeric channels on screen at once (one per color), the
+  first 8 in file order shown on open; state lanes capped at 32 % of the time
+  view; Inter and JetBrains Mono embedded in the app.
+
 ### Fixed
 - **The cache folder no longer grows forever (issue #213).** To reopen files
   instantly, Glyde keeps a copy of their samples and overviews in its cache

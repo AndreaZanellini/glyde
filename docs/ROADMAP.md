@@ -56,7 +56,7 @@ Small, independent PRs. Nothing here changes the look of the app.
 
 Design first. Nothing is implemented before the maintainer approves the mockup.
 
-- [ ] Interactive mockup, light and dark, built on the engine test-bench showcase file:
+- [x] Interactive mockup, light and dark, built on the engine test-bench showcase file:
       visual identity, track layout with state channels, PSD panel, cursors → #229, #230, #231
 - [ ] Visual identity in the app: palette, typography, light/dark following the OS → #229
 - [ ] Track layout: one shared time axis at the bottom, compact state tracks, guaranteed
