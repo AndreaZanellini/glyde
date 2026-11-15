@@ -1,0 +1,1411 @@
+<title>Glyde Redesign Mockup</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<!--
+  Glyde redesign mockup (issues #229, #230, #231).
+  Source: docs/design/mockup.src.html. Built page: docs/design/glyde-mockup.html
+  (python3 docs/design/build_mockup.py <path to 01_engine_testbench.csv>).
+  Everything here is a proposal for the maintainer to approve or veto;
+  the egui app is changed only after approval.
+-->
+<style>
+/* Layout: an instrument window. Chrome recedes into cool graphite hairlines;
+   the plot surface is the brightest (light) or most lifted (dark) plane.
+   Petrol accent is reserved for UI state, never for data. */
+:root {
+  --page: #e4e7eb;
+  --win: #f4f5f7;
+  --surface: #ffffff;
+  --sunk: #eceef1;
+  --line: #d9dde3;
+  --grid: #eef0f3;
+  --ink: #14171c;
+  --ink-2: #4a515c;
+  --ink-3: #7b828d;
+  --accent: #0d6e7b;
+  --accent-ink: #ffffff;
+  --accent-wash: rgba(13, 110, 123, 0.10);
+  --sel: rgba(13, 110, 123, 0.10);
+  --sel-edge: rgba(13, 110, 123, 0.55);
+  --hatch: rgba(20, 23, 28, 0.08);
+  --warn-bg: #fff3d6;
+  --warn-ink: #7a4a00;
+  --warn-mark: #e09a00;
+  --shadow: 0 1px 2px rgba(20, 23, 28, 0.06), 0 8px 28px rgba(20, 23, 28, 0.10);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+  --st1: #dbe5f0; --st2: #f3e3c6; --st3: #d5ebdd; --st4: #e7dcf0; --st5: #f4d8d4; --st6: #d6e9ec;
+  --bool-on: #4a515c;
+  --font-ui: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-num: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --fs-xs: 11px; --fs-s: 12px; --fs-m: 13px; --fs-l: 15px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #08090b; --win: #14171b; --surface: #1a1e24; --sunk: #111418;
+    --line: #2a3038; --grid: #222830; --ink: #e8eaee; --ink-2: #b2b8c2; --ink-3: #7d8591;
+    --accent: #4cb5c3; --accent-ink: #08292e; --accent-wash: rgba(76, 181, 195, 0.14);
+    --sel: rgba(76, 181, 195, 0.12); --sel-edge: rgba(76, 181, 195, 0.6);
+    --hatch: rgba(232, 234, 238, 0.07);
+    --warn-bg: #3a2c0c; --warn-ink: #f6d68a; --warn-mark: #fab219;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 32px rgba(0, 0, 0, 0.45);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --s5: #d55181; --s6: #0ca30c; --s7: #9085e9; --s8: #e66767;
+    --st1: #263345; --st2: #45371f; --st3: #213b2c; --st4: #372c45; --st5: #472a27; --st6: #1f3d44;
+    --bool-on: #b2b8c2;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --page: #08090b; --win: #14171b; --surface: #1a1e24; --sunk: #111418;
+  --line: #2a3038; --grid: #222830; --ink: #e8eaee; --ink-2: #b2b8c2; --ink-3: #7d8591;
+  --accent: #4cb5c3; --accent-ink: #08292e; --accent-wash: rgba(76, 181, 195, 0.14);
+  --sel: rgba(76, 181, 195, 0.12); --sel-edge: rgba(76, 181, 195, 0.6);
+  --hatch: rgba(232, 234, 238, 0.07);
+  --warn-bg: #3a2c0c; --warn-ink: #f6d68a; --warn-mark: #fab219;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 32px rgba(0, 0, 0, 0.45);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --s5: #d55181; --s6: #0ca30c; --s7: #9085e9; --s8: #e66767;
+  --st1: #263345; --st2: #45371f; --st3: #213b2c; --st4: #372c45; --st5: #472a27; --st6: #1f3d44;
+  --bool-on: #b2b8c2;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body {
+  background: var(--page); color: var(--ink); font-family: var(--font-ui); font-size: var(--fs-m);
+  display: flex; flex-direction: column;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 10px 16px; gap: 10px;
+}
+button, select, input { font: inherit; color: inherit; }
+button:focus-visible, select:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
+
+/* ---------- mockup bar (not part of the app) ---------- */
+.mock-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; font-size: var(--fs-s); color: var(--ink-2); }
+.mock-bar .tag { font-weight: 600; color: var(--ink); letter-spacing: 0.02em; }
+.mock-bar .tag small { font-weight: 400; color: var(--ink-3); margin-left: 6px; }
+.mock-bar label { display: inline-flex; align-items: center; gap: 6px; }
+.mock-bar .grow { flex: 1; }
+.mseg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--win); }
+.mseg button { border: 0; background: transparent; padding: 3px 9px; cursor: pointer; font-size: var(--fs-s); }
+.mseg button + button { border-left: 1px solid var(--line); }
+.mseg button[aria-pressed="true"] { background: var(--ink); color: var(--win); }
+.mock-bar select { background: var(--win); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; font-size: var(--fs-s); }
+.mock-btn { border: 1px solid var(--line); background: var(--win); border-radius: 6px; padding: 3px 10px; cursor: pointer; font-size: var(--fs-s); }
+
+/* ---------- the app window ---------- */
+.stage { flex: 1; min-height: 0; overflow: auto; border-radius: 10px; }
+.win {
+  width: 100%; height: 100%; min-width: 1080px; min-height: 640px;
+  background: var(--win); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow);
+  display: flex; flex-direction: column; overflow: hidden; position: relative;
+}
+.win.fixed { width: 1440px; height: 900px; }
+
+.toolbar { height: 44px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 12px; border-bottom: 1px solid var(--line); }
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: var(--fs-l); letter-spacing: -0.01em; }
+.brand svg { width: 22px; height: 22px; }
+.file { display: flex; align-items: baseline; gap: 8px; min-width: 0; margin-left: 6px; padding-left: 14px; border-left: 1px solid var(--line); }
+.file b { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file span { color: var(--ink-3); font-size: var(--fs-s); white-space: nowrap; }
+.toolbar .grow { flex: 1; }
+.tb { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--surface); cursor: pointer; font-size: var(--fs-s); font-weight: 500; white-space: nowrap; }
+.tb:hover { border-color: var(--ink-3); }
+.tb[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.tb svg { width: 14px; height: 14px; }
+.tb .count { font-family: var(--font-num); font-size: var(--fs-xs); color: var(--ink-3); }
+.tb[aria-pressed="true"] .count { color: inherit; opacity: 0.8; }
+.seg { display: inline-flex; height: 28px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--surface); }
+.seg button { border: 0; background: transparent; padding: 0 10px; cursor: pointer; font-size: var(--fs-s); font-weight: 500; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--sunk); color: var(--ink); box-shadow: inset 0 -2px 0 var(--accent); }
+
+.inference { height: 34px; flex: none; display: flex; align-items: center; gap: 6px; padding: 0 12px; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; background: var(--win); }
+.inference::-webkit-scrollbar { display: none; }
+.inference .lead { font-size: var(--fs-xs); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; margin-right: 4px; white-space: nowrap; }
+.chip { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 8px; border-radius: 5px; border: 1px solid var(--line); background: var(--surface); cursor: pointer; white-space: nowrap; font-size: var(--fs-s); flex: none; }
+.chip:hover { border-color: var(--ink-3); }
+.chip .k { color: var(--ink-3); }
+.chip .v { font-family: var(--font-num); font-size: var(--fs-xs); font-weight: 500; }
+.chip.warn { background: var(--warn-bg); border-color: transparent; color: var(--warn-ink); }
+.chip.warn .k { color: inherit; opacity: 0.8; }
+.chip.warn::before { content: ""; width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 9px solid var(--warn-mark); }
+.chip.hidden-count { border-style: dashed; }
+.popover { position: absolute; z-index: 30; min-width: 220px; max-width: 320px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); padding: 6px; font-size: var(--fs-s); }
+.popover h4 { margin: 4px 8px 6px; font-size: var(--fs-xs); font-weight: 600; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; }
+.popover p { margin: 2px 8px 8px; color: var(--ink-2); line-height: 1.45; }
+.popover button { display: flex; width: 100%; align-items: center; gap: 8px; text-align: left; border: 0; background: transparent; padding: 6px 8px; border-radius: 5px; cursor: pointer; }
+.popover button:hover { background: var(--accent-wash); }
+.popover button .ck { width: 14px; color: var(--accent); font-weight: 600; }
+.popover button .alt { margin-left: auto; color: var(--ink-3); font-family: var(--font-num); font-size: var(--fs-xs); }
+
+.body { flex: 1; min-height: 0; display: flex; position: relative; }
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.timeview { flex: 1; min-height: 120px; position: relative; }
+.timeview canvas, .psd-plot canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.timeview canvas { cursor: crosshair; }
+.notice { position: absolute; top: 8px; right: 14px; z-index: 5; font-size: var(--fs-xs); background: var(--warn-bg); color: var(--warn-ink); border-radius: 5px; padding: 4px 8px; max-width: 46%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.tooltip { position: absolute; z-index: 20; pointer-events: none; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; box-shadow: var(--shadow); padding: 8px 10px; font-size: var(--fs-s); min-width: 200px; max-width: 340px; }
+.tooltip .when { font-family: var(--font-num); font-size: var(--fs-xs); color: var(--ink-2); margin-bottom: 6px; }
+.tooltip .row { display: grid; grid-template-columns: 14px 1fr auto; align-items: center; gap: 6px; line-height: 1.6; }
+.tooltip .row .key { height: 2px; border-radius: 1px; }
+.tooltip .row .name { color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tooltip .row .val { font-family: var(--font-num); font-size: var(--fs-xs); font-weight: 500; color: var(--ink); text-align: right; }
+.tooltip .note { margin-top: 6px; color: var(--ink-3); font-size: var(--fs-xs); }
+
+.split { height: 7px; flex: none; cursor: row-resize; position: relative; border-top: 1px solid var(--line); background: var(--win); }
+.split::after { content: ""; position: absolute; left: 50%; top: 2px; width: 36px; height: 3px; margin-left: -18px; border-radius: 2px; background: var(--line); }
+.split:hover::after { background: var(--ink-3); }
+.psd { flex: none; display: flex; flex-direction: column; min-height: 160px; background: var(--win); }
+.psd-head { display: flex; align-items: center; gap: 10px; padding: 6px 12px 4px; flex-wrap: nowrap; }
+.psd-head h3 { margin: 0; font-size: var(--fs-m); font-weight: 600; white-space: nowrap; }
+.psd-head select { height: 26px; border: 1px solid var(--line); background: var(--surface); border-radius: 6px; padding: 0 6px; font-size: var(--fs-s); }
+.psd-head .grow { flex: 1; }
+.psd-head .lbl { color: var(--ink-3); font-size: var(--fs-xs); white-space: nowrap; }
+.psd-head .seg { height: 26px; }
+.psd-info { padding: 0 12px 6px; font-size: var(--fs-xs); color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--font-num); }
+.psd-row { flex: 1; min-height: 0; display: flex; }
+.psd-plot { flex: 1; position: relative; min-width: 0; }
+.psd-plot canvas { cursor: crosshair; }
+.psd-legend { width: 196px; flex: none; padding: 6px 12px; border-left: 1px solid var(--line); font-size: var(--fs-s); display: flex; flex-direction: column; gap: 6px; }
+.psd-legend .it { display: grid; grid-template-columns: 16px 1fr; align-items: center; gap: 8px; }
+.psd-legend .it i { height: 2px; border-radius: 1px; }
+.psd-legend .it span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.psd-legend .hv { margin-top: auto; font-family: var(--font-num); font-size: var(--fs-xs); color: var(--ink-2); line-height: 1.6; min-height: 4.8em; }
+
+.readout { width: 316px; flex: none; border-left: 1px solid var(--line); background: var(--win); display: flex; flex-direction: column; overflow: hidden; }
+.readout header { padding: 10px 14px 8px; display: flex; align-items: baseline; justify-content: space-between; }
+.readout header h3 { margin: 0; font-size: var(--fs-m); font-weight: 600; }
+.readout header span { color: var(--ink-3); font-size: var(--fs-xs); }
+.cur-pos { display: grid; grid-template-columns: 22px 1fr; gap: 4px 8px; padding: 0 14px 10px; align-items: center; }
+.flag { display: inline-grid; place-items: center; width: 18px; height: 16px; border-radius: 3px; background: var(--ink); color: var(--win); font-size: var(--fs-xs); font-weight: 600; }
+.cur-pos .ts { font-family: var(--font-num); font-size: var(--fs-xs); color: var(--ink); }
+.delta { margin: 0 14px 10px; padding: 8px 10px; border-radius: 7px; background: var(--surface); border: 1px solid var(--line); display: grid; grid-template-columns: 1fr 1fr; gap: 2px 12px; }
+.delta .k { font-size: var(--fs-xs); color: var(--ink-3); }
+.delta .v { font-family: var(--font-num); font-size: var(--fs-m); font-weight: 500; font-variant-numeric: tabular-nums; }
+.ro-table { flex: 1; overflow: auto; padding: 0 14px; }
+.ro-ser { padding: 8px 0; border-top: 1px solid var(--line); }
+.ro-ser .nm { display: grid; grid-template-columns: 3px 1fr; gap: 8px; align-items: center; font-weight: 500; font-size: var(--fs-s); margin-bottom: 4px; }
+.ro-ser .nm i { height: 14px; border-radius: 2px; }
+.ro-ser .nm span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ro-ser dl { margin: 0 0 0 11px; display: grid; grid-template-columns: auto 1fr auto 1fr; gap: 1px 8px; font-size: var(--fs-xs); }
+.ro-ser dt { color: var(--ink-3); }
+.ro-ser dd { margin: 0; font-family: var(--font-num); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ro-ser dd.miss { color: var(--ink-3); font-family: var(--font-ui); }
+.readout footer { padding: 8px 14px 12px; font-size: var(--fs-xs); color: var(--ink-3); line-height: 1.45; border-top: 1px solid var(--line); }
+
+.channels { position: absolute; left: 0; top: 0; bottom: 0; width: 300px; z-index: 25; background: var(--surface); border-right: 1px solid var(--line); box-shadow: var(--shadow); display: flex; flex-direction: column; }
+.channels header { padding: 10px 12px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); }
+.channels header h3 { margin: 0; font-size: var(--fs-m); font-weight: 600; flex: 1; }
+.channels header button { border: 0; background: transparent; cursor: pointer; color: var(--ink-3); font-size: 16px; line-height: 1; padding: 2px 4px; }
+.channels input[type="search"] { margin: 10px 12px 4px; height: 28px; border: 1px solid var(--line); border-radius: 6px; padding: 0 8px; background: var(--win); }
+.channels .list { overflow: auto; padding: 4px 0 12px; }
+.channels h4 { margin: 10px 12px 4px; font-size: var(--fs-xs); font-weight: 600; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; display: flex; justify-content: space-between; }
+.channels label { display: grid; grid-template-columns: 16px 3px 1fr auto; gap: 8px; align-items: center; padding: 5px 12px; cursor: pointer; font-size: var(--fs-s); }
+.channels label:hover { background: var(--accent-wash); }
+.channels label i { height: 14px; border-radius: 2px; }
+.channels label span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.channels label em { font-style: normal; color: var(--ink-3); font-family: var(--font-num); font-size: var(--fs-xs); }
+.channels .limit { margin: 6px 12px; padding: 6px 8px; border-radius: 6px; background: var(--warn-bg); color: var(--warn-ink); font-size: var(--fs-xs); }
+
+.status { height: 26px; flex: none; display: flex; align-items: center; gap: 16px; padding: 0 12px; border-top: 1px solid var(--line); font-size: var(--fs-xs); color: var(--ink-3); white-space: nowrap; overflow: hidden; }
+.status .hover { font-family: var(--font-num); color: var(--ink-2); min-width: 190px; }
+.status .help { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.toast { position: absolute; left: 50%; bottom: 40px; transform: translateX(-50%); z-index: 40; background: var(--ink); color: var(--win); padding: 8px 14px; border-radius: 7px; font-size: var(--fs-s); box-shadow: var(--shadow); max-width: 70%; }
+
+/* ---------- review notes (not part of the app) ---------- */
+.notes { position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 100%); z-index: 60; background: var(--surface); border-left: 1px solid var(--line); box-shadow: var(--shadow); overflow: auto; padding: 18px max(20px, env(safe-area-inset-right, 0px)) 24px 22px; font-size: var(--fs-m); line-height: 1.5; }
+.notes h2 { margin: 0 0 4px; font-size: 17px; text-wrap: balance; }
+.notes h3 { margin: 18px 0 6px; font-size: var(--fs-s); text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); }
+.notes p { margin: 0 0 8px; color: var(--ink-2); max-width: 62ch; }
+.notes ol, .notes ul { margin: 0; padding-left: 20px; color: var(--ink-2); }
+.notes li { margin-bottom: 8px; }
+.notes li b { color: var(--ink); font-weight: 600; }
+.notes .close { position: absolute; top: 12px; right: 14px; border: 0; background: transparent; font-size: 18px; cursor: pointer; color: var(--ink-3); }
+@media (prefers-reduced-motion: no-preference) {
+  .tb, .chip, .seg button { transition: border-color 0.12s, background-color 0.12s; }
+}
+</style>
+
+<div class="mock-bar" role="region" aria-label="Mockup controls">
+  <span class="tag">Glyde redesign mockup<small>for #229 · #230 · #231 — not the app</small></span>
+  <label>Theme
+    <span class="mseg" id="m-theme">
+      <button type="button" data-v="system" aria-pressed="true">Follow OS</button>
+      <button type="button" data-v="light" aria-pressed="false">Light</button>
+      <button type="button" data-v="dark" aria-pressed="false">Dark</button>
+    </span>
+  </label>
+  <label>Jump to
+    <select id="m-scene">
+      <option value="all">Whole file</option>
+      <option value="crank">Cranking, 09:00:03</option>
+      <option value="release">Throttle release with cursors, 09:03:00</option>
+      <option value="misfire">Misfire, 09:26:22</option>
+      <option value="steady">Steady run + spectrum</option>
+    </select>
+  </label>
+  <label>Channels
+    <select id="m-scenario">
+      <option value="file">As in the file (4 state channels)</option>
+      <option value="stress">Stress test: 20 state channels</option>
+    </select>
+  </label>
+  <label>Window
+    <span class="mseg" id="m-size">
+      <button type="button" data-v="fill" aria-pressed="true">Fill</button>
+      <button type="button" data-v="fixed" aria-pressed="false">1440 × 900</button>
+    </span>
+  </label>
+  <span class="grow"></span>
+  <button type="button" class="mock-btn" id="m-notes">What to review</button>
+</div>
+
+<div class="stage">
+  <div class="win" id="win">
+    <header class="toolbar">
+      <div class="brand" title="Placeholder mark: the icon is designed in #232">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="1" y="1" width="22" height="22" rx="6" fill="var(--ink)"/><path d="M4.5 15.5c2.2 0 2.8-7 5-7s2.6 7 5 7 2.8-4 5-4" fill="none" stroke="var(--win)" stroke-width="2" stroke-linecap="round"/></svg>
+        Glyde
+      </div>
+      <div class="file"><b id="f-name"></b><span id="f-meta"></span></div>
+      <span class="grow"></span>
+      <button type="button" class="tb" id="b-channels" aria-pressed="false" title="Choose which channels are shown">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h8" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg>
+        Channels <span class="count" id="ch-count"></span>
+      </button>
+      <span class="seg" role="group" aria-label="Numeric layout">
+        <button type="button" id="b-overlay" aria-pressed="false" title="All numeric channels on one plot, one y axis">Overlaid</button>
+        <button type="button" id="b-stacked" aria-pressed="true" title="One plot per channel, one shared time axis">Stacked</button>
+      </span>
+      <button type="button" class="tb" id="b-fit" title="Show the whole file (double-click the plot)">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>
+        Fit
+      </button>
+      <button type="button" class="tb" id="b-cursors" aria-pressed="false" title="Two measurement cursors, A and B">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 1v14M11 1v14" stroke="currentColor" stroke-width="1.5"/><path d="M5 8h6" stroke="currentColor" stroke-width="1" stroke-dasharray="1.5 1.5"/></svg>
+        Cursors
+      </button>
+      <button type="button" class="tb" id="b-psd" aria-pressed="false" title="Power spectral density of the selection">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1 14h14M2 13V9M5 13V4M8 13V8M11 13V6M14 13v-2" stroke="currentColor" stroke-width="1.5"/></svg>
+        Spectrum
+      </button>
+      <button type="button" class="tb" id="b-open">Open…</button>
+    </header>
+
+    <div class="inference" id="inference" role="toolbar" aria-label="What Glyde inferred about this file"></div>
+
+    <div class="body" id="body">
+      <aside class="channels" id="channels" hidden aria-label="Channels">
+        <header><h3>Channels</h3><button type="button" id="ch-close" aria-label="Close">×</button></header>
+        <input type="search" id="ch-search" placeholder="Filter channels" aria-label="Filter channels">
+        <div class="list" id="ch-list"></div>
+      </aside>
+      <div class="main">
+        <div class="timeview" id="timeview">
+          <canvas id="tv" aria-label="Time view"></canvas>
+          <div class="notice" id="tv-notice" hidden></div>
+          <div class="tooltip" id="tip" hidden></div>
+        </div>
+        <div class="split" id="split" hidden role="separator" aria-orientation="horizontal" aria-label="Resize spectrum panel" tabindex="0"></div>
+        <section class="psd" id="psd" hidden aria-label="Spectrum">
+          <div class="psd-head">
+            <h3>Spectrum</h3>
+            <select id="psd-sel" aria-label="Selection"></select>
+            <button type="button" class="tb" id="psd-show" title="Zoom the time view to this selection">Show in time view</button>
+            <span class="grow"></span>
+            <span class="lbl">Frequency</span>
+            <span class="seg" role="group" aria-label="Frequency axis">
+              <button type="button" id="fx-lin" aria-pressed="true">Linear</button>
+              <button type="button" id="fx-log" aria-pressed="false">Log</button>
+            </span>
+            <span class="lbl">Power</span>
+            <span class="seg" role="group" aria-label="Power axis">
+              <button type="button" id="py-lin" aria-pressed="false">Linear</button>
+              <button type="button" id="py-log" aria-pressed="true">Log</button>
+            </span>
+          </div>
+          <div class="psd-info" id="psd-info"></div>
+          <div class="psd-row">
+            <div class="psd-plot" id="psd-plot"><canvas id="pc" aria-label="Spectrum plot"></canvas></div>
+            <div class="psd-legend" id="psd-legend"></div>
+          </div>
+        </section>
+      </div>
+      <aside class="readout" id="readout" hidden aria-label="Cursor readout">
+        <header><h3>Cursors</h3><span>drag A or B</span></header>
+        <div class="cur-pos" id="ro-pos"></div>
+        <div class="delta" id="ro-delta"></div>
+        <div class="ro-table" id="ro-table"></div>
+        <footer>Every value is the raw sample nearest the cursor, read from the file. A missing sample stays missing; nothing is interpolated.</footer>
+      </aside>
+    </div>
+
+    <footer class="status">
+      <span class="hover" id="st-hover">—</span>
+      <span class="help">Scroll to zoom time · drag to pan · Shift-drag to zoom to a range · double-click to fit</span>
+      <span id="st-file"></span>
+    </footer>
+    <div class="toast" id="toast" hidden></div>
+  </div>
+</div>
+
+<aside class="notes" id="notes" hidden aria-label="What to review">
+  <button type="button" class="close" id="notes-close" aria-label="Close">×</button>
+  <h2>What this mockup asks you to decide</h2>
+  <p>It draws the real <code>01_engine_testbench.csv</code> showcase file. Try it in both themes, at 1440 × 900, and with the 20-state-channel stress test. Merging the PR means you approve it; the egui app is then changed to match, one roadmap item at a time.</p>
+  <h3>Layout (#230, #200, #198)</h3>
+  <ol>
+    <li><b>One time axis, at the bottom only.</b> Numeric and state tracks share it. The date and "local time, no zone" sit at its left, so the inferred time zone is always visible.</li>
+    <li><b>Stacked is the default</b> for numeric channels: one plot per channel, each with its own y range that follows the visible data. Overlaid puts them on one plot with one y axis.</li>
+    <li><b>At most 8 numeric channels on screen</b>, one per palette color. On open, the first 8 in file order are shown; the rest are hidden and the inference bar says how many. Enabling a ninth asks you to hide one first.</li>
+    <li><b>State channels take at most 32 % of the time view.</b> Beyond that the group scrolls inside itself; it can be collapsed to one row. Text states are 22 px bands, booleans 12 px strips, markers ticks with a label when there is room.</li>
+    <li><b>Gaps are hatched across every track</b>, with their length on the axis.</li>
+    <li><b>The spectrum lives in a bottom split</b>, 40 % of the height by default and resizable. Its controls do not move, its legend sits outside the plot.</li>
+  </ol>
+  <h3>Reading values (#196, #197, #231)</h3>
+  <ol start="7">
+    <li><b>Hover:</b> where one sample covers the pointer, its exact value and timestamp. Where a pixel holds many samples, the min–max range of those samples and how many there are, never one arbitrary sample.</li>
+    <li><b>Zoom acts on time only.</b> Every y range follows the visible data. You cannot zoom out past the file.</li>
+    <li><b>Cursors A and B</b> run across every track. The panel on the right shows Δt, 1/Δt and, per channel, the value at A and B, ΔY and ΔY/Δt. Each cursor snaps to the nearest sample and shows that sample's timestamp.</li>
+  </ol>
+  <h3>Look (#229)</h3>
+  <ol start="10">
+    <li><b>Palette:</b> cool graphite neutrals, a petrol accent used only for UI state, and an 8-color data palette checked for color-blind separation in both themes. Text states use soft tints with ink labels so they never look like a numeric series.</li>
+    <li><b>Type:</b> Inter for the interface, JetBrains Mono for timestamps and values so digits line up. Both are SIL Open Font License; embedding them should add under 1 MB to the binary.</li>
+    <li><b>Light and dark follow the OS.</b> The switch in the mockup bar is only here so you can compare; the app has no theme setting.</li>
+  </ol>
+  <h3>Not in this mockup</h3>
+  <ul>
+    <li>Horizontal cursors for a pure ΔY (optional in SPEC §4.1): proposed as a later step on the same panel.</li>
+    <li>The compressed (gap) axis: this file's gaps are 20 % of its span, so Glyde correctly does not offer it.</li>
+    <li>The app icon (#232). The mark in the toolbar is a placeholder.</li>
+  </ul>
+  <h3>Mockup limits</h3>
+  <p>To stay one page, it carries a 250 ms min/max overview of the whole file and every raw sample in three windows: cranking, the 09:03:00 throttle release, and the misfire. Outside those windows the cursors say the sample is not in the mockup; the app reads it from the file. The two spectra were computed ahead of time with Glyde's own default settings.</p>
+</aside>
+
+<script>
+"use strict";
+const D = /*__MOCKUP_DATA__*/null;
+
+// ---------------------------------------------------------------- data
+function f32(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return new Float32Array(u8.buffer);
+}
+const NUM = D.numeric.map((c, i) => ({
+  i, name: c.name, dec: c.dec, min: f32(c.min), max: f32(c.max), lo: c.lo, hi: c.hi, nan: c.nan,
+}));
+const WINDOWS = D.windows.map(w => ({ label: w.label, a: w.t[0], b: w.t[1], n: w.n, data: w.data.map(f32) }));
+const PSDS = D.psd.map(p => ({ ...p, freqs: null, series: p.series.map(s => ({ name: s.name, p: f32(s.p) })) }));
+for (const p of PSDS) { p.freqs = new Float64Array(p.nfreq); for (let k = 0; k < p.nfreq; k++) p.freqs[k] = k * p.df; }
+const SEGMENTS = D.segments;
+const GAPS = [];
+for (let k = 1; k < SEGMENTS.length; k++) GAPS.push([SEGMENTS[k - 1][1], SEGMENTS[k][0]]);
+const SPAN = D.span, FS = D.fs, BUCKET = D.bucket;
+
+// State-like lanes: real ones from the file, plus synthetic ones for the stress test.
+function realLanes() {
+  const lanes = [];
+  for (const s of D.states) lanes.push({ kind: "state", name: s.name, runs: s.runs });
+  for (const b of D.bools) lanes.push({ kind: "bool", name: b.name, runs: b.runs });
+  for (const m of D.markers) lanes.push({ kind: "marker", name: m.name, events: m.events });
+  return lanes;
+}
+function syntheticLanes(count) {
+  let seed = 7;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const out = [];
+  const labels = ["Valve", "Pump", "Relay", "Heater", "Clamp", "Door", "Purge", "Lamp"];
+  const modes = ["AUTO", "MANUAL", "HOLD", "TEST"];
+  for (let k = 0; k < count; k++) {
+    const isBool = k % 3 !== 2;
+    const runs = [];
+    for (const [a, b] of SEGMENTS) {
+      let t = a, v = rnd() > 0.5, m = 0;
+      while (t < b) {
+        const len = Math.min(b - t, 5 + rnd() * 90);
+        runs.push([t, t + len, isBool ? v : modes[m]]);
+        t += len; v = !v; m = (m + 1 + Math.floor(rnd() * 3)) % modes.length;
+      }
+    }
+    out.push({ kind: isBool ? "bool" : "state", name: `${labels[k % labels.length]} ${String(k + 1).padStart(2, "0")} (synthetic)`, runs, synthetic: true });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- state
+const S = {
+  t0: 0, t1: SPAN,
+  stacked: true,
+  visible: [],          // numeric channel indices, in display order
+  slot: new Map(),      // channel index -> palette slot 1..8 (follows the entity)
+  lanes: realLanes(),
+  groupOpen: true,
+  groupScroll: 0,
+  cursors: false, ca: 0, cb: 0,
+  psd: false, psdSel: 0, psdShare: 0.4, fxLog: false, pyLog: true,
+  pf0: 0, pf1: 500,
+  hover: null,          // {x, y}
+  drag: null,
+};
+const MAX_NUMERIC = 8;
+function setVisible(idx, on) {
+  if (on) {
+    if (S.visible.includes(idx)) return true;
+    if (S.visible.length >= MAX_NUMERIC) return false;
+    const used = new Set(S.slot.values());
+    let s = 1; while (used.has(s)) s++;
+    S.slot.set(idx, s);
+    S.visible.push(idx);
+    S.visible.sort((a, b) => a - b);
+  } else {
+    S.visible = S.visible.filter(i => i !== idx);
+    S.slot.delete(idx);
+  }
+  return true;
+}
+for (let i = 0; i < Math.min(MAX_NUMERIC, NUM.length); i++) setVisible(i, true);
+
+// ---------------------------------------------------------------- theme tokens
+let TOK = {};
+function readTokens() {
+  const cs = getComputedStyle(document.documentElement);
+  const g = n => cs.getPropertyValue(n).trim();
+  TOK = {
+    surface: g("--surface"), win: g("--win"), sunk: g("--sunk"), line: g("--line"), grid: g("--grid"),
+    ink: g("--ink"), ink2: g("--ink-2"), ink3: g("--ink-3"), accent: g("--accent"),
+    sel: g("--sel"), selEdge: g("--sel-edge"), hatch: g("--hatch"), boolOn: g("--bool-on"),
+    series: [1, 2, 3, 4, 5, 6, 7, 8].map(k => g(`--s${k}`)),
+    states: [1, 2, 3, 4, 5, 6].map(k => g(`--st${k}`)),
+    fontUi: g("--font-ui"), fontNum: g("--font-num"),
+  };
+}
+const colorOf = idx => S.slot.has(idx) ? TOK.series[S.slot.get(idx) - 1] : TOK.ink2;
+const stateTint = new Map();
+function tintFor(value) {
+  if (!stateTint.has(value)) stateTint.set(value, stateTint.size % 6);
+  return TOK.states[stateTint.get(value)];
+}
+
+// ---------------------------------------------------------------- formatting
+const pad = (n, w = 2) => String(n).padStart(w, "0");
+function clock(t, digits = 3) {
+  const ms = Math.round((D.t0_ms % 86400000) + t * 1000);
+  const h = Math.floor(ms / 3600000), m = Math.floor(ms / 60000) % 60, s = Math.floor(ms / 1000) % 60, f = ms % 1000;
+  const base = `${pad(h)}:${pad(m)}:${pad(s)}`;
+  return digits > 0 ? `${base}.${pad(f, 3).slice(0, digits)}` : base;
+}
+const DATE = new Date(D.t0_ms).toISOString().slice(0, 10);
+function group(intStr) { return intStr.replace(/\B(?=(\d{3})+(?!\d))/g, " "); }
+function fmtNum(v, dec) {
+  if (!Number.isFinite(v)) return "missing";
+  const s = Math.abs(v).toFixed(dec);
+  const neg = v < 0 && Number(s) !== 0;
+  const [i, f] = s.split(".");
+  return (neg ? "−" : "") + group(i) + (f ? "." + f : "");
+}
+function fmtSigned(v, dec) { return (v > 0 ? "+" : "") + fmtNum(v, dec); }
+function fmtDuration(dt) {
+  const a = Math.abs(dt);
+  if (a >= 60) { const m = Math.floor(a / 60), s = a - m * 60; return `${m} min ${s.toFixed(s % 1 ? 3 : 0).padStart(2, "0")} s`; }
+  if (a >= 1) return `${a.toFixed(3)} s`;
+  return `${(a * 1000).toFixed(0)} ms`;
+}
+function fmtHz(f) { return f >= 100 ? `${f.toFixed(1)} Hz` : f >= 1 ? `${f.toFixed(3)} Hz` : `${f.toPrecision(4)} Hz`; }
+function fmtSci(v) {
+  if (!Number.isFinite(v) || v <= 0) return "—";
+  const e = Math.floor(Math.log10(v)), m = v / 10 ** e;
+  return `${m.toFixed(2)}e${e}`;
+}
+const SUP = { "-": "⁻", 0: "⁰", 1: "¹", 2: "²", 3: "³", 4: "⁴", 5: "⁵", 6: "⁶", 7: "⁷", 8: "⁸", 9: "⁹" };
+const pow10 = e => "10" + String(e).split("").map(c => SUP[c]).join("");
+
+// ---------------------------------------------------------------- data access
+function windowFor(a, b) { return WINDOWS.find(w => a >= w.a - 1e-9 && b <= w.b + 1e-9) || null; }
+function windowAt(t) { return WINDOWS.find(w => t >= w.a && t < w.b) || null; }
+function inGap(t) { return GAPS.some(([a, b]) => t >= a && t < b); }
+function snapToSample(t) {
+  for (const [a, b] of GAPS) if (t >= a && t < b) t = (t - a < b - t) ? a - 1 / FS : b;
+  t = Math.max(0, Math.min(SPAN - 1 / FS, t));
+  return Math.round(t * FS) / FS;
+}
+function rawAt(idx, t) {
+  const w = windowAt(t);
+  if (!w) return { known: false };
+  const i = Math.round((t - w.a) * FS);
+  if (i < 0 || i >= w.n) return { known: false };
+  return { known: true, v: w.data[idx][i], t: w.a + i / FS };
+}
+// Per-pixel-column min/max for channel idx over [a, b) in `cols` columns.
+function columns(idx, a, b, cols) {
+  const lo = new Float32Array(cols).fill(NaN), hi = new Float32Array(cols).fill(NaN);
+  const cnt = new Uint32Array(cols);
+  const dt = (b - a) / cols;
+  const w = windowFor(a, b);
+  if (w) {
+    const arr = w.data[idx];
+    const i0 = Math.max(0, Math.floor((a - w.a) * FS)), i1 = Math.min(w.n, Math.ceil((b - w.a) * FS) + 1);
+    const spp = (b - a) * FS / cols;
+    if (spp <= 1.5) return { mode: "line", w, i0, i1, arr };
+    for (let i = i0; i < i1; i++) {
+      const c = Math.floor((w.a + i / FS - a) / dt);
+      if (c < 0 || c >= cols) continue;
+      const v = arr[i];
+      cnt[c]++;
+      if (!Number.isFinite(v)) continue;
+      if (Number.isNaN(lo[c])) { lo[c] = v; hi[c] = v; }
+      else { if (v < lo[c]) lo[c] = v; if (v > hi[c]) hi[c] = v; }
+    }
+    return { mode: "band", lo, hi, cnt, raw: true };
+  }
+  const mn = NUM[idx].min, mx = NUM[idx].max, nb = mn.length;
+  for (let c = 0; c < cols; c++) {
+    const ta = a + c * dt, tb = ta + dt;
+    let b0 = Math.floor(ta / BUCKET), b1 = Math.max(b0 + 1, Math.ceil(tb / BUCKET));
+    b0 = Math.max(0, b0); b1 = Math.min(nb, b1);
+    let l = Infinity, h = -Infinity, n = 0;
+    for (let k = b0; k < b1; k++) {
+      const x = mn[k], y = mx[k];
+      if (Number.isFinite(x)) { if (x < l) l = x; if (y > h) h = y; n++; }
+    }
+    if (n) { lo[c] = l; hi[c] = h; cnt[c] = n * BUCKET * FS; }
+  }
+  return { mode: "band", lo, hi, cnt, raw: false, coarse: dt < BUCKET / 1.5 };
+}
+function rangeOf(col) {
+  let l = Infinity, h = -Infinity;
+  if (col.mode === "line") {
+    for (let i = col.i0; i < col.i1; i++) { const v = col.arr[i]; if (Number.isFinite(v)) { if (v < l) l = v; if (v > h) h = v; } }
+  } else {
+    for (let c = 0; c < col.lo.length; c++) { if (Number.isFinite(col.lo[c])) { if (col.lo[c] < l) l = col.lo[c]; if (col.hi[c] > h) h = col.hi[c]; } }
+  }
+  return Number.isFinite(l) ? [l, h] : null;
+}
+function niceTicks(lo, hi, count) {
+  const span = hi - lo;
+  if (!(span > 0)) return [lo];
+  const raw = span / count, mag = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw);
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) out.push(+v.toPrecision(12));
+  return out;
+}
+function tickDecimals(ticks) {
+  if (ticks.length < 2) return 0;
+  const step = Math.abs(ticks[1] - ticks[0]);
+  return Math.max(0, Math.min(6, -Math.floor(Math.log10(step) + 1e-9)));
+}
+const TIME_STEPS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800];
+
+// ---------------------------------------------------------------- canvas helpers
+function fit(canvas) {
+  const r = canvas.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(r.width * dpr)), h = Math.max(1, Math.round(r.height * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, W: r.width, H: r.height };
+}
+function ellipsize(ctx, text, maxW) {
+  if (ctx.measureText(text).width <= maxW) return text;
+  let lo = 0, hi = text.length;
+  while (lo < hi) { const m = (lo + hi + 1) >> 1; if (ctx.measureText(text.slice(0, m) + "…").width <= maxW) lo = m; else hi = m - 1; }
+  return lo ? text.slice(0, lo) + "…" : "";
+}
+function hatch(ctx, x, y, w, h) {
+  ctx.save();
+  ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+  ctx.strokeStyle = TOK.hatch; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let k = -h; k < w; k += 6) { ctx.moveTo(x + k, y + h); ctx.lineTo(x + k + h, y); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------- time view layout
+const G = 184;          // left gutter: names and y ticks
+const RPAD = 14;
+const AXIS_H = 40;
+const LANE_H = { state: 22, marker: 22, bool: 12 };
+const GROUP_HEAD = 22;
+const STATE_CAP = 0.32;
+function layout(W, H) {
+  const top = S.cursors ? 22 : 8;
+  const px0 = G, px1 = W - RPAD;
+  const inner = H - top - AXIS_H;
+  const lanesH = S.lanes.reduce((s, l) => s + LANE_H[l.kind] + 4, 0);
+  const capH = Math.floor(inner * STATE_CAP);
+  const groupBody = S.groupOpen ? Math.min(lanesH, capH - GROUP_HEAD) : 0;
+  const groupH = S.lanes.length ? GROUP_HEAD + groupBody : 0;
+  const numH = inner - groupH - (groupH ? 8 : 0);
+  const tracks = [];
+  const list = S.stacked ? S.visible.map(i => [i]) : (S.visible.length ? [S.visible.slice()] : []);
+  const gapY = 6;
+  const th = list.length ? (numH - gapY * (list.length - 1)) / list.length : 0;
+  list.forEach((members, k) => tracks.push({ members, y: top + k * (th + gapY), h: th }));
+  const gy = top + numH + 8;
+  S.groupScroll = Math.max(0, Math.min(S.groupScroll, lanesH - groupBody));
+  return { top, px0, px1, pw: px1 - px0, tracks, numH, group: { y: gy, h: groupH, body: groupBody, content: lanesH }, axisY: H - AXIS_H };
+}
+const X = (L, t) => L.px0 + (t - S.t0) / (S.t1 - S.t0) * L.pw;
+const T = (L, x) => S.t0 + (x - L.px0) / L.pw * (S.t1 - S.t0);
+
+// ---------------------------------------------------------------- time view render
+const tv = document.getElementById("tv");
+let LAST = null;   // last layout + per-track columns, for hover
+function renderTime() {
+  const { ctx, W, H } = fit(tv);
+  const L = layout(W, H);
+  ctx.clearRect(0, 0, W, H);
+  ctx.textBaseline = "middle";
+  const cols = Math.max(1, Math.floor(L.pw));
+  let coarse = false;
+
+  // time ticks
+  const minPx = 96;
+  const step = TIME_STEPS.find(s => s / (S.t1 - S.t0) * L.pw >= minPx) || 3600;
+  const ticks = [];
+  for (let t = Math.ceil(S.t0 / step) * step; t <= S.t1 + 1e-9; t += step) ticks.push(+t.toFixed(6));
+  const tDigits = step >= 1 ? 0 : step >= 0.1 ? 1 : step >= 0.01 ? 2 : 3;
+
+  // numeric tracks
+  const trackData = [];
+  for (const tr of L.tracks) {
+    ctx.fillStyle = TOK.surface;
+    ctx.fillRect(L.px0, tr.y, L.pw, tr.h);
+    const data = tr.members.map(idx => ({ idx, col: columns(idx, S.t0, S.t1, cols) }));
+    data.forEach(d => { if (d.col.coarse) coarse = true; });
+    let lo = Infinity, hi = -Infinity;
+    data.forEach(d => { const r = rangeOf(d.col); if (r) { lo = Math.min(lo, r[0]); hi = Math.max(hi, r[1]); } });
+    if (!Number.isFinite(lo)) { lo = 0; hi = 1; }
+    if (hi - lo < 1e-12) { const m = Math.abs(lo) * 0.02 || 1; lo -= m; hi += m; }
+    const padY = (hi - lo) * 0.08; lo -= padY; hi += padY;
+    const yOf = v => tr.y + tr.h - (v - lo) / (hi - lo) * tr.h;
+    const yt = niceTicks(lo, hi, Math.max(3, Math.min(6, Math.floor(tr.h / 18))));
+    const ydec = tickDecimals(yt);
+    // grid
+    ctx.strokeStyle = TOK.grid; ctx.lineWidth = 1; ctx.beginPath();
+    for (const v of yt) { const y = Math.round(yOf(v)) + 0.5; if (y > tr.y + 2 && y < tr.y + tr.h - 2) { ctx.moveTo(L.px0, y); ctx.lineTo(L.px1, y); } }
+    for (const t of ticks) { const x = Math.round(X(L, t)) + 0.5; ctx.moveTo(x, tr.y); ctx.lineTo(x, tr.y + tr.h); }
+    ctx.stroke();
+    // series
+    ctx.save(); ctx.beginPath(); ctx.rect(L.px0, tr.y, L.pw, tr.h); ctx.clip();
+    for (const d of data) drawSeries(ctx, L, d.col, yOf, colorOf(d.idx));
+    ctx.restore();
+    // frame
+    ctx.strokeStyle = TOK.line; ctx.strokeRect(L.px0 + 0.5, tr.y + 0.5, L.pw - 1, tr.h - 1);
+    // y tick labels
+    ctx.font = `10.5px ${TOK.fontNum}`; ctx.fillStyle = TOK.ink3; ctx.textAlign = "right";
+    // names
+    ctx.textAlign = "left";
+    ctx.font = `500 12px ${TOK.fontUi}`;
+    const nameW = tr.members.length === 1 ? ctx.measureText(NUM[tr.members[0]].name).width : G;
+    ctx.font = `10.5px ${TOK.fontNum}`; ctx.fillStyle = TOK.ink3; ctx.textAlign = "right";
+    for (const v of yt) {
+      const y = yOf(v), label = fmtNum(v, ydec);
+      if (y < tr.y + 5 || y > tr.y + tr.h - 5) continue;
+      if (y < tr.y + 20 && 10 + nameW + 8 > L.px0 - 6 - ctx.measureText(label).width) continue;
+      ctx.fillText(label, L.px0 - 6, y);
+    }
+    ctx.textAlign = "left";
+    if (tr.members.length === 1) {
+      const idx = tr.members[0];
+      ctx.fillStyle = colorOf(idx); roundRect(ctx, 0, tr.y + 2, 3, Math.min(tr.h - 4, 30), 1.5); ctx.fill();
+      ctx.font = `500 12px ${TOK.fontUi}`; ctx.fillStyle = TOK.ink;
+      ctx.fillText(ellipsize(ctx, NUM[idx].name, G - 20), 10, tr.y + 10);
+    } else {
+      ctx.font = `500 11.5px ${TOK.fontUi}`;
+      const rows = Math.floor((tr.h - 4) / 17);
+      tr.members.slice(0, rows).forEach((idx, k) => {
+        const y = tr.y + 10 + k * 17;
+        ctx.fillStyle = colorOf(idx); ctx.fillRect(0, y - 1, 12, 2);
+        ctx.fillStyle = TOK.ink; ctx.fillText(ellipsize(ctx, NUM[idx].name, G - 82), 18, y);
+      });
+      if (tr.members.length > rows) { ctx.fillStyle = TOK.ink3; ctx.fillText(`+${tr.members.length - rows} more`, 18, tr.y + 10 + rows * 17); }
+    }
+    trackData.push({ tr, data, yOf, lo, hi });
+  }
+  if (!L.tracks.length) {
+    ctx.fillStyle = TOK.ink3; ctx.font = `13px ${TOK.fontUi}`; ctx.textAlign = "center";
+    ctx.fillText("No numeric channel shown. Choose some under Channels.", L.px0 + L.pw / 2, L.top + L.numH / 2);
+    ctx.textAlign = "left";
+  }
+
+  // state group
+  if (L.group.h) drawGroup(ctx, L);
+
+  // gaps across everything
+  const yTop = L.top, yBot = L.axisY;
+  for (const [a, b] of GAPS) {
+    const x0 = Math.max(L.px0, X(L, a)), x1 = Math.min(L.px1, X(L, b));
+    if (x1 <= x0) continue;
+    ctx.fillStyle = TOK.win; ctx.fillRect(x0, yTop, x1 - x0, yBot - yTop);
+    hatch(ctx, x0, yTop, x1 - x0, yBot - yTop);
+  }
+
+  // PSD selection band
+  if (S.psd) {
+    const p = PSDS[S.psdSel];
+    const x0 = Math.max(L.px0, X(L, p.t[0])), x1 = Math.min(L.px1, X(L, p.t[1]));
+    if (x1 > x0) {
+      ctx.fillStyle = TOK.sel; ctx.fillRect(x0, yTop, x1 - x0, yBot - yTop);
+      ctx.strokeStyle = TOK.selEdge; ctx.lineWidth = 1; ctx.beginPath();
+      ctx.moveTo(Math.round(x0) + 0.5, yTop); ctx.lineTo(Math.round(x0) + 0.5, yBot);
+      ctx.moveTo(Math.round(x1) - 0.5, yTop); ctx.lineTo(Math.round(x1) - 0.5, yBot); ctx.stroke();
+    }
+  }
+
+  // time axis
+  drawAxis(ctx, L, ticks, tDigits);
+
+  // cursors
+  if (S.cursors) drawCursors(ctx, L);
+
+  // hover crosshair
+  if (S.hover && !S.drag && S.hover.x >= L.px0 && S.hover.x <= L.px1 && S.hover.y < L.axisY) {
+    const x = Math.round(S.hover.x) + 0.5;
+    ctx.strokeStyle = TOK.ink3; ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, L.top); ctx.lineTo(x, L.axisY); ctx.stroke(); ctx.setLineDash([]);
+  }
+  // box zoom
+  if (S.drag && S.drag.kind === "box") {
+    const x0 = Math.min(S.drag.x0, S.drag.x), x1 = Math.max(S.drag.x0, S.drag.x);
+    ctx.fillStyle = TOK.sel; ctx.fillRect(x0, L.top, x1 - x0, L.axisY - L.top);
+    ctx.strokeStyle = TOK.selEdge; ctx.strokeRect(x0 + 0.5, L.top + 0.5, x1 - x0 - 1, L.axisY - L.top - 1);
+  }
+
+  LAST = { L, trackData, cols };
+  const notice = document.getElementById("tv-notice");
+  notice.hidden = !coarse;
+  if (coarse) notice.textContent = "Mockup detail limit: raw samples exist only in the three “Jump to” windows here";
+  updateHover();
+}
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function drawSeries(ctx, L, col, yOf, color) {
+  ctx.fillStyle = color; ctx.strokeStyle = color;
+  if (col.mode === "line") {
+    const pxPerSample = L.pw / ((S.t1 - S.t0) * FS);
+    ctx.lineWidth = 1.5; ctx.lineJoin = "round"; ctx.beginPath();
+    let pen = false;
+    for (let i = col.i0; i < col.i1; i++) {
+      const v = col.arr[i];
+      if (!Number.isFinite(v)) { pen = false; continue; }
+      const x = X(L, col.w.a + i / FS), y = yOf(v);
+      if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
+    }
+    ctx.stroke();
+    if (pxPerSample >= 7) {
+      for (let i = col.i0; i < col.i1; i++) {
+        const v = col.arr[i]; if (!Number.isFinite(v)) continue;
+        ctx.beginPath(); ctx.arc(X(L, col.w.a + i / FS), yOf(v), 2.5, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    return;
+  }
+  // min/max band: each column spans its samples' range, joined to its neighbour.
+  let pl = NaN, ph = NaN;
+  for (let c = 0; c < col.lo.length; c++) {
+    let l = col.lo[c], h = col.hi[c];
+    if (!Number.isFinite(l)) { pl = ph = NaN; continue; }
+    const ol = l, oh = h;
+    if (Number.isFinite(pl)) { l = Math.min(l, ph); h = Math.max(h, pl); }
+    const y0 = yOf(h), y1 = yOf(l);
+    ctx.fillRect(L.px0 + c, y0, 1, Math.max(1.5, y1 - y0));
+    pl = ol; ph = oh;
+  }
+}
+function drawGroup(ctx, L) {
+  const g = L.group;
+  ctx.font = `600 10.5px ${TOK.fontUi}`; ctx.fillStyle = TOK.ink3; ctx.textAlign = "left";
+  const real = S.lanes.filter(l => !l.synthetic).length;
+  const label = `${S.groupOpen ? "▾" : "▸"}  STATES · ${S.lanes.length}` + (S.lanes.length > real ? ` (${S.lanes.length - real} synthetic)` : "");
+  ctx.fillText(label, 10, g.y + GROUP_HEAD / 2);
+  if (g.content > g.body && S.groupOpen) {
+    ctx.font = `10.5px ${TOK.fontUi}`;
+    const hiddenLanes = S.lanes.length - Math.floor(g.body / 18);
+    ctx.fillText(`scroll here for ${hiddenLanes > 0 ? "the other lanes" : "more"} ↓`, L.px0 + 6, g.y + GROUP_HEAD / 2);
+  }
+  ctx.strokeStyle = TOK.line; ctx.beginPath(); ctx.moveTo(L.px0, g.y + GROUP_HEAD - 3.5); ctx.lineTo(L.px1, g.y + GROUP_HEAD - 3.5); ctx.stroke();
+  if (!S.groupOpen) return;
+  const by = g.y + GROUP_HEAD;
+  ctx.save(); ctx.beginPath(); ctx.rect(0, by, L.px1 + RPAD, g.body); ctx.clip();
+  let y = by - S.groupScroll;
+  g.laneRects = [];
+  for (const lane of S.lanes) {
+    const h = LANE_H[lane.kind];
+    if (y + h >= by && y <= by + g.body) drawLane(ctx, L, lane, y, h);
+    g.laneRects.push({ lane, y, h });
+    y += h + 4;
+  }
+  ctx.restore();
+  if (g.content > g.body) {
+    const sh = g.body * g.body / g.content, sy = by + S.groupScroll / g.content * g.body;
+    ctx.fillStyle = TOK.line; roundRect(ctx, L.px1 + 5, sy, 4, sh, 2); ctx.fill();
+  }
+}
+function drawLane(ctx, L, lane, y, h) {
+  ctx.font = `${lane.kind === "bool" ? "11px" : "500 11.5px"} ${TOK.fontUi}`; ctx.fillStyle = lane.kind === "bool" ? TOK.ink2 : TOK.ink;
+  ctx.textAlign = "left";
+  ctx.fillText(ellipsize(ctx, lane.name, G - 22), 10, y + h / 2);
+  ctx.fillStyle = TOK.surface; ctx.fillRect(L.px0, y, L.pw, h);
+  ctx.save(); ctx.beginPath(); ctx.rect(L.px0, y, L.pw, h); ctx.clip();
+  if (lane.kind === "marker") {
+    ctx.strokeStyle = TOK.ink; ctx.lineWidth = 2;
+    const placed = [];
+    for (const [t, text] of lane.events) {
+      const x = X(L, t); if (x < L.px0 - 200 || x > L.px1) continue;
+      ctx.beginPath(); ctx.moveTo(Math.round(x) + 0.5, y + 3); ctx.lineTo(Math.round(x) + 0.5, y + h - 3); ctx.stroke();
+      placed.push([x, text]);
+    }
+    ctx.font = `11px ${TOK.fontUi}`; ctx.fillStyle = TOK.ink2;
+    for (let k = 0; k < placed.length; k++) {
+      const [x, text] = placed[k], next = k + 1 < placed.length ? placed[k + 1][0] : L.px1 + 400;
+      const room = next - x - 12;
+      if (room > 30) ctx.fillText(ellipsize(ctx, text, room), x + 5, y + h / 2);
+    }
+  } else {
+    ctx.strokeStyle = TOK.line; ctx.lineWidth = 1;
+    let lastMulti = -10;
+    for (const [a, b, v] of lane.runs) {
+      if (b < S.t0 || a > S.t1) continue;
+      const x0 = X(L, a), x1 = X(L, b);
+      if (x1 - x0 < 1.5) {
+        // Several states inside one pixel: the "multiple states" glyph, never dropped.
+        const c = Math.floor(x0);
+        if (c !== lastMulti) { ctx.fillStyle = TOK.ink3; ctx.fillRect(c, y + 1, 1.5, h - 2); lastMulti = c; }
+        continue;
+      }
+      if (lane.kind === "bool") {
+        if (v) { ctx.fillStyle = TOK.boolOn; ctx.fillRect(x0, y + 2, x1 - x0, h - 4); }
+        else { ctx.fillStyle = TOK.line; ctx.fillRect(x0, y + h / 2 - 0.5, x1 - x0, 1); }
+      } else {
+        ctx.fillStyle = tintFor(v); ctx.fillRect(x0 + 0.5, y + 1, Math.max(1, x1 - x0 - 1), h - 2);
+        const vx0 = Math.max(x0, L.px0), vx1 = Math.min(x1, L.px1);
+        ctx.font = `500 10.5px ${TOK.fontUi}`;
+        const tw = ctx.measureText(v).width;
+        if (vx1 - vx0 > tw + 10) { ctx.fillStyle = TOK.ink; ctx.fillText(v, vx0 + 5, y + h / 2 + 0.5); }
+      }
+    }
+  }
+  ctx.restore();
+}
+function drawAxis(ctx, L, ticks, digits) {
+  const y = L.axisY;
+  ctx.strokeStyle = TOK.ink3; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(L.px0, y + 0.5); ctx.lineTo(L.px1, y + 0.5);
+  for (const t of ticks) { const x = Math.round(X(L, t)) + 0.5; ctx.moveTo(x, y); ctx.lineTo(x, y + 4); }
+  ctx.stroke();
+  ctx.font = `11px ${TOK.fontNum}`; ctx.fillStyle = TOK.ink2; ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (const t of ticks) { const x = X(L, t); if (x > L.px0 + 30 && x < L.px1 - 30) ctx.fillText(clock(t, digits), x, y + 7); }
+  // gap lengths
+  ctx.font = `10.5px ${TOK.fontUi}`; ctx.fillStyle = TOK.ink3;
+  for (const [a, b] of GAPS) {
+    const x0 = Math.max(L.px0, X(L, a)), x1 = Math.min(L.px1, X(L, b));
+    if (x1 - x0 > 70) ctx.fillText(`gap ${fmtDuration(b - a)}`, (x0 + x1) / 2, y + 23);
+  }
+  // date and zone, left
+  ctx.textAlign = "left";
+  ctx.font = `500 11px ${TOK.fontNum}`; ctx.fillStyle = TOK.ink2; ctx.fillText(DATE, 10, y + 7);
+  ctx.font = `10.5px ${TOK.fontUi}`; ctx.fillStyle = TOK.ink3; ctx.fillText("local time, no zone", 10, y + 23);
+  ctx.textBaseline = "middle";
+}
+function drawCursors(ctx, L) {
+  const xs = [["A", S.ca], ["B", S.cb]].map(([k, t]) => [k, X(L, t)]);
+  ctx.lineWidth = 1;
+  for (const [k, x] of xs) {
+    if (x < L.px0 - 1 || x > L.px1 + 1) continue;
+    const rx = Math.round(x) + 0.5;
+    ctx.strokeStyle = TOK.ink; ctx.beginPath(); ctx.moveTo(rx, L.top - 4); ctx.lineTo(rx, L.axisY); ctx.stroke();
+    ctx.fillStyle = TOK.ink; roundRect(ctx, rx - 9, 2, 18, 16, 3); ctx.fill();
+    ctx.fillStyle = TOK.win; ctx.font = `600 11px ${TOK.fontUi}`; ctx.textAlign = "center"; ctx.fillText(k, rx, 10.5);
+  }
+  const [xa, xb] = [xs[0][1], xs[1][1]];
+  const l = Math.max(L.px0, Math.min(xa, xb)), r = Math.min(L.px1, Math.max(xa, xb));
+  if (r - l > 120) {
+    ctx.font = `500 11px ${TOK.fontNum}`; ctx.fillStyle = TOK.ink2; ctx.textAlign = "center";
+    ctx.fillText(`Δt ${fmtDuration(S.cb - S.ca)}`, (l + r) / 2, 10.5);
+    ctx.strokeStyle = TOK.ink3; ctx.beginPath();
+    const tw = ctx.measureText(`Δt ${fmtDuration(S.cb - S.ca)}`).width / 2 + 8, m = (l + r) / 2;
+    ctx.moveTo(l + 12, 10.5); ctx.lineTo(m - tw, 10.5); ctx.moveTo(m + tw, 10.5); ctx.lineTo(r - 12, 10.5); ctx.stroke();
+  }
+  ctx.textAlign = "left";
+}
+
+// ---------------------------------------------------------------- hover tooltip
+const tip = document.getElementById("tip");
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function updateHover() {
+  const st = document.getElementById("st-hover");
+  if (!S.hover || !LAST || S.drag) { tip.hidden = true; if (!S.hover) st.textContent = "—"; return; }
+  const { L, trackData } = LAST;
+  const { x, y } = S.hover;
+  if (x < L.px0 || x > L.px1 || y > L.axisY) { tip.hidden = true; return; }
+  const t = T(L, x);
+  st.textContent = `${DATE} ${clock(t)}`;
+  tip.replaceChildren();
+  const gap = GAPS.find(([a, b]) => t >= a && t < b);
+  const tPerPx = (S.t1 - S.t0) / L.pw;
+  const samplesPerPx = tPerPx * FS;
+  if (gap) {
+    tip.append(el("div", "when", `${clock(gap[0])} → ${clock(gap[1])}`));
+    tip.append(el("div", null, `No data: gap of ${fmtDuration(gap[1] - gap[0])}`));
+  } else {
+    // lane under pointer?
+    const g = L.group;
+    const lr = g.laneRects && y >= g.y + GROUP_HEAD && y < g.y + g.h ? g.laneRects.find(r => y >= r.y && y < r.y + r.h + 4) : null;
+    if (lr) {
+      const lane = lr.lane;
+      if (lane.kind === "marker") {
+        let best = null;
+        for (const [et, text] of lane.events) { const d = Math.abs(X(L, et) - x); if (d < 6 && (!best || d < best.d)) best = { d, et, text }; }
+        tip.append(el("div", "when", best ? `${DATE} ${clock(best.et)}` : `${DATE} ${clock(t)}`));
+        tip.append(el("div", null, best ? `${lane.name}: ${best.text}` : `${lane.name}: no marker here`));
+      } else {
+        const tA = t - tPerPx / 2, tB = t + tPerPx / 2;
+        const hits = lane.runs.filter(([a, b]) => b > tA && a < tB);
+        tip.append(el("div", "when", `${DATE} ${clock(t)}`));
+        if (hits.length > 1) {
+          const vals = [...new Set(hits.map(h => String(h[2])))];
+          tip.append(el("div", null, `${lane.name}: ${hits.length} states in this pixel`));
+          tip.append(el("div", "note", vals.slice(0, 5).join(", ") + (vals.length > 5 ? "…" : "") + " · zoom in to separate them"));
+        } else if (hits.length) {
+          const [a, b, v] = hits[0];
+          const shown = lane.kind === "bool" ? (v ? "on" : "off") : v;
+          tip.append(el("div", null, `${lane.name}: ${shown}`));
+          tip.append(el("div", "note", `${clock(a)} → ${clock(b)} · ${fmtDuration(b - a)}`));
+        }
+      }
+    } else {
+      const td = trackData.find(d => y >= d.tr.y && y <= d.tr.y + d.tr.h) || trackData[0];
+      if (!td) { tip.hidden = true; return; }
+      const single = samplesPerPx <= 1.5;
+      const raw = single ? rawAt(td.data[0].idx, snapToSample(t)) : null;
+      tip.append(el("div", "when", single && raw && raw.known ? `${DATE} ${clock(raw.t)}  · nearest sample` : `${DATE} ${clock(t - tPerPx / 2)} → ${clock(t + tPerPx / 2)}`));
+      const c = Math.floor(x - L.px0);
+      let note = null;
+      for (const d of td.data) {
+        const row = el("div", "row");
+        const key = el("i", "key"); key.style.background = colorOf(d.idx);
+        let val;
+        if (single) {
+          const r = rawAt(d.idx, snapToSample(t));
+          val = r.known ? fmtNum(r.v, NUM[d.idx].dec) : "not in mockup";
+        } else if (d.col.mode === "band" && Number.isFinite(d.col.lo[c])) {
+          val = `${fmtNum(d.col.lo[c], NUM[d.idx].dec)} … ${fmtNum(d.col.hi[c], NUM[d.idx].dec)}`;
+          note = `min … max of ~${group(String(Math.round(d.col.cnt[c] || samplesPerPx)))} samples in this pixel`;
+        } else val = "missing";
+        row.append(key, el("span", "name", NUM[d.idx].name), el("span", "val", val));
+        tip.append(row);
+      }
+      if (note) tip.append(el("div", "note", note));
+    }
+  }
+  tip.hidden = false;
+  const box = tv.getBoundingClientRect();
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  let lx = x + 16; if (lx + tw > box.width - 8) lx = x - 16 - tw;
+  let ly = y + 14; if (ly + th > box.height - 8) ly = Math.max(8, y - th - 10);
+  tip.style.left = `${lx}px`; tip.style.top = `${ly}px`;
+}
+
+// ---------------------------------------------------------------- readout panel
+function renderReadout() {
+  const ro = document.getElementById("readout");
+  ro.hidden = !S.cursors;
+  if (!S.cursors) return;
+  const pos = document.getElementById("ro-pos"); pos.replaceChildren();
+  for (const [k, t] of [["A", S.ca], ["B", S.cb]]) {
+    pos.append(el("span", "flag", k));
+    const s = el("span", "ts", `${DATE} ${clock(t)}`);
+    s.title = `Snapped to the sample at ${clock(t)}`;
+    pos.append(s);
+  }
+  const dt = S.cb - S.ca;
+  const dl = document.getElementById("ro-delta"); dl.replaceChildren();
+  dl.append(el("span", "k", "Δt = B − A"), el("span", "k", "1/Δt"));
+  dl.append(el("span", "v", `${dt < 0 ? "−" : ""}${Math.abs(dt).toFixed(3)} s`), el("span", "v", dt ? fmtHz(1 / Math.abs(dt)) : "—"));
+  const tbl = document.getElementById("ro-table"); tbl.replaceChildren();
+  for (const idx of S.visible) {
+    const c = NUM[idx];
+    const box = el("div", "ro-ser");
+    const nm = el("div", "nm"); const sw = el("i"); sw.style.background = colorOf(idx);
+    nm.append(sw, el("span", null, c.name)); box.append(nm);
+    const ra = rawAt(idx, S.ca), rb = rawAt(idx, S.cb);
+    const dlist = el("dl");
+    const cell = (label, r) => {
+      dlist.append(el("dt", null, label));
+      if (inGap(label === "A" ? S.ca : S.cb)) dlist.append(el("dd", "miss", "gap"));
+      else if (!r.known) dlist.append(el("dd", "miss", "not in mockup"));
+      else if (!Number.isFinite(r.v)) dlist.append(el("dd", "miss", "missing"));
+      else dlist.append(el("dd", null, fmtNum(r.v, c.dec)));
+    };
+    cell("A", ra); cell("B", rb);
+    const ok = ra.known && rb.known && Number.isFinite(ra.v) && Number.isFinite(rb.v);
+    const dy = ok ? rb.v - ra.v : NaN;
+    dlist.append(el("dt", null, "ΔY"), el("dd", ok ? null : "miss", ok ? fmtSigned(dy, c.dec) : "—"));
+    dlist.append(el("dt", null, "ΔY/Δt"), el("dd", ok && dt ? null : "miss", ok && dt ? `${fmtSigned(dy / dt, Math.min(6, c.dec + 1))} /s` : "—"));
+    box.append(dlist); tbl.append(box);
+  }
+}
+
+// ---------------------------------------------------------------- PSD
+const pcv = document.getElementById("pc");
+let PLAST = null;
+function renderPsd() {
+  const sec = document.getElementById("psd"), split = document.getElementById("split");
+  sec.hidden = split.hidden = !S.psd;
+  if (!S.psd) return;
+  const bodyH = document.querySelector(".main").getBoundingClientRect().height;
+  sec.style.height = `${Math.round(bodyH * S.psdShare)}px`;
+  const p = PSDS[S.psdSel];
+  document.getElementById("psd-info").textContent =
+    `Welch · ${group(String(p.samples))} samples, ${clock(p.t[0])} → ${clock(p.t[1])} · Hann window · ${group(String(p.seg))}-sample segments, 50 % overlap · ${p.segments} segments averaged · Δf ${p.df.toFixed(4)} Hz`;
+  document.getElementById("psd-info").title = document.getElementById("psd-info").textContent;
+  const leg = document.getElementById("psd-legend"); leg.replaceChildren();
+  const series = p.series.map(s => ({ ...s, idx: NUM.findIndex(c => c.name === s.name) }));
+  for (const s of series) {
+    const it = el("div", "it"); const k = el("i"); k.style.background = colorOf(s.idx);
+    it.append(k, el("span", null, s.name)); it.title = s.name; leg.append(it);
+  }
+  const hv = el("div", "hv"); hv.id = "psd-hv"; leg.append(hv);
+
+  const { ctx, W, H } = fit(pcv);
+  ctx.clearRect(0, 0, W, H);
+  const l = 64, r = W - 12, t = 8, b = H - 34;
+  const pw = r - l, ph = b - t;
+  const fmin = S.fxLog ? Math.max(p.df, S.pf0) : S.pf0, fmax = S.pf1;
+  const fx = f => S.fxLog ? l + (Math.log10(f) - Math.log10(fmin)) / (Math.log10(fmax) - Math.log10(fmin)) * pw : l + (f - fmin) / (fmax - fmin) * pw;
+  let pmax = 0, pmin = Infinity;
+  for (const s of series) for (let k = 1; k < p.nfreq; k++) { const f = p.freqs[k]; if (f < fmin || f > fmax) continue; const v = s.p[k]; if (v > pmax) pmax = v; if (v > 0 && v < pmin) pmin = v; }
+  let ylo, yhi, py;
+  if (S.pyLog) {
+    // Floor: a decade under the quietest series' median, so every series stays on screen.
+    let floor = Infinity;
+    for (const s of series) {
+      const v = []; for (let k = 1; k < p.nfreq; k++) if (p.freqs[k] >= fmin && p.freqs[k] <= fmax && s.p[k] > 0) v.push(s.p[k]);
+      v.sort((a, b) => a - b); if (v.length) floor = Math.min(floor, v[v.length >> 1]);
+    }
+    yhi = Math.ceil(Math.log10(pmax)); ylo = Math.max(Math.floor(Math.log10(Math.max(floor, pmin))) - 1, yhi - 10);
+    py = v => b - (Math.log10(Math.max(v, 10 ** (ylo - 1))) - ylo) / (yhi - ylo) * ph;
+  } else { ylo = 0; yhi = pmax * 1.08; py = v => b - (v - ylo) / (yhi - ylo) * ph; }
+  ctx.fillStyle = TOK.surface; ctx.fillRect(l, t, pw, ph);
+  // grid + y labels
+  ctx.strokeStyle = TOK.grid; ctx.lineWidth = 1; ctx.beginPath();
+  ctx.font = `10.5px ${TOK.fontNum}`; ctx.fillStyle = TOK.ink3; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  const yLabels = [];
+  if (S.pyLog) for (let e = ylo; e <= yhi; e++) yLabels.push([py(10 ** e), pow10(e)]);
+  else for (const v of niceTicks(0, yhi, 4)) yLabels.push([py(v), fmtSci(v)]);
+  for (const [y] of yLabels) { const ry = Math.round(y) + 0.5; ctx.moveTo(l, ry); ctx.lineTo(r, ry); }
+  let xt;
+  if (S.fxLog) { xt = []; for (let e = Math.floor(Math.log10(fmin)); e <= Math.ceil(Math.log10(fmax)); e++) for (const m of [1, 2, 5]) { const f = m * 10 ** e; if (f >= fmin && f <= fmax) xt.push(f); } }
+  else xt = niceTicks(fmin, fmax, Math.max(3, Math.floor(pw / 90)));
+  for (const f of xt) { const x = Math.round(fx(f)) + 0.5; ctx.moveTo(x, t); ctx.lineTo(x, b); }
+  ctx.stroke();
+  for (const [y, txt] of yLabels) if (y >= t - 1 && y <= b + 1) ctx.fillText(txt, l - 6, y);
+  ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillStyle = TOK.ink2;
+  for (const f of xt) ctx.fillText(f >= 1 ? String(+f.toPrecision(6)) : f.toPrecision(2), fx(f), b + 5);
+  ctx.fillStyle = TOK.ink3; ctx.font = `10.5px ${TOK.fontUi}`;
+  ctx.fillText("Frequency (Hz)", l + pw / 2, b + 19);
+  ctx.save(); ctx.translate(12, t + ph / 2); ctx.rotate(-Math.PI / 2); ctx.textBaseline = "middle";
+  ctx.fillText("Power (unit²/Hz)", 0, 0); ctx.restore();
+  // series: min/max per pixel column of the bins it covers (no bin is skipped)
+  ctx.save(); ctx.beginPath(); ctx.rect(l, t, pw, ph); ctx.clip();
+  for (const s of series) {
+    ctx.strokeStyle = colorOf(s.idx); ctx.lineWidth = 1.5; ctx.lineJoin = "round"; ctx.beginPath();
+    let lastC = null, cl = Infinity, ch = -Infinity, first = true;
+    const flush = () => { if (lastC === null) return; const x = l + lastC + 0.5; if (first) { ctx.moveTo(x, py(ch)); first = false; } else ctx.lineTo(x, py(ch)); if (cl !== ch) ctx.lineTo(x, py(cl)); };
+    for (let k = 0; k < p.nfreq; k++) {
+      const f = p.freqs[k]; if (f < fmin || f > fmax || (S.fxLog && f <= 0)) continue;
+      const x = fx(f), c = Math.floor(x - l), v = s.p[k];
+      if (c !== lastC) { flush(); lastC = c; cl = ch = v; } else { cl = Math.min(cl, v); ch = Math.max(ch, v); }
+    }
+    flush(); ctx.stroke();
+  }
+  ctx.restore();
+  ctx.strokeStyle = TOK.line; ctx.strokeRect(l + 0.5, t + 0.5, pw - 1, ph - 1);
+  PLAST = { l, r, t, b, pw, fx, fmin, fmax, p, series, py };
+  if (S.phover) drawPsdHover(ctx);
+}
+function drawPsdHover(ctx) {
+  const P = PLAST; if (!P) return;
+  const { x } = S.phover; const hv = document.getElementById("psd-hv");
+  if (x < P.l || x > P.r) { hv.textContent = ""; return; }
+  const f = S.fxLog ? 10 ** (Math.log10(P.fmin) + (x - P.l) / P.pw * (Math.log10(P.fmax) - Math.log10(P.fmin))) : P.fmin + (x - P.l) / P.pw * (P.fmax - P.fmin);
+  const k = Math.max(0, Math.min(P.p.nfreq - 1, Math.round(f / P.p.df)));
+  const bx = Math.round(P.fx(P.p.freqs[k])) + 0.5;
+  ctx.strokeStyle = TOK.ink3; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(bx, P.t); ctx.lineTo(bx, P.b); ctx.stroke(); ctx.setLineDash([]);
+  hv.replaceChildren(el("div", null, `bin ${k} · ${fmtHz(P.p.freqs[k])}`));
+  for (const s of P.series) {
+    const y = P.py(s.p[k]);
+    ctx.fillStyle = colorOf(s.idx); ctx.beginPath(); ctx.arc(bx, y, 3.5, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = TOK.surface; ctx.lineWidth = 1.5; ctx.stroke();
+    hv.append(el("div", null, `${fmtSci(s.p[k])} · ${s.name.split(" [")[0]}`));
+  }
+}
+
+// ---------------------------------------------------------------- chrome (DOM)
+function bytes(n) { return n >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : `${Math.round(n / 1e6)} MB`; }
+document.getElementById("f-name").textContent = D.file;
+document.getElementById("f-meta").textContent = `${bytes(D.bytes)} · ${group(String(D.rows))} rows · in memory`;
+document.getElementById("st-file").textContent = `${D.file} · read ${bytes(D.bytes)} · RAM budget 4.0 GB`;
+
+const CHIPS = [
+  { k: "Delimiter", v: ";", title: "Delimiter", text: "Semicolon, chosen together with the comma decimal separator: every row splits into 17 fields.", alts: [[";", "semicolon", true], [",", "comma"], ["\\t", "tab"], ["␣", "whitespace"]] },
+  { k: "Decimal", v: ",", title: "Decimal separator", text: "Comma: numbers such as 17,94 are read as 17.94.", alts: [[",", "comma", true], [".", "point"]] },
+  { k: "Encoding", v: "UTF-8", title: "Text encoding", text: "Valid UTF-8 throughout; °C and m/s² read correctly.", alts: [["UTF-8", "", true], ["Latin-1", ""], ["UTF-16", ""]] },
+  { k: "Time", v: "timestamp · YYYY-MM-DD HH:MM:SS.fff", title: "Time column and format", text: "Column 1, read as local time with no zone: the file does not say which zone.", alts: [["YYYY-MM-DD HH:MM:SS.fff", "local", true], ["same, as UTC", "UTC"], ["Use row number instead", ""]] },
+  { k: "Sampling", v: "1 kHz · 3 segments", title: "Sampling", text: "Uniform at 1 kHz inside each of three segments (segmented-uniform).", alts: [] },
+  { k: "Gaps", v: "2 · 6 min total", title: "Gaps", text: "Two pauses of 3 min each, 20 % of the span. That is too little to offer a compressed axis.", alts: [] },
+  { k: "MIL lamp", v: "0/1 read as on/off", warn: true, title: "Ambiguous column", text: "MIL lamp holds only 0 and 1. Glyde shows it as an on/off channel; it could also be a number.", alts: [["On/off", "boolean", true], ["Number", "integer"]] },
+];
+function renderChips() {
+  const bar = document.getElementById("inference"); bar.replaceChildren(el("span", "lead", "Inferred"));
+  CHIPS.forEach((c, i) => {
+    const b = el("button", "chip" + (c.warn ? " warn" : "")); b.type = "button";
+    b.append(el("span", "k", c.k), el("span", "v", c.v)); b.title = `${c.title}: ${c.v}. Click to change.`;
+    b.addEventListener("click", e => openChip(c, b, e)); bar.append(b);
+  });
+  const hiddenNum = NUM.length - S.visible.length;
+  const total = NUM.length + S.lanes.length;
+  const shown = S.visible.length + S.lanes.length;
+  if (hiddenNum) {
+    const b = el("button", "chip hidden-count"); b.type = "button";
+    b.append(el("span", "k", "Hidden"), el("span", "v", `${hiddenNum} of ${total} channels`));
+    b.title = "Some channels are not shown. Click to choose.";
+    b.addEventListener("click", () => toggleChannels(true)); bar.append(b);
+  }
+  document.getElementById("ch-count").textContent = `${shown}/${total}`;
+}
+let pop = null;
+function closePop() { if (pop) { pop.remove(); pop = null; } }
+function openChip(c, anchor, e) {
+  e.stopPropagation(); closePop();
+  pop = el("div", "popover"); pop.append(el("h4", null, c.title), el("p", null, c.text));
+  for (const [v, note, cur] of c.alts) {
+    const b = el("button"); b.type = "button";
+    b.append(el("span", "ck", cur ? "✓" : ""), el("span", null, v), el("span", "alt", note));
+    b.addEventListener("click", () => { closePop(); if (!cur) toast(`In the app this re-reads the file with “${v}” and keeps your view.`); });
+    pop.append(b);
+  }
+  const win = document.getElementById("win"), wr = win.getBoundingClientRect(), ar = anchor.getBoundingClientRect();
+  pop.style.left = `${Math.min(ar.left - wr.left, wr.width - 330)}px`; pop.style.top = `${ar.bottom - wr.top + 6}px`;
+  win.append(pop);
+}
+document.addEventListener("click", e => { if (pop && !pop.contains(e.target)) closePop(); });
+let toastTimer = 0;
+function toast(msg) {
+  const t = document.getElementById("toast"); t.textContent = msg; t.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.hidden = true; }, 3200);
+}
+
+function renderChannels() {
+  const list = document.getElementById("ch-list"); list.replaceChildren();
+  const q = document.getElementById("ch-search").value.trim().toLowerCase();
+  const h = el("h4"); h.append(el("span", null, "Numeric"), el("span", null, `${S.visible.length} of ${NUM.length} · max ${MAX_NUMERIC}`)); list.append(h);
+  if (S.visible.length >= MAX_NUMERIC) list.append(el("div", "limit", "8 numeric channels are shown, one per color. Hide one to show another."));
+  for (const c of NUM) {
+    if (q && !c.name.toLowerCase().includes(q)) continue;
+    const lab = el("label"); const cb = el("input"); cb.type = "checkbox"; cb.checked = S.visible.includes(c.i); cb.id = `ch-${c.i}`;
+    const sw = el("i"); sw.style.background = S.slot.has(c.i) ? colorOf(c.i) : "transparent";
+    cb.addEventListener("change", () => {
+      if (!setVisible(c.i, cb.checked)) { cb.checked = false; toast("Hide a numeric channel first: 8 are shown, one per color."); }
+      refreshAll();
+    });
+    lab.append(cb, sw, el("span", null, c.name), el("em", null, "f64"));
+    list.append(lab);
+  }
+  const h2 = el("h4"); h2.append(el("span", null, "States and markers"), el("span", null, `${S.lanes.length} shown`)); list.append(h2);
+  for (const l of S.lanes) {
+    if (q && !l.name.toLowerCase().includes(q)) continue;
+    const lab = el("label"); const cb = el("input"); cb.type = "checkbox"; cb.checked = true; cb.disabled = true;
+    lab.append(cb, el("i"), el("span", null, l.name), el("em", null, l.kind === "bool" ? "on/off" : l.kind === "marker" ? "marker" : "text"));
+    list.append(lab);
+  }
+}
+function toggleChannels(force) {
+  const p = document.getElementById("channels");
+  const open = force ?? p.hidden;
+  p.hidden = !open; document.getElementById("b-channels").setAttribute("aria-pressed", String(open));
+  if (open) renderChannels();
+}
+
+function press(id, on) { document.getElementById(id).setAttribute("aria-pressed", String(on)); }
+function refreshAll() {
+  readTokens();
+  press("b-stacked", S.stacked); press("b-overlay", !S.stacked);
+  press("b-cursors", S.cursors); press("b-psd", S.psd);
+  press("fx-lin", !S.fxLog); press("fx-log", S.fxLog); press("py-lin", !S.pyLog); press("py-log", S.pyLog);
+  renderChips();
+  renderReadout();
+  renderPsd();
+  renderTime();
+  if (!document.getElementById("channels").hidden) renderChannels();
+}
+let raf = 0;
+function schedule(fn = renderTime) { cancelAnimationFrame(raf); raf = requestAnimationFrame(fn); }
+
+// ---------------------------------------------------------------- interaction: time view
+function clampView(t0, t1) {
+  const minSpan = 0.02;   // 20 samples
+  let span = Math.max(minSpan, Math.min(SPAN, t1 - t0));
+  t0 = Math.max(0, Math.min(SPAN - span, t0));
+  return [t0, t0 + span];
+}
+function setView(t0, t1) { [S.t0, S.t1] = clampView(t0, t1); }
+function localXY(e, canvas) { const r = canvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; }
+tv.addEventListener("wheel", e => {
+  e.preventDefault();
+  if (!LAST) return;
+  const { x, y } = localXY(e, tv); const L = LAST.L, g = L.group;
+  if (S.groupOpen && g.content > g.body && y >= g.y + GROUP_HEAD && y < g.y + g.h) {
+    S.groupScroll += e.deltaY; schedule(); return;
+  }
+  const t = T(L, Math.max(L.px0, Math.min(L.px1, x)));
+  const k = Math.exp(Math.max(-1, Math.min(1, e.deltaY * 0.0022)));
+  setView(t - (t - S.t0) * k, t + (S.t1 - t) * k);
+  schedule();
+}, { passive: false });
+function cursorHit(x, y) {
+  if (!S.cursors || !LAST) return null;
+  const L = LAST.L;
+  for (const k of ["ca", "cb"]) if (Math.abs(X(L, S[k]) - x) <= 6 && y <= L.axisY) return k;
+  return null;
+}
+tv.addEventListener("pointerdown", e => {
+  if (!LAST) return;
+  const { x, y } = localXY(e, tv); const L = LAST.L;
+  tv.setPointerCapture(e.pointerId);
+  if (y >= L.group.y && y < L.group.y + GROUP_HEAD && x < L.px0 && S.lanes.length) { S.groupOpen = !S.groupOpen; schedule(); return; }
+  const ck = cursorHit(x, y);
+  if (ck) S.drag = { kind: "cursor", key: ck };
+  else if (e.shiftKey) S.drag = { kind: "box", x0: x, x };
+  else S.drag = { kind: "pan", x0: x, t0: S.t0, t1: S.t1 };
+});
+tv.addEventListener("pointermove", e => {
+  const { x, y } = localXY(e, tv);
+  S.hover = { x, y };
+  if (S.drag && LAST) {
+    const L = LAST.L;
+    if (S.drag.kind === "pan") {
+      const dt = (x - S.drag.x0) / L.pw * (S.drag.t1 - S.drag.t0);
+      setView(S.drag.t0 - dt, S.drag.t1 - dt);
+    } else if (S.drag.kind === "box") S.drag.x = Math.max(L.px0, Math.min(L.px1, x));
+    else if (S.drag.kind === "cursor") { S[S.drag.key] = snapToSample(T(L, Math.max(L.px0, Math.min(L.px1, x)))); renderReadout(); }
+  }
+  tv.style.cursor = S.drag ? (S.drag.kind === "pan" ? "grabbing" : S.drag.kind === "cursor" ? "ew-resize" : "crosshair") : (cursorHit(x, y) ? "ew-resize" : "crosshair");
+  schedule();
+});
+tv.addEventListener("pointerup", () => {
+  if (S.drag && S.drag.kind === "box" && LAST) {
+    const L = LAST.L, a = T(L, Math.min(S.drag.x0, S.drag.x)), b = T(L, Math.max(S.drag.x0, S.drag.x));
+    if (b - a > 0.005) setView(a, b);
+  }
+  S.drag = null; schedule();
+});
+tv.addEventListener("pointerleave", () => { if (!S.drag) { S.hover = null; schedule(); } });
+tv.addEventListener("dblclick", () => { setView(0, SPAN); schedule(); });
+
+// ---------------------------------------------------------------- interaction: PSD
+pcv.addEventListener("pointermove", e => { S.phover = localXY(e, pcv); if (S.pdrag && PLAST) { const d = (S.phover.x - S.pdrag.x0) / PLAST.pw * (S.pdrag.f1 - S.pdrag.f0); setPsdView(S.pdrag.f0 - d, S.pdrag.f1 - d); } schedule(renderPsd); });
+pcv.addEventListener("pointerleave", () => { S.phover = null; schedule(renderPsd); });
+pcv.addEventListener("pointerdown", e => { pcv.setPointerCapture(e.pointerId); S.pdrag = { x0: localXY(e, pcv).x, f0: S.pf0, f1: S.pf1 }; });
+pcv.addEventListener("pointerup", () => { S.pdrag = null; });
+pcv.addEventListener("dblclick", () => { S.pf0 = 0; S.pf1 = 500; schedule(renderPsd); });
+function setPsdView(a, b) { const span = Math.max(2, Math.min(500, b - a)); a = Math.max(0, Math.min(500 - span, a)); S.pf0 = a; S.pf1 = a + span; }
+pcv.addEventListener("wheel", e => {
+  e.preventDefault(); if (!PLAST) return;
+  const { x } = localXY(e, pcv);
+  const f = S.pf0 + Math.max(0, Math.min(1, (x - PLAST.l) / PLAST.pw)) * (S.pf1 - S.pf0);
+  const k = Math.exp(Math.max(-1, Math.min(1, e.deltaY * 0.0022)));
+  setPsdView(f - (f - S.pf0) * k, f + (S.pf1 - f) * k); schedule(renderPsd);
+}, { passive: false });
+const split = document.getElementById("split");
+split.addEventListener("pointerdown", e => { split.setPointerCapture(e.pointerId); S.sdrag = true; });
+split.addEventListener("pointermove", e => {
+  if (!S.sdrag) return;
+  const m = document.querySelector(".main").getBoundingClientRect();
+  S.psdShare = Math.max(0.2, Math.min(0.7, (m.bottom - e.clientY) / m.height));
+  renderPsd(); renderTime();
+});
+split.addEventListener("pointerup", () => { S.sdrag = false; });
+split.addEventListener("keydown", e => {
+  if (e.key === "ArrowUp" || e.key === "ArrowDown") { S.psdShare = Math.max(0.2, Math.min(0.7, S.psdShare + (e.key === "ArrowUp" ? 0.05 : -0.05))); renderPsd(); renderTime(); e.preventDefault(); }
+});
+
+// ---------------------------------------------------------------- buttons
+const on = (id, fn) => document.getElementById(id).addEventListener("click", fn);
+on("b-stacked", () => { S.stacked = true; refreshAll(); });
+on("b-overlay", () => { S.stacked = false; refreshAll(); });
+on("b-fit", () => { setView(0, SPAN); refreshAll(); });
+on("b-cursors", () => {
+  S.cursors = !S.cursors;
+  if (S.cursors) { const s = S.t1 - S.t0; S.ca = snapToSample(S.t0 + s / 3); S.cb = snapToSample(S.t0 + 2 * s / 3); }
+  refreshAll();
+});
+on("b-psd", () => { S.psd = !S.psd; refreshAll(); });
+on("b-open", () => toast("In the app: File → Open, or drop a file on the window."));
+on("b-channels", e => { e.stopPropagation(); toggleChannels(); });
+on("ch-close", () => toggleChannels(false));
+document.getElementById("ch-search").addEventListener("input", renderChannels);
+on("fx-lin", () => { S.fxLog = false; refreshAll(); });
+on("fx-log", () => { S.fxLog = true; refreshAll(); });
+on("py-lin", () => { S.pyLog = false; refreshAll(); });
+on("py-log", () => { S.pyLog = true; refreshAll(); });
+const psdSel = document.getElementById("psd-sel");
+PSDS.forEach((p, i) => { const o = el("option", null, `${p.label}: ${clock(p.t[0], 0)} → ${clock(p.t[1], 0)}`); o.value = String(i); psdSel.append(o); });
+psdSel.addEventListener("change", () => { S.psdSel = +psdSel.value; refreshAll(); });
+on("psd-show", () => { const p = PSDS[S.psdSel]; const pad = (p.t[1] - p.t[0]) * 0.15; setView(p.t[0] - pad, p.t[1] + pad); refreshAll(); });
+
+// ---------------------------------------------------------------- mockup bar
+function segGroup(id, fn) {
+  const g = document.getElementById(id);
+  g.addEventListener("click", e => {
+    const b = e.target.closest("button"); if (!b) return;
+    for (const x of g.querySelectorAll("button")) x.setAttribute("aria-pressed", String(x === b));
+    fn(b.dataset.v);
+  });
+}
+segGroup("m-theme", v => {
+  if (v === "system") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", v);
+  refreshAll();
+});
+segGroup("m-size", v => { document.getElementById("win").classList.toggle("fixed", v === "fixed"); refreshAll(); });
+document.getElementById("m-scenario").addEventListener("change", e => {
+  S.lanes = e.target.value === "stress" ? realLanes().concat(syntheticLanes(16)) : realLanes();
+  S.groupScroll = 0; S.groupOpen = true; refreshAll();
+});
+const SCENES = {
+  all: () => { setView(0, SPAN); S.cursors = false; S.psd = false; },
+  crank: () => { setView(1.5, 8.5); S.cursors = false; S.psd = false; },
+  release: () => { setView(177.2, 184.8); S.cursors = true; S.ca = 180.0; S.cb = 181.25; S.psd = false; },
+  misfire: () => { setView(1320 + 259.5, 1320 + 268.5); S.cursors = false; S.psd = true; S.psdSel = 1; S.psdShare = 0.4; },
+  steady: () => { setView(660 + 30, 660 + 330); S.cursors = false; S.psd = true; S.psdSel = 0; S.psdShare = 0.4; },
+};
+document.getElementById("m-scene").addEventListener("change", e => {
+  SCENES[e.target.value](); psdSel.value = String(S.psdSel); refreshAll();
+});
+on("m-notes", () => { document.getElementById("notes").hidden = false; });
+on("notes-close", () => { document.getElementById("notes").hidden = true; });
+document.addEventListener("keydown", e => { if (e.key === "Escape") { closePop(); toggleChannels(false); document.getElementById("notes").hidden = true; } });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", refreshAll);
+new ResizeObserver(() => schedule(() => { renderPsd(); renderTime(); })).observe(document.getElementById("win"));
+
+refreshAll();
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(refreshAll);
+</script>
