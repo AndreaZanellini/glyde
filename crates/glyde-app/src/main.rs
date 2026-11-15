@@ -59,7 +59,11 @@ fn main() -> anyhow::Result<()> {
     let result = eframe::run_native(
         "Glyde",
         native_options,
-        Box::new(|_creation_context| Ok(Box::new(GlydeApp::new()))),
+        Box::new(|creation_context| {
+            // Issue #229: the visual identity, light or dark as the OS says.
+            glyde_app::theme::install(&creation_context.egui_ctx);
+            Ok(Box::new(GlydeApp::new()))
+        }),
     )
     .map_err(|err| anyhow::anyhow!("glyde window failed: {err}"));
 

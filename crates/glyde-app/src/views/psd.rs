@@ -51,8 +51,8 @@ use glyde_core::ingest::Dataset;
 use glyde_core::series::ViewKind;
 
 use crate::plumbing::psd::{PsdJob, PsdOutcome, Spectrum};
+use crate::theme::series_color;
 use crate::views::channels::{self, ChannelVisibility};
-use crate::views::time::series_color;
 
 /// Height of one plot when spectra are stacked.
 const STACKED_PLOT_HEIGHT: f32 = 140.0;
@@ -412,6 +412,8 @@ impl PsdPanel {
         let y_label = power_axis_label(plan.frequency_unit, self.log_power);
         let log_frequency = self.log_frequency;
         let log_power = self.log_power;
+        let visuals = ui.visuals().clone();
+        let color = |index: usize| series_color(&visuals, index);
         let build = |id: egui::Id| {
             Plot::new(id)
                 .x_axis_label(x_label.clone())
@@ -440,7 +442,12 @@ impl PsdPanel {
                 build(egui::Id::new("psd_overlay"))
                     .show(ui, |plot_ui| {
                         for &(index, spectrum) in &shown {
-                            plot_ui.line(spectrum_line(spectrum, index, log_frequency, log_power));
+                            plot_ui.line(spectrum_line(
+                                spectrum,
+                                color(index),
+                                log_frequency,
+                                log_power,
+                            ));
                         }
                     })
                     .response
@@ -466,13 +473,13 @@ impl PsdPanel {
                         for &(index, spectrum) in &shown {
                             // The plot's own name, in place of the one-entry
                             // legend it used to carry.
-                            series_label(ui, &spectrum.name, series_color(index));
+                            series_label(ui, &spectrum.name, color(index));
                             build(egui::Id::new(("psd_stacked", index)))
                                 .height(STACKED_PLOT_HEIGHT)
                                 .show(ui, |plot_ui| {
                                     plot_ui.line(spectrum_line(
                                         spectrum,
-                                        index,
+                                        color(index),
                                         log_frequency,
                                         log_power,
                                     ));
@@ -482,7 +489,7 @@ impl PsdPanel {
                     .inner_rect
             }
         };
-        channels::show(ui, "psd", area, channels, series_color);
+        channels::show(ui, "psd", area, channels, color);
     }
 }
 
@@ -501,7 +508,7 @@ fn series_label(ui: &mut egui::Ui, name: &str, color: egui::Color32) {
 /// view (both enumerate the numeric series in column order).
 fn spectrum_line(
     spectrum: &Spectrum,
-    index: usize,
+    color: egui::Color32,
     log_frequency: bool,
     log_power: bool,
 ) -> Line<'_> {
@@ -511,7 +518,7 @@ fn spectrum_line(
         log_power,
     )))
     .name(&spectrum.name)
-    .color(series_color(index))
+    .color(color)
 }
 
 /// The bins of `psd` as plot coordinates. A log axis plots `log10` of the
@@ -873,6 +880,7 @@ mod tests {
 #[cfg(test)]
 mod render_tests {
     use super::*;
+    use crate::views::time::series_color;
     use glyde_core::dsp::psd::{
         compute_psds, plan_psd_on, AxisScale, PsdMemoryCap, PSD_MEMORY_CAP_BYTES,
     };

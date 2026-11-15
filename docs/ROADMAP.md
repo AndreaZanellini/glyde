@@ -58,7 +58,7 @@ Design first. Nothing is implemented before the maintainer approves the mockup.
 
 - [x] Interactive mockup, light and dark, built on the engine test-bench showcase file:
       visual identity, track layout with state channels, PSD panel, cursors → #229, #230, #231
-- [ ] Visual identity in the app: palette, typography, light/dark following the OS → #229
+- [x] Visual identity in the app: palette, typography, light/dark following the OS → #229
 - [ ] Track layout: one shared time axis at the bottom, compact state tracks, guaranteed
       plot height, collapsible state group, PSD panel → #230, #200
 - [ ] Stacked numeric view sharing the time axis → #198
