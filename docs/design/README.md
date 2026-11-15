@@ -65,6 +65,25 @@ column's first (#147).
 Inter and JetBrains Mono are both under the SIL Open Font License 1.1, which allows embedding
 them in an Apache-2.0 application. Embedding the needed weights (Latin subset) should add under 1 MB to the binary, far inside the 50 MB budget.
 
+## Your own files
+
+Drop a CSV, TXT, TSV or Parquet file on the page, or use **Open…**. The file is read in the
+browser tab only: nothing is uploaded. A simplified version of Glyde's inference reads it:
+- encoding, delimiter together with the decimal separator, preamble and header;
+- the time column: ISO 8601, `DD/MM/YYYY` or `MM/DD/YYYY`, epoch s/ms/µs/ns, plain numbers, or the row index;
+- on/off, text and marker columns.
+
+Every guess shows in the inference bar. Rows that cannot be read are skipped and counted.
+Timestamps that run backwards are counted, then sorted so they can be drawn (the app asks first).
+All raw samples are kept, so the cursors and **Compute for visible range** in the spectrum
+panel work anywhere. That button runs the same Welch defaults as `glyde-core`; on the showcase
+file it reproduces the precomputed spectrum to 6 × 10⁻⁸.
+
+Limits: the whole file has to fit in the tab (the page refuses files over 1.5 GB). Excel and
+LabVIEW dates are not read. Parquet needs the internet once, to load the
+[hyparquet](https://github.com/hyparam/hyparquet) reader (pinned to 1.31.5) from jsDelivr.
+Parquet timestamps are read as exact integer nanoseconds.
+
 ## Mockup limits
 
 To stay one page, it carries a 250 ms min/max overview of the whole file and every raw sample in

@@ -221,6 +221,16 @@ button:focus-visible, select:focus-visible, input:focus-visible, [tabindex]:focu
 .status .help { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .toast { position: absolute; left: 50%; bottom: 40px; transform: translateX(-50%); z-index: 40; background: var(--ink); color: var(--win); padding: 8px 14px; border-radius: 7px; font-size: var(--fs-s); box-shadow: var(--shadow); max-width: 70%; }
 
+.mock-bar .drop-hint { color: var(--ink-3); font-size: var(--fs-xs); }
+.loading { position: absolute; inset: 0; z-index: 45; display: grid; place-content: center; justify-items: center; gap: 12px; background: color-mix(in srgb, var(--win) 82%, transparent); font-size: var(--fs-m); color: var(--ink-2); }
+.loading i { width: 28px; height: 28px; border-radius: 50%; border: 3px solid var(--line); border-top-color: var(--accent); }
+@media (prefers-reduced-motion: no-preference) { .loading i { animation: spin 0.8s linear infinite; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+.drop { position: fixed; inset: 0; z-index: 70; display: grid; place-items: center; background: color-mix(in srgb, var(--page) 70%, transparent); pointer-events: none; }
+.drop > div { display: grid; gap: 6px; text-align: center; padding: 28px 40px; border: 2px dashed var(--accent); border-radius: 14px; background: var(--surface); box-shadow: var(--shadow); max-width: min(520px, 90vw); }
+.drop b { font-size: var(--fs-l); }
+.drop span { color: var(--ink-2); font-size: var(--fs-s); }
+
 /* ---------- review notes (not part of the app) ---------- */
 .notes { position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 100%); z-index: 60; background: var(--surface); border-left: 1px solid var(--line); box-shadow: var(--shadow); overflow: auto; padding: 18px max(20px, env(safe-area-inset-right, 0px)) 24px 22px; font-size: var(--fs-m); line-height: 1.5; }
 .notes h2 { margin: 0 0 4px; font-size: 17px; text-wrap: balance; }
@@ -246,7 +256,7 @@ button:focus-visible, select:focus-visible, input:focus-visible, [tabindex]:focu
   </label>
   <label>Jump to
     <select id="m-scene">
-      <option value="all">Whole file</option>
+      <option value="all">Whole showcase file</option>
       <option value="crank">Cranking, 09:00:03</option>
       <option value="release">Throttle release with cursors, 09:03:00</option>
       <option value="misfire">Misfire, 09:26:22</option>
@@ -266,6 +276,8 @@ button:focus-visible, select:focus-visible, input:focus-visible, [tabindex]:focu
     </span>
   </label>
   <span class="grow"></span>
+  <span class="drop-hint">Drop your own CSV, TXT or Parquet file on the window, or use Open…</span>
+  <button type="button" class="mock-btn" id="m-back" hidden>Back to the showcase file</button>
   <button type="button" class="mock-btn" id="m-notes">What to review</button>
 </div>
 
@@ -321,6 +333,7 @@ button:focus-visible, select:focus-visible, input:focus-visible, [tabindex]:focu
             <h3>Spectrum</h3>
             <select id="psd-sel" aria-label="Selection"></select>
             <button type="button" class="tb" id="psd-show" title="Zoom the time view to this selection">Show in time view</button>
+            <button type="button" class="tb" id="psd-compute" title="Welch PSD of the visible range, for the first three shown channels">Compute for visible range</button>
             <span class="grow"></span>
             <span class="lbl">Frequency</span>
             <span class="seg" role="group" aria-label="Frequency axis">
@@ -355,9 +368,12 @@ button:focus-visible, select:focus-visible, input:focus-visible, [tabindex]:focu
       <span id="st-file"></span>
     </footer>
     <div class="toast" id="toast" hidden></div>
+    <div class="loading" id="loading" hidden><i></i><span>Reading…</span></div>
   </div>
 </div>
 
+<input type="file" id="file-in" hidden accept=".csv,.txt,.tsv,.dat,.log,.parquet">
+<div class="drop" id="drop" hidden><div><b>Drop to open in the mockup</b><span>CSV, TXT or Parquet. The file is read in this browser only and never uploaded.</span></div></div>
 <aside class="notes" id="notes" hidden aria-label="What to review">
   <button type="button" class="close" id="notes-close" aria-label="Close">×</button>
   <h2>What this mockup asks you to decide</h2>
@@ -390,6 +406,8 @@ button:focus-visible, select:focus-visible, input:focus-visible, [tabindex]:focu
     <li>The compressed (gap) axis: this file's gaps are 20 % of its span, so Glyde correctly does not offer it.</li>
     <li>The app icon (#232). The mark in the toolbar is a placeholder.</li>
   </ul>
+  <h3>Your own files</h3>
+  <p>Drop a CSV, TXT or Parquet file on the page, or use Open…. It is read in this browser tab only and never uploaded. A simplified version of Glyde's inference reads it, and every guess it makes shows in the inference bar. Every raw sample is kept, so the cursors and Compute for visible range in the spectrum panel work anywhere. Parquet needs the internet once, to download the reader.</p>
   <h3>Mockup limits</h3>
   <p>To stay one page, it carries a 250 ms min/max overview of the whole file and every raw sample in three windows: cranking, the 09:03:00 throttle release, and the misfire. Outside those windows the cursors say the sample is not in the mockup; the app reads it from the file. The two spectra were computed ahead of time with Glyde's own default settings.</p>
 </aside>
@@ -399,31 +417,65 @@ button:focus-visible, select:focus-visible, input:focus-visible, [tabindex]:focu
 const D = /*__MOCKUP_DATA__*/null;
 
 // ---------------------------------------------------------------- data
+// The page shows one dataset at a time: the built-in showcase file, or a
+// file the viewer drops on it (read in this browser only, see LOADER below).
 function f32(b64) {
   const bin = atob(b64);
   const u8 = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
   return new Float32Array(u8.buffer);
 }
-const NUM = D.numeric.map((c, i) => ({
-  i, name: c.name, dec: c.dec, min: f32(c.min), max: f32(c.max), lo: c.lo, hi: c.hi, nan: c.nan,
-}));
-const WINDOWS = D.windows.map(w => ({ label: w.label, a: w.t[0], b: w.t[1], n: w.n, data: w.data.map(f32) }));
-const PSDS = D.psd.map(p => ({ ...p, freqs: null, series: p.series.map(s => ({ name: s.name, p: f32(s.p) })) }));
-for (const p of PSDS) { p.freqs = new Float64Array(p.nfreq); for (let k = 0; k < p.nfreq; k++) p.freqs[k] = k * p.df; }
-const SEGMENTS = D.segments;
-const GAPS = [];
-for (let k = 1; k < SEGMENTS.length; k++) GAPS.push([SEGMENTS[k - 1][1], SEGMENTS[k][0]]);
-const SPAN = D.span, FS = D.fs, BUCKET = D.bucket;
-
-// State-like lanes: real ones from the file, plus synthetic ones for the stress test.
-function realLanes() {
+function lowerBound(arr, x, lo = 0, hi = arr.length) {
+  while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] < x) lo = m + 1; else hi = m; }
+  return lo;
+}
+function showcaseDataset() {
+  const windows = D.windows.map(w => {
+    const t = new Float64Array(w.n);
+    for (let i = 0; i < w.n; i++) t[i] = w.t[0] + i / D.fs;
+    return { label: w.label, a: w.t[0], b: w.t[1], n: w.n, t, data: w.data.map(f32) };
+  });
+  const psds = D.psd.map(p => {
+    const freqs = new Float64Array(p.nfreq); for (let k = 0; k < p.nfreq; k++) freqs[k] = k * p.df;
+    return { ...p, nyq: D.fs / 2, freqs, series: p.series.map(s => ({ name: s.name, p: f32(s.p) })) };
+  });
   const lanes = [];
-  for (const s of D.states) lanes.push({ kind: "state", name: s.name, runs: s.runs });
+  for (const st of D.states) lanes.push({ kind: "state", name: st.name, runs: st.runs });
   for (const b of D.bools) lanes.push({ kind: "bool", name: b.name, runs: b.runs });
   for (const m of D.markers) lanes.push({ kind: "marker", name: m.name, events: m.events });
-  return lanes;
+  const gaps = [];
+  for (let k = 1; k < D.segments.length; k++) gaps.push([D.segments[k - 1][1], D.segments[k][0]]);
+  return {
+    showcase: true, name: D.file, bytes: D.bytes, rows: D.rows, storage: "in memory",
+    t0ms: D.t0_ms, tKind: "naive", tDigits: 3, span: D.span, fs: D.fs, bucket: D.bucket,
+    segments: D.segments, gaps, windows, psds, lanes,
+    num: D.numeric.map((c, i) => ({ i, name: c.name, dec: c.dec, dtype: "f64", min: f32(c.min), max: f32(c.max), nan: c.nan })),
+    // Every sample of this file sits on a 1 ms grid; snapping never leaves a segment.
+    snap(t) {
+      for (const [a, b] of gaps) if (t >= a && t < b) t = (t - a < b - t) ? a - 1 / D.fs : b;
+      t = Math.max(0, Math.min(D.span - 1 / D.fs, t));
+      return Math.round(t * D.fs) / D.fs;
+    },
+    chips: [
+      { k: "Delimiter", v: ";", title: "Delimiter", text: "Semicolon, chosen together with the comma decimal separator: every row splits into 17 fields.", alts: [[";", "semicolon", true], [",", "comma"], ["\\t", "tab"], ["␣", "whitespace"]] },
+      { k: "Decimal", v: ",", title: "Decimal separator", text: "Comma: numbers such as 17,94 are read as 17.94.", alts: [[",", "comma", true], [".", "point"]] },
+      { k: "Encoding", v: "UTF-8", title: "Text encoding", text: "Valid UTF-8 throughout; °C and m/s² read correctly.", alts: [["UTF-8", "", true], ["Latin-1", ""], ["UTF-16", ""]] },
+      { k: "Time", v: "timestamp · YYYY-MM-DD HH:MM:SS.fff", title: "Time column and format", text: "Column 1, read as local time with no zone: the file does not say which zone.", alts: [["YYYY-MM-DD HH:MM:SS.fff", "local", true], ["same, as UTC", "UTC"], ["Use row number instead", ""]] },
+      { k: "Sampling", v: "1 kHz · 3 segments", title: "Sampling", text: "Uniform at 1 kHz inside each of three segments (segmented-uniform).", alts: [] },
+      { k: "Gaps", v: "2 · 6 min total", title: "Gaps", text: "Two pauses of 3 min each, 20 % of the span. That is too little to offer a compressed axis.", alts: [] },
+      { k: "MIL lamp", v: "0/1 read as on/off", warn: true, title: "Ambiguous column", text: "MIL lamp holds only 0 and 1. Glyde shows it as an on/off channel; it could also be a number.", alts: [["On/off", "boolean", true], ["Number", "integer"]] },
+    ],
+  };
 }
+let DS, NUM, WINDOWS, PSDS, SEGMENTS, GAPS, SPAN, FS, BUCKET;
+function adopt(ds) {
+  DS = ds; NUM = ds.num; WINDOWS = ds.windows; PSDS = ds.psds; SEGMENTS = ds.segments; GAPS = ds.gaps;
+  SPAN = ds.span; FS = ds.fs; BUCKET = ds.bucket;
+}
+adopt(showcaseDataset());
+
+// State-like lanes: real ones from the file, plus synthetic ones for the stress test.
+function realLanes() { return DS.lanes.slice(); }
 function syntheticLanes(count) {
   let seed = 7;
   const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
@@ -477,7 +529,13 @@ function setVisible(idx, on) {
   }
   return true;
 }
-for (let i = 0; i < Math.min(MAX_NUMERIC, NUM.length); i++) setVisible(i, true);
+function resetView() {
+  S.t0 = 0; S.t1 = SPAN; S.visible = []; S.slot = new Map();
+  S.lanes = realLanes(); S.groupOpen = true; S.groupScroll = 0;
+  S.cursors = false; S.psd = false; S.psdSel = 0; S.pf0 = 0; S.pf1 = (PSDS[0] ? PSDS[0].nyq : FS / 2) || FS / 2;
+  for (let i = 0; i < Math.min(MAX_NUMERIC, NUM.length); i++) setVisible(i, true);
+}
+resetView();
 
 // ---------------------------------------------------------------- theme tokens
 let TOK = {};
@@ -502,13 +560,28 @@ function tintFor(value) {
 
 // ---------------------------------------------------------------- formatting
 const pad = (n, w = 2) => String(n).padStart(w, "0");
-function clock(t, digits = 3) {
-  const ms = Math.round((D.t0_ms % 86400000) + t * 1000);
-  const h = Math.floor(ms / 3600000), m = Math.floor(ms / 60000) % 60, s = Math.floor(ms / 1000) % 60, f = ms % 1000;
-  const base = `${pad(h)}:${pad(m)}:${pad(s)}`;
-  return digits > 0 ? `${base}.${pad(f, 3).slice(0, digits)}` : base;
+// Wall-clock text of a time t (seconds from the first sample). Naive times are
+// kept as written: they are stored as if UTC and printed back in UTC.
+function clock(t, digits = DS.tDigits) {
+  if (DS.tKind === "index") return fmtNum(t, 0);
+  if (DS.tKind === "number") return fmtNum(DS.t0num + t, Math.min(digits, 6));
+  if (DS.tKind === "seconds") return `${fmtNum(t, Math.min(digits, 6))} s`;
+  // Whole seconds of the anchor and the small remainder are kept apart, so
+  // sub-microsecond steps survive (one double of absolute seconds would not).
+  const a0 = Math.floor(DS.t0ms / 1000), x = (DS.t0ms / 1000 - a0) + t, w = Math.floor(x);
+  let sec = a0 + w, frac = x - w;
+  const scale = 10 ** Math.max(0, digits);
+  let f = Math.round(frac * scale);
+  if (f >= scale) { f -= scale; sec += 1; }
+  const d = new Date(sec * 1000);
+  const base = `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+  return digits > 0 ? `${base}.${String(f).padStart(digits, "0")}` : base;
 }
-const DATE = new Date(D.t0_ms).toISOString().slice(0, 10);
+function dateAt(t) {
+  if (DS.tKind !== "naive" && DS.tKind !== "utc") return "";
+  return new Date(Math.floor(DS.t0ms + t * 1000)).toISOString().slice(0, 10);
+}
+const stamp = (t, digits) => { const d = dateAt(t); return d ? `${d} ${clock(t, digits)}` : clock(t, digits); };
 function group(intStr) { return intStr.replace(/\B(?=(\d{3})+(?!\d))/g, " "); }
 function fmtNum(v, dec) {
   if (!Number.isFinite(v)) return "missing";
@@ -520,9 +593,15 @@ function fmtNum(v, dec) {
 function fmtSigned(v, dec) { return (v > 0 ? "+" : "") + fmtNum(v, dec); }
 function fmtDuration(dt) {
   const a = Math.abs(dt);
+  if (DS.tKind === "index") return `${fmtNum(a, 0)} rows`;
+  if (a >= 86400) { const d = Math.floor(a / 86400); return `${d} d ${Math.round((a - d * 86400) / 3600)} h`; }
+  if (a >= 3600) { const h = Math.floor(a / 3600); return `${h} h ${Math.round((a - h * 3600) / 60)} min`; }
   if (a >= 60) { const m = Math.floor(a / 60), s = a - m * 60; return `${m} min ${s.toFixed(s % 1 ? 3 : 0).padStart(2, "0")} s`; }
   if (a >= 1) return `${a.toFixed(3)} s`;
-  return `${(a * 1000).toFixed(0)} ms`;
+  if (a >= 1e-3) return `${(a * 1000).toFixed(a >= 0.01 ? 0 : 3)} ms`;
+  if (a >= 1e-6) return `${(a * 1e6).toFixed(3)} µs`;
+  if (a >= 1e-9) return `${(a * 1e9).toFixed(3)} ns`;
+  return `${(a * 1e12).toFixed(3)} ps`;
 }
 function fmtHz(f) { return f >= 100 ? `${f.toFixed(1)} Hz` : f >= 1 ? `${f.toFixed(3)} Hz` : `${f.toPrecision(4)} Hz`; }
 function fmtSci(v) {
@@ -537,17 +616,19 @@ const pow10 = e => "10" + String(e).split("").map(c => SUP[c]).join("");
 function windowFor(a, b) { return WINDOWS.find(w => a >= w.a - 1e-9 && b <= w.b + 1e-9) || null; }
 function windowAt(t) { return WINDOWS.find(w => t >= w.a && t < w.b) || null; }
 function inGap(t) { return GAPS.some(([a, b]) => t >= a && t < b); }
-function snapToSample(t) {
-  for (const [a, b] of GAPS) if (t >= a && t < b) t = (t - a < b - t) ? a - 1 / FS : b;
-  t = Math.max(0, Math.min(SPAN - 1 / FS, t));
-  return Math.round(t * FS) / FS;
+function snapToSample(t) { return DS.snap(t); }
+function nearestIndex(w, t) {
+  const i = lowerBound(w.t, t);
+  if (i <= 0) return 0;
+  if (i >= w.n) return w.n - 1;
+  return (t - w.t[i - 1] <= w.t[i] - t) ? i - 1 : i;
 }
 function rawAt(idx, t) {
   const w = windowAt(t);
   if (!w) return { known: false };
-  const i = Math.round((t - w.a) * FS);
-  if (i < 0 || i >= w.n) return { known: false };
-  return { known: true, v: w.data[idx][i], t: w.a + i / FS };
+  const i = nearestIndex(w, t);
+  if (Math.abs(w.t[i] - t) > 1.5 / FS && !DS.local) return { known: false };
+  return { known: true, v: w.data[idx][i], t: w.t[i] };
 }
 // Per-pixel-column min/max for channel idx over [a, b) in `cols` columns.
 function columns(idx, a, b, cols) {
@@ -555,13 +636,15 @@ function columns(idx, a, b, cols) {
   const cnt = new Uint32Array(cols);
   const dt = (b - a) / cols;
   const w = windowFor(a, b);
-  if (w) {
+  const wi0 = w ? Math.max(0, lowerBound(w.t, a) - 1) : 0, wi1 = w ? Math.min(w.n, lowerBound(w.t, b) + 1) : 0;
+  // Raw samples when the view holds few enough of them; the overview otherwise.
+  if (w && (wi1 - wi0) <= 48 * cols) {
     const arr = w.data[idx];
-    const i0 = Math.max(0, Math.floor((a - w.a) * FS)), i1 = Math.min(w.n, Math.ceil((b - w.a) * FS) + 1);
-    const spp = (b - a) * FS / cols;
+    const i0 = wi0, i1 = wi1;
+    const spp = (i1 - i0) / cols;
     if (spp <= 1.5) return { mode: "line", w, i0, i1, arr };
     for (let i = i0; i < i1; i++) {
-      const c = Math.floor((w.a + i / FS - a) / dt);
+      const c = Math.floor((w.t[i] - a) / dt);
       if (c < 0 || c >= cols) continue;
       const v = arr[i];
       cnt[c]++;
@@ -571,7 +654,7 @@ function columns(idx, a, b, cols) {
     }
     return { mode: "band", lo, hi, cnt, raw: true };
   }
-  const mn = NUM[idx].min, mx = NUM[idx].max, nb = mn.length;
+  const mn = NUM[idx].min, mx = NUM[idx].max, nb = mn.length, bc = DS.bucketCount;
   for (let c = 0; c < cols; c++) {
     const ta = a + c * dt, tb = ta + dt;
     let b0 = Math.floor(ta / BUCKET), b1 = Math.max(b0 + 1, Math.ceil(tb / BUCKET));
@@ -581,9 +664,12 @@ function columns(idx, a, b, cols) {
       const x = mn[k], y = mx[k];
       if (Number.isFinite(x)) { if (x < l) l = x; if (y > h) h = y; n++; }
     }
-    if (n) { lo[c] = l; hi[c] = h; cnt[c] = n * BUCKET * FS; }
+    if (n) {
+      lo[c] = l; hi[c] = h;
+      if (bc) { let k2 = 0; for (let k = b0; k < b1; k++) k2 += bc[k]; cnt[c] = k2; } else cnt[c] = n * BUCKET * FS;
+    }
   }
-  return { mode: "band", lo, hi, cnt, raw: false, coarse: dt < BUCKET / 1.5 };
+  return { mode: "band", lo, hi, cnt, raw: false, coarse: !DS.local && dt < BUCKET / 1.5 };
 }
 function rangeOf(col) {
   let l = Infinity, h = -Infinity;
@@ -608,7 +694,10 @@ function tickDecimals(ticks) {
   const step = Math.abs(ticks[1] - ticks[0]);
   return Math.max(0, Math.min(6, -Math.floor(Math.log10(step) + 1e-9)));
 }
-const TIME_STEPS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800];
+const TIME_STEPS = [1e-12, 2e-12, 5e-12, 1e-11, 2e-11, 5e-11, 1e-10, 2e-10, 5e-10, 1e-9, 2e-9, 5e-9, 1e-8, 2e-8, 5e-8, 1e-7, 2e-7, 5e-7, 1e-6, 2e-6, 5e-6, 1e-5, 2e-5, 5e-5, 1e-4, 2e-4, 5e-4,
+  0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800,
+  3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800, 2592000, 31536000];
+const INDEX_STEPS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5, 2e5, 5e5, 1e6, 2e6, 5e6, 1e7, 2e7, 5e7, 1e8];
 
 // ---------------------------------------------------------------- canvas helpers
 function fit(canvas) {
@@ -678,10 +767,13 @@ function renderTime() {
 
   // time ticks
   const minPx = 96;
-  const step = TIME_STEPS.find(s => s / (S.t1 - S.t0) * L.pw >= minPx) || 3600;
+  const steps = DS.tKind === "index" ? INDEX_STEPS : TIME_STEPS;
+  const step = steps.find(s => s / (S.t1 - S.t0) * L.pw >= minPx) || steps[steps.length - 1];
+  // Ticks fall on round wall-clock values, not on round offsets from the first sample.
+  const base = (DS.tKind === "naive" || DS.tKind === "utc") ? (DS.t0ms / 1000) % step : 0;
   const ticks = [];
-  for (let t = Math.ceil(S.t0 / step) * step; t <= S.t1 + 1e-9; t += step) ticks.push(+t.toFixed(6));
-  const tDigits = step >= 1 ? 0 : step >= 0.1 ? 1 : step >= 0.01 ? 2 : 3;
+  for (let k = Math.ceil((S.t0 + base) / step); k * step - base <= S.t1 + step * 1e-9; k++) ticks.push(k * step - base);
+  const tDigits = step >= 1 ? 0 : Math.min(12, Math.ceil(-Math.log10(step) - 1e-9));
 
   // numeric tracks
   const trackData = [];
@@ -763,7 +855,7 @@ function renderTime() {
 
   // PSD selection band
   if (S.psd) {
-    const p = PSDS[S.psdSel];
+    const p = PSDS[S.psdSel] || { t: [0, 0] };
     const x0 = Math.max(L.px0, X(L, p.t[0])), x1 = Math.min(L.px1, X(L, p.t[1]));
     if (x1 > x0) {
       ctx.fillStyle = TOK.sel; ctx.fillRect(x0, yTop, x1 - x0, yBot - yTop);
@@ -805,20 +897,20 @@ function roundRect(ctx, x, y, w, h, r) {
 function drawSeries(ctx, L, col, yOf, color) {
   ctx.fillStyle = color; ctx.strokeStyle = color;
   if (col.mode === "line") {
-    const pxPerSample = L.pw / ((S.t1 - S.t0) * FS);
+    const pxPerSample = L.pw / Math.max(1, col.i1 - col.i0);
     ctx.lineWidth = 1.5; ctx.lineJoin = "round"; ctx.beginPath();
     let pen = false;
     for (let i = col.i0; i < col.i1; i++) {
       const v = col.arr[i];
       if (!Number.isFinite(v)) { pen = false; continue; }
-      const x = X(L, col.w.a + i / FS), y = yOf(v);
+      const x = X(L, col.w.t[i]), y = yOf(v);
       if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
     }
     ctx.stroke();
     if (pxPerSample >= 7) {
       for (let i = col.i0; i < col.i1; i++) {
         const v = col.arr[i]; if (!Number.isFinite(v)) continue;
-        ctx.beginPath(); ctx.arc(X(L, col.w.a + i / FS), yOf(v), 2.5, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(X(L, col.w.t[i]), yOf(v), 2.5, 0, Math.PI * 2); ctx.fill();
       }
     }
     return;
@@ -936,7 +1028,11 @@ function drawAxis(ctx, L, ticks, digits) {
   for (const t of ticks) { const x = Math.round(X(L, t)) + 0.5; ctx.moveTo(x, y); ctx.lineTo(x, y + 4); }
   ctx.stroke();
   ctx.font = `11px ${TOK.fontNum}`; ctx.fillStyle = TOK.ink2; ctx.textAlign = "center"; ctx.textBaseline = "top";
-  for (const t of ticks) { const x = X(L, t); if (x > L.px0 + 30 && x < L.px1 - 30) ctx.fillText(clock(t, digits), x, y + 7); }
+  const long = (S.t1 - S.t0) > 2 * 86400 && (DS.tKind === "naive" || DS.tKind === "utc");
+  for (const t of ticks) {
+    const x = X(L, t); if (x < L.px0 + 30 || x > L.px1 - 30) continue;
+    ctx.fillText(long ? dateAt(t).slice(5) + " " + clock(t, 0).slice(0, 5) : clock(t, digits), x, y + 7);
+  }
   // gap lengths
   ctx.font = `10.5px ${TOK.fontUi}`; ctx.fillStyle = TOK.ink3;
   for (const [a, b] of GAPS) {
@@ -945,8 +1041,9 @@ function drawAxis(ctx, L, ticks, digits) {
   }
   // date and zone, left
   ctx.textAlign = "left";
-  ctx.font = `500 11px ${TOK.fontNum}`; ctx.fillStyle = TOK.ink2; ctx.fillText(DATE, 10, y + 7);
-  ctx.font = `10.5px ${TOK.fontUi}`; ctx.fillStyle = TOK.ink3; ctx.fillText("local time, no zone", 10, y + 23);
+  const zone = { naive: "local time, no zone", utc: "UTC", seconds: "seconds", number: "first column's values", index: "row index" }[DS.tKind];
+  ctx.font = `500 11px ${TOK.fontNum}`; ctx.fillStyle = TOK.ink2; ctx.fillText(dateAt(S.t0) || (DS.tKind === "index" ? "Row" : "Index"), 10, y + 7);
+  ctx.font = `10.5px ${TOK.fontUi}`; ctx.fillStyle = TOK.ink3; ctx.fillText(zone, 10, y + 23);
   ctx.textBaseline = "middle";
 }
 function drawCursors(ctx, L) {
@@ -981,7 +1078,7 @@ function updateHover() {
   const { x, y } = S.hover;
   if (x < L.px0 || x > L.px1 || y > L.axisY) { tip.hidden = true; return; }
   const t = T(L, x);
-  st.textContent = `${DATE} ${clock(t)}`;
+  st.textContent = `${stamp(t)}`;
   tip.replaceChildren();
   const gap = GAPS.find(([a, b]) => t >= a && t < b);
   const tPerPx = (S.t1 - S.t0) / L.pw;
@@ -994,7 +1091,7 @@ function updateHover() {
     const g = L.group;
     if (y >= L.anom.y && y < L.anom.y + L.anom.h) {
       const hits = anomalyRuns().filter(([a, b]) => X(L, b) >= x - 3 && X(L, a) <= x + 3);
-      tip.append(el("div", "when", `${DATE} ${clock(t)}`));
+      tip.append(el("div", "when", `${stamp(t)}`));
       if (!hits.length) tip.append(el("div", null, "No anomaly here"));
       for (const [a, b, idx] of hits.slice(0, 6)) {
         const row = el("div", "row"); const key = el("i", "key"); key.style.background = colorOf(idx);
@@ -1014,12 +1111,12 @@ function updateHover() {
       if (lane.kind === "marker") {
         let best = null;
         for (const [et, text] of lane.events) { const d = Math.abs(X(L, et) - x); if (d < 6 && (!best || d < best.d)) best = { d, et, text }; }
-        tip.append(el("div", "when", best ? `${DATE} ${clock(best.et)}` : `${DATE} ${clock(t)}`));
+        tip.append(el("div", "when", best ? `${stamp(best.et)}` : `${stamp(t)}`));
         tip.append(el("div", null, best ? `${lane.name}: ${best.text}` : `${lane.name}: no marker here`));
       } else {
         const tA = t - tPerPx / 2, tB = t + tPerPx / 2;
         const hits = lane.runs.filter(([a, b]) => b > tA && a < tB);
-        tip.append(el("div", "when", `${DATE} ${clock(t)}`));
+        tip.append(el("div", "when", `${stamp(t)}`));
         if (hits.length > 1) {
           const vals = [...new Set(hits.map(h => String(h[2])))];
           tip.append(el("div", null, `${lane.name}: ${hits.length} states in this pixel`));
@@ -1036,7 +1133,7 @@ function updateHover() {
       if (!td) { tip.hidden = true; return; }
       const single = samplesPerPx <= 1.5;
       const raw = single ? rawAt(td.data[0].idx, snapToSample(t)) : null;
-      tip.append(el("div", "when", single && raw && raw.known ? `${DATE} ${clock(raw.t)}  · nearest sample` : `${DATE} ${clock(t - tPerPx / 2)} → ${clock(t + tPerPx / 2)}`));
+      tip.append(el("div", "when", single && raw && raw.known ? `${stamp(raw.t)}  · nearest sample` : `${stamp(t - tPerPx / 2)} → ${clock(t + tPerPx / 2)}`));
       const c = Math.floor(x - L.px0);
       let note = null;
       for (const d of td.data) {
@@ -1072,7 +1169,7 @@ function renderReadout() {
   const pos = document.getElementById("ro-pos"); pos.replaceChildren();
   for (const [k, t] of [["A", S.ca], ["B", S.cb]]) {
     pos.append(el("span", "flag", k));
-    const s = el("span", "ts", `${DATE} ${clock(t)}`);
+    const s = el("span", "ts", `${stamp(t)}`);
     s.title = `Snapped to the sample at ${clock(t)}`;
     pos.append(s);
   }
@@ -1114,11 +1211,17 @@ function renderPsd() {
   const bodyH = document.querySelector(".main").getBoundingClientRect().height;
   sec.style.height = `${Math.round(bodyH * S.psdShare)}px`;
   const p = PSDS[S.psdSel];
+  if (!p) {
+    document.getElementById("psd-info").textContent = "No spectrum yet. Zoom to the range you want, then Compute for visible range.";
+    document.getElementById("psd-legend").replaceChildren();
+    const { ctx, W, H } = fit(pcv); ctx.clearRect(0, 0, W, H); PLAST = null;
+    return;
+  }
   document.getElementById("psd-info").textContent =
-    `Welch · ${group(String(p.samples))} samples, ${clock(p.t[0])} → ${clock(p.t[1])} · Hann window · ${group(String(p.seg))}-sample segments, 50 % overlap · ${p.segments} segments averaged · Δf ${p.df.toFixed(4)} Hz`;
+    `Welch · ${group(String(p.samples))} samples, ${clock(p.t[0])} → ${clock(p.t[1])} · Hann window · ${group(String(p.seg))}-sample segments, 50 % overlap · ${p.segments} segments averaged · Δf ${p.df.toPrecision(4)} Hz${p.note ? " · " + p.note : ""}`;
   document.getElementById("psd-info").title = document.getElementById("psd-info").textContent;
   const leg = document.getElementById("psd-legend"); leg.replaceChildren();
-  const series = p.series.map(s => ({ ...s, idx: NUM.findIndex(c => c.name === s.name) }));
+  const series = p.series.map(s => ({ ...s, idx: s.idx ?? NUM.findIndex(c => c.name === s.name) }));
   for (const s of series) {
     const it = el("div", "it"); const k = el("i"); k.style.background = colorOf(s.idx);
     it.append(k, el("span", null, s.name)); it.title = s.name; leg.append(it);
@@ -1200,23 +1303,21 @@ function drawPsdHover(ctx) {
 }
 
 // ---------------------------------------------------------------- chrome (DOM)
-function bytes(n) { return n >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : `${Math.round(n / 1e6)} MB`; }
-document.getElementById("f-name").textContent = D.file;
-document.getElementById("f-meta").textContent = `${bytes(D.bytes)} · ${group(String(D.rows))} rows · in memory`;
-document.getElementById("st-file").textContent = `${D.file} · read ${bytes(D.bytes)} · RAM budget 4.0 GB`;
+function bytes(n) { return n >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : n >= 1e6 ? `${Math.round(n / 1e6)} MB` : n >= 1e3 ? `${Math.round(n / 1e3)} kB` : `${n} B`; }
+function renderFileInfo() {
+  document.getElementById("f-name").textContent = DS.name;
+  document.getElementById("f-meta").textContent = `${bytes(DS.bytes)} · ${group(String(DS.rows))} rows · ${DS.storage}`;
+  document.getElementById("st-file").textContent = DS.local
+    ? `${DS.name} · read in this browser only, nothing is uploaded`
+    : `${DS.name} · read ${bytes(DS.bytes)} · RAM budget 4.0 GB`;
+  document.getElementById("m-scene").disabled = !DS.showcase;
+  document.getElementById("m-back").hidden = !!DS.showcase;
+  rebuildPsdOptions();
+}
 
-const CHIPS = [
-  { k: "Delimiter", v: ";", title: "Delimiter", text: "Semicolon, chosen together with the comma decimal separator: every row splits into 17 fields.", alts: [[";", "semicolon", true], [",", "comma"], ["\\t", "tab"], ["␣", "whitespace"]] },
-  { k: "Decimal", v: ",", title: "Decimal separator", text: "Comma: numbers such as 17,94 are read as 17.94.", alts: [[",", "comma", true], [".", "point"]] },
-  { k: "Encoding", v: "UTF-8", title: "Text encoding", text: "Valid UTF-8 throughout; °C and m/s² read correctly.", alts: [["UTF-8", "", true], ["Latin-1", ""], ["UTF-16", ""]] },
-  { k: "Time", v: "timestamp · YYYY-MM-DD HH:MM:SS.fff", title: "Time column and format", text: "Column 1, read as local time with no zone: the file does not say which zone.", alts: [["YYYY-MM-DD HH:MM:SS.fff", "local", true], ["same, as UTC", "UTC"], ["Use row number instead", ""]] },
-  { k: "Sampling", v: "1 kHz · 3 segments", title: "Sampling", text: "Uniform at 1 kHz inside each of three segments (segmented-uniform).", alts: [] },
-  { k: "Gaps", v: "2 · 6 min total", title: "Gaps", text: "Two pauses of 3 min each, 20 % of the span. That is too little to offer a compressed axis.", alts: [] },
-  { k: "MIL lamp", v: "0/1 read as on/off", warn: true, title: "Ambiguous column", text: "MIL lamp holds only 0 and 1. Glyde shows it as an on/off channel; it could also be a number.", alts: [["On/off", "boolean", true], ["Number", "integer"]] },
-];
 function renderChips() {
   const bar = document.getElementById("inference"); bar.replaceChildren(el("span", "lead", "Inferred"));
-  CHIPS.forEach((c, i) => {
+  DS.chips.forEach((c, i) => {
     const b = el("button", "chip" + (c.warn ? " warn" : "")); b.type = "button";
     b.append(el("span", "k", c.k), el("span", "v", c.v)); b.title = `${c.title}: ${c.v}. Click to change.`;
     b.addEventListener("click", e => openChip(c, b, e)); bar.append(b);
@@ -1291,6 +1392,7 @@ function refreshAll() {
   press("b-stacked", S.stacked); press("b-overlay", !S.stacked);
   press("b-cursors", S.cursors); press("b-psd", S.psd);
   press("fx-lin", !S.fxLog); press("fx-log", S.fxLog); press("py-lin", !S.pyLog); press("py-log", S.pyLog);
+  renderFileInfo();
   renderChips();
   renderReadout();
   renderPsd();
@@ -1302,7 +1404,7 @@ function schedule(fn = renderTime) { cancelAnimationFrame(raf); raf = requestAni
 
 // ---------------------------------------------------------------- interaction: time view
 function clampView(t0, t1) {
-  const minSpan = 0.02;   // 20 samples
+  const minSpan = Math.max(20 / FS, 1e-9);   // about 20 samples
   let span = Math.max(minSpan, Math.min(SPAN, t1 - t0));
   t0 = Math.max(0, Math.min(SPAN - span, t0));
   return [t0, t0 + span];
@@ -1366,8 +1468,13 @@ pcv.addEventListener("pointermove", e => { S.phover = localXY(e, pcv); if (S.pdr
 pcv.addEventListener("pointerleave", () => { S.phover = null; schedule(renderPsd); });
 pcv.addEventListener("pointerdown", e => { pcv.setPointerCapture(e.pointerId); S.pdrag = { x0: localXY(e, pcv).x, f0: S.pf0, f1: S.pf1 }; });
 pcv.addEventListener("pointerup", () => { S.pdrag = null; });
-pcv.addEventListener("dblclick", () => { S.pf0 = 0; S.pf1 = 500; schedule(renderPsd); });
-function setPsdView(a, b) { const span = Math.max(2, Math.min(500, b - a)); a = Math.max(0, Math.min(500 - span, a)); S.pf0 = a; S.pf1 = a + span; }
+const nyq = () => (PSDS[S.psdSel] && PSDS[S.psdSel].nyq) || FS / 2;
+pcv.addEventListener("dblclick", () => { S.pf0 = 0; S.pf1 = nyq(); schedule(renderPsd); });
+function setPsdView(a, b) {
+  const top = nyq(), p = PSDS[S.psdSel];
+  const span = Math.max(p ? 8 * p.df : top / 100, Math.min(top, b - a));
+  a = Math.max(0, Math.min(top - span, a)); S.pf0 = a; S.pf1 = a + span;
+}
 pcv.addEventListener("wheel", e => {
   e.preventDefault(); if (!PLAST) return;
   const { x } = localXY(e, pcv);
@@ -1399,7 +1506,8 @@ on("b-cursors", () => {
   refreshAll();
 });
 on("b-psd", () => { S.psd = !S.psd; refreshAll(); });
-on("b-open", () => toast("In the app: File → Open, or drop a file on the window."));
+on("b-open", () => document.getElementById("file-in").click());
+on("m-back", () => { adopt(showcaseDataset()); resetView(); document.getElementById("m-scene").value = "all"; refreshAll(); });
 on("b-channels", e => { e.stopPropagation(); toggleChannels(); });
 on("ch-close", () => toggleChannels(false));
 document.getElementById("ch-search").addEventListener("input", renderChannels);
@@ -1408,9 +1516,516 @@ on("fx-log", () => { S.fxLog = true; refreshAll(); });
 on("py-lin", () => { S.pyLog = false; refreshAll(); });
 on("py-log", () => { S.pyLog = true; refreshAll(); });
 const psdSel = document.getElementById("psd-sel");
-PSDS.forEach((p, i) => { const o = el("option", null, `${p.label}: ${clock(p.t[0], 0)} → ${clock(p.t[1], 0)}`); o.value = String(i); psdSel.append(o); });
-psdSel.addEventListener("change", () => { S.psdSel = +psdSel.value; refreshAll(); });
-on("psd-show", () => { const p = PSDS[S.psdSel]; const pad = (p.t[1] - p.t[0]) * 0.15; setView(p.t[0] - pad, p.t[1] + pad); refreshAll(); });
+function rebuildPsdOptions() {
+  psdSel.replaceChildren();
+  PSDS.forEach((p, i) => { const o = el("option", null, `${p.label}: ${clock(p.t[0], 0)} → ${clock(p.t[1], 0)}`); o.value = String(i); psdSel.append(o); });
+  if (!PSDS.length) { const o = el("option", null, "No spectrum yet"); o.value = "-1"; psdSel.append(o); }
+  psdSel.value = String(PSDS.length ? S.psdSel : -1);
+}
+psdSel.addEventListener("change", () => { S.psdSel = +psdSel.value; S.pf0 = 0; S.pf1 = nyq(); refreshAll(); });
+on("psd-show", () => { const p = PSDS[S.psdSel]; if (!p) return; const pad = (p.t[1] - p.t[0]) * 0.15; setView(p.t[0] - pad, p.t[1] + pad); refreshAll(); });
+on("psd-compute", () => {
+  const r = computeVisiblePsd();
+  if (r.error) { toast(r.error); return; }
+  const k = PSDS.findIndex(p => p.computed);
+  if (k >= 0) PSDS.splice(k, 1);
+  PSDS.push(r); S.psdSel = PSDS.length - 1; S.pf0 = 0; S.pf1 = r.nyq;
+  rebuildPsdOptions(); refreshAll();
+});
+
+// ---------------------------------------------------------------- LOADER (your own files)
+// Reads a dropped file in this browser tab only: nothing is uploaded. The
+// inference here is a simplified stand-in for Glyde's reader (SPEC §1.2, §2),
+// good enough to judge the layout on real files; every choice it makes is
+// shown in the inference bar, and the app's own reader decides in the end.
+const MAX_FILE_BYTES = 1.5e9;
+const NA = new Set(["", "nan", "na", "n/a", "null", "none", "-", "--", "#n/a", "#value!"]);
+const BOOL_PAIRS = [["true", "false"], ["on", "off"], ["yes", "no"]];
+const yieldUi = () => new Promise(r => setTimeout(r, 0));
+function progress(text) {
+  const o = document.getElementById("loading");
+  if (text == null) { o.hidden = true; return; }
+  o.hidden = false; o.querySelector("span").textContent = text;
+}
+
+function decodeText(bytes) {
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return { text: new TextDecoder("utf-8").decode(bytes.subarray(3)), enc: "UTF-8 (BOM)" };
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return { text: new TextDecoder("utf-16le").decode(bytes.subarray(2)), enc: "UTF-16 LE" };
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) return { text: new TextDecoder("utf-16be").decode(bytes.subarray(2)), enc: "UTF-16 BE" };
+  const head = bytes.subarray(0, Math.max(0, Math.min(bytes.length, 1 << 20) - 4));
+  try { new TextDecoder("utf-8", { fatal: true }).decode(head); return { text: new TextDecoder("utf-8").decode(bytes), enc: "UTF-8" }; }
+  catch { return { text: new TextDecoder("windows-1252").decode(bytes), enc: "Windows-1252" }; }
+}
+function splitter(delim) {
+  if (delim === "ws") return line => line.trim().split(/\s+/);
+  return line => {
+    if (line.indexOf('"') < 0) return line.split(delim);
+    const out = []; let cur = "", q = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (q) { if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; }
+      else if (c === '"') q = true;
+      else if (c === delim) { out.push(cur); cur = ""; }
+      else cur += c;
+    }
+    out.push(cur); return out;
+  };
+}
+function mode(arr) {
+  const m = new Map(); let best = 0, bv = 0;
+  for (const v of arr) { const c = (m.get(v) || 0) + 1; m.set(v, c); if (c > best) { best = c; bv = v; } }
+  return [bv, best / Math.max(1, arr.length)];
+}
+const numRe = /^[+-]?(\d+([.]\d*)?|[.]\d+)([eE][+-]?\d+)?$/;
+const numCommaRe = /^[+-]?(\d+(,\d*)?|,\d+)([eE][+-]?\d+)?$/;
+function parseNum(tok, comma) {
+  const s = tok.trim();
+  if (NA.has(s.toLowerCase())) return NaN;
+  if (comma ? numCommaRe.test(s) : numRe.test(s)) return Number(comma ? s.replace(",", ".") : s);
+  if (/^[+-]?inf(inity)?$/i.test(s)) return s[0] === "-" ? -Infinity : Infinity;
+  return undefined;   // not a number
+}
+function decimalsOf(tok, comma) {
+  const s = tok.trim(), k = s.indexOf(comma ? "," : ".");
+  if (k < 0 || /e/i.test(s)) return 0;
+  return s.length - k - 1;
+}
+
+// Time formats (SPEC §2.1, the subset this mockup reads).
+const ISO_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{1,2}):(\d{2})(?::(\d{2})(?:[.,](\d+))?)?)?\s*(Z|[+-]\d{2}:?\d{2})?$/;
+const DMY_RE = /^(\d{1,2})[/.](\d{1,2})[/.](\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:[.,](\d+))?)?)?$/;
+function matchTime(tok, fmt) {
+  const s = tok.trim(), m = (fmt === "iso" ? ISO_RE : DMY_RE).exec(s);
+  if (!m) return null;
+  let y, mo, d;
+  if (fmt === "iso") { y = +m[1]; mo = +m[2]; d = +m[3]; }
+  else if (fmt === "dmy") { d = +m[1]; mo = +m[2]; y = +m[3]; }
+  else { mo = +m[1]; d = +m[2]; y = +m[3]; }
+  const h = +(m[4] || 0), mi = +(m[5] || 0), se = +(m[6] || 0), frac = m[7] || "";
+  if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 24 || mi > 59 || se > 60) return null;
+  let sec = Date.UTC(y, mo - 1, d, h, mi, se) / 1000;
+  const zone = fmt === "iso" ? m[8] : undefined;
+  if (zone && zone !== "Z") { const z = zone.replace(":", ""); sec -= (z[0] === "-" ? -1 : 1) * (+z.slice(1, 3) * 3600 + +z.slice(3, 5) * 60); }
+  return { sec, frac: frac ? Number("0." + frac) : 0, fracDigits: frac.length, zone: !!zone };
+}
+function detectTime(name, sample) {
+  const vals = sample.filter(v => v.trim() !== "");
+  if (vals.length < 2) return null;
+  if (vals.every(v => ISO_RE.test(v.trim()))) {
+    const fd = Math.max(...vals.map(v => (matchTime(v, "iso") || { fracDigits: 0 }).fracDigits));
+    const zoned = vals.some(v => (matchTime(v, "iso") || {}).zone);
+    return { kind: "datetime", fmt: "iso", label: `YYYY-MM-DD HH:MM:SS${fd ? "." + "f".repeat(fd) : ""}`, zoned, low: false };
+  }
+  if (vals.every(v => DMY_RE.test(v.trim()))) {
+    let dmy = false, mdy = false;
+    for (const v of vals) { const m = DMY_RE.exec(v.trim()); if (+m[1] > 12) dmy = true; if (+m[2] > 12) mdy = true; }
+    const fmt = mdy && !dmy ? "mdy" : "dmy";
+    const sep = vals[0].trim()[2] === "." || vals[0].trim()[1] === "." ? "." : "/";
+    const label = (fmt === "dmy" ? `DD${sep}MM${sep}YYYY` : `MM${sep}DD${sep}YYYY`) + " HH:MM:SS";
+    return { kind: "datetime", fmt, label, zoned: false, low: !(dmy || mdy) };
+  }
+  return null;
+}
+function epochUnit(v) {
+  const a = Math.abs(v);
+  if (a > 1e17) return ["ns", 1e-9]; if (a > 1e14) return ["µs", 1e-6]; if (a > 1e11) return ["ms", 1e-3]; if (a > 3e8) return ["s", 1];
+  return null;
+}
+
+async function readDelimited(file) {
+  progress(`Reading ${file.name}…`); await yieldUi();
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const { text, enc } = decodeText(bytes);
+  progress("Splitting lines…"); await yieldUi();
+  const lines = text.split(/\r\n|\n|\r/);
+  while (lines.length && lines[lines.length - 1].trim() === "") lines.pop();
+  const head = lines.slice(0, 400).filter(l => l.trim() !== "");
+  // Delimiter: column-count consistency across the sampled lines (SPEC §1.2).
+  const cands = [[";", "semicolon"], ["\t", "tab"], ["|", "pipe"], [",", "comma"], ["ws", "whitespace"]];
+  const tail = head.slice(Math.floor(head.length / 2));
+  let pick = null;
+  for (const [d, label] of cands) {
+    const sp = splitter(d);
+    const [m, share] = mode(tail.map(l => sp(l).length));
+    if (m >= 2 && share >= 0.9 && (!pick || share > pick.share + 0.05)) pick = { d, label, m, share };
+  }
+  if (!pick) throw new Error("No delimiter splits the lines into a consistent number of columns.");
+  const split = splitter(pick.d);
+  // Decimal separator, jointly with the delimiter: "1,5;2,3" is two columns.
+  let comma = false;
+  if (pick.d !== ",") {
+    let c = 0, p = 0;
+    for (const l of tail.slice(0, 200)) for (const f of split(l)) { const s = f.trim(); if (/^[+-]?\d+,\d+$/.test(s)) c++; else if (/^[+-]?\d+\.\d+$/.test(s)) p++; }
+    comma = c > p;
+  }
+  // Preamble and header: the header is the first line with the data's field count
+  // when it is mostly not numbers.
+  let first = 0;
+  while (first < lines.length && split(lines[first]).length !== pick.m) first++;
+  const firstFields = split(lines[first]);
+  const numericShare = firstFields.filter(f => parseNum(f, comma) !== undefined && f.trim() !== "").length / firstFields.length;
+  const hasHeader = numericShare < 0.5;
+  const names = hasHeader ? firstFields.map((f, i) => f.trim() || `Column ${i + 1}`) : firstFields.map((_, i) => `Column ${i + 1}`);
+  const dataStart = first + (hasHeader ? 1 : 0);
+  // Sample rows spread over the whole file, not only its start.
+  const sampleRows = [], stride = Math.max(1, Math.floor((lines.length - dataStart) / 5000));
+  for (let i = dataStart; i < lines.length && sampleRows.length < 5000; i += stride) { const f = split(lines[i]); if (f.length === pick.m) sampleRows.push(f); }
+  const colSample = c => sampleRows.map(r => r[c]);
+
+  // Column kinds from the sample.
+  const time = detectTime(names[0], colSample(0));
+  const kinds = names.map((name, c) => {
+    const vals = colSample(c).map(v => v.trim());
+    const nonEmpty = vals.filter(v => !NA.has(v.toLowerCase()));
+    if (!nonEmpty.length) return { kind: "pending" };   // decided after reading every row
+    const lower = new Set(nonEmpty.map(v => v.toLowerCase()));
+    if (BOOL_PAIRS.some(([a, b]) => [...lower].every(v => v === a || v === b))) return { kind: "bool" };
+    const nums = nonEmpty.filter(v => parseNum(v, comma) !== undefined);
+    if (nums.length >= 0.95 * nonEmpty.length) {
+      if ([...lower].every(v => v === "0" || v === "1") && lower.size === 2 && c > 0) return { kind: "bool01" };
+      return { kind: "num", dec: Math.min(9, Math.max(0, ...nums.slice(0, 500).map(v => decimalsOf(v, comma)))) };
+    }
+    return { kind: nonEmpty.length < 0.2 * vals.length ? "marker" : "text" };
+  });
+
+  // Time index (SPEC §2.1): datetime first column, else a numeric first column
+  // that never decreases and advances on at least half of its steps, else row index.
+  let tMode = "index", tInfo = null;
+  if (time) { tMode = "datetime"; tInfo = time; }
+  else if (kinds[0].kind === "num") {
+    const v = colSample(0).map(x => parseNum(x, comma));
+    let dec = 0, adv = 0;
+    for (let i = 1; i < v.length; i++) { if (!(v[i] >= v[i - 1])) dec++; if (v[i] > v[i - 1]) adv++; }
+    if (dec === 0 && adv >= (v.length - 1) / 2) { tMode = "number"; const u = epochUnit(v[0]); if (u) { tMode = "epoch"; tInfo = { unit: u[0], scale: u[1] }; } }
+  }
+  const dataCols = names.map((n, c) => c).filter(c => !(c === 0 && tMode !== "index"));
+
+  // One pass over every data row.
+  const n0 = lines.length - dataStart;
+  const t = new Float64Array(n0);
+  const out = dataCols.map(c => {
+    const k = kinds[c].kind;
+    if (k === "num") return { name: names[c], kind: "num", dec: kinds[c].dec, dtype: "f64", values: new Float64Array(n0), bad: 0 };
+    if (k === "bool" || k === "bool01") return { name: names[c], kind: "bool", ambiguous: k === "bool01", values: new Uint8Array(n0) };
+    return { name: names[c], kind: k === "pending" ? "pending" : k === "marker" ? "marker" : "text", values: new Int32Array(n0), dict: new Map(), list: [] };
+  });
+  let rows = 0, skipped = 0, t0sec = null, t0big = null, maxFrac = 0;
+  for (let i = dataStart; i < lines.length; i++) {
+    if ((i & 0x3ffff) === 0) { progress(`Reading rows… ${Math.round(100 * (i - dataStart) / n0)} %`); await yieldUi(); }
+    const line = lines[i];
+    if (line.trim() === "") continue;
+    const f = split(line);
+    if (f.length !== pick.m) { skipped++; continue; }
+    let tv;
+    if (tMode === "datetime") {
+      const m = matchTime(f[0], tInfo.fmt);
+      if (!m) { skipped++; continue; }
+      if (t0sec === null) t0sec = m.sec;
+      tv = (m.sec - t0sec) + m.frac; if (m.fracDigits > maxFrac) maxFrac = m.fracDigits;
+    } else if (tMode === "epoch" || tMode === "number") {
+      const s = f[0].trim();
+      if (tMode === "epoch" && /^-?\d{16,}$/.test(s)) {   // integer epochs beyond 2^53: subtract in BigInt first
+        const b = BigInt(s); if (t0big === null) t0big = b;
+        tv = Number(b - t0big) * tInfo.scale; if (t0sec === null) t0sec = Number(t0big) * tInfo.scale;
+      } else {
+        const v = parseNum(s, comma); if (v === undefined || !Number.isFinite(v)) { skipped++; continue; }
+        const sv = tMode === "epoch" ? v * tInfo.scale : v;
+        if (t0sec === null) t0sec = sv; tv = sv - t0sec;
+      }
+    } else tv = rows;
+    t[rows] = tv;
+    for (let k = 0; k < out.length; k++) {
+      const o = out[k], tok = f[dataCols[k]];
+      if (o.kind === "num") { const v = parseNum(tok, comma); if (v === undefined) { o.bad++; o.values[rows] = NaN; } else o.values[rows] = v; }
+      else if (o.kind === "bool") { const s = tok.trim().toLowerCase(); o.values[rows] = (s === "true" || s === "on" || s === "yes" || s === "1") ? 1 : (s === "false" || s === "off" || s === "no" || s === "0") ? 0 : 2; }
+      else { const s = tok.trim(); if (!s) { o.values[rows] = -1; continue; } let id = o.dict.get(s); if (id === undefined) { id = o.list.length; o.dict.set(s, id); o.list.push(s); } o.values[rows] = id; }
+    }
+    rows++;
+  }
+  // Columns empty in the sample: numbers if every value read is a number, else markers or text.
+  for (const o of out) {
+    if (o.kind !== "pending") continue;
+    const parsed = o.list.map(v => parseNum(v, comma));
+    let filled = 0; for (let i = 0; i < rows; i++) if (o.values[i] >= 0) filled++;
+    if (o.list.length && parsed.every(v => v !== undefined)) {
+      const v = new Float64Array(rows); for (let i = 0; i < rows; i++) v[i] = o.values[i] >= 0 ? parsed[o.values[i]] : NaN;
+      Object.assign(o, { kind: "num", dec: Math.max(0, ...o.list.map(x => decimalsOf(x, comma))), dtype: "f64", values: v, bad: 0 });
+    } else o.kind = filled < 0.2 * rows ? "marker" : "text";
+  }
+  const chips = [
+    { k: "Delimiter", v: pick.d === "\t" ? "tab" : pick.d === "ws" ? "whitespace" : pick.d, title: "Delimiter", text: `${pick.label[0].toUpperCase() + pick.label.slice(1)}: ${Math.round(pick.share * 100)} % of the sampled lines split into ${pick.m} fields.`, alts: [] },
+    { k: "Decimal", v: comma ? "," : ".", title: "Decimal separator", text: comma ? "Comma, chosen together with the delimiter." : "Point.", alts: [] },
+    { k: "Encoding", v: enc, title: "Text encoding", text: enc === "Windows-1252" ? "The file is not valid UTF-8, so it was read as Windows-1252." : `Read as ${enc}.`, alts: [] },
+  ];
+  if (first > 0) chips.push({ k: "Preamble", v: `${first} line${first > 1 ? "s" : ""}`, title: "Lines before the header", text: `${first} line(s) before the column header were not read as data.`, alts: [] });
+  if (!hasHeader) chips.push({ k: "Header", v: "none", warn: true, title: "No header", text: "The first line looks like data, so columns are named Column 1, Column 2…", alts: [] });
+  if (skipped) chips.push({ k: "Skipped", v: `${group(String(skipped))} rows`, warn: true, title: "Rows skipped", text: "Rows with the wrong number of fields or an unreadable time were skipped and counted, never guessed.", alts: [] });
+  for (const o of out) if (o.kind === "num" && o.bad) chips.push({ k: o.name, v: `${group(String(o.bad))} unreadable values`, warn: true, title: "Unreadable values", text: `${o.name}: ${o.bad} cells were not numbers. They are shown as missing.`, alts: [] });
+  for (const o of out) if (o.ambiguous) chips.push({ k: o.name, v: "0/1 read as on/off", warn: true, title: "Ambiguous column", text: `${o.name} holds only 0 and 1. It is shown as an on/off channel; it could also be a number.`, alts: [] });
+  let tKind, tLabel, t0ms = 0, t0num = 0, low = false;
+  if (tMode === "datetime") { tKind = tInfo.zoned ? "utc" : "naive"; tLabel = `${names[0]} · ${tInfo.label}${tInfo.zoned ? " · zone in file, shown as UTC" : ""}`; t0ms = t0sec * 1000; low = tInfo.low; }
+  else if (tMode === "epoch") { tKind = "utc"; tLabel = `${names[0]} · epoch ${tInfo.unit}`; t0ms = t0sec * 1000; }
+  else if (tMode === "number") { tKind = "number"; tLabel = `${names[0]} · plain numbers`; t0num = t0sec; }
+  else { tKind = "index"; tLabel = "row index (no time column)"; low = true; }
+  chips.push({ k: "Time", v: tLabel, warn: low, title: "Time column", text: tMode === "index" ? "The first column is not a time index, so rows are plotted against their row number." : low ? "Every date could be read day-first or month-first. Day-first was chosen; in the app this is one click to swap." : "Read from the first column.", alts: [] });
+  return { name: file.name, bytes: file.size, n: rows, t: t.subarray(0, rows), tKind, t0ms, t0num, tDigits: tMode === "datetime" ? Math.min(12, maxFrac) : null, cols: out.map(o => ({ ...o, values: o.values.subarray(0, rows) })), chips };
+}
+
+async function readParquet(file) {
+  progress("Loading the Parquet reader…"); await yieldUi();
+  let hp, comp;
+  try {
+    hp = await import("https://cdn.jsdelivr.net/npm/hyparquet@1.31.5/+esm");
+    comp = await import("https://cdn.jsdelivr.net/npm/hyparquet-compressors@1.1.2/+esm");
+  } catch { throw new Error("The Parquet reader could not be downloaded (it needs the internet). CSV and TXT files work offline."); }
+  progress(`Reading ${file.name}…`); await yieldUi();
+  const buf = await file.arrayBuffer();
+  const metadata = await hp.parquetMetadataAsync(buf);
+  const n = Number(metadata.num_rows);
+  const names = metadata.schema.slice(1).filter(e => !e.num_children).map(e => e.name);
+  const cols = new Map(names.map(nm => [nm, new Array(n)]));
+  // Timestamps as exact integer nanoseconds: a JS Date would keep only milliseconds.
+  const ns = k => v => ({ ns: BigInt(v) * k });
+  const parsers = { timestampFromMilliseconds: ns(1000000n), timestampFromMicroseconds: ns(1000n), timestampFromNanoseconds: ns(1n) };
+  await hp.parquetRead({
+    file: buf, metadata, compressors: comp.compressors, parsers,
+    onChunk: ({ columnName, columnData, rowStart }) => { const a = cols.get(columnName); if (a) for (let i = 0; i < columnData.length; i++) a[rowStart + i] = columnData[i]; },
+  });
+  progress("Indexing…"); await yieldUi();
+  const firstVal = arr => arr.find(v => v !== null && v !== undefined);
+  // Time column: the first Date or epoch-like column.
+  const isTs = v => v && typeof v === "object" && typeof v.ns === "bigint";
+  let tName = names.find(nm => isTs(firstVal(cols.get(nm)))) || null;
+  let tKind = "index", tLabel = "row index (no time column)", t0ms = 0;
+  const t = new Float64Array(n);
+  if (tName) {
+    const a = cols.get(tName), base = firstVal(a).ns; t0ms = Number(base / 1000000n) + Number(base % 1000000n) / 1e6;
+    for (let i = 0; i < n; i++) t[i] = isTs(a[i]) ? Number(a[i].ns - base) / 1e9 : NaN;
+    tKind = "utc"; tLabel = `${tName} · Parquet timestamp, shown as UTC`;
+  } else {
+    const nm = names[0], v0 = firstVal(cols.get(nm));
+    const u = (typeof v0 === "bigint" || typeof v0 === "number") ? epochUnit(Number(v0)) : null;
+    if (u) {
+      const a = cols.get(nm); tName = nm;
+      const big = typeof v0 === "bigint", b0 = a[0];
+      for (let i = 0; i < n; i++) t[i] = big ? Number(BigInt(a[i]) - BigInt(b0)) * u[1] : (a[i] - b0) * u[1];
+      t0ms = Number(b0) * u[1] * 1000; tKind = "utc"; tLabel = `${nm} · epoch ${u[0]}`;
+    } else for (let i = 0; i < n; i++) t[i] = i;
+  }
+  const out = [], chips = [];
+  for (const nm of names) {
+    if (nm === tName) continue;
+    const a = cols.get(nm), v0 = firstVal(a);
+    if (v0 === undefined) { out.push({ name: nm, kind: "num", dec: 0, dtype: "null", values: new Float64Array(n).fill(NaN) }); continue; }
+    if (typeof v0 === "boolean") { const v = new Uint8Array(n); for (let i = 0; i < n; i++) v[i] = a[i] === true ? 1 : a[i] === false ? 0 : 2; out.push({ name: nm, kind: "bool", values: v }); continue; }
+    if (typeof v0 === "number" || typeof v0 === "bigint") {
+      const v = new Float64Array(n); let lossy = 0, mx = 0;
+      for (let i = 0; i < n; i++) {
+        const x = a[i];
+        if (x === null || x === undefined) v[i] = NaN;
+        else if (typeof x === "bigint") { if (x > 9007199254740992n || x < -9007199254740992n) lossy++; v[i] = Number(x); }
+        else v[i] = x;
+        if (Number.isFinite(v[i]) && Math.abs(v[i]) > mx) mx = Math.abs(v[i]);
+      }
+      const isInt = typeof v0 === "bigint" || a.slice(0, 2000).every(x => x === null || x === undefined || Number.isInteger(x));
+      const dec = isInt ? 0 : Math.max(0, Math.min(6, 4 - Math.floor(Math.log10(mx || 1))));
+      out.push({ name: nm, kind: "num", dec, dtype: typeof v0 === "bigint" ? "i64" : isInt ? "int" : "float", values: v });
+      if (lossy) chips.push({ k: nm, v: `${lossy} values beyond ±2⁵³`, warn: true, title: "Precision", text: `${nm}: ${lossy} integers are too large to plot exactly.`, alts: [] });
+      continue;
+    }
+    const v = new Int32Array(n), dict = new Map(), list = []; let filled = 0;
+    for (let i = 0; i < n; i++) {
+      const x = a[i]; if (x === null || x === undefined || x === "") { v[i] = -1; continue; }
+      const s = typeof x === "string" ? x : x instanceof Date ? x.toISOString() : isTs(x) ? new Date(Number(x.ns / 1000000n)).toISOString() : String(x);
+      let id = dict.get(s); if (id === undefined) { id = list.length; dict.set(s, id); list.push(s); } v[i] = id; filled++;
+    }
+    out.push({ name: nm, kind: filled < 0.2 * n ? "marker" : "text", values: v, list });
+  }
+  chips.unshift({ k: "Format", v: "Parquet", title: "File format", text: `${names.length} columns, ${group(String(n))} rows, read with hyparquet in this browser.`, alts: [] });
+  chips.push({ k: "Time", v: tLabel, warn: tKind === "index", title: "Time column", text: tKind === "index" ? "No timestamp column was found, so rows are plotted against their row number." : "Read from the file's timestamp column.", alts: [] });
+  return { name: file.name, bytes: file.size, n, t, tKind, t0ms, t0num: 0, tDigits: null, cols: out, chips };
+}
+
+function buildLocalDataset(r) {
+  let { t, n } = r;
+  // Out-of-order timestamps: counted and reported; this mockup sorts them to draw
+  // (the app asks [Sort] / [Keep as-is], SPEC §2.1).
+  let back = 0, missingT = 0;
+  for (let i = 1; i < n; i++) if (t[i] < t[i - 1]) back++;
+  for (let i = 0; i < n; i++) if (!Number.isFinite(t[i])) missingT++;
+  let order = null;
+  if (back || missingT) {
+    const idx = []; for (let i = 0; i < n; i++) if (Number.isFinite(t[i])) idx.push(i);
+    idx.sort((a, b) => t[a] - t[b]); order = Int32Array.from(idx);
+    const t2 = new Float64Array(order.length); for (let i = 0; i < order.length; i++) t2[i] = t[order[i]];
+    t = t2; n = order.length;
+  }
+  const pickRows = v => { if (!order) return v; const o = new v.constructor(n); for (let i = 0; i < n; i++) o[i] = v[order[i]]; return o; };
+  const shift = t[0]; if (shift) for (let i = 0; i < n; i++) t[i] -= shift;
+  // Sampling (SPEC §2.2): median Δt, gaps at Δt > 10× median, robust CV for uniformity.
+  const step = Math.max(1, Math.floor(n / 200000)), diffs = [];
+  for (let i = 1; i < n; i += step) { const d = t[i] - t[i - 1]; if (d > 0) diffs.push(d); }
+  diffs.sort((a, b) => a - b);
+  const med = diffs.length ? diffs[diffs.length >> 1] : 1;
+  const mad = diffs.length ? diffs.map(d => Math.abs(d - med)).sort((a, b) => a - b)[diffs.length >> 1] : 0;
+  const gaps = [], segments = []; let segStart = 0, gapTotal = 0;
+  for (let i = 1; i < n; i++) if (t[i] - t[i - 1] > 10 * med) { gaps.push([t[i - 1] + med, t[i]]); segments.push([t[segStart], t[i - 1] + med]); segStart = i; gapTotal += t[i] - t[i - 1] - med; }
+  const span = (t[n - 1] || 0) + med;
+  segments.push([t[segStart], span]);
+  const cv = 1.4826 * mad / med;
+  const sampling = cv <= 0.01 ? (gaps.length ? "SegmentedUniform" : "Uniform") : "Irregular";
+  const fs = 1 / med;
+  // Overview buckets, shared by every numeric channel.
+  const nb = Math.max(1, Math.min(65536, Math.ceil(n / 4))), bw = span / nb;
+  const bucketOf = new Int32Array(n), bucketCount = new Uint32Array(nb);
+  for (let i = 0; i < n; i++) { const b = Math.min(nb - 1, Math.floor(t[i] / bw)); bucketOf[i] = b; bucketCount[b]++; }
+  const gapAfter = new Uint8Array(n); for (let i = 0; i + 1 < n; i++) gapAfter[i] = t[i + 1] - t[i] > 10 * med ? 1 : 0;
+  const endOf = i => (i + 1 < n && !gapAfter[i]) ? t[i + 1] : t[i] + med;
+  const num = [], data = [], lanes = [], chips = r.chips.slice(), tooMany = [];
+  for (const c of r.cols) {
+    if (c.kind === "num") {
+      const v = pickRows(c.values), mn = new Float64Array(nb).fill(NaN), mx = new Float64Array(nb).fill(NaN), nan = [];
+      let run = -1;
+      for (let i = 0; i < n; i++) {
+        const x = v[i], b = bucketOf[i];
+        if (Number.isFinite(x)) {
+          if (!(mn[b] <= x)) mn[b] = x; if (!(mx[b] >= x)) mx[b] = x;
+          if (run >= 0) { if (nan.length < 20000) nan.push([t[run], t[i]]); run = -1; }
+        } else if (run < 0) run = i;
+        if (run >= 0 && gapAfter[i]) { if (nan.length < 20000) nan.push([t[run], endOf(i)]); run = -1; }
+      }
+      if (run >= 0 && nan.length < 20000) nan.push([t[run], endOf(n - 1)]);
+      num.push({ i: num.length, name: c.name, dec: c.dec, dtype: c.dtype, min: mn, max: mx, nan });
+      data.push(v);
+    } else if (c.kind === "bool" || c.kind === "text") {
+      const v = pickRows(c.values), runs = [], missing = c.kind === "bool" ? 2 : -1;
+      let s = 0;
+      for (let i = 1; i <= n; i++) {
+        if (i === n || v[i] !== v[s] || gapAfter[i - 1]) {
+          if (v[s] !== missing) runs.push([t[s], endOf(i - 1), c.kind === "bool" ? v[s] === 1 : c.list[v[s]]]);
+          s = i;
+          if (runs.length > 100000) break;
+        }
+      }
+      if (runs.length > 100000) { tooMany.push(c.name); continue; }
+      lanes.push({ kind: c.kind === "bool" ? "bool" : "state", name: c.name, runs });
+    } else {
+      const v = pickRows(c.values), events = [];
+      for (let i = 0; i < n && events.length < 20000; i++) if (v[i] >= 0) events.push([t[i], c.list[v[i]]]);
+      lanes.push({ kind: "marker", name: c.name, events });
+    }
+  }
+  if (back) chips.push({ k: "Order", v: `${group(String(back))} steps back in time`, warn: true, title: "Timestamps not monotonic", text: "The mockup sorted the rows to draw them. The app asks you: Sort, or keep them as they are.", alts: [["Sort", "", true], ["Keep as-is", ""]] });
+  if (tooMany.length) chips.push({ k: "Not drawn", v: tooMany.join(", "), warn: true, title: "Too many state changes", text: "These text columns change value on almost every row, more than this mockup draws (issue #212 covers them in the app).", alts: [] });
+  const fsText = r.tKind === "index" ? "1 per row" : fs >= 1e9 ? `${+(fs / 1e9).toPrecision(4)} GHz` : fs >= 1e6 ? `${+(fs / 1e6).toPrecision(4)} MHz` : fs >= 1000 ? `${+(fs / 1000).toPrecision(4)} kHz` : fs >= 1 ? `${+fs.toPrecision(4)} Hz` : `every ${fmtDuration(med)}`;
+  chips.push({ k: "Sampling", v: `${sampling} · ${fsText}`, warn: sampling === "Irregular", title: "Sampling", text: sampling === "Irregular" ? "The time steps vary by more than 1 %: the spectrum is disabled (SPEC §3.3)." : `Median step ${fmtDuration(med)}, robust spread ${(cv * 100).toFixed(2)} %.`, alts: [] });
+  if (gaps.length) chips.push({ k: "Gaps", v: `${gaps.length} · ${(100 * gapTotal / span).toFixed(0)} % of the span`, title: "Gaps", text: gapTotal > span / 2 ? "Steps longer than 10× the median step. They cover over half the span, so the app offers Compress here (not in this mockup)." : "Steps longer than 10× the median step.", alts: [] });
+  chips.push({ k: "Mockup", v: "simplified reader", title: "About this reader", text: "This page reads your file with a simplified version of Glyde's inference, in this browser only. The app's own reader is the reference.", alts: [] });
+  const tDigits = r.tDigits ?? (med >= 1 ? 0 : Math.min(12, Math.ceil(-Math.log10(med) - 1e-9)));
+  const shiftMs = shift * 1000;
+  const ds = {
+    local: true, name: r.name, bytes: r.bytes, rows: n, storage: "read in this browser",
+    t0ms: r.t0ms + (r.tKind === "index" ? 0 : shiftMs), t0num: (r.t0num || 0) + shift, tKind: r.tKind, tDigits, span, fs, bucket: bw, bucketCount, sampling,
+    segments, gaps, psds: [], lanes, num, chips,
+    windows: [{ label: "whole file", a: 0, b: span, n, t, data }],
+    snap(x) { const w = this.windows[0]; return w.t[nearestIndex(w, x)]; },
+  };
+  return ds;
+}
+
+async function openFile(file) {
+  if (!file) return;
+  if (file.size > MAX_FILE_BYTES) { toast(`${file.name} is ${bytes(file.size)}. This mockup reads the whole file into the browser tab and stops at ${bytes(MAX_FILE_BYTES)}; the app has no such limit.`); return; }
+  try {
+    const isPq = /\.parquet$/i.test(file.name);
+    const raw = isPq ? await readParquet(file) : await readDelimited(file);
+    if (!raw.n) throw new Error("No data rows were found.");
+    progress("Building the overview…"); await yieldUi();
+    const ds = buildLocalDataset(raw);
+    if (!ds.num.length && !ds.lanes.length) throw new Error("Nothing to plot: no numeric, on/off or text column besides the time.");
+    adopt(ds); resetView();
+    document.getElementById("m-scenario").value = "file";
+    progress(null); refreshAll();
+  } catch (e) {
+    progress(null);
+    toast(`Could not open ${file.name}: ${e && e.message ? e.message : e}`);
+  }
+}
+
+// Welch PSD of the visible range (same defaults as glyde-core; SPEC §3.2, §3.3).
+function fftInPlace(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) { let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; } }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const a = i + k, b = a + len / 2, xr = re[b] * cr - im[b] * ci, xi = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - xr; im[b] = im[a] - xi; re[a] += xr; im[a] += xi;
+        const nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr;
+      }
+    }
+  }
+}
+function computeVisiblePsd() {
+  if (DS.sampling === "Irregular") return { error: "The spectrum is disabled on irregularly sampled data (SPEC §3.3)." };
+  if (DS.tKind === "index") return { error: "Rows have no time, so there is no frequency to show." };
+  const w = windowFor(S.t0, S.t1);
+  if (!w) return { error: "The mockup has raw samples only inside the three “Jump to” windows of this file. Zoom inside one, or open your own file." };
+  const chans = S.visible.slice(0, 3);
+  if (!chans.length) return { error: "Show at least one numeric channel first." };
+  const i0 = lowerBound(w.t, S.t0), i1 = lowerBound(w.t, S.t1);
+  // Contiguous runs between gaps.
+  const runs = []; let s = i0;
+  for (let i = i0 + 1; i <= i1; i++) if (i === i1 || w.t[i] - w.t[i - 1] > 10 / FS) { runs.push([s, i]); s = i; }
+  const longest = Math.max(...runs.map(([a, b]) => b - a));
+  const target = Math.floor(longest / 8);
+  let seg = target ? 1 << (31 - Math.clz32(target)) : 1;
+  seg = Math.min(65536, Math.max(256, seg));
+  if (longest < seg) return { error: `The visible range holds ${longest} contiguous samples; the spectrum needs at least 256.` };
+  const hop = seg / 2, win = new Float64Array(seg);
+  for (let k = 0; k < seg; k++) win[k] = 0.5 - 0.5 * Math.cos(2 * Math.PI * k / (seg - 1));
+  let wss = 0; for (let k = 0; k < seg; k++) wss += win[k] * win[k];
+  const scale = 1 / (FS * wss), nf = seg / 2 + 1;
+  const series = []; let segCount = 0;
+  const re = new Float64Array(seg), im = new Float64Array(seg);
+  for (const idx of chans) {
+    const x = w.data[idx], acc = new Float64Array(nf); let count = 0;
+    for (const [a, b] of runs) {
+      let start = a;
+      while (start + seg <= b) {
+        // A window never spans a missing sample: restart right after it (welch.rs).
+        let hole = -1; for (let k = start; k < start + seg; k++) if (!Number.isFinite(x[k])) { hole = k; break; }
+        if (hole >= 0) { start = hole + 1; continue; }
+        let mean = 0; for (let k = 0; k < seg; k++) mean += x[start + k]; mean /= seg;
+        for (let k = 0; k < seg; k++) { re[k] = (x[start + k] - mean) * win[k]; im[k] = 0; }
+        fftInPlace(re, im);
+        for (let k = 0; k < nf; k++) { let p = (re[k] * re[k] + im[k] * im[k]) * scale; if (k > 0 && k < seg / 2) p *= 2; acc[k] += p; }
+        count++; start += hop;
+      }
+    }
+    if (!count) continue;
+    for (let k = 0; k < nf; k++) acc[k] /= count;
+    series.push({ name: NUM[idx].name, idx, p: acc }); segCount = Math.max(segCount, count);
+  }
+  if (!series.length) return { error: "Every analysis window crossed a missing sample." };
+  const freqs = new Float64Array(nf); for (let k = 0; k < nf; k++) freqs[k] = k * FS / seg;
+  return {
+    computed: true, label: "Visible range", t: [w.t[i0], w.t[Math.max(i0, i1 - 1)]], samples: i1 - i0, df: FS / seg, segments: segCount, seg, nfreq: nf, nyq: FS / 2, freqs, series,
+    note: runs.length > 1 ? `averaged over ${runs.length} segments between gaps` : "",
+  };
+}
+
+// File input, Open… and drag-and-drop anywhere on the page.
+const fileInput = document.getElementById("file-in");
+fileInput.addEventListener("change", () => { openFile(fileInput.files[0]); fileInput.value = ""; });
+let dragDepth = 0;
+const dropOverlay = document.getElementById("drop");
+document.addEventListener("dragenter", e => { if ([...(e.dataTransfer?.types || [])].includes("Files")) { dragDepth++; dropOverlay.hidden = false; e.preventDefault(); } });
+document.addEventListener("dragover", e => { if (!dropOverlay.hidden) e.preventDefault(); });
+document.addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; dropOverlay.hidden = true; } });
+document.addEventListener("drop", e => { e.preventDefault(); dragDepth = 0; dropOverlay.hidden = true; openFile(e.dataTransfer?.files?.[0]); });
 
 // ---------------------------------------------------------------- mockup bar
 function segGroup(id, fn) {
@@ -1439,7 +2054,7 @@ const SCENES = {
   steady: () => { setView(660 + 30, 660 + 330); S.cursors = false; S.psd = true; S.psdSel = 0; S.psdShare = 0.4; },
 };
 document.getElementById("m-scene").addEventListener("change", e => {
-  SCENES[e.target.value](); psdSel.value = String(S.psdSel); refreshAll();
+  SCENES[e.target.value](); S.pf0 = 0; S.pf1 = nyq(); psdSel.value = String(S.psdSel); refreshAll();
 });
 on("m-notes", () => { document.getElementById("notes").hidden = false; });
 on("notes-close", () => { document.getElementById("notes").hidden = true; });
