@@ -552,9 +552,15 @@ fn show_lanes(
         let states = state_lanes.get(index).and_then(Option::as_ref);
         let markers = marker_lanes.get(index).and_then(Option::as_ref);
         let bools = bool_bands.get(index).and_then(Option::as_ref);
-        if states.is_none() && markers.is_none() && bools.is_none() {
-            continue;
-        }
+        // A text column that can be drawn either way gets the switch in its
+        // gutter; every other lane is what it is.
+        let choice = match (states, markers, bools) {
+            (Some(states), Some(markers), _) => LaneChoice::Switchable(states, markers),
+            (None, Some(markers), _) => LaneChoice::Fixed(LaneRef::Markers(&markers.lane)),
+            (Some(states), None, _) => LaneChoice::Fixed(LaneRef::State(states)),
+            (None, None, Some(bools)) => LaneChoice::Fixed(LaneRef::Bool(bools)),
+            (None, None, None) => continue,
+        };
         let row_left = ui.cursor().left();
         // Over exactly the plot's frame: the same x, the same pixel. With no
         // plot, the gutter is as wide as the plot's would be.
@@ -573,19 +579,15 @@ fn show_lanes(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
                         ui.set_width(gutter);
-                        let lane = match (states, markers, bools) {
-                            (Some(states), Some(markers), _) => {
+                        let lane = match choice {
+                            LaneChoice::Switchable(states, markers) => {
                                 if string_lane_toggle(ui, index, series.name(), markers) {
                                     LaneRef::Markers(&markers.lane)
                                 } else {
                                     LaneRef::State(states)
                                 }
                             }
-                            (None, Some(markers), _) => LaneRef::Markers(&markers.lane),
-                            (Some(states), None, _) => LaneRef::State(states),
-                            (_, _, bools) => {
-                                LaneRef::Bool(bools.expect("a column with no lane was skipped"))
-                            }
+                            LaneChoice::Fixed(lane) => lane,
                         };
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             ui.add(
@@ -601,6 +603,14 @@ fn show_lanes(
             show_lane(ui, index, lane, time, axis, width, state);
         });
     }
+}
+
+/// What a column's lane is: fixed, or a text column's two views, one of
+/// which its gutter switch picks.
+#[derive(Clone, Copy)]
+enum LaneChoice<'a> {
+    Fixed(LaneRef<'a>),
+    Switchable(&'a StateLane, &'a MarkerColumn),
 }
 
 /// The visible window as screen columns, and where those columns are in
@@ -1560,9 +1570,25 @@ mod render_tests {
                 axis.top() >= plot.bottom() + group - 1.0 && axis.bottom() <= LAPTOP.y,
                 "{channels} channels: the axis {axis:?} is the last track (plot {plot:?})"
             );
-            if channels > 0 {
-                let first = lane_view(&ctx, 1).expect("the first lane is drawn");
-                assert!(first.top >= plot.bottom() && first.bottom <= axis.top());
+            // The group got the room it wants: every lane fits when they
+            // can (4), its whole share when they cannot (20). Measuring the
+            // group by what fitted on the first frame — the plot had taken
+            // everything then — would leave it a sliver for good.
+            let view = lanes_state.view_height.expect("the view was measured");
+            if channels == 4 {
+                for index in 1..=channels {
+                    let lane = lane_view(&ctx, index).expect("the lane is drawn");
+                    assert!(
+                        lane.top >= plot.bottom() && lane.bottom <= axis.top(),
+                        "lane {index} is fully on screen: {lane:?}, plot {plot:?}, axis {axis:?}"
+                    );
+                }
+            }
+            if channels == 20 {
+                assert!(
+                    group >= STATE_GROUP_SHARE * view - 6.0,
+                    "the group uses its share: {group} of {view}"
+                );
             }
         }
     }
@@ -1753,8 +1779,9 @@ mod render_tests {
     }
 
     // Issue #200: the cursor readout appearing under the pointer used to
-    // push every lane down a row. Its row is reserved: hovering the plot
-    // moves nothing.
+    // push every lane down a row. Its row is reserved under the plot: the
+    // readout is painted inside it when hovering, nothing moves, and the
+    // row is there (empty) when not.
     #[test]
     fn hovering_the_plot_moves_no_track() {
         let dataset = layout_dataset(2, 0);
@@ -1762,8 +1789,9 @@ mod render_tests {
         let mut time_state = super::super::time::TimeViewState::default();
         let mut lanes_state = StateTimelineState::default();
         let mut frame = |pointer| {
+            let mut output = None;
             for _ in 0..4 {
-                time_view_frame(
+                output = Some(time_view_frame(
                     &ctx,
                     &dataset,
                     &mut time_state,
@@ -1771,16 +1799,41 @@ mod render_tests {
                     None,
                     LAPTOP,
                     pointer,
-                );
+                ));
             }
+            let plot = time_state.shared_axis().expect("plot drawn").frame;
             (
+                plot,
                 lane_view(&ctx, 1).expect("lane drawn"),
                 super::super::time::time_axis_rect(&ctx).expect("axis drawn"),
+                painted_texts(output.as_ref().unwrap()),
             )
         };
-        let still = frame(None);
-        let hovered = frame(Some(egui::pos2(700.0, 300.0)));
-        assert_eq!((still.0.top, still.1), (hovered.0.top, hovered.1));
+        let readout = |texts: &[(String, egui::Rect)]| {
+            texts
+                .iter()
+                .find(|(text, _)| text.contains("speed: "))
+                .map(|(_, rect)| *rect)
+        };
+        let (plot, lane, axis, texts) = frame(None);
+        assert_eq!(readout(&texts), None, "no readout without the pointer");
+        let row = lane.top - plot.bottom();
+        assert!(
+            row >= ui_text_height(&ctx),
+            "the readout's row is reserved between the plot and the group: {row} points"
+        );
+
+        let (hovered_plot, hovered_lane, hovered_axis, hovered_texts) =
+            frame(Some(egui::pos2(700.0, 300.0)));
+        let shown = readout(&hovered_texts).expect("the readout is painted while hovering");
+        assert!(
+            shown.top() >= plot.bottom() - 1.0 && shown.bottom() <= lane.top,
+            "the readout {shown:?} sits in its row, between the plot {plot:?} and the lanes"
+        );
+        assert_eq!(
+            (plot, lane.top, axis),
+            (hovered_plot, hovered_lane.top, hovered_axis)
+        );
     }
 
     fn assert_close(actual: (f64, f64), expected: (f64, f64)) {
@@ -1793,6 +1846,11 @@ mod render_tests {
     // SPEC §4.1/§4.3: one synchronized time axis. A lane shows exactly the
     // span the plot above it shows — the whole file at first, the zoomed
     // window after a jump — over exactly the same screen columns.
+    /// The height of one line of body text.
+    fn ui_text_height(ctx: &egui::Context) -> f32 {
+        ctx.style().text_styles[&egui::TextStyle::Body].size
+    }
+
     #[test]
     fn lanes_share_the_time_plots_axis_and_frame() {
         let dataset = sample_dataset();

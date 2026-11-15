@@ -65,7 +65,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   a small "events" / "bands" button next to its name; what was inferred, and
   from how many rows, is now in that button's tooltip rather than printed on
   screen. The name column is 184 points wide, as in the mockup, so the plot is
-  about 140 points narrower than before. **Not in this change** (issue
+  about 140 points narrower than before. The gray "several states here" mark
+  is the mockup's color, and in an on/off lane it sits next to a gray "on"
+  strip: check in the smoke ritual that you can tell them apart. **Not in this change** (issue
   #255): the time view's channel list still floats over the top right of the
   plot, an empty plot still shows for a file with no numeric column, and "Fit to
   data" still leaves no margin at the edges.

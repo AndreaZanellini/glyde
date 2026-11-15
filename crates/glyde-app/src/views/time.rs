@@ -967,18 +967,7 @@ pub fn show_time_axis(
             .include_y(0.0)
             .include_y(1.0)
             .set_margin_fraction(egui::Vec2::ZERO)
-            .x_axis_formatter(move |mark, _range| match broken {
-                Some(b) if b.gap_at(mark.value).is_some() => "⫽".to_string(),
-                Some(b) => format_x_axis_tick(
-                    ticks,
-                    GridMark {
-                        value: b.expand(mark.value),
-                        ..mark
-                    },
-                    time,
-                ),
-                None => format_x_axis_tick(ticks, mark, time),
-            })
+            .x_axis_formatter(move |mark, _range| time_axis_label(ticks, mark, time, broken))
             .show(ui, |_| {});
     });
     // The whole row, its labels included (the plot's own rect is only its
@@ -987,6 +976,30 @@ pub fn show_time_axis(
     ui.ctx().data_mut(|data| {
         data.insert_temp(egui::Id::new("time_axis_track_rect"), _row.response.rect)
     });
+}
+
+/// The time axis's label for `mark`: the real time under it — `broken`
+/// maps a compressed coordinate back to it ([`BrokenAxis::expand`]) — or
+/// `⫽` for a mark inside a collapsed gap, which has no time of its own
+/// (SPEC §2.3: labels make the discontinuity explicit).
+fn time_axis_label(
+    ticks: &[i128],
+    mark: GridMark,
+    time: &TimeAxis,
+    broken: Option<&BrokenAxis>,
+) -> String {
+    match broken {
+        Some(b) if b.gap_at(mark.value).is_some() => "⫽".to_string(),
+        Some(b) => format_x_axis_tick(
+            ticks,
+            GridMark {
+                value: b.expand(mark.value),
+                ..mark
+            },
+            time,
+        ),
+        None => format_x_axis_tick(ticks, mark, time),
+    }
 }
 
 /// Where [`show_time_axis`] drew the axis on the last frame, for the tests.
@@ -2651,6 +2664,112 @@ mod render_tests {
         assert!(
             has_text(&compressed, "⫽ 2.8 h gap"),
             "the break glyph names the real gap length"
+        );
+    }
+
+    // SPEC §2.3 on the axis that now draws the labels (issue #230): a mark
+    // inside a collapsed gap reads `⫽`, any other mark the real time under
+    // it, never its compressed coordinate.
+    #[test]
+    fn a_compressed_time_axis_labels_gaps_and_real_times() {
+        let dataset = gap_heavy_dataset();
+        let fit = fit_bounds_of(&dataset);
+        let broken = fit.compress.as_deref().expect("the gaps are compressible");
+        let ticks = dataset.time.to_pyramid_ticks();
+        let mark = |value| GridMark {
+            value,
+            step_size: 1.0,
+        };
+        let (gap_start, gap_end) = (broken.compress(49.0), broken.compress(10_050.0));
+        let in_gap = (gap_start + gap_end) / 2.0;
+        assert!(broken.gap_at(in_gap).is_some());
+        assert_eq!(
+            time_axis_label(&ticks, mark(in_gap), &dataset.time, Some(broken)),
+            "⫽"
+        );
+        let after = broken.compress(10_070.0);
+        assert_eq!(
+            time_axis_label(&ticks, mark(after), &dataset.time, Some(broken)),
+            format_x_axis_tick(&ticks, mark(10_070.0), &dataset.time)
+        );
+    }
+
+    // The same, drawn: with the view compressed, the axis row prints times
+    // from after the gap (beyond 10 050 s), which the compressed coordinates
+    // alone would never reach.
+    #[test]
+    fn the_compressed_time_axis_row_prints_real_times() {
+        let dataset = gap_heavy_dataset();
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
+        let ticks = dataset.time.to_pyramid_ticks();
+        let sample_cache = cache_column_samples(&dataset);
+        let cursor = CursorLookup::for_time(&dataset.time);
+        let fit = fit_bounds_of(&dataset);
+        let mut state = TimeViewState::default();
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        // Opened on the true-to-scale axis, then the user presses Compress.
+        for frame in 0..8 {
+            if frame == 3 {
+                state.compressed = true;
+            }
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            shapes = ctx
+                .run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        // The plot above, the axis row under it, as the app
+                        // lays them out.
+                        let plot = egui::vec2(
+                            ui.available_width(),
+                            ui.available_height() - TIME_AXIS_HEIGHT - 20.0,
+                        );
+                        ui.allocate_ui(plot, |ui| {
+                            show(
+                                ui,
+                                &dataset,
+                                &pyramids,
+                                &ticks,
+                                &sample_cache,
+                                &[],
+                                &cursor,
+                                &fit,
+                                &mut state,
+                            );
+                        });
+                        show_time_axis(ui, &dataset.time, &ticks, &fit, &state);
+                    });
+                })
+                .shapes;
+        }
+        let axis = time_axis_rect(&ctx).expect("the axis is drawn");
+        let mut labels = Vec::new();
+        fn walk(shape: &egui::Shape, labels: &mut Vec<(String, egui::Pos2)>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, labels)),
+                egui::Shape::Text(t) => labels.push((t.galley.text().to_owned(), t.pos)),
+                _ => {}
+            }
+        }
+        for clipped in &shapes {
+            walk(&clipped.shape, &mut labels);
+        }
+        let on_axis: Vec<&String> = labels
+            .iter()
+            .filter(|(_, pos)| axis.y_range().contains(pos.y))
+            .map(|(text, _)| text)
+            .collect();
+        assert!(
+            on_axis
+                .iter()
+                .filter_map(|t| t.parse::<f64>().ok())
+                .any(|seconds| seconds >= 10_050.0),
+            "real times after the gap on the axis: {on_axis:?}"
         );
     }
 
