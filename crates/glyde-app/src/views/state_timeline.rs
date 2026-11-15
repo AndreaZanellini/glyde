@@ -429,16 +429,23 @@ fn group_header(ui: &mut egui::Ui, count: usize, state: &mut StateTimelineState)
     if response.clicked() {
         state.set_collapsed(!state.collapsed);
     }
+    // The arrow, drawn in its own 8-point box: pointing right when
+    // collapsed, down when open. (egui's `paint_default_icon` sizes it from
+    // the response's rect, which here is the whole header row.)
     let icon = egui::Rect::from_center_size(
         egui::pos2(rect.left() + 8.0, rect.center().y),
-        egui::vec2(10.0, 10.0),
+        egui::vec2(8.0, 8.0),
     );
-    let mut icon_ui = ui.new_child(egui::UiBuilder::new().max_rect(icon));
-    egui::collapsing_header::paint_default_icon(
-        &mut icon_ui,
-        if state.collapsed { 0.0 } else { 1.0 },
-        &response,
-    );
+    let points = if state.collapsed {
+        vec![icon.left_top(), icon.right_center(), icon.left_bottom()]
+    } else {
+        vec![icon.left_top(), icon.right_top(), icon.center_bottom()]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(
+        points,
+        ui.style().interact(&response).fg_stroke.color,
+        egui::Stroke::NONE,
+    ));
     let plural = if count == 1 { "" } else { "s" };
     ui.painter().text(
         egui::pos2(rect.left() + 20.0, rect.center().y),
@@ -1724,6 +1731,56 @@ mod render_tests {
                 palette.state_tints.iter().any(|tint| fills.contains(tint)),
                 "{theme:?}: state tints"
             );
+        }
+    }
+
+    // The header's arrow is a small triangle left of its label, open or
+    // collapsed. It used to be sized from the whole header row, so the
+    // collapsed (rotated) arrow became a white needle ~1000 points tall
+    // through the plot (seen at 1440 x 900 on the engine showcase file).
+    #[test]
+    fn the_group_arrow_stays_in_its_icon_box() {
+        fn triangles(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| triangles(s, out)),
+                egui::Shape::Path(path) if path.points.len() == 3 => {
+                    out.push(egui::Rect::from_points(&path.points));
+                }
+                _ => {}
+            }
+        }
+        let dataset = layout_dataset(2, 2);
+        for collapsed in [false, true] {
+            let ctx = egui::Context::default();
+            let mut time_state = super::super::time::TimeViewState::default();
+            let mut lanes_state = StateTimelineState::default();
+            lanes_state.set_collapsed(collapsed);
+            let mut output = None;
+            for _ in 0..4 {
+                output = Some(time_view_frame(
+                    &ctx,
+                    &dataset,
+                    &mut time_state,
+                    &mut lanes_state,
+                    None,
+                    LAPTOP,
+                    None,
+                ));
+            }
+            let mut found = Vec::new();
+            for clipped in &output.unwrap().shapes {
+                triangles(&clipped.shape, &mut found);
+            }
+            assert!(
+                !found.is_empty(),
+                "collapsed {collapsed}: the arrow is drawn"
+            );
+            for rect in found {
+                assert!(
+                    rect.width() <= 12.0 && rect.height() <= 12.0,
+                    "collapsed {collapsed}: a {rect:?} triangle"
+                );
+            }
         }
     }
 
