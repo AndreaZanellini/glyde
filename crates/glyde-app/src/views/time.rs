@@ -1519,7 +1519,7 @@ fn lay_out_marks(
     width_px: f32,
     char_px: f32,
 ) -> Vec<AxisMark> {
-    if !(x1 > x0) || marks.is_empty() {
+    if x1.partial_cmp(&x0) != Some(std::cmp::Ordering::Greater) || marks.is_empty() {
         return marks;
     }
     let px_per_x = f64::from(width_px) / (x1 - x0);
@@ -1615,7 +1615,9 @@ pub(crate) struct MarkBoxes {
     pub context: Option<(f32, f32)>,
 }
 
-/// [`MarkBoxes`] for every mark of [`time_axis_marks`] over `view`.
+/// [`MarkBoxes`] for every mark of [`time_axis_marks`] over `view` (what
+/// the tests check the layout against).
+#[cfg(test)]
 pub(crate) fn mark_boxes(
     marks: &[AxisMark],
     view: (f64, f64),
@@ -1623,7 +1625,7 @@ pub(crate) fn mark_boxes(
     char_px: f32,
 ) -> Vec<MarkBoxes> {
     let (x0, x1) = view;
-    if !(x1 > x0) {
+    if x1.partial_cmp(&x0) != Some(std::cmp::Ordering::Greater) {
         return Vec::new();
     }
     let px_per_x = f64::from(width_px) / (x1 - x0);
