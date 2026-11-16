@@ -1496,7 +1496,7 @@ pub(crate) fn calendar_grid<'a>(
 ) -> impl Fn(egui_plot::GridInput) -> Vec<GridMark> + 'a {
     move |input| {
         let (x0, x1) = input.bounds;
-        if !(input.base_step_size > 0.0) {
+        if input.base_step_size.is_nan() || input.base_step_size <= 0.0 {
             return Vec::new();
         }
         let width_px = (x1 - x0) / input.base_step_size * f64::from(GRID_SPACING.min);
