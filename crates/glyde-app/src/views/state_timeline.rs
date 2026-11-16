@@ -1624,7 +1624,12 @@ mod render_tests {
         let texts = painted_texts(&output.unwrap());
         let axis = super::super::time::time_axis_rect(&ctx).expect("the time axis is drawn");
         let mut seen = std::collections::HashSet::new();
-        for (text, _) in texts.iter().filter(|(text, _)| !text.trim().is_empty()) {
+        // A numeric channel's name is both in the channel picker and left of
+        // its stacked plot (issue #198): not a time label.
+        for (text, _) in texts
+            .iter()
+            .filter(|(text, _)| !text.trim().is_empty() && text != "speed")
+        {
             assert!(seen.insert(text.as_str()), "{text:?} is painted twice");
         }
         for name in ["flag0", "flag1", "flag2", "flag3"] {

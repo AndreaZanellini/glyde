@@ -68,6 +68,13 @@
 //! decimation first drops that cache — otherwise a repeated full-view frame
 //! would time a cache hit, not the worst case this bench gates.
 //!
+//! The time view stacks one plot per shown channel by default (issue
+//! #198). Every case above keeps its **overlaid** layout, one plot for all
+//! channels, so its numbers stay comparable with earlier runs; the
+//! many-channel fixture is also benched **stacked** (one plot for each of its
+//! 32 channels, panned in the frame and in the background), against the same
+//! SPEC §5 ceiling.
+//!
 //! Per issue #61 decision 2 (mirrored from `glyde-core`'s benches), only the
 //! absolute SPEC §5 ceiling is build-blocking here; the >15% regression
 //! comparison is a manual check on the SPEC §5 reference machine using
@@ -80,7 +87,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use egui::{Pos2, Rect, Vec2};
 use glyde_app::views;
 use glyde_app::views::channels::ChannelVisibility;
-use glyde_app::views::time::TimeViewState;
+use glyde_app::views::time::{NumericLayout, TimeViewState};
 use glyde_core::index::disk_pyramid::ColumnPyramid;
 use glyde_core::ingest::{pyramids_for_dataset, Dataset, TimeAxis};
 use glyde_core::series::{Series, SeriesValues};
@@ -411,20 +418,32 @@ fn assert_frame_budget(
     );
 }
 
-/// Benches `fixture` with `channels` as the picker's choice; `shown`, when
-/// non-empty, names that choice in the bench ids (e.g. "1 of 32 shown").
+/// A view state with `layout`, otherwise fresh.
+fn state_with(layout: NumericLayout) -> TimeViewState {
+    let mut state = TimeViewState::default();
+    state.layout = layout;
+    state
+}
+
+/// Benches `fixture` with `channels` as the picker's choice and `layout`;
+/// `shown`, when non-empty, names that choice in the bench ids (e.g. "1 of
+/// 32 shown"), and a stacked layout adds ", stacked".
 fn bench_one_fixture(
     c: &mut Criterion,
     fixture: &Fixture,
     channels: ChannelVisibility,
     shown: &str,
+    layout: NumericLayout,
 ) {
-    let label = if shown.is_empty() {
+    let mut label = if shown.is_empty() {
         fixture.label.to_owned()
     } else {
         format!("{}, {shown}", fixture.label)
     };
-    let mut state = TimeViewState::default();
+    if layout == NumericLayout::Stacked {
+        label.push_str(", stacked");
+    }
+    let mut state = state_with(layout);
     state.channels = channels;
     let full = full_view(fixture);
     let span_ticks = fixture.ticks.last().expect("non-empty") - fixture.ticks[0];
@@ -492,7 +511,7 @@ fn bench_one_fixture(
 fn bench_picker_click(c: &mut Criterion, fixture: &Fixture) {
     let ctx = egui::Context::default();
     let full = full_view(fixture);
-    let mut state = TimeViewState::default();
+    let mut state = state_with(NumericLayout::Overlaid);
     // Settle: every channel decimated for this view once.
     for _ in 0..3 {
         render_frame(&ctx, fixture, &mut state, false, full);
@@ -534,14 +553,14 @@ fn bench_picker_click(c: &mut Criterion, fixture: &Fixture) {
 /// Panning `fixture` with every channel shown and its decimation off the UI
 /// thread, as the app does for a completed spilled load: the UI frame never
 /// waits for a decimation, so this times drawing alone.
-fn bench_background_pan(c: &mut Criterion, fixture: &Fixture) {
+fn bench_background_pan(c: &mut Criterion, fixture: &Fixture, layout: NumericLayout) {
     let shared = Arc::new((
         fixture.dataset.clone(),
         fixture.pyramids.clone(),
         fixture.ticks.clone(),
         fixture.sample_cache.clone(),
     ));
-    let mut state = TimeViewState::default();
+    let mut state = state_with(layout);
     state.set_background(Some(views::time::BackgroundDecimator::new(
         move |column, range, pixel_columns| {
             let (dataset, pyramids, ticks, sample_cache) = &*shared;
@@ -575,9 +594,14 @@ fn bench_background_pan(c: &mut Criterion, fixture: &Fixture) {
         "a background-decimated pan frame took {elapsed:?}, exceeding the \
          {FRAME_TIME_CEILING:?} build-blocking ceiling"
     );
+    let stacked = if layout == NumericLayout::Stacked {
+        ", stacked"
+    } else {
+        ""
+    };
     c.bench_function(
         &format!(
-            "time_view_render/{}, all {MULTI_CHANNELS} shown/pan, background",
+            "time_view_render/{}, all {MULTI_CHANNELS} shown{stacked}/pan, background",
             fixture.label
         ),
         |b| b.iter(|| frame(std::hint::black_box(&mut state))),
@@ -593,7 +617,8 @@ fn bench_background_pan(c: &mut Criterion, fixture: &Fixture) {
 fn bench_fit_click(c: &mut Criterion, fixture: &Fixture) {
     let ctx = egui::Context::default();
     let full = full_view(fixture);
-    let mut state = TimeViewState::default();
+    // Overlaid: the one plot whose bounds the click is checked on.
+    let mut state = state_with(NumericLayout::Overlaid);
     let mut frame = render_frame_with(&ctx, fixture, &mut state, Vec::new(), Some(full), true);
     for _ in 0..2 {
         frame = render_frame_with(&ctx, fixture, &mut state, Vec::new(), Some(full), true);
@@ -688,7 +713,7 @@ fn bench_hover_unordered(c: &mut Criterion, fixture: &Fixture) {
         "the fixture's axis must be unordered"
     );
     let ctx = egui::Context::default();
-    let mut state = TimeViewState::default();
+    let mut state = state_with(NumericLayout::Overlaid);
     let full = full_view(fixture);
     for _ in 0..3 {
         render_frame(&ctx, fixture, &mut state, true, full);
@@ -727,13 +752,15 @@ fn bench_hover_unordered(c: &mut Criterion, fixture: &Fixture) {
 
 fn bench_time_view_render(c: &mut Criterion) {
     let all = ChannelVisibility::default;
-    bench_one_fixture(c, &f64_fixture(SAMPLE_COUNT), all(), "");
-    bench_one_fixture(c, &i64_fixture(SAMPLE_COUNT), all(), "");
+    let overlaid = NumericLayout::Overlaid;
+    bench_one_fixture(c, &f64_fixture(SAMPLE_COUNT), all(), "", overlaid);
+    bench_one_fixture(c, &i64_fixture(SAMPLE_COUNT), all(), "", overlaid);
     bench_one_fixture(
         c,
         &spilled_fixture("f64 spilled (disk pyramid)", SAMPLE_COUNT, 1),
         all(),
         "",
+        overlaid,
     );
 
     let many = spilled_fixture(
@@ -741,14 +768,23 @@ fn bench_time_view_render(c: &mut Criterion) {
         MULTI_CHANNEL_SAMPLES,
         MULTI_CHANNELS,
     );
-    bench_one_fixture(c, &many, all(), &format!("all {MULTI_CHANNELS} shown"));
+    let all_shown = format!("all {MULTI_CHANNELS} shown");
+    bench_one_fixture(c, &many, all(), &all_shown, overlaid);
+    bench_one_fixture(c, &many, all(), &all_shown, NumericLayout::Stacked);
     let mut one_shown = ChannelVisibility::default();
     one_shown.sync((0..MULTI_CHANNELS).map(|channel| many.dataset.columns[channel].name()));
     one_shown.solo(0);
     assert_eq!(one_shown.visible_count(), 1);
-    bench_one_fixture(c, &many, one_shown, &format!("1 of {MULTI_CHANNELS} shown"));
+    bench_one_fixture(
+        c,
+        &many,
+        one_shown,
+        &format!("1 of {MULTI_CHANNELS} shown"),
+        overlaid,
+    );
     bench_picker_click(c, &many);
-    bench_background_pan(c, &many);
+    bench_background_pan(c, &many, overlaid);
+    bench_background_pan(c, &many, NumericLayout::Stacked);
     bench_fit_click(c, &many);
     bench_hover_unordered(c, &unordered_fixture(SAMPLE_COUNT));
 }
