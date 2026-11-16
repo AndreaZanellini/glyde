@@ -558,9 +558,19 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     let readout_row = ui.text_style_height(&egui::TextStyle::Body);
     let spacing = ui.spacing().item_spacing.y;
     let plots_height = (ui.available_height() - readout_row - spacing).max(0.0);
-    // Stacked plots share the height equally (the approved mockup).
-    let track_height =
-        ((plots_height - spacing * (tracks.len() - 1) as f32) / tracks.len() as f32).max(1.0);
+    // Stacked plots share the height equally (the approved mockup). With so
+    // many that a plot would be under a point tall, the gaps between them
+    // shrink too, so the plots, the readout and the time axis below them
+    // never leave the window (issue #230; the 8-channel cap is #257).
+    let count = tracks.len() as f32;
+    let track_gap = if count > 1.0 {
+        spacing.min(((plots_height - count) / (count - 1.0)).max(0.0))
+    } else {
+        spacing
+    };
+    let track_height = ((plots_height - track_gap * (count - 1.0)) / count).max(1.0);
+    let item_spacing = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = track_gap;
     let gutter_left = ui.cursor().left();
 
     // Applied to every plot alike, so the linked x axis stays one axis.
@@ -602,7 +612,6 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     let mut decimated_view: Option<((i128, i128), usize)> = None;
     let mut hovered = None;
     let mut updating = false;
-    let mut moved = false;
     let mut frames: Vec<egui::Rect> = Vec::with_capacity(tracks.len());
     let mut last_bounds: Option<PlotBounds> = None;
     #[cfg(test)]
@@ -804,16 +813,16 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             let hovered = plot_ui
                 .pointer_coordinate()
                 .and_then(|pointer| cursor.nearest(&dataset.time, from_x(pointer.x)));
-            (hovered, plot_updating, view_x)
+            (hovered, plot_updating)
         });
-        let (plot_hovered, plot_updating, drawn_x) = response.inner;
+        let (plot_hovered, plot_updating) = response.inner;
         hovered = hovered.or(plot_hovered);
         updating |= plot_updating;
         let bounds = *response.transform.bounds();
-        // The plot ended the frame elsewhere than it drew (a drag, a zoom,
-        // its linked axis): one more frame draws every plot there, so a
-        // plot above the one being dragged never stays a step behind.
-        moved |= (bounds.min()[0], bounds.max()[0]) != drawn_x;
+        // A plot above one that moved this frame (a drag, a zoom) was drawn
+        // before the move; it follows on the next frame, which egui runs
+        // after any input or smooth-scroll step anyway
+        // (`plots_above_a_panned_one_catch_up_without_more_input`).
         // SPEC §2.3: a click on a cluster next to a gap fits it to the
         // viewport. A double click is egui_plot's own reset to the full fit,
         // so it wins.
@@ -854,9 +863,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             frame,
         });
     }
-    if moved {
-        ui.ctx().request_repaint();
-    }
+    ui.spacing_mut().item_spacing.y = item_spacing;
     #[cfg(test)]
     ui.ctx()
         .data_mut(|data| data.insert_temp(egui::Id::new("time_drawn_tracks"), drawn));
@@ -5500,9 +5507,11 @@ mod render_tests {
     }
 
     // SPEC §2.3's toggle keeps the view where it was, re-expressed in the
-    // other coordinates — once, for every stacked plot alike (they share
-    // one x axis, so re-mapping each plot's linked bounds again would
-    // shift all but the first).
+    // other coordinates, on every stacked plot alike. The re-map starts from
+    // the span on screen, not from each plot's own memory: a channel shown
+    // again on the very frame of the toggle has a plot whose memory is still
+    // where it was when it was hidden, and re-mapping that would leave it on
+    // another span than the rest.
     #[test]
     fn compressing_keeps_every_stacked_plot_on_the_same_span() {
         let mut dataset = gap_heavy_dataset();
@@ -5515,9 +5524,17 @@ mod render_tests {
         let broken = fixture.fit.compress.clone().expect("compressible");
         let ctx = egui::Context::default();
         let mut state = TimeViewState::default();
+        // Both plots drawn once, at the fit; then the second is hidden while
+        // the view moves.
+        for _ in 0..2 {
+            state_frame(&ctx, &fixture, &mut state, None);
+        }
+        state.channels.toggle(1);
         for _ in 0..2 {
             state_frame(&ctx, &fixture, &mut state, Some((10.0, 10_060.0)));
         }
+        // Shown again on the frame the axis is compressed.
+        state.channels.toggle(1);
         state.compressed = true;
         for _ in 0..3 {
             state_frame(&ctx, &fixture, &mut state, None);
@@ -5535,9 +5552,86 @@ mod render_tests {
         }
     }
 
-    // The catch-up repaint for a plot that ended a frame elsewhere than it
-    // drew must settle: a view nobody touches stops asking for frames, or
-    // an idle window would burn a core.
+    // A lower plot that pans moves the plots above it only on the next frame
+    // (they were drawn before it moved). Like eframe, run frames only while
+    // something asks for one: a smooth wheel pan's last step comes with no
+    // input of its own, and the plots above must still end on its span, not
+    // a step behind.
+    #[test]
+    fn plots_above_a_panned_one_catch_up_without_more_input() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        for _ in 0..20 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let tracks = drawn_tracks(&ctx);
+        let before = x_bounds(&ctx, &tracks[0]);
+        let over = tracks[2].frame.center();
+        frame_with_events(
+            &ctx,
+            &fixture,
+            &mut state,
+            vec![
+                egui::Event::PointerMoved(over),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(-150.0, 0.0),
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        let mut frames = 0;
+        while ctx.has_requested_repaint() && frames < 200 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+            frames += 1;
+        }
+        let tracks = drawn_tracks(&ctx);
+        let panned = x_bounds(&ctx, &tracks[2]);
+        assert!(
+            panned.0 > before.0,
+            "the wheel panned: {before:?} -> {panned:?}"
+        );
+        for track in &tracks {
+            assert_eq!(x_bounds(&ctx, track), panned, "column {:?}", track.column);
+        }
+    }
+
+    // However many channels are stacked, the plots, the readout and the time
+    // axis under them stay in the window: the gaps between plots shrink
+    // with the plots (issue #230's layout; the 8-channel cap is #257).
+    #[test]
+    fn many_stacked_channels_stay_inside_the_window() {
+        let n = 200usize;
+        let columns: Vec<(String, Vec<f64>)> = (0..n)
+            .map(|c| (format!("ch{c}"), (0..50).map(|i| (i + c) as f64).collect()))
+            .collect();
+        let fixture = ViewFixture::new(dataset_of(
+            columns
+                .iter()
+                .map(|(name, values)| (name.as_str(), values.clone()))
+                .collect(),
+        ));
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        for _ in 0..3 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), n);
+        for pair in tracks.windows(2) {
+            assert!(pair[0].frame.bottom() <= pair[1].frame.top());
+        }
+        let readout_row = ctx.style().text_styles[&egui::TextStyle::Body].size;
+        assert!(
+            tracks.last().unwrap().frame.bottom() + readout_row <= 600.0,
+            "the last plot ends at {}, the readout below it must fit",
+            tracks.last().unwrap().frame.bottom()
+        );
+    }
+
+    // A view nobody touches stops asking for frames, or an idle window
+    // would burn a core.
     #[test]
     fn an_idle_stacked_view_stops_repainting() {
         let fixture = ViewFixture::new(three_scales_dataset());

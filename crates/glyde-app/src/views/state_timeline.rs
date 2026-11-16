@@ -1624,8 +1624,13 @@ mod render_tests {
         let texts = painted_texts(&output.unwrap());
         let axis = super::super::time::time_axis_rect(&ctx).expect("the time axis is drawn");
         let mut seen = std::collections::HashSet::new();
-        // A numeric channel's name is both in the channel picker and left of
-        // its stacked plot (issue #198): not a time label.
+        // A numeric channel's name is in the channel picker and left of its
+        // stacked plot (issue #198): exactly twice, and not a time label.
+        assert_eq!(
+            texts.iter().filter(|(text, _)| text == "speed").count(),
+            2,
+            "\"speed\" in the picker and beside its plot: {texts:?}"
+        );
         for (text, _) in texts
             .iter()
             .filter(|(text, _)| !text.trim().is_empty() && text != "speed")

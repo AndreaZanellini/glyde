@@ -53,8 +53,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
   pans them all; Fit, Compress, hover and the Overlaid toggle) and by the frame-time
   benchmark with 32 stacked channels (numbers in the pull request). **Assumptions to
   veto:** the plots split the height equally however many channels are shown, so with
-  dozens of channels each plot gets thin: the mockup's limit of 8 channels on screen
-  is not built yet (issue #257). The y range of a stacked plot does not follow the
+  dozens of channels each plot gets thin, and with a couple of hundred each is a
+  one-point sliver (they always stay inside the window, with the readout and the time
+  axis under them; use Overlaid or hide channels): the mockup's limit of 8 channels
+  on screen is not built yet (issue #257). The y range of a stacked plot does not follow the
   visible data yet when you zoom in time: that is the next roadmap item (#197).
   Switching layout re-fits each plot's y to its channels, forgetting a y zoom.
 - **The time view is laid out as tracks with one time axis at the bottom, and
