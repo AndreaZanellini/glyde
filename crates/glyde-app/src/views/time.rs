@@ -185,6 +185,16 @@ pub struct TimeViewState {
 /// jump in any of them moves all of them.
 pub(crate) const TIME_AXIS_LINK_GROUP: &str = "time_axis";
 
+/// Width, in points, of the gutter left of every track's frame (issue #230,
+/// the approved mockup's `G`): the time plot's y labels, the state lanes'
+/// names. The plot's y axis is at least this wide, so every track starts at
+/// the same x.
+pub const NAME_GUTTER: f32 = 184.0;
+
+/// Height, in points, of the one time axis at the bottom of the time view
+/// ([`show_time_axis`]; the approved mockup's `AXIS_H`).
+pub const TIME_AXIS_HEIGHT: f32 = 40.0;
+
 /// The time plot's x axis as drawn this frame — what the state lanes below
 /// it line up with, so a band sits exactly under the samples of its time.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -197,6 +207,8 @@ pub struct SharedAxis {
     pub left: f32,
     /// The plot frame's width, in screen points.
     pub width: f32,
+    /// The plot frame, in screen points.
+    pub frame: egui::Rect,
 }
 
 /// One column's decimation and the view it was computed for.
@@ -472,7 +484,17 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         .map(|(channel, &(column_index, series))| (channel, column_index, series))
         .collect();
 
+    // The cursor readout's row under the plot is always there, so the
+    // tracks below never move as the pointer comes and goes (issue #200).
+    let readout_row = ui.text_style_height(&egui::TextStyle::Body);
+    let plot_height = (ui.available_height() - readout_row - ui.spacing().item_spacing.y).max(0.0);
     let mut plot = Plot::new("time_domain_view")
+        .height(plot_height)
+        // Issue #230: one time axis, at the bottom of the time view
+        // (`show_time_axis`), shared by every track; the plot keeps its
+        // vertical grid lines.
+        .show_axes([false, true])
+        .y_axis_min_width(NAME_GUTTER)
         .allow_zoom(true)
         .allow_scroll(true)
         .allow_drag(true)
@@ -481,21 +503,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         // No horizontal margin: a fit (first frame, double-click) shows
         // exactly `fit`, the span every linked lane fits to as well, so a
         // fit never leaves the plot and the lanes on different spans.
-        .set_margin_fraction(egui::vec2(0.0, 0.05))
-        .x_axis_formatter(|mark, _range| match broken {
-            // A mark inside a collapsed gap says so, instead of a time it
-            // does not have (SPEC §2.3: labels make the discontinuity
-            // explicit).
-            Some(b) if b.gap_at(mark.value).is_some() => "⫽".to_string(),
-            _ => format_x_axis_tick(
-                ticks,
-                GridMark {
-                    value: from_x(mark.value),
-                    ..mark
-                },
-                &dataset.time,
-            ),
-        });
+        .set_margin_fraction(egui::vec2(0.0, 0.05));
     if let Some((x_min, x_max)) = fit {
         plot = plot.include_x(x_min).include_x(x_max);
     }
@@ -875,6 +883,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         x_range: (bounds.min()[0], bounds.max()[0]),
         left: frame.left(),
         width: frame.width(),
+        frame: *frame,
     });
 
     if let Some(frame) = updating {
@@ -893,17 +902,110 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         crate::theme::series_color(&visuals, index)
     });
 
-    if let Some(index) = hovered {
-        ui.horizontal(|ui| {
-            ui.label(format_cursor_time(&dataset.time, index));
-            for &(_, _, series) in &plotted {
-                if let Some(text) = format_series_value(series.values(), index) {
-                    ui.label(format!("{}: {text}", series.name()));
-                }
+    // One line, cut with an ellipsis where the window ends; the whole line
+    // is its tooltip (issue #200).
+    let readout = hovered
+        .map(|index| {
+            std::iter::once(format_cursor_time(&dataset.time, index))
+                .chain(plotted.iter().filter_map(|&(_, _, series)| {
+                    format_series_value(series.values(), index)
+                        .map(|text| format!("{}: {text}", series.name()))
+                }))
+                .collect::<Vec<_>>()
+                .join("    ")
+        })
+        .unwrap_or_default();
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, readout_row),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(egui::vec2(width, readout_row));
+            if !readout.is_empty() {
+                ui.add(egui::Label::new(readout).truncate());
             }
-        });
-    }
+        },
+    );
     visible
+}
+
+/// Draws the time view's one time axis (issue #230): a row of time labels
+/// under the last track, over exactly the plot's frame and linked to it, so
+/// dragging or scrolling it pans and zooms every track. Nothing before the
+/// plot was first drawn (`state` has no [`SharedAxis`] yet).
+pub fn show_time_axis(
+    ui: &mut egui::Ui,
+    time: &TimeAxis,
+    ticks: &[i128],
+    fit_bounds: &FitBounds,
+    state: &TimeViewState,
+) {
+    let Some(shared) = state.shared_axis else {
+        return;
+    };
+    // The compressed map in force, if on: a label inside a collapsed gap
+    // says so instead of a time it does not have (SPEC §2.3: labels make
+    // the discontinuity explicit).
+    let broken: Option<&BrokenAxis> = fit_bounds.compress.as_deref().filter(|_| state.compressed);
+    let _row = ui.horizontal(|ui| {
+        ui.add_space((shared.left - ui.cursor().left()).max(0.0));
+        Plot::new("time_axis_track")
+            .width(shared.width)
+            .height(TIME_AXIS_HEIGHT)
+            .show_axes([true, false])
+            .show_grid([false, false])
+            .show_background(false)
+            .show_x(false)
+            .show_y(false)
+            .allow_zoom([true, false])
+            .allow_scroll([true, false])
+            .allow_drag([true, false])
+            .allow_boxed_zoom(false)
+            .link_axis(TIME_AXIS_LINK_GROUP, [true, false])
+            .include_x(shared.fit.0)
+            .include_x(shared.fit.1)
+            .include_y(0.0)
+            .include_y(1.0)
+            .set_margin_fraction(egui::Vec2::ZERO)
+            .x_axis_formatter(move |mark, _range| time_axis_label(ticks, mark, time, broken))
+            .show(ui, |_| {});
+    });
+    // The whole row, its labels included (the plot's own rect is only its
+    // frame, above them).
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(egui::Id::new("time_axis_track_rect"), _row.response.rect)
+    });
+}
+
+/// The time axis's label for `mark`: the real time under it — `broken`
+/// maps a compressed coordinate back to it ([`BrokenAxis::expand`]) — or
+/// `⫽` for a mark inside a collapsed gap, which has no time of its own
+/// (SPEC §2.3: labels make the discontinuity explicit).
+fn time_axis_label(
+    ticks: &[i128],
+    mark: GridMark,
+    time: &TimeAxis,
+    broken: Option<&BrokenAxis>,
+) -> String {
+    match broken {
+        Some(b) if b.gap_at(mark.value).is_some() => "⫽".to_string(),
+        Some(b) => format_x_axis_tick(
+            ticks,
+            GridMark {
+                value: b.expand(mark.value),
+                ..mark
+            },
+            time,
+        ),
+        None => format_x_axis_tick(ticks, mark, time),
+    }
+}
+
+/// Where [`show_time_axis`] drew the axis on the last frame, for the tests.
+#[cfg(test)]
+pub(crate) fn time_axis_rect(ctx: &egui::Context) -> Option<egui::Rect> {
+    ctx.data(|data| data.get_temp(egui::Id::new("time_axis_track_rect")))
 }
 
 /// The radius, in points, of the marker for a sample with no neighbour to
@@ -2562,6 +2664,112 @@ mod render_tests {
         assert!(
             has_text(&compressed, "⫽ 2.8 h gap"),
             "the break glyph names the real gap length"
+        );
+    }
+
+    // SPEC §2.3 on the axis that now draws the labels (issue #230): a mark
+    // inside a collapsed gap reads `⫽`, any other mark the real time under
+    // it, never its compressed coordinate.
+    #[test]
+    fn a_compressed_time_axis_labels_gaps_and_real_times() {
+        let dataset = gap_heavy_dataset();
+        let fit = fit_bounds_of(&dataset);
+        let broken = fit.compress.as_deref().expect("the gaps are compressible");
+        let ticks = dataset.time.to_pyramid_ticks();
+        let mark = |value| GridMark {
+            value,
+            step_size: 1.0,
+        };
+        let (gap_start, gap_end) = (broken.compress(49.0), broken.compress(10_050.0));
+        let in_gap = (gap_start + gap_end) / 2.0;
+        assert!(broken.gap_at(in_gap).is_some());
+        assert_eq!(
+            time_axis_label(&ticks, mark(in_gap), &dataset.time, Some(broken)),
+            "⫽"
+        );
+        let after = broken.compress(10_070.0);
+        assert_eq!(
+            time_axis_label(&ticks, mark(after), &dataset.time, Some(broken)),
+            format_x_axis_tick(&ticks, mark(10_070.0), &dataset.time)
+        );
+    }
+
+    // The same, drawn: with the view compressed, the axis row prints times
+    // from after the gap (beyond 10 050 s), which the compressed coordinates
+    // alone would never reach.
+    #[test]
+    fn the_compressed_time_axis_row_prints_real_times() {
+        let dataset = gap_heavy_dataset();
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
+        let ticks = dataset.time.to_pyramid_ticks();
+        let sample_cache = cache_column_samples(&dataset);
+        let cursor = CursorLookup::for_time(&dataset.time);
+        let fit = fit_bounds_of(&dataset);
+        let mut state = TimeViewState::default();
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        // Opened on the true-to-scale axis, then the user presses Compress.
+        for frame in 0..8 {
+            if frame == 3 {
+                state.compressed = true;
+            }
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            shapes = ctx
+                .run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        // The plot above, the axis row under it, as the app
+                        // lays them out.
+                        let plot = egui::vec2(
+                            ui.available_width(),
+                            ui.available_height() - TIME_AXIS_HEIGHT - 20.0,
+                        );
+                        ui.allocate_ui(plot, |ui| {
+                            show(
+                                ui,
+                                &dataset,
+                                &pyramids,
+                                &ticks,
+                                &sample_cache,
+                                &[],
+                                &cursor,
+                                &fit,
+                                &mut state,
+                            );
+                        });
+                        show_time_axis(ui, &dataset.time, &ticks, &fit, &state);
+                    });
+                })
+                .shapes;
+        }
+        let axis = time_axis_rect(&ctx).expect("the axis is drawn");
+        let mut labels = Vec::new();
+        fn walk(shape: &egui::Shape, labels: &mut Vec<(String, egui::Pos2)>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, labels)),
+                egui::Shape::Text(t) => labels.push((t.galley.text().to_owned(), t.pos)),
+                _ => {}
+            }
+        }
+        for clipped in &shapes {
+            walk(&clipped.shape, &mut labels);
+        }
+        let on_axis: Vec<&String> = labels
+            .iter()
+            .filter(|(_, pos)| axis.y_range().contains(pos.y))
+            .map(|(text, _)| text)
+            .collect();
+        assert!(
+            on_axis
+                .iter()
+                .filter_map(|t| t.parse::<f64>().ok())
+                .any(|seconds| seconds >= 10_050.0),
+            "real times after the gap on the axis: {on_axis:?}"
         );
     }
 
@@ -4318,7 +4526,9 @@ mod render_tests {
     /// `torque` looked dashed (issue #147), with a NaN run wide enough to
     /// span several columns.
     fn steep_fixture() -> ViewFixture {
-        let n = 1_800usize;
+        // The plot frame is ~600 points wide in the 800-point test window,
+        // right of the name gutter (issue #230).
+        let n = 1_450usize;
         let mut steep: Vec<f64> = (0..n).map(|i| (i as f64 * 0.9).sin() * 0.9).collect();
         for value in &mut steep[1_000..1_040] {
             *value = f64::NAN;

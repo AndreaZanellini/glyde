@@ -30,6 +30,47 @@ Versioning: [Semantic Versioning](https://semver.org/).
   view; Inter and JetBrains Mono embedded in the app.
 
 ### Changed
+- **The time view is laid out as tracks with one time axis at the bottom, and
+  the spectrum gets real room (issues #230, #200).** This is the layout of the
+  approved mockup; stacked numeric channels, readable times and cursors come in
+  the next steps. What you will see:
+  - **One time axis, at the bottom only.** The time labels are no longer
+    repeated under every state lane. Drag or scroll the axis row to pan and
+    zoom; every track follows, as before.
+  - **Compact state lanes with their name on the left.** A text-state lane is
+    22 points tall, an on/off lane a 12-point strip, an event lane 22 points.
+    The name sits in a column left of the plot (the plot's y labels share that
+    column), instead of a header row above each lane. Text states are now pale
+    tints with dark text, on/off is a filled strip for "on" and a thin line for
+    "off", events are dark ticks: the mockup's colors, in light and dark.
+  - **A state group that never squeezes the plot.** The lanes are grouped under
+    a "4 state channels" header. The group takes at most 32 % of the time view;
+    beyond that it scrolls inside itself. Click the header to collapse it to that
+    one row and give the room to the plot. Hover it for what the gray "several
+    states here" mark means — that text used to be a permanent orange line.
+  - **Nothing moves under the pointer.** The value readout under the plot keeps
+    its row even when you are not hovering, so the lanes no longer jump down a
+    line; a readout too long for the window ends in "…". The spilled-file
+    notice while loading does the same.
+  - **The spectrum panel opens at 40 % of the window once it holds a result**
+    (it stays resizable; before you compute, it is only as tall as its controls).
+    The channel list sits right of the spectrum instead of over it, and "The
+    time view or the settings changed…" no longer pushes the plot down when it
+    appears, so "Compute PSD" stays where it was.
+
+  Checked by tests at 1440 × 900: with 0, 4 and 20 state channels the plot keeps
+  at least 55 % of the time view, and with a computed spectrum both the time plot
+  and the spectrum are at least 200 and 150 points tall. **Assumptions to veto:**
+  a text column that can be drawn as events or as state bands shows its choice as
+  a small "events" / "bands" button next to its name; what was inferred, and
+  from how many rows, is now in that button's tooltip rather than printed on
+  screen. The name column is 184 points wide, as in the mockup, so the plot is
+  about 140 points narrower than before. The gray "several states here" mark
+  is the mockup's color, and in an on/off lane it sits next to a gray "on"
+  strip: check in the smoke ritual that you can tell them apart. **Not in this change** (issue
+  #255): the time view's channel list still floats over the top right of the
+  plot, an empty plot still shows for a file with no numeric column, and "Fit to
+  data" still leaves no margin at the edges.
 - **The app has its new look, light or dark as your system is set (issue #229).**
   This is the palette and the fonts of the approved mockup; the layout comes in
   the next steps. Before, the app always used egui's stock dark gray with blue

@@ -58,11 +58,10 @@ pub struct Palette {
     pub error_ink: Color32,
     /// The numeric channels, in order.
     pub series: [Color32; 8],
-    /// Text-state bands, with [`Palette::ink`] labels on top. Made for the
-    /// 22 px bands of the track layout (#230), which adopts them: today's
-    /// lanes are a few pixels tall, where these pale tints would vanish.
+    /// Text-state bands, with [`Palette::ink`] labels on top: the 22 px
+    /// bands of the track layout (#230).
     pub state_tints: [Color32; 6],
-    /// A `true` stretch of an on/off lane (adopted with #230, as above).
+    /// A `true` stretch of an on/off lane (#230).
     pub bool_on: Color32,
 }
 

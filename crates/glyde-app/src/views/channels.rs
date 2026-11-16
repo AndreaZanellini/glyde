@@ -37,7 +37,11 @@ pub const VISIBLE_ROWS: usize = 4;
 
 /// The picker's fixed width, in points; longer names are truncated with an
 /// ellipsis and shown in full on hover.
-const WIDTH: f32 = 200.0;
+pub const WIDTH: f32 = 200.0;
+
+/// The gap, in points, between the picker and the edges of the rectangle it
+/// is placed in.
+pub const MARGIN: f32 = 8.0;
 
 /// Which of the time view's channels are shown. A channel is identified by
 /// its position among the plotted columns (the same index that picks its
@@ -146,7 +150,7 @@ pub fn show(
         return;
     }
     let before = visibility.clone();
-    let margin = 8.0;
+    let margin = MARGIN;
     egui::Area::new(egui::Id::new(("glyde_channel_picker", view)))
         .order(egui::Order::Middle)
         .pivot(Align2::RIGHT_TOP)

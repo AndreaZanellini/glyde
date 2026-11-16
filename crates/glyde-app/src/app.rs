@@ -38,10 +38,14 @@ use crate::inference_bar::Correction;
 use crate::plumbing::{
     background_decimator, lane_refiner, spawn_index_job, spawn_index_job_with_overrides,
     spawn_open_dialog, spawn_open_folder_dialog, CancelFlag, ColumnPyramids, IndexingMessage,
-    PreparedView, TimeIndexPreview, PROGRESS_BOOL_BAND_ROWS,
+    PreparedView, TimeIndexPreview,
 };
 use crate::views::psd::{selection_rows, PsdPanel, PsdRequest};
 use crate::{inference_bar, views};
+
+/// How much of the window the PSD panel opens at once it holds a spectrum
+/// (issue #200; the approved mockup's bottom split).
+const PSD_PANEL_SHARE: f32 = 0.4;
 
 /// One numeric column's min/max pyramid, or `None` for a non-numeric column
 /// — parallel to `Dataset::columns` (see `glyde_core::ingest::Checkpoint::pyramids`).
@@ -386,6 +390,14 @@ impl GlydeApp {
 
 impl eframe::App for GlydeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui(ctx);
+    }
+}
+
+impl GlydeApp {
+    /// One frame of the whole window (split out of [`eframe::App::update`]
+    /// so a headless test can lay out the real window).
+    fn ui(&mut self, ctx: &egui::Context) {
         self.drain_indexing_messages();
 
         // SPEC §6 drag-and-drop. Native builds only populate `path` (the web
@@ -432,9 +444,18 @@ impl eframe::App for GlydeApp {
             if self.psd.poll() {
                 ctx.request_repaint_after(Duration::from_millis(50));
             }
-            let request = egui::TopBottomPanel::bottom("psd_view")
-                .resizable(true)
-                .default_height(320.0)
+            // Issue #200: once it holds a spectrum (or is computing one) the
+            // panel opens at 40% of the window, still resizable; before that
+            // it is as tall as its controls, and leaves the rest to the time
+            // view. Two panel ids, so each keeps its own height.
+            let panel = if self.psd.holds_result() {
+                egui::TopBottomPanel::bottom("psd_view")
+                    .resizable(true)
+                    .default_height(ctx.screen_rect().height() * PSD_PANEL_SHARE)
+            } else {
+                egui::TopBottomPanel::bottom("psd_view_empty").resizable(false)
+            };
+            let request = panel
                 .show(ctx, |ui| {
                     self.psd.show(
                         ui,
@@ -474,7 +495,16 @@ impl eframe::App for GlydeApp {
                     Some(partial) => {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(loading_label(path, partial.rows_read, partial.spilled));
+                            // One line, cut with an ellipsis at the window
+                            // edge, the whole text on hover (issue #200).
+                            ui.add(
+                                egui::Label::new(loading_label(
+                                    path,
+                                    partial.rows_read,
+                                    partial.spilled,
+                                ))
+                                .truncate(),
+                            );
                         });
                         // Issue #119: a wrong time column is visible in the
                         // preview for as long as a big file takes to load,
@@ -491,36 +521,46 @@ impl eframe::App for GlydeApp {
                             pending_correction =
                                 Some((path.clone(), Correction::TimeColumn(picked)));
                         }
-                        views::state_timeline::plot_above_lanes(ui, &self.state_timeline, |ui| {
-                            views::time::show(
-                                ui,
-                                &partial.dataset,
-                                &partial.pyramids,
-                                &partial.prepared.ticks,
-                                &partial.prepared.sample_cache,
-                                // A still-growing checkpoint has no
-                                // level0 cache of its own (issue #92's
-                                // doc comment on
-                                // `IndexingMessage::Completed`) — it
-                                // renders straight from the in-memory
-                                // dataset like it always has, same as a
-                                // `None` entry would.
-                                &[],
-                                &partial.prepared.cursor,
-                                &partial.prepared.fit,
-                                &mut self.time_view,
-                            )
-                        });
+                        views::state_timeline::plot_above_lanes(
+                            ui,
+                            &mut self.state_timeline,
+                            |ui| {
+                                views::time::show(
+                                    ui,
+                                    &partial.dataset,
+                                    &partial.pyramids,
+                                    &partial.prepared.ticks,
+                                    &partial.prepared.sample_cache,
+                                    // A still-growing checkpoint has no
+                                    // level0 cache of its own (issue #92's
+                                    // doc comment on
+                                    // `IndexingMessage::Completed`) — it
+                                    // renders straight from the in-memory
+                                    // dataset like it always has, same as a
+                                    // `None` entry would.
+                                    &[],
+                                    &partial.prepared.cursor,
+                                    &partial.prepared.fit,
+                                    &mut self.time_view,
+                                )
+                            },
+                        );
                         let ticks = &partial.prepared.ticks;
                         views::state_timeline::show(
                             ui,
                             &partial.dataset,
-                            &ticks[..ticks.len().min(PROGRESS_BOOL_BAND_ROWS)],
                             &partial.prepared.bool_bands,
                             &partial.prepared.state_lanes,
                             &partial.prepared.marker_lanes,
                             self.time_view.shared_axis(),
                             &mut self.state_timeline,
+                        );
+                        views::time::show_time_axis(
+                            ui,
+                            &partial.dataset.time,
+                            ticks,
+                            &partial.prepared.fit,
+                            &self.time_view,
                         );
                     }
                     None => {
@@ -556,7 +596,7 @@ impl eframe::App for GlydeApp {
                 // Stacked above the state lanes, which share its time axis
                 // (SPEC §4.1, §4.3).
                 let visible =
-                    views::state_timeline::plot_above_lanes(ui, &self.state_timeline, |ui| {
+                    views::state_timeline::plot_above_lanes(ui, &mut self.state_timeline, |ui| {
                         views::time::show_with_selection(
                             ui,
                             dataset,
@@ -582,12 +622,19 @@ impl eframe::App for GlydeApp {
                 views::state_timeline::show(
                     ui,
                     dataset,
-                    &prepared.ticks,
                     &prepared.bool_bands,
                     &prepared.state_lanes,
                     &prepared.marker_lanes,
                     self.time_view.shared_axis(),
                     &mut self.state_timeline,
+                );
+                // Issue #230: the one time axis, under the last track.
+                views::time::show_time_axis(
+                    ui,
+                    &dataset.time,
+                    &prepared.ticks,
+                    &prepared.fit,
+                    &self.time_view,
                 );
             }
             Status::Failed { path, message } => {
@@ -1347,6 +1394,88 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    /// Issue #200's measurements, on the real window at 1440 x 900: a file
+    /// with a numeric channel and 4 state channels, its PSD computed. The
+    /// spectrum panel opens at 40% of the window with a usable plot, and the
+    /// time view above it keeps a real plot, its state group and its one
+    /// time axis, all on screen.
+    #[test]
+    fn at_1440x900_the_time_view_and_a_computed_psd_both_get_usable_room() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("states.csv");
+        let mut csv = String::from("t,sine,a,b,c,d\n");
+        for n in 0..4_000 {
+            let t = n as f64 / 1000.0;
+            let sine = (2.0 * std::f64::consts::PI * 50.0 * t).sin();
+            let flags: Vec<&str> = (0..4)
+                .map(|k| {
+                    if (n / (100 + 37 * k)) % 2 == 0 {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                })
+                .collect();
+            csv.push_str(&format!("{t:.3},{sine:.6},{}\n", flags.join(",")));
+        }
+        std::fs::write(&path, csv).expect("write fixture");
+
+        let mut app = GlydeApp::new();
+        app.open(path);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let dataset = loop {
+            app.drain_indexing_messages();
+            if let Status::Loaded { dataset, .. } = &app.status {
+                break Arc::clone(dataset);
+            }
+            assert!(Instant::now() < deadline, "file never finished loading");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        app.psd.compute(&dataset, 0..4_000);
+        while app.psd.poll() {
+            assert!(Instant::now() < deadline, "PSD never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let ctx = egui::Context::default();
+        let size = egui::vec2(1440.0, 900.0);
+        for _ in 0..5 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.ui(ctx));
+        }
+
+        let panel = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("psd_view"))
+            .expect("the PSD panel holds the result")
+            .rect;
+        assert!(
+            (panel.height() - 0.4 * size.y).abs() <= 8.0,
+            "the PSD panel is {} points tall",
+            panel.height()
+        );
+        let spectrum: egui::Rect = ctx
+            .data(|data| data.get_temp(egui::Id::new("psd_plot_area")))
+            .expect("the spectrum is drawn");
+        assert!(
+            spectrum.height() >= 150.0,
+            "the spectrum is {} points tall",
+            spectrum.height()
+        );
+        let plot = app
+            .time_view
+            .shared_axis()
+            .expect("the plot is drawn")
+            .frame;
+        let axis = views::time::time_axis_rect(&ctx).expect("the time axis is drawn");
+        assert!(plot.height() >= 200.0, "the time plot is {plot:?}");
+        assert!(
+            axis.top() > plot.bottom() && axis.bottom() <= panel.top(),
+            "the time axis {axis:?} sits under the tracks, above the PSD panel {panel:?}"
+        );
     }
 
     /// End to end, headless (docs/ROADMAP.md M5 maintainer test "the PSD

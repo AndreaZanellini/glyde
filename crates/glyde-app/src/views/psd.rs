@@ -242,15 +242,20 @@ impl PsdPanel {
             return request;
         };
 
-        if self.job.is_none()
-            && (selection.as_ref() != Some(&shown.selection) || shown.settings != self.settings)
-        {
-            ui.colored_label(
-                ui.visuals().weak_text_color(),
+        // Its row is always there, so nothing under it moves when it comes
+        // and goes (issue #200: a second click on "Compute PSD" used to land
+        // on something else).
+        let stale = self.job.is_none()
+            && (selection.as_ref() != Some(&shown.selection) || shown.settings != self.settings);
+        single_line(
+            ui,
+            if stale {
                 "The time view or the settings changed since this PSD was computed — press \
-                 \"Compute PSD\" to update it.",
-            );
-        }
+                 \"Compute PSD\" to update it."
+            } else {
+                ""
+            },
+        );
 
         match &shown.outcome {
             PsdOutcome::Ready { plan, spectra } => {
@@ -312,6 +317,12 @@ impl PsdPanel {
             }
         }
         request
+    }
+
+    /// Whether the panel has something to show beyond its controls: a
+    /// finished computation or one running.
+    pub fn holds_result(&self) -> bool {
+        self.shown.is_some() || self.job.is_some()
     }
 
     /// The spectra currently shown, if the last computation produced any.
@@ -437,60 +448,104 @@ impl PsdPanel {
             .enumerate()
             .filter(|&(index, _)| channels.is_visible(index))
             .collect();
-        let area = match self.layout {
-            Layout::Overlay => {
-                build(egui::Id::new("psd_overlay"))
-                    .show(ui, |plot_ui| {
-                        for &(index, spectrum) in &shown {
-                            plot_ui.line(spectrum_line(
-                                spectrum,
-                                color(index),
-                                log_frequency,
-                                log_power,
-                            ));
-                        }
-                    })
-                    .response
-                    .rect
-            }
-            Layout::Stacked => {
-                egui::ScrollArea::vertical()
-                    .show(ui, |ui| {
-                        if shown.is_empty() {
-                            // Room for the picker, so a channel can be shown
-                            // again from here.
-                            ui.allocate_ui(
-                                egui::vec2(ui.available_width(), STACKED_PLOT_HEIGHT),
-                                |ui| {
-                                    ui.set_min_size(egui::vec2(
-                                        ui.available_width(),
-                                        STACKED_PLOT_HEIGHT,
-                                    ));
-                                    ui.weak("No series shown.");
-                                },
-                            );
-                        }
-                        for &(index, spectrum) in &shown {
-                            // The plot's own name, in place of the one-entry
-                            // legend it used to carry.
-                            series_label(ui, &spectrum.name, color(index));
-                            build(egui::Id::new(("psd_stacked", index)))
-                                .height(STACKED_PLOT_HEIGHT)
-                                .show(ui, |plot_ui| {
+        // Issue #200: the channel picker sits in its own column right of the
+        // plots, never over the spectrum.
+        let legend_width = channels::WIDTH + 2.0 * channels::MARGIN;
+        let plots_width = (ui.available_width() - legend_width).max(0.0);
+        let legend = egui::Rect::from_min_size(
+            ui.cursor().min + egui::vec2(plots_width, 0.0),
+            egui::vec2(legend_width, ui.available_height()),
+        );
+        let plots = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(plots_width, ui.available_height()),
+        );
+        // Allocated in the panel, so a resizable panel keeps the plots' room.
+        let area = ui
+            .allocate_new_ui(egui::UiBuilder::new().max_rect(plots), |ui| {
+                match self.layout {
+                    Layout::Overlay => {
+                        build(egui::Id::new("psd_overlay"))
+                            .show(ui, |plot_ui| {
+                                for &(index, spectrum) in &shown {
                                     plot_ui.line(spectrum_line(
                                         spectrum,
                                         color(index),
                                         log_frequency,
                                         log_power,
                                     ));
-                                });
-                        }
-                    })
-                    .inner_rect
-            }
-        };
-        channels::show(ui, "psd", area, channels, color);
+                                }
+                            })
+                            .response
+                            .rect
+                    }
+                    Layout::Stacked => {
+                        egui::ScrollArea::vertical()
+                            .show(ui, |ui| {
+                                if shown.is_empty() {
+                                    // Room for the picker, so a channel can be shown
+                                    // again from here.
+                                    ui.allocate_ui(
+                                        egui::vec2(ui.available_width(), STACKED_PLOT_HEIGHT),
+                                        |ui| {
+                                            ui.set_min_size(egui::vec2(
+                                                ui.available_width(),
+                                                STACKED_PLOT_HEIGHT,
+                                            ));
+                                            ui.weak("No series shown.");
+                                        },
+                                    );
+                                }
+                                for &(index, spectrum) in &shown {
+                                    // The plot's own name, in place of the one-entry
+                                    // legend it used to carry.
+                                    series_label(ui, &spectrum.name, color(index));
+                                    build(egui::Id::new(("psd_stacked", index)))
+                                        .height(STACKED_PLOT_HEIGHT)
+                                        .show(ui, |plot_ui| {
+                                            plot_ui.line(spectrum_line(
+                                                spectrum,
+                                                color(index),
+                                                log_frequency,
+                                                log_power,
+                                            ));
+                                        });
+                                }
+                            })
+                            .inner_rect
+                    }
+                }
+            })
+            .inner;
+        #[cfg(test)]
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::new("psd_plot_area"), area));
+        #[cfg(not(test))]
+        let _ = area;
+        channels::show(ui, "psd", legend, channels, color);
     }
+}
+
+/// One line of `text` (or an empty row of the same height), cut with an
+/// ellipsis where the panel ends; the whole text is its tooltip.
+fn single_line(ui: &mut egui::Ui, text: &str) {
+    let height = ui.text_style_height(&egui::TextStyle::Body);
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(egui::vec2(width, height));
+            if !text.is_empty() {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(text).color(ui.visuals().weak_text_color()),
+                    )
+                    .truncate(),
+                );
+            }
+        },
+    );
 }
 
 /// A stacked plot's title: its series' name after a dot in its color, the
@@ -1060,6 +1115,56 @@ mod render_tests {
                 "{layout:?}: with nothing shown the picker stays reachable"
             );
         }
+    }
+
+    fn psd_plot_area(ctx: &egui::Context) -> egui::Rect {
+        ctx.data(|data| data.get_temp(egui::Id::new("psd_plot_area")))
+            .expect("the spectra were drawn")
+    }
+
+    // Issue #200: the legend covered the right third of the spectrum. The
+    // channel picker now has its own column, right of the plots.
+    #[test]
+    fn the_channel_picker_never_covers_the_spectrum() {
+        for layout in [Layout::Overlay, Layout::Stacked] {
+            let ctx = egui::Context::default();
+            let mut panel = panel_showing(ready(), layout);
+            let mut channels = ChannelVisibility::default();
+            for _ in 0..2 {
+                render_channels(&ctx, &mut panel, &mut channels);
+            }
+            let plot = psd_plot_area(&ctx);
+            let picker = ctx
+                .memory(|memory| memory.area_rect(egui::Id::new(("glyde_channel_picker", "psd"))))
+                .expect("the picker is drawn");
+            assert!(
+                picker.left() >= plot.right(),
+                "{layout:?}: picker {picker:?} over plot {plot:?}"
+            );
+        }
+    }
+
+    // Issue #200: "The time view or the settings changed…" used to push the
+    // spectrum down as it appeared, under the pointer. Its row is reserved.
+    #[test]
+    fn the_out_of_date_notice_moves_nothing() {
+        let ctx = egui::Context::default();
+        let dataset = tiny_dataset();
+        let mut panel = panel_showing(ready(), Layout::Overlay);
+        let mut channels = ChannelVisibility::default();
+        let mut plot_with = |selection: Range<usize>| {
+            for _ in 0..2 {
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        panel.show(ui, &dataset, Some(selection.clone()), &mut channels);
+                    });
+                });
+            }
+            psd_plot_area(&ctx)
+        };
+        let fresh = plot_with(0..8192);
+        let stale = plot_with(0..100);
+        assert_eq!(fresh, stale);
     }
 
     // In stacked mode each plot is titled with its series, since it no
