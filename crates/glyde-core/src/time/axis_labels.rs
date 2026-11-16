@@ -41,6 +41,14 @@ use chrono::{Datelike, NaiveDate};
 
 use super::format::{format_timestamp, TimeUnit, Timestamp, TimestampFormat};
 
+const SECONDS_PER_DAY: i128 = 86_400;
+const PICOS_PER_SECOND: i128 = 1_000_000_000_000;
+/// `chrono`'s day number (days since 0001-01-01, plus one) of 1970-01-01.
+const UNIX_EPOCH_DAY_FROM_CE: i128 = 719_163;
+/// 1970-01-05, the first Monday after the epoch, in days: where weekly
+/// labels are aligned from.
+const FIRST_MONDAY_DAY: i128 = 4;
+
 /// The zone an axis's wall clock is read in (SPEC §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AxisZone {
@@ -54,15 +62,45 @@ pub enum AxisZone {
 
 impl AxisZone {
     /// The zone of a timestamp in `format` whose row carried
-    /// `offset_seconds`.
+    /// `offset_seconds`. The same rule the inference bar's timezone field
+    /// states (`ingest::report`'s `TimezoneLabel`).
     pub fn for_format(format: TimestampFormat, offset_seconds: Option<i32>) -> Self {
-        let _ = (format, offset_seconds);
-        AxisZone::NaiveLocal
+        use TimestampFormat::*;
+        match format {
+            EpochSeconds | EpochMillis | EpochMicros | EpochNanos | LabViewEpoch => AxisZone::Utc,
+            Iso8601WithOffset | ParquetTimestamp => match offset_seconds {
+                Some(offset) => AxisZone::Offset(offset),
+                None => AxisZone::NaiveLocal,
+            },
+            Iso8601Naive | DateTimeSpace | DayFirst | MonthFirst | ExcelSerial => {
+                AxisZone::NaiveLocal
+            }
+        }
     }
 
     /// How the axis names the zone: `UTC`, `UTC+02:00`, `naive local time`.
     pub fn label(&self) -> String {
-        String::new()
+        match *self {
+            AxisZone::Utc | AxisZone::Offset(0) => "UTC".to_string(),
+            AxisZone::Offset(offset) => {
+                let sign = if offset < 0 { '-' } else { '+' };
+                let magnitude = offset.unsigned_abs();
+                format!(
+                    "UTC{sign}{:02}:{:02}",
+                    magnitude / 3_600,
+                    (magnitude % 3_600) / 60
+                )
+            }
+            AxisZone::NaiveLocal => "naive local time".to_string(),
+        }
+    }
+
+    /// Seconds to add to a UTC instant to read its wall clock.
+    fn offset_seconds(&self) -> i128 {
+        match *self {
+            AxisZone::Offset(offset) => i128::from(offset),
+            AxisZone::Utc | AxisZone::NaiveLocal => 0,
+        }
     }
 }
 
@@ -73,6 +111,33 @@ pub enum DateOrder {
     Iso,
     DayFirst,
     MonthFirst,
+}
+
+impl DateOrder {
+    fn for_format(format: TimestampFormat) -> Self {
+        match format {
+            TimestampFormat::DayFirst => DateOrder::DayFirst,
+            TimestampFormat::MonthFirst => DateOrder::MonthFirst,
+            _ => DateOrder::Iso,
+        }
+    }
+
+    fn date(self, date: NaiveDate) -> String {
+        let (y, m, d) = (date.year(), date.month(), date.day());
+        match self {
+            DateOrder::Iso => format!("{y:04}-{m:02}-{d:02}"),
+            DateOrder::DayFirst => format!("{d:02}/{m:02}/{y:04}"),
+            DateOrder::MonthFirst => format!("{m:02}/{d:02}/{y:04}"),
+        }
+    }
+
+    fn month(self, date: NaiveDate) -> String {
+        let (y, m) = (date.year(), date.month());
+        match self {
+            DateOrder::Iso => format!("{y:04}-{m:02}"),
+            DateOrder::DayFirst | DateOrder::MonthFirst => format!("{m:02}/{y:04}"),
+        }
+    }
 }
 
 /// Everything about a label that comes from the source, not the zoom.
@@ -86,10 +151,9 @@ impl AxisLabelStyle {
     /// The style of an axis in `format` whose rows carry `offset_seconds`
     /// (for a per-row offset, the one of the sample nearest the view).
     pub fn new(format: TimestampFormat, offset_seconds: Option<i32>) -> Self {
-        let _ = (format, offset_seconds);
         Self {
-            zone: AxisZone::NaiveLocal,
-            date_order: DateOrder::Iso,
+            zone: AxisZone::for_format(format, offset_seconds),
+            date_order: DateOrder::for_format(format),
         }
     }
 }
@@ -110,6 +174,185 @@ pub struct CalendarTick {
     pub context: Option<String>,
 }
 
+/// A candidate label step.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// A fixed duration in picoseconds, aligned to whole multiples of it
+    /// counted from `origin_days` (local midnight of that day).
+    Fixed { picos: i128, origin_days: i128 },
+    /// A whole number of calendar months, aligned to month (or, for a
+    /// multiple of 12, year) boundaries.
+    Months(i128),
+}
+
+/// Every candidate step, finest first. Consecutive steps are at most ~2.5×
+/// apart, so the one chosen always leaves at least two labels on a range
+/// wide enough for five.
+fn steps() -> impl Iterator<Item = Step> {
+    let fixed = |picos: i128| Step::Fixed {
+        picos,
+        origin_days: 0,
+    };
+    let sub_second = (0..12).flat_map(move |exponent| {
+        [1, 2, 5]
+            .into_iter()
+            .map(move |mantissa| fixed(mantissa * 10_i128.pow(exponent)))
+    });
+    let clock = [
+        1, 2, 5, 10, 15, 30, // seconds
+        60, 120, 300, 600, 900, 1_800, // minutes
+        3_600, 7_200, 10_800, 21_600, 43_200, // hours
+        86_400, 172_800, // days
+    ]
+    .into_iter()
+    .map(move |seconds| fixed(seconds * PICOS_PER_SECOND));
+    let weeks = [7, 14].into_iter().map(|days| Step::Fixed {
+        picos: days * SECONDS_PER_DAY * PICOS_PER_SECOND,
+        origin_days: FIRST_MONDAY_DAY,
+    });
+    let months = [1, 2, 3, 6].into_iter().map(Step::Months);
+    let years = (0..6).flat_map(|exponent| {
+        [1, 2, 5]
+            .into_iter()
+            .map(move |mantissa| Step::Months(12 * mantissa * 10_i128.pow(exponent)))
+    });
+    sub_second
+        .chain(clock)
+        .chain(weeks)
+        .chain(months)
+        .chain(years)
+}
+
+/// How much of a wall-clock instant a label shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Precision {
+    Year,
+    Month,
+    Date,
+    Minutes,
+    Seconds,
+    /// Seconds and this many fractional digits (1..=12).
+    Fraction(usize),
+}
+
+impl Precision {
+    fn of(step: Step) -> Self {
+        match step {
+            Step::Months(months) if months % 12 == 0 => Precision::Year,
+            Step::Months(_) => Precision::Month,
+            Step::Fixed { picos, .. } => {
+                if picos % (SECONDS_PER_DAY * PICOS_PER_SECOND) == 0 {
+                    Precision::Date
+                } else if picos % (60 * PICOS_PER_SECOND) == 0 {
+                    Precision::Minutes
+                } else if picos % PICOS_PER_SECOND == 0 {
+                    Precision::Seconds
+                } else {
+                    let mut zeros = 0;
+                    let mut rest = picos;
+                    while rest % 10 == 0 {
+                        rest /= 10;
+                        zeros += 1;
+                    }
+                    Precision::Fraction(12 - zeros)
+                }
+            }
+        }
+    }
+
+    fn is_day_or_more(self) -> bool {
+        matches!(self, Precision::Year | Precision::Month | Precision::Date)
+    }
+}
+
+/// A local (wall-clock) instant, split into calendar parts.
+#[derive(Debug, Clone, Copy)]
+struct Wall {
+    /// Days since 1970-01-01 on the wall clock.
+    days: i128,
+    second_of_day: i128,
+    /// Picoseconds into the second, `0..10¹²`.
+    picos: i128,
+    date: NaiveDate,
+}
+
+impl Wall {
+    fn of(local_ticks: i128, unit: TimeUnit) -> Option<Self> {
+        let per_second = unit.ticks_per_second();
+        let seconds = local_ticks.div_euclid(per_second);
+        let picos = local_ticks.rem_euclid(per_second) * (PICOS_PER_SECOND / per_second);
+        let days = seconds.div_euclid(SECONDS_PER_DAY);
+        let date = date_of_day(days)?;
+        Some(Self {
+            days,
+            second_of_day: seconds.rem_euclid(SECONDS_PER_DAY),
+            picos,
+            date,
+        })
+    }
+
+    /// Months since year 0, January: what monthly steps align to.
+    fn month_index(&self) -> i128 {
+        i128::from(self.date.year()) * 12 + i128::from(self.date.month0())
+    }
+
+    fn is_month_start(&self) -> bool {
+        self.date.day() == 1 && self.second_of_day == 0 && self.picos == 0
+    }
+
+    fn clock(&self, fraction_digits: usize, with_seconds: bool) -> String {
+        let (h, m, s) = (
+            self.second_of_day / 3_600,
+            (self.second_of_day % 3_600) / 60,
+            self.second_of_day % 60,
+        );
+        let mut text = if with_seconds {
+            format!("{h:02}:{m:02}:{s:02}")
+        } else {
+            format!("{h:02}:{m:02}")
+        };
+        if fraction_digits > 0 {
+            let digits = format!("{:012}", self.picos);
+            text.push('.');
+            text.push_str(&digits[..fraction_digits.min(12)]);
+        }
+        text
+    }
+
+    fn label(&self, precision: Precision, order: DateOrder) -> String {
+        match precision {
+            Precision::Year => format!("{:04}", self.date.year()),
+            Precision::Month => order.month(self.date),
+            Precision::Date => order.date(self.date),
+            Precision::Minutes => self.clock(0, false),
+            Precision::Seconds => self.clock(0, true),
+            Precision::Fraction(digits) => self.clock(digits, true),
+        }
+    }
+}
+
+fn date_of_day(days_since_epoch: i128) -> Option<NaiveDate> {
+    let from_ce = i32::try_from(days_since_epoch.checked_add(UNIX_EPOCH_DAY_FROM_CE)?).ok()?;
+    NaiveDate::from_num_days_from_ce_opt(from_ce)
+}
+
+/// Local ticks of the first instant of month `index` (months since year 0).
+fn month_start(index: i128, unit: TimeUnit) -> Option<i128> {
+    let year = i32::try_from(index.div_euclid(12)).ok()?;
+    let month = u32::try_from(index.rem_euclid(12) + 1).ok()?;
+    let date = NaiveDate::from_ymd_opt(year, month, 1)?;
+    let days = i128::from(date.num_days_from_ce()) - UNIX_EPOCH_DAY_FROM_CE;
+    days.checked_mul(SECONDS_PER_DAY * unit.ticks_per_second())
+}
+
+fn floor_div(a: i128, b: i128) -> i128 {
+    a.div_euclid(b)
+}
+
+fn ceil_div(a: i128, b: i128) -> i128 {
+    -((-a).div_euclid(b))
+}
+
 /// The labels for the visible range `start..=end` (ticks in `unit`): the
 /// smallest round step that yields at most `max_ticks` of them, every one
 /// inside the range, in increasing order. Empty for `max_ticks == 0`, an
@@ -121,8 +364,103 @@ pub fn calendar_ticks(
     style: &AxisLabelStyle,
     max_ticks: usize,
 ) -> Vec<CalendarTick> {
-    let _ = (start, end, unit, style, max_ticks);
+    if max_ticks == 0 || start > end {
+        return Vec::new();
+    }
+    let per_second = unit.ticks_per_second();
+    let picos_per_tick = PICOS_PER_SECOND / per_second;
+    let Some(offset) = style.zone.offset_seconds().checked_mul(per_second) else {
+        return Vec::new();
+    };
+    let (Some(local_start), Some(local_end)) = (start.checked_add(offset), end.checked_add(offset))
+    else {
+        return Vec::new();
+    };
+    let budget = max_ticks as i128;
+
+    for step in steps() {
+        // Each candidate's labels as local-tick positions, if it fits.
+        let positions: Vec<(i128, i128)> = match step {
+            Step::Fixed { picos, origin_days } => {
+                // Only a whole number of the axis's own ticks.
+                if picos % picos_per_tick != 0 {
+                    continue;
+                }
+                let size = picos / picos_per_tick;
+                let Some(origin) = origin_days.checked_mul(SECONDS_PER_DAY * per_second) else {
+                    return Vec::new();
+                };
+                let first = ceil_div(local_start - origin, size);
+                let last = floor_div(local_end - origin, size);
+                if last - first + 1 > budget {
+                    continue;
+                }
+                (first..=last).map(|k| (origin + k * size, size)).collect()
+            }
+            Step::Months(months) => {
+                let (Some(start_wall), Some(end_wall)) =
+                    (Wall::of(local_start, unit), Wall::of(local_end, unit))
+                else {
+                    return Vec::new();
+                };
+                let first_boundary =
+                    start_wall.month_index() + i128::from(!start_wall.is_month_start());
+                let first = ceil_div(first_boundary, months);
+                let last = floor_div(end_wall.month_index(), months);
+                if last - first + 1 > budget {
+                    continue;
+                }
+                let mut positions = Vec::new();
+                for k in first..=last {
+                    let (Some(at), Some(next)) = (
+                        month_start(k * months, unit),
+                        month_start((k + 1) * months, unit),
+                    ) else {
+                        return Vec::new();
+                    };
+                    positions.push((at, next - at));
+                }
+                positions
+            }
+        };
+        return label_positions(&positions, offset, unit, style, Precision::of(step))
+            .unwrap_or_default();
+    }
     Vec::new()
+}
+
+/// Labels local-tick `positions` (each with its step) at `precision`; `None`
+/// if any falls outside the calendar.
+fn label_positions(
+    positions: &[(i128, i128)],
+    offset: i128,
+    unit: TimeUnit,
+    style: &AxisLabelStyle,
+    precision: Precision,
+) -> Option<Vec<CalendarTick>> {
+    let zone = style.zone.label();
+    let mut previous_day = None;
+    positions
+        .iter()
+        .map(|&(local, step_ticks)| {
+            let wall = Wall::of(local, unit)?;
+            let context = match previous_day {
+                None if precision.is_day_or_more() => Some(zone.clone()),
+                None => Some(format!("{} · {zone}", style.date_order.date(wall.date))),
+                Some(day) if !precision.is_day_or_more() && day != wall.days => {
+                    Some(style.date_order.date(wall.date))
+                }
+                Some(_) => None,
+            };
+            previous_day = Some(wall.days);
+            Some(CalendarTick {
+                tick: local - offset,
+                step_ticks,
+                label: wall.label(precision, style.date_order),
+                context,
+            })
+        })
+        .collect()
 }
 
 /// The cursor readout's timestamp (SPEC §4.1): a text format as the source
@@ -130,7 +468,41 @@ pub fn calendar_ticks(
 /// zone, followed by the exact raw value, e.g.
 /// `2026-06-21 10:04:10.587450 UTC (1782036250587450)`.
 pub fn format_cursor_timestamp(timestamp: &Timestamp, format: TimestampFormat) -> String {
-    format_timestamp(timestamp, format)
+    use TimestampFormat::*;
+    let raw = format_timestamp(timestamp, format);
+    match format {
+        EpochSeconds | EpochMillis | EpochMicros | EpochNanos | LabViewEpoch | ExcelSerial => {
+            match readable_timestamp(timestamp, format) {
+                Some(readable) => format!("{readable} ({raw})"),
+                None => raw,
+            }
+        }
+        Iso8601WithOffset | Iso8601Naive | DateTimeSpace | DayFirst | MonthFirst
+        | ParquetTimestamp => raw,
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS[.fff…] [zone]` at the timestamp's full native
+/// precision, trailing zero groups of three dropped (`.500`, not
+/// `.500000000`). A naive source gets no zone suffix.
+fn readable_timestamp(timestamp: &Timestamp, format: TimestampFormat) -> Option<String> {
+    let zone = AxisZone::for_format(format, timestamp.offset_seconds);
+    let per_second = timestamp.unit.ticks_per_second();
+    let local = timestamp
+        .ticks
+        .checked_add(zone.offset_seconds().checked_mul(per_second)?)?;
+    let wall = Wall::of(local, timestamp.unit)?;
+    let mut digits = per_second.ilog10() as usize;
+    let all_digits = format!("{:012}", wall.picos);
+    while digits >= 3 && all_digits[digits - 3..digits] == *"000" {
+        digits -= 3;
+    }
+    let date = DateOrder::for_format(format).date(wall.date);
+    let clock = wall.clock(digits, true);
+    Some(match zone {
+        AxisZone::NaiveLocal => format!("{date} {clock}"),
+        AxisZone::Utc | AxisZone::Offset(_) => format!("{date} {clock} {}", zone.label()),
+    })
 }
 
 #[cfg(test)]
