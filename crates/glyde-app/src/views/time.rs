@@ -1295,7 +1295,25 @@ pub(crate) struct AxisMark {
 /// gaps is labelled on its own, over its own real time span and width, and
 /// each visible gap gets a `⫽` (SPEC §2.3: labels make the discontinuity
 /// explicit) — never a time inside a gap, which has none.
+///
+/// Every label and date line is then laid out ([`lay_out_marks`]) so none
+/// overlaps another: a mark that would is left out here — its grid line
+/// with it — never by the painter, and a date it carried moves to the next
+/// label (PR #259 review).
 pub(crate) fn time_axis_marks(
+    time: &TimeAxis,
+    ticks: &[i128],
+    view: (f64, f64),
+    width_px: f32,
+    broken: Option<&BrokenAxis>,
+    char_px: f32,
+) -> Vec<AxisMark> {
+    let marks = unlaid_axis_marks(time, ticks, view, width_px, broken, char_px);
+    lay_out_marks(marks, view, width_px, char_px)
+}
+
+/// [`time_axis_marks`] before layout.
+fn unlaid_axis_marks(
     time: &TimeAxis,
     ticks: &[i128],
     view: (f64, f64),
@@ -1419,37 +1437,141 @@ fn segment_marks(
     }
 }
 
-/// The finest labelling `generate(budget)` offers whose labels all keep
-/// their own width plus [`AXIS_LABEL_GAP`] apart, at most
-/// [`MAX_AXIS_LABELS`]: starts from the budget an 8-character label would
-/// allow and lowers it until the labels it got fit.
+/// The finest labelling `generate(budget)` offers in which every two
+/// neighbouring marks are at least half of each one's width plus
+/// [`AXIS_LABEL_GAP`] apart — a mark's width being its label's or its date
+/// line's, whichever is wider (PR #259 review: spacing by the label alone
+/// let date lines overlap). At most [`MAX_AXIS_LABELS`]: starts from the
+/// budget an 8-character label would allow and lowers it until it fits.
 fn fit_labels(
     width_px: f64,
     px_per_x: f64,
     char_px: f32,
     generate: impl Fn(usize) -> Vec<AxisMark>,
 ) -> Vec<AxisMark> {
-    let room = |chars: usize| chars as f64 * f64::from(char_px) + f64::from(AXIS_LABEL_GAP);
-    let mut budget = ((width_px / room(8)).max(0.0) as usize).clamp(1, MAX_AXIS_LABELS);
+    let gap = f64::from(AXIS_LABEL_GAP);
+    let width = |mark: &AxisMark| f64::from(mark_width(mark, char_px));
+    let mut budget =
+        ((width_px / (8.0 * f64::from(char_px) + gap)).max(0.0) as usize).clamp(1, MAX_AXIS_LABELS);
     loop {
         let marks = generate(budget);
-        let longest = marks
-            .iter()
-            .map(|mark| mark.label.chars().count())
-            .max()
-            .unwrap_or(0);
-        let tightest = marks
-            .windows(2)
-            .map(|pair| (pair[1].x - pair[0].x) * px_per_x)
-            .fold(f64::INFINITY, f64::min);
-        if marks.len() <= 1 || tightest >= room(longest) - 1e-9 {
+        let mut worst_need = 0.0_f64;
+        let mut fits = true;
+        for pair in marks.windows(2) {
+            let need = (width(&pair[0]) + width(&pair[1])) / 2.0 + gap;
+            worst_need = worst_need.max(need);
+            fits &= (pair[1].x - pair[0].x) * px_per_x >= need - 1e-9;
+        }
+        if fits {
             return marks;
         }
-        let fits = (width_px / room(longest)).max(0.0) as usize;
-        budget = fits.min(budget - 1);
+        budget = ((width_px / worst_need).max(0.0) as usize).min(budget - 1);
         if budget == 0 {
             return Vec::new();
         }
+    }
+}
+
+/// Estimated width, in points, of `text` at `char_px` per character.
+fn text_width(text: &str, char_px: f32) -> f32 {
+    text.chars().count() as f32 * char_px
+}
+
+/// A mark's estimated width: its label's or its date line's, if wider.
+fn mark_width(mark: &AxisMark, char_px: f32) -> f32 {
+    let label = text_width(&mark.label, char_px);
+    mark.context
+        .as_deref()
+        .map_or(label, |context| label.max(text_width(context, char_px)))
+}
+
+/// Space, in points, kept between two labels (or two date lines) after
+/// layout, against the error of the width estimate.
+const AXIS_LAYOUT_GAP: f32 = 8.0;
+
+/// Text `width` wide, centered on `center` and moved inside `0..=axis`.
+fn placed(center: f32, width: f32, axis: f32) -> (f32, f32) {
+    let left = (center - width / 2.0).min(axis - width).max(0.0);
+    (left, left + width)
+}
+
+/// One mark's [`MarkBoxes`].
+fn boxes_of(mark: &AxisMark, x0: f64, px_per_x: f64, width_px: f32, char_px: f32) -> MarkBoxes {
+    let center = ((mark.x - x0) * px_per_x) as f32;
+    MarkBoxes {
+        label: placed(center, text_width(&mark.label, char_px), width_px),
+        context: mark
+            .context
+            .as_deref()
+            .map(|context| placed(center, text_width(context, char_px), width_px)),
+    }
+}
+
+/// Leaves out every mark whose label or date line would come within
+/// [`AXIS_LAYOUT_GAP`] of the one kept before it — in practice only next to
+/// an edge, where a label is moved inward. Its date line is not lost: it
+/// moves to the next mark kept (a mark without one of its own is on the
+/// same day; one with its own date keeps that, and gains the zone if the
+/// dropped line carried it). A gap's `⫽` is never the one left out.
+fn lay_out_marks(
+    marks: Vec<AxisMark>,
+    (x0, x1): (f64, f64),
+    width_px: f32,
+    char_px: f32,
+) -> Vec<AxisMark> {
+    if !(x1 > x0) || marks.is_empty() {
+        return marks;
+    }
+    let px_per_x = f64::from(width_px) / (x1 - x0);
+    let boxes = |mark: &AxisMark| boxes_of(mark, x0, px_per_x, width_px, char_px);
+    let clashes = |before: &MarkBoxes, after: &MarkBoxes| {
+        after.label.0 < before.label.1 + AXIS_LAYOUT_GAP
+            || matches!((before.context, after.context), (Some(b), Some(a)) if a.0 < b.1 + AXIS_LAYOUT_GAP)
+    };
+    let mut kept: Vec<AxisMark> = Vec::with_capacity(marks.len());
+    let mut carried: Option<String> = None;
+    for mut mark in marks {
+        if mark.step_x == 0.0 {
+            // A gap's `⫽` stays; any label it would touch goes, its date
+            // carried on past the gap.
+            while let Some(previous) = kept.last() {
+                if previous.step_x == 0.0 || !clashes(&boxes(previous), &boxes(&mark)) {
+                    break;
+                }
+                if let Some(dropped) = kept.pop().and_then(|previous| previous.context) {
+                    carried = Some(match carried.take() {
+                        None => dropped,
+                        Some(later) => with_zone_of(later, &dropped),
+                    });
+                }
+            }
+            kept.push(mark);
+            continue;
+        }
+        if let Some(context) = carried.take() {
+            mark.context = Some(match mark.context.take() {
+                None => context,
+                Some(own) => with_zone_of(own, &context),
+            });
+        }
+        if kept
+            .last()
+            .is_some_and(|previous| clashes(&boxes(previous), &boxes(&mark)))
+        {
+            carried = mark.context;
+            continue;
+        }
+        kept.push(mark);
+    }
+    kept
+}
+
+/// `own` date line, plus the zone `dropped` named (`… · UTC`) if `own`
+/// names none.
+fn with_zone_of(own: String, dropped: &str) -> String {
+    match (own.contains(" · "), dropped.split_once(" · ")) {
+        (false, Some((_, zone))) => format!("{own} · {zone}"),
+        _ => own,
     }
 }
 
@@ -1481,6 +1603,33 @@ fn decimal_marks((a, b): (f64, f64), budget: usize) -> Vec<AxisMark> {
                 context: None,
             }
         })
+        .collect()
+}
+
+/// Where a mark's label and context line go, in points from the axis's
+/// left edge, as (left, right) — estimated from `char_px` per character
+/// and moved inside the axis at either edge, as [`paint_axis_marks`] does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MarkBoxes {
+    pub label: (f32, f32),
+    pub context: Option<(f32, f32)>,
+}
+
+/// [`MarkBoxes`] for every mark of [`time_axis_marks`] over `view`.
+pub(crate) fn mark_boxes(
+    marks: &[AxisMark],
+    view: (f64, f64),
+    width_px: f32,
+    char_px: f32,
+) -> Vec<MarkBoxes> {
+    let (x0, x1) = view;
+    if !(x1 > x0) {
+        return Vec::new();
+    }
+    let px_per_x = f64::from(width_px) / (x1 - x0);
+    marks
+        .iter()
+        .map(|mark| boxes_of(mark, x0, px_per_x, width_px, char_px))
         .collect()
 }
 
@@ -1520,8 +1669,8 @@ pub(crate) fn axis_char_px(ui: &egui::Ui) -> f32 {
 
 /// Paints `marks` in the axis `frame`: a short tick at each, the label
 /// under it — moved inside the frame at either edge, never cut (issue
-/// #196) — and the context line below; a label that would touch the one
-/// before it is left out rather than overlap it.
+/// #196) — and the date line below. Nothing is left out here:
+/// [`time_axis_marks`] already laid the marks out so none overlaps.
 fn paint_axis_marks(
     ui: &egui::Ui,
     frame: egui::Rect,
@@ -1534,30 +1683,23 @@ fn paint_axis_marks(
     let weak = ui.visuals().weak_text_color();
     let row = ui.text_style_height(&egui::TextStyle::Body);
     let top = frame.top() + 6.0;
-    let inside = |left: f32, width: f32| left.max(frame.left()).min(frame.right() - width);
-    let (mut label_right, mut context_right) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
     for mark in marks {
         let x = transform.position_from_point_x(mark.x);
-        let galley = painter.layout_no_wrap(mark.label.clone(), font.clone(), strong);
-        let left = inside(x - galley.size().x / 2.0, galley.size().x);
-        if left < label_right + 4.0 {
-            continue;
-        }
-        label_right = left + galley.size().x;
         if mark.step_x > 0.0 {
             painter.line_segment(
                 [egui::pos2(x, frame.top()), egui::pos2(x, frame.top() + 4.0)],
                 egui::Stroke::new(1.0_f32, weak),
             );
         }
-        painter.galley(egui::pos2(left, top), galley, strong);
-        if let Some(context) = &mark.context {
-            let galley = painter.layout_no_wrap(context.clone(), font.clone(), weak);
-            let left = inside(x - galley.size().x / 2.0, galley.size().x);
-            if left >= context_right + 8.0 {
-                context_right = left + galley.size().x;
-                painter.galley(egui::pos2(left, top + row), galley, weak);
-            }
+        let lines = [
+            (Some(&mark.label), top, strong),
+            (mark.context.as_ref(), top + row, weak),
+        ];
+        for (text, y, color) in lines {
+            let Some(text) = text else { continue };
+            let galley = painter.layout_no_wrap(text.clone(), font.clone(), color);
+            let (left, _) = placed(x - frame.left(), galley.size().x, frame.width());
+            painter.galley(egui::pos2(frame.left() + left, y), galley, color);
         }
     }
 }
@@ -3361,6 +3503,108 @@ mod render_tests {
                 rect.left() >= axis.left() - 0.5 && rect.right() <= axis.right() + 0.5,
                 "{text:?} at {rect:?} is cut by the axis {axis:?}"
             );
+        }
+        assert_no_overlap(&on_axis);
+    }
+
+    /// Epoch-seconds samples every 10 minutes from `start` over `hours`.
+    fn epoch_seconds_dataset(start: i128, hours: i128) -> Dataset {
+        let seconds: Vec<i128> = (0..=hours * 3_600).step_by(600).collect();
+        let mut dataset = sample_dataset();
+        dataset.time = TimeAxis::Absolute {
+            timestamps: seconds
+                .iter()
+                .map(|&s| Timestamp::new(start + s, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        dataset.columns = vec![Series::new(
+            "value",
+            SeriesValues::F64(seconds.iter().map(|&s| (s % 7_000) as f64).collect()),
+        )];
+        dataset
+    }
+
+    /// No two texts on the same row of the axis overlap.
+    fn assert_no_overlap(on_axis: &[(String, egui::Rect)]) {
+        let mut rows: Vec<Vec<&(String, egui::Rect)>> = Vec::new();
+        for text in on_axis {
+            match rows
+                .iter_mut()
+                .find(|row| (row[0].1.top() - text.1.top()).abs() < 1.0)
+            {
+                Some(row) => row.push(text),
+                None => rows.push(vec![text]),
+            }
+        }
+        for row in &mut rows {
+            row.sort_by(|a, b| a.1.left().total_cmp(&b.1.left()));
+            for pair in row.windows(2) {
+                assert!(
+                    pair[0].1.right() <= pair[1].1.left(),
+                    "{:?} overlaps {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
+
+    // PR #259 review, finding 1, as the reviewer reproduced it: 4.75 days
+    // from 2026-06-21 12:00 UTC in a 1440-point window. The axis used to
+    // read `12:00 / 2026-06-21 · UTC`, `00:00`, `12:00`, `00:00 /
+    // 2026-06-23`: the 22nd was never named.
+    #[test]
+    fn a_multi_day_axis_names_every_day_it_labels() {
+        let dataset = epoch_seconds_dataset(1_782_043_200, 114);
+        let (ctx, shapes) = run_view_with_axis(&dataset, 1_440.0, 4, None, None);
+        let on_axis = axis_texts(&ctx, &shapes);
+        assert!(
+            on_axis.iter().any(|(t, _)| t.starts_with("2026-06-22")),
+            "the 22nd is named: {on_axis:?}"
+        );
+        assert_no_overlap(&on_axis);
+    }
+
+    // PR #259 review, finding 2: the plots really draw their vertical grid
+    // lines from `calendar_grid`, one under each tick of the axis row.
+    #[test]
+    fn the_plots_grid_lines_are_drawn_over_the_axis_ticks() {
+        let dataset = epoch_micros_dataset();
+        let (ctx, shapes) = run_view_with_axis(&dataset, 1_440.0, 4, None, None);
+        let axis = time_axis_rect(&ctx).expect("the axis is drawn");
+        let mut segments = Vec::new();
+        fn walk(shape: &egui::Shape, out: &mut Vec<[egui::Pos2; 2]>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+                egui::Shape::LineSegment { points, .. } => out.push(*points),
+                _ => {}
+            }
+        }
+        for clipped in &shapes {
+            walk(&clipped.shape, &mut segments);
+        }
+        let vertical = |p: &[egui::Pos2; 2]| (p[0].x - p[1].x).abs() < 0.01;
+        let mut ticks: Vec<f32> = segments
+            .iter()
+            .filter(|p| vertical(p) && axis.contains(p[0]) && axis.contains(p[1]))
+            .map(|p| p[0].x)
+            .collect();
+        let mut grid: Vec<f32> = segments
+            .iter()
+            .filter(|p| {
+                vertical(p) && p[0].y.max(p[1].y) < axis.top() && (p[0].y - p[1].y).abs() > 50.0
+            })
+            .map(|p| p[0].x)
+            .collect();
+        ticks.sort_by(f32::total_cmp);
+        grid.sort_by(f32::total_cmp);
+        grid.dedup_by(|a, b| (*a - *b).abs() < 0.5);
+        assert!(ticks.len() >= 6, "{ticks:?}");
+        assert_eq!(grid.len(), ticks.len(), "grid {grid:?} vs ticks {ticks:?}");
+        for (g, t) in grid.iter().zip(&ticks) {
+            assert!((g - t).abs() < 0.5, "grid {grid:?} vs ticks {ticks:?}");
         }
     }
 
@@ -6755,6 +6999,73 @@ mod tests {
         let labels: Vec<&str> = marks.iter().map(|m| m.label.as_str()).collect();
         assert_eq!(labels, ["0.0", "0.5", "1.0", "1.5", "2.0"]);
         assert!(marks.iter().all(|m| m.context.is_none()));
+    }
+
+    /// Two epoch-seconds samples, `span` seconds apart from `start`.
+    fn epoch_seconds_axis(start: i128, span: i128) -> TimeAxis {
+        TimeAxis::Absolute {
+            timestamps: vec![
+                Timestamp::new(start, TimeUnit::Seconds),
+                Timestamp::new(start + span, TimeUnit::Seconds),
+            ]
+            .into(),
+            format: TimestampFormat::EpochSeconds,
+        }
+    }
+
+    // PR #259 review, finding 1: a label where the day changes always
+    // names its date, and no label or date line overlaps another, so the
+    // painter never has to leave one out. Swept over start times (noon,
+    // 18:00, 23:00 on 2026-06-21 UTC), spans from 12 h to 6 days, and
+    // widths from 500 to 1900 points.
+    #[test]
+    fn every_day_change_on_the_axis_names_its_date_and_nothing_overlaps() {
+        for start in [1_782_043_200_i128, 1_782_064_800, 1_782_082_800] {
+            for hours in [12_i128, 30, 60, 114, 150] {
+                let time = epoch_seconds_axis(start, hours * 3_600);
+                let ticks = time.to_pyramid_ticks();
+                let view = full_view(&time, &ticks);
+                for width in (500..=1_900).step_by(100).map(|w| w as f32) {
+                    let case = format!("start {start}, {hours} h, {width} px");
+                    let marks = time_axis_marks(&time, &ticks, view, width, None, CHAR_PX);
+                    assert!(marks.len() >= 2, "{case}: {marks:?}");
+                    assert!(
+                        marks[0].context.is_some(),
+                        "{case}: the first label has the date"
+                    );
+                    let mut previous_day = None;
+                    for mark in &marks {
+                        let day = (mark.x / 86_400.0).floor() as i64;
+                        if previous_day.is_some_and(|d| d != day) && mark.label.contains(':') {
+                            assert!(
+                                mark.context
+                                    .as_deref()
+                                    .is_some_and(|c| c.starts_with("2026-06-")),
+                                "{case}: {:?} starts a new day without its date: {marks:?}",
+                                mark.label
+                            );
+                        }
+                        previous_day = Some(day);
+                    }
+                    let boxes = mark_boxes(&marks, view, width, CHAR_PX);
+                    assert_eq!(boxes.len(), marks.len(), "{case}");
+                    for b in &boxes {
+                        assert!(b.label.0 >= 0.0 && b.label.1 <= width, "{case}: {b:?}");
+                    }
+                    for pair in boxes.windows(2) {
+                        assert!(
+                            pair[0].label.1 < pair[1].label.0,
+                            "{case}: labels overlap {pair:?}"
+                        );
+                    }
+                    let contexts: Vec<(f32, f32)> =
+                        boxes.iter().filter_map(|b| b.context).collect();
+                    for pair in contexts.windows(2) {
+                        assert!(pair[0].1 < pair[1].0, "{case}: date lines overlap {pair:?}");
+                    }
+                }
+            }
+        }
     }
 
     // The plots' vertical grid lines are the axis's own label positions,
