@@ -1255,6 +1255,58 @@ fn time_axis_label(
     }
 }
 
+/// Most labels the time axis shows, however wide the window (issue #196).
+pub(crate) const MAX_AXIS_LABELS: usize = 10;
+
+/// Free space, in points, kept between two neighbouring axis labels.
+pub(crate) const AXIS_LABEL_GAP: f32 = 40.0;
+
+/// The plots' grid fade range (`egui_plot`'s default), set explicitly so
+/// [`calendar_grid`] can read each plot's width back from
+/// [`egui_plot::GridInput::base_step_size`].
+pub(crate) const GRID_SPACING: egui::Rangef = egui::Rangef {
+    min: 8.0,
+    max: 300.0,
+};
+
+/// One label of the time axis (issue #196), at plot coordinate `x`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AxisMark {
+    /// Where, in plot coordinates (compressed, when the axis is).
+    pub x: f64,
+    /// The distance to the next label of the same step, in plot
+    /// coordinates; `0` for a gap's `⫽`, which has no grid line.
+    pub step_x: f64,
+    pub label: String,
+    /// The second line: the date where it is new, and the zone.
+    pub context: Option<String>,
+}
+
+/// The time axis's labels for the plot-coordinate range `view` drawn
+/// `width_px` points wide, with labels `char_px` points per character.
+pub(crate) fn time_axis_marks(
+    time: &TimeAxis,
+    ticks: &[i128],
+    view: (f64, f64),
+    width_px: f32,
+    broken: Option<&BrokenAxis>,
+    char_px: f32,
+) -> Vec<AxisMark> {
+    let _ = (time, ticks, view, width_px, broken, char_px);
+    Vec::new()
+}
+
+/// The plots' x grid: one line under each [`time_axis_marks`] label.
+pub(crate) fn calendar_grid<'a>(
+    time: &'a TimeAxis,
+    ticks: &'a [i128],
+    broken: Option<&'a BrokenAxis>,
+    char_px: f32,
+) -> impl Fn(egui_plot::GridInput) -> Vec<GridMark> + 'a {
+    let _ = (time, ticks, broken, char_px);
+    |_| Vec::new()
+}
+
 /// Where [`show_time_axis`] drew the axis on the last frame, for the tests.
 #[cfg(test)]
 pub(crate) fn time_axis_rect(ctx: &egui::Context) -> Option<egui::Rect> {
@@ -2920,64 +2972,73 @@ mod render_tests {
         );
     }
 
-    // SPEC §2.3 on the axis that now draws the labels (issue #230): a mark
-    // inside a collapsed gap reads `⫽`, any other mark the real time under
-    // it, never its compressed coordinate.
+    // SPEC §2.3 on the axis that now draws the labels (issue #230): a
+    // collapsed gap reads `⫽`, every other label the real time under it
+    // (gap_heavy_dataset is epoch seconds from 1970-01-01 00:00 UTC; its
+    // second cluster starts at 10 050 s = 02:47:30), never its compressed
+    // coordinate; no label sits inside a gap.
     #[test]
     fn a_compressed_time_axis_labels_gaps_and_real_times() {
         let dataset = gap_heavy_dataset();
         let fit = fit_bounds_of(&dataset);
         let broken = fit.compress.as_deref().expect("the gaps are compressible");
         let ticks = dataset.time.to_pyramid_ticks();
-        let mark = |value| GridMark {
-            value,
-            step_size: 1.0,
-        };
-        let (gap_start, gap_end) = (broken.compress(49.0), broken.compress(10_050.0));
-        let in_gap = (gap_start + gap_end) / 2.0;
-        assert!(broken.gap_at(in_gap).is_some());
-        assert_eq!(
-            time_axis_label(&ticks, mark(in_gap), &dataset.time, Some(broken)),
-            "⫽"
-        );
-        let after = broken.compress(10_070.0);
-        assert_eq!(
-            time_axis_label(&ticks, mark(after), &dataset.time, Some(broken)),
-            format_x_axis_tick(&ticks, mark(10_070.0), &dataset.time)
+        let view = (broken.compress(0.0), broken.compress(10_099.0));
+        let marks = time_axis_marks(&dataset.time, &ticks, view, 800.0, Some(broken), 8.0);
+
+        let gap_marks: Vec<&AxisMark> = marks.iter().filter(|m| m.label == "⫽").collect();
+        assert_eq!(gap_marks.len(), 1, "{marks:?}");
+        assert!(broken.gap_at(gap_marks[0].x).is_some());
+        assert!(marks
+            .iter()
+            .filter(|m| m.label != "⫽")
+            .all(|m| broken.gap_at(m.x).is_none()));
+        let after: Vec<&str> = marks
+            .iter()
+            .filter(|m| m.x > broken.compress(10_050.0))
+            .map(|m| m.label.as_str())
+            .collect();
+        assert!(
+            !after.is_empty() && after.iter().all(|l| l.starts_with("02:4")),
+            "real times after the gap: {marks:?}"
         );
     }
 
-    // The same, drawn: with the view compressed, the axis row prints times
-    // from after the gap (beyond 10 050 s), which the compressed coordinates
-    // alone would never reach.
-    #[test]
-    fn the_compressed_time_axis_row_prints_real_times() {
-        let dataset = gap_heavy_dataset();
-        let pyramids = glyde_core::ingest::pyramids_for_dataset(&dataset);
+    /// The time view and its axis row in an 800×600 (or `width`×600)
+    /// window, as the app lays them out, over `frames` frames; returns the
+    /// last frame's shapes. `compress_from` presses Compress on that frame.
+    fn run_view_with_axis(
+        dataset: &Dataset,
+        width: f32,
+        frames: usize,
+        compress_from: Option<usize>,
+        pointer: Option<egui::Pos2>,
+    ) -> (egui::Context, Vec<egui::epaint::ClippedShape>) {
+        let pyramids = glyde_core::ingest::pyramids_for_dataset(dataset);
         let ticks = dataset.time.to_pyramid_ticks();
-        let sample_cache = cache_column_samples(&dataset);
+        let sample_cache = cache_column_samples(dataset);
         let cursor = CursorLookup::for_time(&dataset.time);
-        let fit = fit_bounds_of(&dataset);
+        let fit = fit_bounds_of(dataset);
         let mut state = TimeViewState::default();
         let ctx = egui::Context::default();
         let mut shapes = Vec::new();
-        // Opened on the true-to-scale axis, then the user presses Compress.
-        for frame in 0..8 {
-            if frame == 3 {
+        for frame in 0..frames {
+            if compress_from == Some(frame) {
                 state.compressed = true;
             }
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(800.0, 600.0),
+                    egui::vec2(width, 600.0),
                 )),
+                events: pointer
+                    .map(|pos| vec![egui::Event::PointerMoved(pos)])
+                    .unwrap_or_default(),
                 ..Default::default()
             };
             shapes = ctx
                 .run(input, |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        // The plot above, the axis row under it, as the app
-                        // lays them out.
                         let plot = egui::vec2(
                             ui.available_width(),
                             ui.available_height() - TIME_AXIS_HEIGHT - 20.0,
@@ -2985,7 +3046,7 @@ mod render_tests {
                         ui.allocate_ui(plot, |ui| {
                             show(
                                 ui,
-                                &dataset,
+                                dataset,
                                 &pyramids,
                                 &ticks,
                                 &sample_cache,
@@ -3000,29 +3061,126 @@ mod render_tests {
                 })
                 .shapes;
         }
-        let axis = time_axis_rect(&ctx).expect("the axis is drawn");
-        let mut labels = Vec::new();
-        fn walk(shape: &egui::Shape, labels: &mut Vec<(String, egui::Pos2)>) {
+        (ctx, shapes)
+    }
+
+    /// Every text shape: its text and screen rect.
+    fn texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
             match shape {
-                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, labels)),
-                egui::Shape::Text(t) => labels.push((t.galley.text().to_owned(), t.pos)),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(t) => out.push((
+                    t.galley.text().to_owned(),
+                    egui::Rect::from_min_size(t.pos, t.galley.size()),
+                )),
                 _ => {}
             }
         }
-        for clipped in &shapes {
-            walk(&clipped.shape, &mut labels);
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
         }
-        let on_axis: Vec<&String> = labels
-            .iter()
-            .filter(|(_, pos)| axis.y_range().contains(pos.y))
-            .map(|(text, _)| text)
+        out
+    }
+
+    fn axis_texts(
+        ctx: &egui::Context,
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<(String, egui::Rect)> {
+        let axis = time_axis_rect(ctx).expect("the axis is drawn");
+        texts(shapes)
+            .into_iter()
+            .filter(|(text, rect)| !text.is_empty() && axis.y_range().contains(rect.center().y))
+            .collect()
+    }
+
+    // The same, drawn: with the view compressed, the axis row prints times
+    // from after the gap, which the compressed coordinates alone would
+    // never reach.
+    #[test]
+    fn the_compressed_time_axis_row_prints_real_times() {
+        let dataset = gap_heavy_dataset();
+        let (ctx, shapes) = run_view_with_axis(&dataset, 800.0, 8, Some(3), None);
+        let on_axis: Vec<String> = axis_texts(&ctx, &shapes)
+            .into_iter()
+            .map(|(t, _)| t)
             .collect();
         assert!(
-            on_axis
-                .iter()
-                .filter_map(|t| t.parse::<f64>().ok())
-                .any(|seconds| seconds >= 10_050.0),
+            on_axis.iter().any(|t| t.starts_with("02:4")),
             "real times after the gap on the axis: {on_axis:?}"
+        );
+        assert!(on_axis.iter().any(|t| t == "⫽"), "{on_axis:?}");
+    }
+
+    /// An hour of epoch-µs samples from 2026-06-21 10:04:10.587450 UTC.
+    fn epoch_micros_dataset() -> Dataset {
+        let seconds: Vec<i128> = (0..=3_600).step_by(10).collect();
+        let mut dataset = sample_dataset();
+        dataset.time = TimeAxis::Absolute {
+            timestamps: seconds
+                .iter()
+                .map(|&s| {
+                    Timestamp::new(
+                        1_782_036_250_587_450 + s * 1_000_000,
+                        TimeUnit::Microseconds,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochMicros,
+        };
+        dataset.columns = vec![Series::new(
+            "value",
+            SeriesValues::F64(seconds.iter().map(|&s| (s % 70) as f64).collect()),
+        )];
+        dataset
+    }
+
+    // Issue #196 (1) and (3), drawn at the reference 1440 px: the axis row
+    // reads times of day and the date once, no raw epoch number anywhere,
+    // and no label is cut at either edge.
+    #[test]
+    fn the_time_axis_row_reads_dates_and_times_and_clips_no_label() {
+        let dataset = epoch_micros_dataset();
+        let (ctx, shapes) = run_view_with_axis(&dataset, 1_440.0, 4, None, None);
+        let axis = time_axis_rect(&ctx).expect("the axis is drawn");
+        let on_axis = axis_texts(&ctx, &shapes);
+
+        let times = on_axis.iter().filter(|(t, _)| t.contains(':')).count();
+        assert!((6..=MAX_AXIS_LABELS).contains(&times), "{on_axis:?}");
+        assert!(
+            on_axis.iter().any(|(t, _)| t == "2026-06-21 · UTC"),
+            "{on_axis:?}"
+        );
+        assert!(
+            !texts(&shapes).iter().any(|(t, _)| t.contains("1782036")),
+            "no raw epoch value is drawn"
+        );
+        for (text, rect) in &on_axis {
+            assert!(
+                rect.left() >= axis.left() - 0.5 && rect.right() <= axis.right() + 0.5,
+                "{text:?} at {rect:?} is cut by the axis {axis:?}"
+            );
+        }
+    }
+
+    // Issue #196 (2): no `x = <f64>` hover tooltip over the data; the
+    // cursor readout under the plot is the one place time is read exactly.
+    #[test]
+    fn hovering_the_plot_shows_no_raw_coordinate_tooltip() {
+        let dataset = epoch_micros_dataset();
+        let (_ctx, shapes) =
+            run_view_with_axis(&dataset, 800.0, 4, None, Some(egui::pos2(400.0, 250.0)));
+        let all = texts(&shapes);
+        assert!(
+            all.iter()
+                .any(|(t, _)| t.starts_with("2026-06-21 ") && t.contains(" UTC (")),
+            "the readout shows the readable time: {all:?}"
+        );
+        assert!(
+            !all.iter()
+                .any(|(t, _)| t.contains("x = ") || t.contains("y = ")),
+            "no raw plot-coordinate tooltip: {all:?}"
         );
     }
 
@@ -6243,85 +6401,183 @@ mod tests {
         assert_eq!(format_cursor_time(&time, 1), "1");
     }
 
-    // Issue #56: the axis must show the same human-readable timestamp the
-    // cursor readout does, not the raw seconds-since-epoch `x_axis_seconds`
-    // coordinate.
     #[test]
-    fn format_x_axis_tick_formats_an_absolute_axis_like_the_cursor_readout() {
+    fn format_cursor_time_reads_an_epoch_as_a_date_with_its_raw_value() {
         let time = TimeAxis::Absolute {
-            timestamps: vec![Timestamp::with_offset(0, TimeUnit::Nanoseconds, 2 * 3600)].into(),
-            format: TimestampFormat::Iso8601WithOffset,
-        };
-        let ticks = time.to_pyramid_ticks();
-        let mark = GridMark {
-            value: 0.0,
-            step_size: 1.0,
+            timestamps: vec![Timestamp::new(
+                1_782_036_250_587_450,
+                TimeUnit::Microseconds,
+            )]
+            .into(),
+            format: TimestampFormat::EpochMicros,
         };
 
-        let text = format_x_axis_tick(&ticks, mark, &time);
-
-        assert!(text.contains("02:00"), "must honor the offset: {text}");
+        assert_eq!(
+            format_cursor_time(&time, 0),
+            "2026-06-21 10:04:10.587450 UTC (1782036250587450)"
+        );
     }
 
-    // A tick between two sample instants must still convert to a real
-    // timestamp at that grid position, not the nearest sample's tick.
-    #[test]
-    fn format_x_axis_tick_converts_a_grid_value_that_is_not_an_existing_sample() {
-        let time = TimeAxis::Absolute {
-            timestamps: vec![Timestamp::new(0, TimeUnit::Seconds)].into(),
-            format: TimestampFormat::EpochSeconds,
-        };
-        let ticks = time.to_pyramid_ticks();
-        let mark = GridMark {
-            value: 1.4,
-            step_size: 1.0,
-        };
+    /// One digit's width in the tests: Inter at 13 px is about this.
+    const CHAR_PX: f32 = 8.0;
 
-        assert_eq!(format_x_axis_tick(&ticks, mark, &time), "1");
+    /// An epoch-µs axis over `seconds` after 2026-06-21 10:04:10.587450 UTC
+    /// (the PV inverter file of issue #196).
+    fn pv_axis(seconds: &[i128]) -> TimeAxis {
+        TimeAxis::Absolute {
+            timestamps: seconds
+                .iter()
+                .map(|&s| {
+                    Timestamp::new(
+                        1_782_036_250_587_450 + s * 1_000_000,
+                        TimeUnit::Microseconds,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochMicros,
+        }
     }
 
-    // A source column can carry a different UTC offset per row (e.g. a DST
-    // transition partway through the file, SPEC §2.1's "honor it and display
-    // it" applied per row). A tick far from the first sample must use the
-    // offset of the sample nearest to it, not always the first sample's —
-    // otherwise ticks after the transition would show a stale offset even
-    // though their underlying instant is unaffected.
+    fn full_view(time: &TimeAxis, ticks: &[i128]) -> (f64, f64) {
+        (
+            tick_to_seconds(time, *ticks.first().unwrap()),
+            tick_to_seconds(time, *ticks.last().unwrap()),
+        )
+    }
+
+    // Issue #196 (1): an epoch axis reads as times of day, the date and
+    // zone once — never `1782036250587450`. (3): 6–10 labels at full width.
     #[test]
-    fn format_x_axis_tick_uses_the_nearest_samples_own_offset_not_the_first_samples() {
+    fn an_epoch_axis_is_labelled_as_times_of_day_with_the_date_once() {
+        let time = pv_axis(&[0, 3_600]);
+        let ticks = time.to_pyramid_ticks();
+        let marks = time_axis_marks(
+            &time,
+            &ticks,
+            full_view(&time, &ticks),
+            1_400.0,
+            None,
+            CHAR_PX,
+        );
+
+        assert!((6..=MAX_AXIS_LABELS).contains(&marks.len()), "{marks:?}");
+        for mark in &marks {
+            let parts: Vec<&str> = mark.label.split(':').collect();
+            assert!(
+                parts.len() >= 2
+                    && parts
+                        .iter()
+                        .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit())),
+                "a time of day, not a raw number: {:?}",
+                mark.label
+            );
+        }
+        assert_eq!(marks[0].context.as_deref(), Some("2026-06-21 · UTC"));
+        assert!(marks[1..].iter().all(|m| m.context.is_none()));
+    }
+
+    // Issue #196 (3): however wide or narrow the axis, labels never come
+    // closer than their own width plus a gap, and never exceed the cap.
+    #[test]
+    fn the_axis_never_crowds_its_labels() {
+        let time = pv_axis(&[0, 86_400 * 3]);
+        let ticks = time.to_pyramid_ticks();
+        let view = full_view(&time, &ticks);
+        for width in [120.0_f32, 300.0, 700.0, 1_400.0, 2_800.0] {
+            let marks = time_axis_marks(&time, &ticks, view, width, None, CHAR_PX);
+            assert!(marks.len() <= MAX_AXIS_LABELS);
+            let px_per_x = f64::from(width) / (view.1 - view.0);
+            let longest = marks
+                .iter()
+                .map(|m| m.label.chars().count())
+                .max()
+                .unwrap_or(0);
+            for pair in marks.windows(2) {
+                let apart = (pair[1].x - pair[0].x) * px_per_x;
+                assert!(
+                    apart >= longest as f64 * f64::from(CHAR_PX) + f64::from(AXIS_LABEL_GAP) - 1e-6,
+                    "{width} px: {apart} px apart for {longest}-char labels"
+                );
+            }
+            if width >= 300.0 {
+                assert!(marks.len() >= 2, "{width} px: {marks:?}");
+            }
+        }
+    }
+
+    // SPEC §2.1: an offset the source carried is honored and shown (#56).
+    #[test]
+    fn an_offset_axis_is_labelled_on_its_own_wall_clock() {
         let time = TimeAxis::Absolute {
             timestamps: vec![
-                Timestamp::with_offset(0, TimeUnit::Seconds, 3600),
-                Timestamp::with_offset(3600, TimeUnit::Seconds, 2 * 3600),
+                Timestamp::with_offset(0, TimeUnit::Nanoseconds, 2 * 3_600),
+                Timestamp::with_offset(3_600_000_000_000, TimeUnit::Nanoseconds, 2 * 3_600),
             ]
             .into(),
             format: TimestampFormat::Iso8601WithOffset,
         };
         let ticks = time.to_pyramid_ticks();
-        let mark = GridMark {
-            value: 3600.0,
-            step_size: 1.0,
+        let marks = time_axis_marks(&time, &ticks, (0.0, 3_600.0), 800.0, None, CHAR_PX);
+
+        assert_eq!(marks[0].label, "02:00");
+        assert_eq!(marks[0].context.as_deref(), Some("1970-01-01 · UTC+02:00"));
+        assert_eq!(marks.last().unwrap().label, "03:00");
+    }
+
+    // A column can carry a different offset per row (a DST change): the
+    // axis reads the offset of the sample nearest the view, not the first.
+    #[test]
+    fn the_axis_takes_the_offset_of_the_sample_nearest_the_view() {
+        let time = TimeAxis::Absolute {
+            timestamps: vec![
+                Timestamp::with_offset(0, TimeUnit::Seconds, 3_600),
+                Timestamp::with_offset(36_000, TimeUnit::Seconds, 2 * 3_600),
+            ]
+            .into(),
+            format: TimestampFormat::Iso8601WithOffset,
         };
+        let ticks = time.to_pyramid_ticks();
+        let marks = time_axis_marks(&time, &ticks, (35_000.0, 36_000.0), 800.0, None, CHAR_PX);
 
-        let text = format_x_axis_tick(&ticks, mark, &time);
-
-        assert!(
-            text.contains("02:00"),
-            "must use the second sample's own offset, not the first's: {text}"
-        );
+        let context = marks[0].context.as_deref().unwrap_or_default();
+        assert!(context.ends_with("UTC+02:00"), "{context}");
     }
 
     #[test]
-    fn format_x_axis_tick_of_a_progressive_index_shows_a_plain_number() {
+    fn a_progressive_axis_is_labelled_with_plain_round_numbers() {
         let time = TimeAxis::Progressive {
             values: vec![0.0, 1.0, 2.0].into(),
         };
         let ticks = time.to_pyramid_ticks();
-        let mark = GridMark {
-            value: 1.5,
-            step_size: 0.1,
-        };
+        let marks = time_axis_marks(&time, &ticks, (0.0, 2.0), 800.0, None, CHAR_PX);
 
-        assert_eq!(format_x_axis_tick(&ticks, mark, &time), "1.5");
+        let labels: Vec<&str> = marks.iter().map(|m| m.label.as_str()).collect();
+        assert_eq!(labels, ["0.0", "0.5", "1.0", "1.5", "2.0"]);
+        assert!(marks.iter().all(|m| m.context.is_none()));
+    }
+
+    // The plots' vertical grid lines are the axis's own label positions,
+    // so a label always sits under its line.
+    #[test]
+    fn the_plots_grid_lines_sit_exactly_over_the_axis_labels() {
+        let time = pv_axis(&[0, 7_200]);
+        let ticks = time.to_pyramid_ticks();
+        let view = full_view(&time, &ticks);
+        let width = 1_234.0_f32;
+        let grid = calendar_grid(&time, &ticks, None, CHAR_PX);
+        let lines = grid(egui_plot::GridInput {
+            bounds: view,
+            base_step_size: (view.1 - view.0) / f64::from(width) * f64::from(GRID_SPACING.min),
+        });
+        let marks = time_axis_marks(&time, &ticks, view, width, None, CHAR_PX);
+
+        assert!(!marks.is_empty());
+        let xs: Vec<f64> = lines.iter().map(|line| line.value).collect();
+        assert_eq!(xs, marks.iter().map(|m| m.x).collect::<Vec<_>>());
+        for (line, mark) in lines.iter().zip(&marks) {
+            assert!((line.step_size - mark.step_x).abs() < 1e-9);
+        }
     }
 
     #[test]
