@@ -149,6 +149,8 @@ pub fn show<P: Pyramid + Sync>(
 pub struct TimeViewState {
     /// Which channels are plotted, edited by the channel picker.
     pub channels: ChannelVisibility,
+    /// One plot per channel, or all of them on one plot (SPEC §4.1).
+    pub layout: NumericLayout,
     /// `dataset.columns`-parallel; `None` until a column is first shown.
     decimated: Vec<Option<CachedDecimation>>,
     /// The `ticks` the cache was filled from (address and length) — a
@@ -177,6 +179,40 @@ pub struct TimeViewState {
     /// reference encoding to compare the two.
     #[cfg(test)]
     bar_encoding: BarEncoding,
+}
+
+/// How the shown numeric channels are laid out (SPEC §4.1: "either
+/// overlaid on one plot or stacked on multiple plots sharing a single,
+/// synchronized time axis"; issue #198). View state only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NumericLayout {
+    /// One plot per shown channel, each on its own y scale, all on the one
+    /// time axis. The approved mockup's default (docs/design).
+    #[default]
+    Stacked,
+    /// Every shown channel on one plot, with one y axis.
+    Overlaid,
+}
+
+/// One numeric plot drawn on the last frame, for the tests.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DrawnTrack {
+    /// The column it plots when stacked; `None` for the overlaid plot (or
+    /// the empty one when no channel is shown).
+    pub column: Option<usize>,
+    /// Its `egui_plot` id, to read its bounds from egui's memory.
+    pub plot_id: egui::Id,
+    /// Its frame, in screen points.
+    pub frame: egui::Rect,
+}
+
+/// The numeric plots [`show_with_selection`] drew on the last frame, top to
+/// bottom.
+#[cfg(test)]
+pub(crate) fn drawn_tracks(ctx: &egui::Context) -> Vec<DrawnTrack> {
+    ctx.data(|data| data.get_temp::<Vec<DrawnTrack>>(egui::Id::new("time_drawn_tracks")))
+        .unwrap_or_default()
 }
 
 /// The `egui_plot` link group through which the time plot and every state
@@ -4901,6 +4937,406 @@ mod render_tests {
             !output.shapes.is_empty(),
             "must draw something for a large, decimated dataset without panicking"
         );
+    }
+
+    // ---- Stacked numeric view (SPEC §4.1, issue #198) ----
+
+    /// Three channels on very different scales, like the engine test
+    /// bench's lambda (≈1) next to its combustion-cycle counter (thousands).
+    fn three_scales_dataset() -> Dataset {
+        let n = 200usize;
+        let mut dataset = sample_dataset();
+        dataset.time = TimeAxis::Absolute {
+            timestamps: (0..n as i128)
+                .map(|i| Timestamp::new(i, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        dataset.columns = vec![
+            Series::new(
+                "small",
+                SeriesValues::F64((0..n).map(|i| (i as f64 * 0.1).sin()).collect()),
+            ),
+            Series::new(
+                "huge",
+                SeriesValues::F64((0..n).map(|i| 1_000.0 + i as f64).collect()),
+            ),
+            Series::new(
+                "mid",
+                SeriesValues::F64((0..n).map(|i| 50.0 + (i % 10) as f64).collect()),
+            ),
+        ];
+        dataset
+    }
+
+    /// The finite min and max of `dataset`'s column `column`.
+    fn column_range(dataset: &Dataset, column: usize) -> (f64, f64) {
+        finite_min_max(
+            dataset.columns[column]
+                .values()
+                .to_f64_vec()
+                .expect("numeric")
+                .into_iter(),
+        )
+        .expect("a finite sample")
+    }
+
+    /// The y bounds the plot `track` keeps in egui's memory.
+    fn y_bounds(ctx: &egui::Context, track: &DrawnTrack) -> (f64, f64) {
+        let memory = egui_plot::PlotMemory::load(ctx, track.plot_id).expect("plot memory");
+        let bounds = memory.bounds();
+        (bounds.min()[1], bounds.max()[1])
+    }
+
+    /// The x bounds the plot `track` keeps in egui's memory.
+    fn x_bounds(ctx: &egui::Context, track: &DrawnTrack) -> (f64, f64) {
+        let memory = egui_plot::PlotMemory::load(ctx, track.plot_id).expect("plot memory");
+        let bounds = memory.bounds();
+        (bounds.min()[0], bounds.max()[0])
+    }
+
+    /// The centre of every text exactly `label` in `shapes`.
+    fn text_centres(shapes: &[egui::epaint::ClippedShape], label: &str) -> Vec<egui::Pos2> {
+        fn find(shape: &egui::Shape, label: &str, found: &mut Vec<egui::Pos2>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, label, found)),
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    found.push(text.pos + text.galley.size() / 2.0)
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in shapes {
+            find(&clipped.shape, label, &mut found);
+        }
+        found
+    }
+
+    /// Whether some text in `shapes` contains `needle`.
+    fn has_text_containing(shapes: &[egui::epaint::ClippedShape], needle: &str) -> bool {
+        fn find(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().any(|s| find(s, needle)),
+                egui::Shape::Text(t) => t.galley.text().contains(needle),
+                _ => false,
+            }
+        }
+        shapes.iter().any(|clipped| find(&clipped.shape, needle))
+    }
+
+    /// A primary click at `pos`, over three frames.
+    fn click_at(
+        ctx: &egui::Context,
+        fixture: &ViewFixture,
+        state: &mut TimeViewState,
+        pos: egui::Pos2,
+    ) {
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        frame_with_events(
+            ctx,
+            fixture,
+            state,
+            vec![egui::Event::PointerMoved(pos), press(true)],
+        );
+        frame_with_events(ctx, fixture, state, vec![press(false)]);
+        frame_with_events(ctx, fixture, state, Vec::new());
+    }
+
+    // Issue #198: with one y axis, the counter flattens every other channel
+    // into the zero line. Stacked — the default of the approved mockup —
+    // gives each shown channel its own plot and its own y range, one under
+    // the other in column order, all in the same frame width so they share
+    // the time axis, and all inside the window.
+    #[test]
+    fn stacked_is_the_default_one_plot_per_channel_each_on_its_own_scale() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        assert_eq!(state.layout, NumericLayout::Stacked);
+        for _ in 0..3 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(
+            tracks.iter().map(|t| t.column).collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
+        for pair in tracks.windows(2) {
+            assert_eq!(pair[0].frame.left(), pair[1].frame.left());
+            assert_eq!(pair[0].frame.width(), pair[1].frame.width());
+            assert!(pair[0].frame.bottom() <= pair[1].frame.top());
+            assert_eq!(pair[0].frame.height(), pair[1].frame.height());
+        }
+        assert!(
+            tracks.last().unwrap().frame.bottom() <= 600.0,
+            "every track fits in the window"
+        );
+        for track in &tracks {
+            let column = track.column.unwrap();
+            let (lo, hi) = column_range(&fixture.dataset, column);
+            let (y_min, y_max) = y_bounds(&ctx, track);
+            assert!(
+                y_min <= lo && y_max >= hi,
+                "column {column}: {y_min}..{y_max} must show {lo}..{hi}"
+            );
+            assert!(
+                y_max - y_min <= (hi - lo) * 1.2,
+                "column {column}: {y_min}..{y_max} is not its own scale ({lo}..{hi})"
+            );
+        }
+        // The lanes and the time axis line up with the tracks as a whole.
+        let shared = state.shared_axis().expect("the plots share their axis");
+        assert_eq!(shared.left, tracks[0].frame.left());
+        assert_eq!(shared.width, tracks[0].frame.width());
+        assert_eq!(shared.frame.top(), tracks[0].frame.top());
+        assert_eq!(shared.frame.bottom(), tracks[2].frame.bottom());
+    }
+
+    // A hidden channel has no plot; the shown ones share its room.
+    #[test]
+    fn a_hidden_channel_has_no_stacked_plot_and_the_others_take_its_room() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        for _ in 0..2 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let three = drawn_tracks(&ctx)[0].frame.height();
+        state.channels.toggle(1);
+        for _ in 0..2 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(
+            tracks.iter().map(|t| t.column).collect::<Vec<_>>(),
+            vec![Some(0), Some(2)]
+        );
+        assert!(tracks[0].frame.height() > three);
+
+        // None shown: one empty plot, so the picker and the axis stay.
+        state.channels.toggle(0);
+        state.channels.toggle(2);
+        for _ in 0..2 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].column, None);
+        assert!(state.shared_axis().is_some());
+    }
+
+    // Every stacked track carries its channel's name in the gutter left of
+    // its frame: three palette colors are under 3:1 on white, so a channel
+    // is never identified by color alone (docs/design).
+    #[test]
+    fn every_stacked_plot_is_named_in_the_gutter() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = frame_with_events(&ctx, &fixture, &mut state, Vec::new()).0;
+        }
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), 3);
+        for track in tracks {
+            let name = fixture.dataset.columns[track.column.unwrap()].name();
+            assert!(
+                text_centres(&shapes, name).iter().any(|centre| {
+                    centre.x < track.frame.left()
+                        && (track.frame.top()..=track.frame.bottom()).contains(&centre.y)
+                }),
+                "{name} is written left of its plot"
+            );
+        }
+    }
+
+    // The toggle, the same control the spectrum panel has: Overlaid puts
+    // every shown channel on one plot, with one y axis covering them all.
+    #[test]
+    fn overlaid_puts_every_shown_channel_on_one_plot() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = frame_with_events(&ctx, &fixture, &mut state, Vec::new()).0;
+        }
+        assert!(has_text(&shapes, "Stacked"));
+        click_at(&ctx, &fixture, &mut state, text_centre(&shapes, "Overlaid"));
+        frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        assert_eq!(state.layout, NumericLayout::Overlaid);
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].column, None);
+        let (y_min, y_max) = y_bounds(&ctx, &tracks[0]);
+        assert!(y_min <= column_range(&fixture.dataset, 0).0);
+        assert!(y_max >= column_range(&fixture.dataset, 1).1);
+
+        // And back: one plot per channel again, each on its own scale.
+        let shapes = frame_with_events(&ctx, &fixture, &mut state, Vec::new()).0;
+        click_at(&ctx, &fixture, &mut state, text_centre(&shapes, "Stacked"));
+        frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        assert_eq!(state.layout, NumericLayout::Stacked);
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), 3);
+        let (lo, hi) = column_range(&fixture.dataset, 0);
+        let (y_min, y_max) = y_bounds(&ctx, &tracks[0]);
+        assert!(y_min <= lo && y_max >= hi && y_max - y_min <= (hi - lo) * 1.2);
+    }
+
+    // SPEC §4.1: "sharing a single, synchronized time axis". Dragging one
+    // stacked plot pans every one of them to the same time span.
+    #[test]
+    fn dragging_one_stacked_plot_pans_them_all() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        for _ in 0..3 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let tracks = drawn_tracks(&ctx);
+        let before = x_bounds(&ctx, &tracks[0]);
+        let start = tracks[2].frame.center();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let end = start - egui::vec2(200.0, 0.0);
+        let mid = start - egui::vec2(100.0, 0.0);
+        for events in [
+            vec![egui::Event::PointerMoved(start)],
+            vec![button(start, true)],
+            vec![egui::Event::PointerMoved(mid)],
+            vec![egui::Event::PointerMoved(end)],
+            vec![button(end, false)],
+            Vec::new(),
+            Vec::new(),
+        ] {
+            frame_with_events(&ctx, &fixture, &mut state, events);
+        }
+        let tracks = drawn_tracks(&ctx);
+        let after = x_bounds(&ctx, &tracks[2]);
+        assert!(
+            after.0 > before.0 + 1.0,
+            "the drag panned: {before:?} -> {after:?}"
+        );
+        for track in &tracks {
+            assert_eq!(x_bounds(&ctx, track), after, "column {:?}", track.column);
+        }
+        assert_eq!(state.shared_axis().unwrap().x_range, after);
+    }
+
+    // "Fit to data" frames every stacked plot on its own channel, wherever
+    // each was zoomed to.
+    #[test]
+    fn fit_to_data_frames_each_stacked_plot_on_its_own_channel() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = frame_with_events(&ctx, &fixture, &mut state, Vec::new()).0;
+        }
+        for track in drawn_tracks(&ctx) {
+            let mut memory = egui_plot::PlotMemory::load(&ctx, track.plot_id).unwrap();
+            memory.auto_bounds = egui::Vec2b::FALSE;
+            memory.set_bounds(PlotBounds::from_min_max([10.0, -500.0], [20.0, -400.0]));
+            memory.store(&ctx, track.plot_id);
+        }
+        click_at(
+            &ctx,
+            &fixture,
+            &mut state,
+            text_centre(&shapes, "Fit to data"),
+        );
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), 3);
+        for track in tracks {
+            let column = track.column.unwrap();
+            let fitted = fixture.fit.frame([column]).expect("finite samples");
+            let memory = egui_plot::PlotMemory::load(&ctx, track.plot_id).unwrap();
+            let bounds = memory.bounds();
+            assert_eq!(
+                (bounds.min(), bounds.max()),
+                (fitted.min(), fitted.max()),
+                "column {column}"
+            );
+        }
+    }
+
+    // SPEC §2.3's toggle keeps the view where it was, re-expressed in the
+    // other coordinates — once, for every stacked plot alike (they share
+    // one x axis, so re-mapping each plot's linked bounds again would
+    // shift all but the first).
+    #[test]
+    fn compressing_keeps_every_stacked_plot_on_the_same_span() {
+        let mut dataset = gap_heavy_dataset();
+        let second = Series::new(
+            "second",
+            SeriesValues::F64((0..dataset.time.len()).map(|i| 100.0 + i as f64).collect()),
+        );
+        dataset.columns.push(second);
+        let fixture = ViewFixture::new(dataset);
+        let broken = fixture.fit.compress.clone().expect("compressible");
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        for _ in 0..2 {
+            state_frame(&ctx, &fixture, &mut state, Some((10.0, 10_060.0)));
+        }
+        state.compressed = true;
+        for _ in 0..3 {
+            state_frame(&ctx, &fixture, &mut state, None);
+        }
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), 2);
+        let expected = (broken.compress(10.0), broken.compress(10_060.0));
+        for track in &tracks {
+            let (lo, hi) = x_bounds(&ctx, track);
+            assert!(
+                (lo - expected.0).abs() < 1e-6 && (hi - expected.1).abs() < 1e-6,
+                "column {:?}: {lo}..{hi}, expected {expected:?}",
+                track.column
+            );
+        }
+    }
+
+    // The readout under the tracks names every shown channel's value at the
+    // pointer, whichever plot it hovers.
+    #[test]
+    fn hovering_any_stacked_plot_reads_every_shown_channel() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        for _ in 0..2 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let last = drawn_tracks(&ctx)[2].frame.center();
+        frame_with_events(
+            &ctx,
+            &fixture,
+            &mut state,
+            vec![egui::Event::PointerMoved(last)],
+        );
+        let shapes = frame_with_events(
+            &ctx,
+            &fixture,
+            &mut state,
+            vec![egui::Event::PointerMoved(last)],
+        )
+        .0;
+        for name in ["small: ", "huge: ", "mid: "] {
+            assert!(has_text_containing(&shapes, name), "{name} in the readout");
+        }
     }
 }
 
