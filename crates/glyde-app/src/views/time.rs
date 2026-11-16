@@ -60,7 +60,8 @@ use glyde_core::ingest::{
 };
 use glyde_core::series::{Series, SeriesValues, ViewKind};
 use glyde_core::time::{
-    cluster_at, format_timestamp, should_offer_compression, visit_gaps, BrokenAxis, Timestamp,
+    calendar_ticks, cluster_at, format_cursor_timestamp, should_offer_compression, visit_gaps,
+    AxisLabelStyle, BrokenAxis,
 };
 
 use crate::views::channels::{self, ChannelVisibility};
@@ -617,6 +618,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     #[cfg(test)]
     let mut drawn: Vec<DrawnTrack> = Vec::with_capacity(tracks.len());
 
+    let char_px = axis_char_px(ui);
     for (track_index, (column, members)) in tracks.iter().enumerate() {
         let id_source = match column {
             Some(column) => egui::Id::new(("time_domain_view", *column)),
@@ -636,6 +638,13 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             .allow_drag(true)
             .allow_boxed_zoom(true)
             .link_axis(TIME_AXIS_LINK_GROUP, [true, false])
+            // Issue #196: the vertical grid lines sit under the time axis's
+            // own labels, and the pointer gets no `x = <f64>` tooltip (the
+            // cursor readout is the one place time is read exactly); the
+            // crosshair stays.
+            .grid_spacing(GRID_SPACING)
+            .x_grid_spacer(calendar_grid(&dataset.time, ticks, broken, char_px))
+            .label_formatter(|_, _| String::new())
             // No horizontal margin: a fit (first frame, double-click) shows
             // exactly `fit`, the span every linked lane fits to as well, so
             // a fit never leaves the plot and the lanes on different spans.
@@ -1200,12 +1209,15 @@ pub fn show_time_axis(
     // says so instead of a time it does not have (SPEC §2.3: labels make
     // the discontinuity explicit).
     let broken: Option<&BrokenAxis> = fit_bounds.compress.as_deref().filter(|_| state.compressed);
+    let char_px = axis_char_px(ui);
     let _row = ui.horizontal(|ui| {
         ui.add_space((shared.left - ui.cursor().left()).max(0.0));
-        Plot::new("time_axis_track")
+        let response = Plot::new("time_axis_track")
             .width(shared.width)
             .height(TIME_AXIS_HEIGHT)
-            .show_axes([true, false])
+            // Issue #196: the labels are painted below from
+            // `time_axis_marks`, not by `egui_plot`'s own axis.
+            .show_axes([false, false])
             .show_grid([false, false])
             .show_background(false)
             .show_x(false)
@@ -1220,8 +1232,19 @@ pub fn show_time_axis(
             .include_y(0.0)
             .include_y(1.0)
             .set_margin_fraction(egui::Vec2::ZERO)
-            .x_axis_formatter(move |mark, _range| time_axis_label(ticks, mark, time, broken))
             .show(ui, |_| {});
+        let transform = response.transform;
+        let frame = *transform.frame();
+        let bounds = transform.bounds();
+        let marks = time_axis_marks(
+            time,
+            ticks,
+            (bounds.min()[0], bounds.max()[0]),
+            frame.width(),
+            broken,
+            char_px,
+        );
+        paint_axis_marks(ui, frame, &transform, &marks);
     });
     // The whole row, its labels included (the plot's own rect is only its
     // frame, above them).
@@ -1229,30 +1252,6 @@ pub fn show_time_axis(
     ui.ctx().data_mut(|data| {
         data.insert_temp(egui::Id::new("time_axis_track_rect"), _row.response.rect)
     });
-}
-
-/// The time axis's label for `mark`: the real time under it — `broken`
-/// maps a compressed coordinate back to it ([`BrokenAxis::expand`]) — or
-/// `⫽` for a mark inside a collapsed gap, which has no time of its own
-/// (SPEC §2.3: labels make the discontinuity explicit).
-fn time_axis_label(
-    ticks: &[i128],
-    mark: GridMark,
-    time: &TimeAxis,
-    broken: Option<&BrokenAxis>,
-) -> String {
-    match broken {
-        Some(b) if b.gap_at(mark.value).is_some() => "⫽".to_string(),
-        Some(b) => format_x_axis_tick(
-            ticks,
-            GridMark {
-                value: b.expand(mark.value),
-                ..mark
-            },
-            time,
-        ),
-        None => format_x_axis_tick(ticks, mark, time),
-    }
 }
 
 /// Most labels the time axis shows, however wide the window (issue #196).
@@ -1283,7 +1282,19 @@ pub(crate) struct AxisMark {
 }
 
 /// The time axis's labels for the plot-coordinate range `view` drawn
-/// `width_px` points wide, with labels `char_px` points per character.
+/// `width_px` points wide, with labels `char_px` points per character
+/// (issue #196).
+///
+/// An absolute axis gets [`calendar_ticks`]: times of day at the zoom's
+/// precision, the date where it changes, and its zone (SPEC §2.1). A
+/// progressive index gets plain round numbers. The step is the finest that
+/// keeps every label its own width plus [`AXIS_LABEL_GAP`] from the next,
+/// at most [`MAX_AXIS_LABELS`] of them.
+///
+/// On a compressed axis (`broken`), each stretch between two collapsed
+/// gaps is labelled on its own, over its own real time span and width, and
+/// each visible gap gets a `⫽` (SPEC §2.3: labels make the discontinuity
+/// explicit) — never a time inside a gap, which has none.
 pub(crate) fn time_axis_marks(
     time: &TimeAxis,
     ticks: &[i128],
@@ -1292,19 +1303,263 @@ pub(crate) fn time_axis_marks(
     broken: Option<&BrokenAxis>,
     char_px: f32,
 ) -> Vec<AxisMark> {
-    let _ = (time, ticks, view, width_px, broken, char_px);
-    Vec::new()
+    let (x0, x1) = view;
+    if !(x0.is_finite() && x1.is_finite() && x1 > x0 && width_px > 0.0) {
+        return Vec::new();
+    }
+    let px_per_x = f64::from(width_px) / (x1 - x0);
+    let Some(broken) = broken else {
+        return segment_marks(time, ticks, view, px_per_x, char_px);
+    };
+    let mut marks = Vec::new();
+    let mut cursor = x0;
+    for (gap_start, gap_end) in broken.collapsed_extents() {
+        if gap_end <= x0 {
+            continue;
+        }
+        if gap_start >= x1 {
+            break;
+        }
+        if gap_start > cursor {
+            marks.extend(compressed_segment_marks(
+                time,
+                ticks,
+                (cursor, gap_start),
+                px_per_x,
+                broken,
+                char_px,
+            ));
+        }
+        marks.push(AxisMark {
+            x: (gap_start.max(x0) + gap_end.min(x1)) / 2.0,
+            step_x: 0.0,
+            label: "⫽".to_string(),
+            context: None,
+        });
+        cursor = cursor.max(gap_end);
+    }
+    if cursor < x1 {
+        marks.extend(compressed_segment_marks(
+            time,
+            ticks,
+            (cursor, x1),
+            px_per_x,
+            broken,
+            char_px,
+        ));
+    }
+    marks
 }
 
-/// The plots' x grid: one line under each [`time_axis_marks`] label.
+/// One stretch of a compressed axis, labelled over its real time span and
+/// placed back in compressed coordinates. A stretch has no gap inside it,
+/// so its scale is the true one and `step_x` carries over unchanged.
+fn compressed_segment_marks(
+    time: &TimeAxis,
+    ticks: &[i128],
+    (a, b): (f64, f64),
+    px_per_x: f64,
+    broken: &BrokenAxis,
+    char_px: f32,
+) -> Vec<AxisMark> {
+    segment_marks(
+        time,
+        ticks,
+        (broken.expand(a), broken.expand(b)),
+        px_per_x,
+        char_px,
+    )
+    .into_iter()
+    .map(|mark| AxisMark {
+        x: broken.compress(mark.x),
+        ..mark
+    })
+    .filter(|mark| mark.x >= a && mark.x <= b)
+    .collect()
+}
+
+/// Labels for an uncompressed plot-seconds range at `px_per_x`.
+fn segment_marks(
+    time: &TimeAxis,
+    ticks: &[i128],
+    (a, b): (f64, f64),
+    px_per_x: f64,
+    char_px: f32,
+) -> Vec<AxisMark> {
+    let width_px = (b - a) * px_per_x;
+    match time {
+        TimeAxis::Absolute { timestamps, format } => {
+            let Some(first) = timestamps.get(0) else {
+                return Vec::new();
+            };
+            let unit = first.unit;
+            let per_second = unit.ticks_per_second() as f64;
+            let (start, end) = (seconds_to_tick(time, a), seconds_to_tick(time, b));
+            // A per-row offset (SPEC §2.1, e.g. a DST change): the one of
+            // the real sample nearest the stretch's start.
+            let offset = nearest_tick_index(ticks, start)
+                .and_then(|index| timestamps.get(index))
+                .and_then(|timestamp| timestamp.offset_seconds);
+            let style = AxisLabelStyle::new(*format, offset);
+            fit_labels(width_px, px_per_x, char_px, |budget| {
+                calendar_ticks(start, end, unit, &style, budget)
+                    .into_iter()
+                    .map(|tick| AxisMark {
+                        x: tick_to_seconds(time, tick.tick),
+                        step_x: tick.step_ticks as f64 / per_second,
+                        label: tick.label,
+                        context: tick.context,
+                    })
+                    .collect()
+            })
+        }
+        TimeAxis::Progressive { .. } => fit_labels(width_px, px_per_x, char_px, |budget| {
+            decimal_marks((a, b), budget)
+        }),
+    }
+}
+
+/// The finest labelling `generate(budget)` offers whose labels all keep
+/// their own width plus [`AXIS_LABEL_GAP`] apart, at most
+/// [`MAX_AXIS_LABELS`]: starts from the budget an 8-character label would
+/// allow and lowers it until the labels it got fit.
+fn fit_labels(
+    width_px: f64,
+    px_per_x: f64,
+    char_px: f32,
+    generate: impl Fn(usize) -> Vec<AxisMark>,
+) -> Vec<AxisMark> {
+    let room = |chars: usize| chars as f64 * f64::from(char_px) + f64::from(AXIS_LABEL_GAP);
+    let mut budget = ((width_px / room(8)).max(0.0) as usize).clamp(1, MAX_AXIS_LABELS);
+    loop {
+        let marks = generate(budget);
+        let longest = marks
+            .iter()
+            .map(|mark| mark.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        let tightest = marks
+            .windows(2)
+            .map(|pair| (pair[1].x - pair[0].x) * px_per_x)
+            .fold(f64::INFINITY, f64::min);
+        if marks.len() <= 1 || tightest >= room(longest) - 1e-9 {
+            return marks;
+        }
+        let fits = (width_px / room(longest)).max(0.0) as usize;
+        budget = fits.min(budget - 1);
+        if budget == 0 {
+            return Vec::new();
+        }
+    }
+}
+
+/// Round numbers (1, 2 or 5 × 10ⁿ apart) over `(a, b)`, about `budget` of
+/// them, each with as many decimals as its step needs.
+fn decimal_marks((a, b): (f64, f64), budget: usize) -> Vec<AxisMark> {
+    let span = b - a;
+    if !(span.is_finite() && span > 0.0) || budget == 0 {
+        return Vec::new();
+    }
+    let raw = span / budget as f64;
+    let base = 10_f64.powf(raw.log10().floor());
+    let step = [1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .map(|m| m * base)
+        .find(|&step| step >= raw * (1.0 - 1e-12))
+        .unwrap_or(10.0 * base);
+    let decimals = (-step.log10().floor()).max(0.0) as usize;
+    let first = (a / step - 1e-9).ceil() as i64;
+    let last = (b / step + 1e-9).floor() as i64;
+    (first..=last)
+        .map(|k| {
+            let value = k as f64 * step;
+            let value = if value == 0.0 { 0.0 } else { value };
+            AxisMark {
+                x: value,
+                step_x: step,
+                label: format!("{value:.decimals$}"),
+                context: None,
+            }
+        })
+        .collect()
+}
+
+/// The plots' x grid: one line under each [`time_axis_marks`] label, so a
+/// label always sits under its line. The plot's width is read back from
+/// `base_step_size`, which `egui_plot` derives from it and
+/// [`GRID_SPACING`]'s minimum.
 pub(crate) fn calendar_grid<'a>(
     time: &'a TimeAxis,
     ticks: &'a [i128],
     broken: Option<&'a BrokenAxis>,
     char_px: f32,
 ) -> impl Fn(egui_plot::GridInput) -> Vec<GridMark> + 'a {
-    let _ = (time, ticks, broken, char_px);
-    |_| Vec::new()
+    move |input| {
+        let (x0, x1) = input.bounds;
+        if !(input.base_step_size > 0.0) {
+            return Vec::new();
+        }
+        let width_px = (x1 - x0) / input.base_step_size * f64::from(GRID_SPACING.min);
+        time_axis_marks(time, ticks, input.bounds, width_px as f32, broken, char_px)
+            .into_iter()
+            .filter(|mark| mark.step_x > 0.0)
+            .map(|mark| GridMark {
+                value: mark.x,
+                step_size: mark.step_x,
+            })
+            .collect()
+    }
+}
+
+/// One digit's width in the axis font: what [`time_axis_marks`] sizes its
+/// labels by (they are digits and `:`/`.`/`-` almost entirely).
+pub(crate) fn axis_char_px(ui: &egui::Ui) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    ui.fonts(|fonts| fonts.glyph_width(&font, '0'))
+}
+
+/// Paints `marks` in the axis `frame`: a short tick at each, the label
+/// under it — moved inside the frame at either edge, never cut (issue
+/// #196) — and the context line below; a label that would touch the one
+/// before it is left out rather than overlap it.
+fn paint_axis_marks(
+    ui: &egui::Ui,
+    frame: egui::Rect,
+    transform: &egui_plot::PlotTransform,
+    marks: &[AxisMark],
+) {
+    let painter = ui.painter_at(frame);
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let strong = ui.visuals().text_color();
+    let weak = ui.visuals().weak_text_color();
+    let row = ui.text_style_height(&egui::TextStyle::Body);
+    let top = frame.top() + 6.0;
+    let inside = |left: f32, width: f32| left.max(frame.left()).min(frame.right() - width);
+    let (mut label_right, mut context_right) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for mark in marks {
+        let x = transform.position_from_point_x(mark.x);
+        let galley = painter.layout_no_wrap(mark.label.clone(), font.clone(), strong);
+        let left = inside(x - galley.size().x / 2.0, galley.size().x);
+        if left < label_right + 4.0 {
+            continue;
+        }
+        label_right = left + galley.size().x;
+        if mark.step_x > 0.0 {
+            painter.line_segment(
+                [egui::pos2(x, frame.top()), egui::pos2(x, frame.top() + 4.0)],
+                egui::Stroke::new(1.0_f32, weak),
+            );
+        }
+        painter.galley(egui::pos2(left, top), galley, strong);
+        if let Some(context) = &mark.context {
+            let galley = painter.layout_no_wrap(context.clone(), font.clone(), weak);
+            let left = inside(x - galley.size().x / 2.0, galley.size().x);
+            if left >= context_right + 8.0 {
+                context_right = left + galley.size().x;
+                painter.galley(egui::pos2(left, top + row), galley, weak);
+            }
+        }
+    }
 }
 
 /// Where [`show_time_axis`] drew the axis on the last frame, for the tests.
@@ -1644,70 +1899,13 @@ fn x_axis_seconds(time: &TimeAxis) -> Vec<f64> {
     }
 }
 
-/// The x-axis tick label for `mark` (SPEC §4.1's timestamp fidelity applied
-/// to the axis, not just the cursor readout — issue #56). For
-/// [`TimeAxis::Absolute`] this reuses [`format_timestamp`] with the same
-/// format/unit as the dataset's own samples, so the axis reads identically to
-/// the cursor readout ([`format_cursor_time`]) instead of the raw
-/// seconds-since-epoch number [`x_axis_seconds`] uses for plotting.
-///
-/// `mark.value` is a grid position, not necessarily an existing sample's
-/// tick, so its *tick count* is derived via [`seconds_to_tick`] — a pure
-/// display transform, not a new inference. Its UTC *offset*, however, is
-/// taken from `ticks`'s nearest real sample ([`nearest_tick_index`]) rather
-/// than always the first one: SPEC §2.1 honors whatever offset each source
-/// row carried, and [`crate::time::format::parse_iso8601_with_offset`]-parsed
-/// columns can carry a different offset per row (e.g. a DST transition
-/// partway through the file), so anchoring every tick to the first sample's
-/// offset would mislabel ticks elsewhere in such a file even though their
-/// underlying instant is unaffected. `glyde_core`'s ISO 8601 parser reads
-/// each row's offset independently, so this is a real, not merely
-/// hypothetical, case.
-///
-/// `egui_plot` calls this once per rendered gridline, and typically several
-/// more times per frame while it settles on a tick spacing — cheap on a
-/// small file, but `nearest_index`'s O(n) exact scan turned into the
-/// dominant per-frame cost once large files became a real, supported case
-/// via decimated rendering (issue #80's `crates/glyde-app/benches/time_view_render.rs`
-/// caught an 8M-sample frame taking ~4.75s, entirely from this call site).
-/// [`nearest_tick_index`]'s O(log n) binary search is what this function
-/// uses instead — see its own doc comment for why that is safe for an
-/// *offset label*, unlike the cursor readout's exact-value guarantee.
-///
-/// A [`TimeAxis::Progressive`] index has no calendar meaning, so its tick is
-/// shown as a plain number, matching `egui_plot`'s own default axis
-/// formatting.
-pub(crate) fn format_x_axis_tick(ticks: &[i128], mark: GridMark, time: &TimeAxis) -> String {
-    match time {
-        TimeAxis::Absolute { timestamps, format } => {
-            let tick = seconds_to_tick(time, mark.value);
-            let Some(index) = nearest_tick_index(ticks, tick) else {
-                return String::new();
-            };
-            let Some(nearest) = timestamps.get(index) else {
-                return String::new();
-            };
-            let timestamp = Timestamp {
-                ticks: tick,
-                unit: nearest.unit,
-                offset_seconds: nearest.offset_seconds,
-            };
-            format_timestamp(&timestamp, *format)
-        }
-        TimeAxis::Progressive { .. } => {
-            let num_decimals = (-mark.step_size.log10().round()) as usize;
-            egui::emath::format_with_decimals_in_range(mark.value, num_decimals..=num_decimals)
-        }
-    }
-}
-
 /// The index into `ticks` nearest `target`, assuming `ticks` is sorted
 /// (non-decreasing) — via binary search ([`slice::partition_point`]),
 /// O(log n) rather than [`nearest_index`]'s O(n) exact scan.
 ///
 /// This assumption is safe *here* specifically because the only thing
-/// [`format_x_axis_tick`] uses the result for is which real sample's UTC
-/// *offset* an axis label borrows — a cosmetic refinement (issue #56), not
+/// [`time_axis_marks`] uses the result for is which real sample's UTC
+/// *offset* the axis labels borrow — a cosmetic refinement (issue #56), not
 /// the label's own instant (computed directly from `target`, independent of
 /// any sample) and not SPEC §4.1's "exact raw value" guarantee, which the
 /// cursor readout gets from [`nearest_index`]'s real scan instead. SPEC
@@ -2735,15 +2933,17 @@ fn format_series_value(values: &SeriesValues, index: usize) -> Option<String> {
 }
 
 /// The cursor-readout text for the timestamp at `index` (SPEC §4.1 "exact
-/// ... timestamp"): [`format_timestamp`] round-trips an absolute timestamp
-/// in its own detected format (honoring an offset if one was present, SPEC
-/// §2.1); a progressive index has no calendar meaning, so its raw numeric
+/// ... timestamp"): [`format_cursor_timestamp`] round-trips a text
+/// timestamp in its own detected format (honoring an offset if one was
+/// present, SPEC §2.1) and reads a numeric one (epoch, LabVIEW, Excel) as a
+/// date and time with its exact raw value beside it (issue #196); a
+/// progressive index has no calendar meaning, so its raw numeric
 /// value is shown instead.
 fn format_cursor_time(time: &TimeAxis, index: usize) -> String {
     match time {
         TimeAxis::Absolute { timestamps, format } => timestamps
             .get(index)
-            .map(|timestamp| format_timestamp(&timestamp, *format))
+            .map(|timestamp| format_cursor_timestamp(&timestamp, *format))
             .unwrap_or_default(),
         TimeAxis::Progressive { values } => values
             .as_slice()

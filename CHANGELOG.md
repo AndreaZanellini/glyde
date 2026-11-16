@@ -30,6 +30,40 @@ Versioning: [Semantic Versioning](https://semver.org/).
   view; Inter and JetBrains Mono embedded in the app.
 
 ### Changed
+- **Time reads as dates and times, everywhere (issue #196).** Before, a file
+  timed in epoch seconds/ms/µs/ns, LabVIEW or Excel serial days showed raw
+  numbers (`1782036250587450`, `46023.86`) on the time axis and in the cursor
+  readout, and every file got a floating `x = 1773306959.64` label on top of
+  the data. Now:
+  - **The time axis shows times of day** (`10:10`, `10:20` … or `10:04:10.588`
+    when zoomed in deep), with the **date written once**, under the first label,
+    and again only where the day changes. A span of days shows dates, months
+    `2026-03`, years `2026`. A `DD/MM/YYYY` or `MM/DD/YYYY` file keeps its own
+    date order.
+  - **The zone is always named** under the first label: `UTC` for epoch and
+    LabVIEW files, `UTC+02:00` when the file carries an offset (the axis then
+    reads that wall clock), `naive local time` when it carries none (SPEC §2.1:
+    never an invented zone).
+  - **6–10 labels across a full-width window**, fewer as it narrows, never
+    overlapping, and **none cut at the left or right edge**. The plots' vertical
+    grid lines sit exactly over the labels.
+  - **No more `x = …` tooltip** over the data. The crosshair stays; the readout
+    row under the plots is where you read the exact time and values.
+  - **The cursor readout** shows a numeric timestamp as a date with its raw value
+    beside it, e.g. `2026-06-21 10:04:10.587450 UTC (1782036250587450)`. Text
+    timestamps read exactly as the file wrote them, as before.
+  - On a **compressed axis**, each stretch between gaps is labelled on its own
+    real times, and each collapsed gap shows `⫽`.
+
+  **Try it:** open `02_pv_inverter_spill.csv` and `01_engine_testbench.csv` in a
+  1440×900 window; zoom from the whole file down to milliseconds; open the epoch,
+  Excel and LabVIEW corpus cases (`case-29` … `case-34`).
+  **Assumptions to veto:** an Excel serial date is naive local time (it carries
+  no zone), as the inference bar already says; the readout keeps the raw value in
+  brackets after the readable time; dates on the axis are ISO (`2026-03-12`)
+  except for day-first/month-first files. Sub-microsecond precision on the plot
+  itself (case-41's picosecond file) is still #206, next on the roadmap.
+
 - **Each numeric channel gets its own plot by default (issue #198).** Before, every
   numeric channel shared one plot and one y axis, so a large channel (a cycle
   counter in the thousands, engine speed in rpm) flattened every small one (lambda
