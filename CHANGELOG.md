@@ -30,6 +30,35 @@ Versioning: [Semantic Versioning](https://semver.org/).
   view; Inter and JetBrains Mono embedded in the app.
 
 ### Changed
+- **Each numeric channel gets its own plot by default (issue #198).** Before, every
+  numeric channel shared one plot and one y axis, so a large channel (a cycle
+  counter in the thousands, engine speed in rpm) flattened every small one (lambda
+  ≈ 1, a 12 V battery) into a line at zero. Now the time view stacks one plot per
+  shown channel, one under the other, each with its own y scale, all on the one
+  time axis at the bottom. What you will see:
+  - **Stacked / Overlaid buttons** next to "Fit to data", like the spectrum panel's.
+    Stacked is the default (the approved mockup); Overlaid puts every shown channel
+    back on one plot with one y axis. Switching frames each plot's y on its
+    channels and keeps the time span you were looking at.
+  - **Every stacked plot is named** at the top of the column on its left, after a
+    short bar in its color, so a channel is never told by its color alone.
+  - **Pan, zoom, "Fit to data", Compress and a click next to a gap act on every
+    plot at once**: they share one time axis. "Fit to data" frames each plot on its
+    own channel. Dragging a plot up or down still moves only that plot's y.
+  - **The readout under the plots** lists every shown channel's value at the
+    pointer, whichever plot you hover.
+  - Hiding a channel in the channel list removes its plot; the others share the room.
+
+  Checked by tests (one plot per channel, each on its own scale; a drag on one plot
+  pans them all; Fit, Compress, hover and the Overlaid toggle) and by the frame-time
+  benchmark with 32 stacked channels (numbers in the pull request). **Assumptions to
+  veto:** the plots split the height equally however many channels are shown, so with
+  dozens of channels each plot gets thin, and with a couple of hundred each is a
+  one-point sliver (they always stay inside the window, with the readout and the time
+  axis under them; use Overlaid or hide channels): the mockup's limit of 8 channels
+  on screen is not built yet (issue #257). The y range of a stacked plot does not follow the
+  visible data yet when you zoom in time: that is the next roadmap item (#197).
+  Switching layout re-fits each plot's y to its channels, forgetting a y zoom.
 - **The time view is laid out as tracks with one time axis at the bottom, and
   the spectrum gets real room (issues #230, #200).** This is the layout of the
   approved mockup; stacked numeric channels, readable times and cursors come in

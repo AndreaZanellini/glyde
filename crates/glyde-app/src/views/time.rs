@@ -38,6 +38,12 @@
 //! "draw individual point markers" convergence guarantee hold here without
 //! this module needing its own `samples < pixels` check.
 //!
+//! The shown channels are stacked by default, one plot each on its own y
+//! scale, or overlaid on one plot ([`NumericLayout`], SPEC §4.1, issue
+//! #198). Every plot is linked to the one time axis ([`TIME_AXIS_LINK_GROUP`]);
+//! the decimation is computed once per frame for every shown channel, from
+//! the top plot's view, and each plot draws its own channels from it.
+//!
 //! Non-numeric columns (`bool`/`string`, SPEC §1.4) are not drawn here —
 //! they route to the state timeline (SPEC §4.3, docs/ROADMAP.md M6,
 //! [`super::state_timeline`]), whose lanes share this plot's x axis through
@@ -149,6 +155,8 @@ pub fn show<P: Pyramid + Sync>(
 pub struct TimeViewState {
     /// Which channels are plotted, edited by the channel picker.
     pub channels: ChannelVisibility,
+    /// One plot per channel, or all of them on one plot (SPEC §4.1).
+    pub layout: NumericLayout,
     /// `dataset.columns`-parallel; `None` until a column is first shown.
     decimated: Vec<Option<CachedDecimation>>,
     /// The `ticks` the cache was filled from (address and length) — a
@@ -177,6 +185,40 @@ pub struct TimeViewState {
     /// reference encoding to compare the two.
     #[cfg(test)]
     bar_encoding: BarEncoding,
+}
+
+/// How the shown numeric channels are laid out (SPEC §4.1: "either
+/// overlaid on one plot or stacked on multiple plots sharing a single,
+/// synchronized time axis"; issue #198). View state only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NumericLayout {
+    /// One plot per shown channel, each on its own y scale, all on the one
+    /// time axis. The approved mockup's default (docs/design).
+    #[default]
+    Stacked,
+    /// Every shown channel on one plot, with one y axis.
+    Overlaid,
+}
+
+/// One numeric plot drawn on the last frame, for the tests.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DrawnTrack {
+    /// The column it plots when stacked; `None` for the overlaid plot (or
+    /// the empty one when no channel is shown).
+    pub column: Option<usize>,
+    /// Its `egui_plot` id, to read its bounds from egui's memory.
+    pub plot_id: egui::Id,
+    /// Its frame, in screen points.
+    pub frame: egui::Rect,
+}
+
+/// The numeric plots [`show_with_selection`] drew on the last frame, top to
+/// bottom.
+#[cfg(test)]
+pub(crate) fn drawn_tracks(ctx: &egui::Context) -> Vec<DrawnTrack> {
+    ctx.data(|data| data.get_temp::<Vec<DrawnTrack>>(egui::Id::new("time_drawn_tracks")))
+        .unwrap_or_default()
 }
 
 /// The `egui_plot` link group through which the time plot and every state
@@ -417,6 +459,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     let bar_encoding = BarEncoding::default();
     let TimeViewState {
         channels,
+        layout,
         decimated: cache,
         background,
         pending,
@@ -427,7 +470,22 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         cluster_fit,
         ..
     } = state;
-    let fit_clicked = ui.button("Fit to data").clicked();
+    let (fit_clicked, layout_changed) = ui
+        .horizontal(|ui| {
+            let fit_clicked = ui.button("Fit to data").clicked();
+            ui.separator();
+            // SPEC §4.1, issue #198: the same control the spectrum panel has.
+            let before = *layout;
+            ui.selectable_value(layout, NumericLayout::Stacked, "Stacked")
+                .on_hover_text("One plot per channel, one shared time axis");
+            ui.selectable_value(layout, NumericLayout::Overlaid, "Overlaid")
+                .on_hover_text("Every channel on one plot, with one y axis");
+            (fit_clicked, *layout != before)
+        })
+        .inner;
+    if layout_changed {
+        tracing::info!(layout = ?*layout, "numeric channels layout changed (SPEC §4.1)");
+    }
     // SPEC §2.3: a discreet `N gaps detected · [Compress]`, only when gaps
     // cover more than half the span; the linear axis is never overridden.
     if let Some(broken) = &fit_bounds.compress {
@@ -484,421 +542,364 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         .map(|(channel, &(column_index, series))| (channel, column_index, series))
         .collect();
 
-    // The cursor readout's row under the plot is always there, so the
+    // The tracks: one plot per shown channel when stacked, else one plot for
+    // them all — and one empty plot when none is shown, so the picker and
+    // the time axis keep a frame to sit on.
+    let tracks: Vec<(Option<usize>, Vec<ShownChannel>)> = match *layout {
+        NumericLayout::Stacked if !plotted.is_empty() => plotted
+            .iter()
+            .map(|&channel| (Some(channel.1), vec![channel]))
+            .collect(),
+        _ => vec![(None, plotted.clone())],
+    };
+
+    // The cursor readout's row under the plots is always there, so the
     // tracks below never move as the pointer comes and goes (issue #200).
     let readout_row = ui.text_style_height(&egui::TextStyle::Body);
-    let plot_height = (ui.available_height() - readout_row - ui.spacing().item_spacing.y).max(0.0);
-    let mut plot = Plot::new("time_domain_view")
-        .height(plot_height)
-        // Issue #230: one time axis, at the bottom of the time view
-        // (`show_time_axis`), shared by every track; the plot keeps its
-        // vertical grid lines.
-        .show_axes([false, true])
-        .y_axis_min_width(NAME_GUTTER)
-        .allow_zoom(true)
-        .allow_scroll(true)
-        .allow_drag(true)
-        .allow_boxed_zoom(true)
-        .link_axis(TIME_AXIS_LINK_GROUP, [true, false])
-        // No horizontal margin: a fit (first frame, double-click) shows
-        // exactly `fit`, the span every linked lane fits to as well, so a
-        // fit never leaves the plot and the lanes on different spans.
-        .set_margin_fraction(egui::vec2(0.0, 0.05));
-    if let Some((x_min, x_max)) = fit {
-        plot = plot.include_x(x_min).include_x(x_max);
-    }
-    if std::mem::take(fit_requested) {
+    let spacing = ui.spacing().item_spacing.y;
+    let plots_height = (ui.available_height() - readout_row - spacing).max(0.0);
+    // Stacked plots share the height equally (the approved mockup). With so
+    // many that a plot would be under a point tall, the gaps between them
+    // shrink too, so the plots, the readout and the time axis below them
+    // never leave the window (issue #230; the 8-channel cap is #257).
+    let count = tracks.len() as f32;
+    let track_gap = if count > 1.0 {
+        spacing.min(((plots_height - count) / (count - 1.0)).max(0.0))
+    } else {
+        spacing
+    };
+    let track_height = ((plots_height - track_gap * (count - 1.0)) / count).max(1.0);
+    let item_spacing = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = track_gap;
+    let gutter_left = ui.cursor().left();
+
+    // Applied to every plot alike, so the linked x axis stays one axis.
+    let reset = std::mem::take(fit_requested);
+    if reset {
         // A new file (issue #205): `egui_plot` would keep the previous
         // file's bounds once a pan or zoom turned its auto-bounds off, and
         // so would the lanes through their link group, which `reset` also
         // clears. Fresh bounds are in linear coordinates.
-        plot = plot.reset();
         *bounds_compressed = false;
         tracing::debug!("new data on screen: the time view starts fitted");
     }
+    // The span the user saw last frame, in last frame's coordinates.
+    let previous_x = shared_axis.map(|shared| shared.x_range);
+    // The compress toggle: the same view, re-expressed in the other
+    // coordinates, so it neither jumps nor re-fits. Computed once, from the
+    // span last drawn, and set on every plot as is: re-mapping each plot's
+    // own (linked) bounds would map all but the first twice.
+    let remapped_x = if *bounds_compressed != broken.is_some() {
+        *bounds_compressed = broken.is_some();
+        match (previous_x, fit_bounds.compress.as_deref()) {
+            (Some((lo, hi)), Some(axis)) => {
+                let seconds = |x: f64| if broken.is_some() { x } else { axis.expand(x) };
+                Some((to_x(seconds(lo)), to_x(seconds(hi))))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    // A jump to a span in plot seconds: the caller's focus, or a clicked
+    // cluster (SPEC §2.3).
+    let jump = focus.or_else(|| cluster_fit.take());
 
     let visuals = ui.visuals().clone();
     let palette = crate::theme::palette(&visuals);
-    let response = plot.show(ui, |plot_ui| {
-        if fit_clicked {
-            // Prepared with the data, off the UI thread (issue #144): this
-            // reads no sample, however large the file. It used to scan the
-            // whole axis and every shown channel here, in the frame —
-            // seconds on a spilled file.
-            let shown = plotted.iter().map(|&(_, column_index, _)| column_index);
-            if let Some(bounds) = fit_bounds.frame(shown) {
-                plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                    [to_x(bounds.min()[0]), bounds.min()[1]],
-                    [to_x(bounds.max()[0]), bounds.max()[1]],
-                ));
-            }
-        }
+    // The view decimated this frame: the first plot's; the others draw the
+    // same decimations (a lagging linked plot catches up next frame).
+    let mut decimated_view: Option<((i128, i128), usize)> = None;
+    let mut hovered = None;
+    let mut updating = false;
+    let mut frames: Vec<egui::Rect> = Vec::with_capacity(tracks.len());
+    let mut last_bounds: Option<PlotBounds> = None;
+    #[cfg(test)]
+    let mut drawn: Vec<DrawnTrack> = Vec::with_capacity(tracks.len());
 
-        if *bounds_compressed != broken.is_some() {
-            // The compress toggle: the same view, re-expressed in the other
-            // coordinates, so it neither jumps nor re-fits.
-            let current = plot_ui.plot_bounds();
-            if let (true, Some(axis)) = (current.is_valid_x(), fit_bounds.compress.as_deref()) {
-                let seconds = |x: f64| {
-                    if *bounds_compressed {
-                        axis.expand(x)
-                    } else {
-                        x
-                    }
-                };
-                plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                    [to_x(seconds(current.min()[0])), current.min()[1]],
-                    [to_x(seconds(current.max()[0])), current.max()[1]],
-                ));
-            }
-            *bounds_compressed = broken.is_some();
-        }
-
-        if let Some((x_min, x_max)) = focus.or_else(|| cluster_fit.take()) {
-            let current = plot_ui.plot_bounds();
-            plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                [to_x(x_min), current.min()[1]],
-                [to_x(x_max), current.max()[1]],
-            ));
-            plot_ui.ctx().request_repaint();
-        }
-
-        // SPEC §3.1: resolve this frame's visible range and pixel width from
-        // the plot's own current transform, so a decimation query always
-        // matches exactly what is about to be drawn — never a fixed,
-        // once-per-open resampling (docs/ROADMAP.md M3, issue #80).
-        let plot_bounds = plot_ui.plot_bounds();
-        let view_x = (plot_bounds.min()[0], plot_bounds.max()[0]);
-        // The view range is a real time range, whatever the axis coordinates.
-        let plot_bounds = if broken.is_some() && plot_bounds.is_valid_x() {
-            PlotBounds::from_min_max(
-                [from_x(plot_bounds.min()[0]), plot_bounds.min()[1]],
-                [from_x(plot_bounds.max()[0]), plot_bounds.max()[1]],
-            )
-        } else {
-            plot_bounds
+    for (track_index, (column, members)) in tracks.iter().enumerate() {
+        let id_source = match column {
+            Some(column) => egui::Id::new(("time_domain_view", *column)),
+            None => egui::Id::new("time_domain_view"),
         };
-        let pixel_columns = plot_ui.transform().frame().width().round().max(1.0) as usize;
-        let range = query_range(&plot_bounds, ticks, &dataset.time);
-        // `egui_plot` computes axis gridlines from the *previous* frame's
-        // memory (same staleness `query_range` accounts for above), so the
-        // frame a "Fit to data" click changes the view still renders with
-        // the old gridlines for one frame. Request an immediate follow-up
-        // frame so that lag is never something the user has to nudge (e.g.
-        // a mouse move) their way out of.
-        if fit_clicked {
-            plot_ui.ctx().request_repaint();
+        let plot_id = ui.make_persistent_id(id_source);
+        let mut plot = Plot::new(id_source)
+            .id(plot_id)
+            .height(track_height)
+            // Issue #230: one time axis, at the bottom of the time view
+            // (`show_time_axis`), shared by every track; the plots keep
+            // their vertical grid lines.
+            .show_axes([false, true])
+            .y_axis_min_width(NAME_GUTTER)
+            .allow_zoom(true)
+            .allow_scroll(true)
+            .allow_drag(true)
+            .allow_boxed_zoom(true)
+            .link_axis(TIME_AXIS_LINK_GROUP, [true, false])
+            // No horizontal margin: a fit (first frame, double-click) shows
+            // exactly `fit`, the span every linked lane fits to as well, so
+            // a fit never leaves the plot and the lanes on different spans.
+            .set_margin_fraction(egui::vec2(0.0, 0.05));
+        if let Some((x_min, x_max)) = fit {
+            plot = plot.include_x(x_min).include_x(x_max);
         }
+        if reset {
+            plot = plot.reset();
+        }
+        let member_columns = || members.iter().map(|&(_, column_index, _)| column_index);
 
-        // Whether this frame's samples-in-range fit one raw sample per
-        // pixel column or fewer (SPEC §3.1 convergence) — the same
-        // condition `decimate_viewport` itself branches on internally, but
-        // needed here too since the branches render differently: connected
-        // (SPEC §3.1's raw-samples-plus-markers regime, docs/ROADMAP.md M2)
-        // vs. per-column vertical bars joined by connectors (issue #147).
-        // Kept with each decimation, which is drawn the way it was computed.
-        let converged = is_converged(ticks, range, pixel_columns);
+        let response = plot.show(ui, |plot_ui| {
+            if fit_clicked {
+                // Prepared with the data, off the UI thread (issue #144):
+                // this reads no sample, however large the file. It used to
+                // scan the whole axis and every shown channel here, in the
+                // frame — seconds on a spilled file. Stacked, each plot
+                // frames its own channel.
+                if let Some(bounds) = fit_bounds.frame(member_columns()) {
+                    plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                        [to_x(bounds.min()[0]), bounds.min()[1]],
+                        [to_x(bounds.max()[0]), bounds.max()[1]],
+                    ));
+                }
+            } else if layout_changed {
+                // A plot that just appeared, or now holds other channels:
+                // its y frames them, its x stays where the view was.
+                if let Some(bounds) = fit_bounds.frame(member_columns()) {
+                    let (x_min, x_max) =
+                        previous_x.unwrap_or((to_x(bounds.min()[0]), to_x(bounds.max()[0])));
+                    plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                        [x_min, bounds.min()[1]],
+                        [x_max, bounds.max()[1]],
+                    ));
+                }
+            }
 
-        // Decimate every plotted column whose cached decimation is not for
-        // this exact view, in parallel on the `rayon` compute pool
-        // (docs/ARCHITECTURE.md §Threading model: "Compute pool (rayon):
-        // decimation queries"; issue #114): columns are independent
-        // queries, so a multi-channel file costs about one column's query
-        // per frame instead of the sum of all of them. Drawing below stays
-        // sequential and in column order. Hidden channels are not in
-        // `plotted` at all, so they cost nothing; an unchanged view reuses
-        // every shown channel's decimation (issue #135).
-        cache.resize_with(dataset.columns.len(), || None);
-        let stale: Vec<(usize, usize, &Series)> = plotted
-            .iter()
-            .copied()
-            .filter(|&(_, column_index, _)| {
-                !cache[column_index].as_ref().is_some_and(|cached| {
+            if let Some((x_min, x_max)) = remapped_x {
+                let current = plot_ui.plot_bounds();
+                plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                    [x_min, current.min()[1]],
+                    [x_max, current.max()[1]],
+                ));
+            }
+
+            if let Some((x_min, x_max)) = jump {
+                let current = plot_ui.plot_bounds();
+                plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                    [to_x(x_min), current.min()[1]],
+                    [to_x(x_max), current.max()[1]],
+                ));
+                plot_ui.ctx().request_repaint();
+            }
+
+            // SPEC §3.1: resolve this frame's visible range and pixel width
+            // from the plot's own current transform, so a decimation query
+            // always matches exactly what is about to be drawn — never a
+            // fixed, once-per-open resampling (docs/ROADMAP.md M3, issue
+            // #80).
+            let plot_bounds = plot_ui.plot_bounds();
+            let view_x = (plot_bounds.min()[0], plot_bounds.max()[0]);
+            // The view range is a real time range, whatever the axis
+            // coordinates.
+            let plot_bounds = if broken.is_some() && plot_bounds.is_valid_x() {
+                PlotBounds::from_min_max(
+                    [from_x(plot_bounds.min()[0]), plot_bounds.min()[1]],
+                    [from_x(plot_bounds.max()[0]), plot_bounds.max()[1]],
+                )
+            } else {
+                plot_bounds
+            };
+            let pixel_columns = plot_ui.transform().frame().width().round().max(1.0) as usize;
+            let range = query_range(&plot_bounds, ticks, &dataset.time);
+            // `egui_plot` computes axis gridlines from the *previous*
+            // frame's memory (same staleness `query_range` accounts for
+            // above), so the frame a "Fit to data" click changes the view
+            // still renders with the old gridlines for one frame. Request an
+            // immediate follow-up frame so that lag is never something the
+            // user has to nudge (e.g. a mouse move) their way out of.
+            if fit_clicked || layout_changed {
+                plot_ui.ctx().request_repaint();
+            }
+
+            if decimated_view.is_none() {
+                decimated_view = Some((range, pixel_columns));
+                // Whether this frame's samples-in-range fit one raw sample
+                // per pixel column or fewer (SPEC §3.1 convergence) — the
+                // same condition `decimate_viewport` itself branches on
+                // internally, but needed here too since the branches render
+                // differently: connected (SPEC §3.1's
+                // raw-samples-plus-markers regime, docs/ROADMAP.md M2) vs.
+                // per-column vertical bars joined by connectors (issue
+                // #147). Kept with each decimation, which is drawn the way
+                // it was computed.
+                let converged = is_converged(ticks, range, pixel_columns);
+                decimate_shown(
+                    dataset,
+                    pyramids,
+                    ticks,
+                    sample_cache,
+                    level0_caches,
+                    fit_bounds,
+                    &plotted,
+                    cache,
+                    background,
+                    pending,
+                    (range, pixel_columns, converged),
+                    plot_ui.ctx(),
+                );
+            }
+            // Whether any channel here is drawn from a decimation of another
+            // view (or not drawn yet) — said on the plot, never left silent.
+            let current = |column_index: usize| {
+                cache[column_index].as_ref().is_some_and(|cached| {
                     cached.range == range && cached.pixel_columns == pixel_columns
                 })
-            })
-            .collect();
-        match background {
-            // Off the UI thread (issue #135): this frame draws what is
-            // cached and never waits. A running decimation is left to
-            // finish — the next one catches up with the latest view.
-            Some(decimator) => {
-                if pending.is_none() && !stale.is_empty() {
-                    let columns = stale.iter().map(|&(_, column, _)| column).collect();
-                    *pending = Some(PendingDecimation::spawn(
-                        decimator,
-                        columns,
-                        range,
-                        pixel_columns,
-                        plot_ui.ctx().clone(),
-                    ));
-                }
-            }
-            None => {
-                let decimate = |&(_, column_index, _): &(usize, usize, &Series)| {
-                    decimate_column(
-                        dataset,
-                        pyramids,
-                        ticks,
-                        sample_cache,
-                        level0_caches,
-                        fit_bounds.gaps(),
-                        column_index,
-                        range,
-                        pixel_columns,
-                    )
-                };
-                // A lone column has nothing to run alongside, and the pool
-                // hand-off would only add its own latency to the frame.
-                let fresh: Vec<Vec<Bucket>> = if stale.len() > 1 {
-                    use rayon::prelude::*;
-                    stale.par_iter().map(decimate).collect()
-                } else {
-                    stale.iter().map(decimate).collect()
-                };
-                for (&(_, column_index, _), buckets) in stale.iter().zip(fresh) {
-                    cache[column_index] = Some(CachedDecimation {
-                        range,
-                        pixel_columns,
-                        converged,
-                        buckets,
-                    });
-                }
-            }
-        }
-        // Whether any shown channel is drawn from a decimation of another
-        // view (or not drawn yet) — said on the plot, never left silent.
-        let updating = plotted.iter().any(|&(_, column_index, _)| {
-            !cache[column_index].as_ref().is_some_and(|cached| {
-                cached.range == range && cached.pixel_columns == pixel_columns
-            })
-        });
-
-        for &(color_index, column_index, series) in &plotted {
-            let Some(cached) = cache[column_index].as_ref() else {
-                continue;
             };
-            let buckets: &[Bucket] = &cached.buckets;
-            // Issue #55: one color per series, assigned here rather than
-            // left to `egui_plot`'s own per-draw-call auto-assignment —
-            // `egui_plot` would otherwise hand out a new color to every
-            // `line()`/`points()` call, so a series with more than one
-            // vertical-extent bar (drawn as separate `Line`s below) rendered
-            // as several differently-colored segments instead of one
-            // consistent color.
-            let color = crate::theme::series_color(&visuals, color_index);
+            let plot_updating = member_columns().any(|column_index| !current(column_index));
 
-            let marks = off_scale_marks(buckets);
-            if !marks.is_empty() {
-                plot_ui.add(OffScaleMarks {
-                    name: series.name().to_owned(),
+            for &(color_index, column_index, series) in members {
+                let Some(cached) = cache[column_index].as_ref() else {
+                    continue;
+                };
+                // Issue #55: one color per series, assigned here rather
+                // than left to `egui_plot`'s own per-draw-call
+                // auto-assignment.
+                let color = crate::theme::series_color(&visuals, color_index);
+                draw_series(
+                    plot_ui,
+                    &dataset.time,
+                    series.name(),
+                    cached,
                     color,
-                    marks: marks
-                        .into_iter()
-                        .map(|(tick, above)| (to_x(tick_to_seconds(&dataset.time, tick)), above))
-                        .collect(),
-                    highlighted: false,
-                });
+                    &to_x,
+                    fit_bounds.gap_threshold,
+                    bar_encoding,
+                );
             }
 
-            if cached.converged {
-                // SPEC §3.1's raw-samples regime (docs/ROADMAP.md M2): a
-                // connected line through consecutive raw samples, broken at
-                // each gap bucket (SPEC §1.3), plus point markers on top so
-                // "the user must be able to reach the individual sample".
-                // A bug found from a real repro: this used to push every
-                // converged bucket into the point-markers list only, with
-                // no connecting line at all, rendering a small file as
-                // scattered disconnected dots instead of a line plot.
-                let mut segments =
-                    bucket_segments(&dataset.time, buckets, fit_bounds.gap_threshold);
-                for point in segments.iter_mut().flatten() {
-                    point[0] = to_x(point[0]);
-                }
-                for segment in &segments {
-                    plot_ui.line(
-                        Line::new(PlotPoints::new(segment.clone()))
-                            .name(series.name())
-                            .color(color),
-                    );
-                }
-                // A run of one sample has no line to show it (issue #207):
-                // it gets the larger marker.
-                let (isolated, connected): (Vec<_>, Vec<_>) =
-                    segments.into_iter().partition(|segment| segment.len() == 1);
-                let points: Vec<[f64; 2]> = connected.into_iter().flatten().collect();
-                if !points.is_empty() {
-                    plot_ui.points(
-                        Points::new(PlotPoints::new(points))
-                            .name(series.name())
-                            .radius(2.0_f32)
-                            .color(color),
-                    );
-                }
-                let isolated: Vec<[f64; 2]> = isolated.into_iter().flatten().collect();
-                if !isolated.is_empty() {
-                    plot_ui.points(
-                        Points::new(PlotPoints::new(isolated))
-                            .name(series.name())
-                            .radius(ISOLATED_MARKER_RADIUS)
-                            .color(color),
-                    );
-                }
-            } else {
-                // SPEC §3.1's aggregated regime: one vertical extent per
-                // pixel column, and a connector from each column's last raw
-                // sample to the next column's first — the line the
-                // convergence regime draws between those two samples, so a
-                // steep signal stays one continuous trace instead of
-                // looking dashed (issue #147). Never a connector touching a
-                // NaN sample, so a gap bucket stays a visible break (SPEC
-                // §1.3). All of a channel's extents and connectors are one
-                // plot item (issue #137), not one `Line` each.
-                let mut points: Vec<[f64; 2]> = Vec::new();
-                let mut bars = MinMaxBars::new(series.name(), color, bar_encoding);
-                let mut isolated: Vec<[f64; 2]> = Vec::new();
-                let gap_at = |index: Option<usize>| {
-                    index
-                        .and_then(|index| buckets.get(index))
-                        .is_none_or(bucket_is_gap)
-                };
-                for (index, bucket) in buckets.iter().enumerate() {
-                    if bucket_is_gap(bucket) {
-                        continue;
-                    }
-                    let bucket_x = to_x(tick_to_seconds(
-                        &dataset.time,
-                        (bucket.first_ts + bucket.last_ts) / 2,
-                    ));
-                    if bucket.min == bucket.max {
-                        // A lone ±∞ is only marked at the edge (issue #203).
-                        if bucket.min.is_finite() {
-                            // Between two empty columns, nothing joins it
-                            // (issue #207): the larger marker.
-                            if gap_at(index.checked_sub(1)) && gap_at(Some(index + 1)) {
-                                isolated.push([bucket_x, bucket.min]);
-                            } else {
-                                points.push([bucket_x, bucket.min]);
-                            }
-                        }
-                    } else {
-                        bars.push(bucket_x, bucket.min, bucket.max);
-                    }
-                }
-                let at = |(tick, value): (i128, f64)| {
-                    [to_x(tick_to_seconds(&dataset.time, tick)), value]
-                };
-                // Never a connector to an infinite sample: like NaN, it
-                // breaks the trace (issue #203).
-                for connector in connectors_across_gaps(buckets, fit_bounds.gap_threshold)
-                    .filter(|c| c.from.1.is_finite() && c.to.1.is_finite())
+            // SPEC §2.3: an unmistakable break glyph at every collapsed gap,
+            // naming how long the real gap was (once, on the top plot).
+            if let Some(b) = broken {
+                for (lo, hi) in b
+                    .collapsed_extents()
+                    .filter(|&(lo, hi)| hi >= view_x.0 && lo <= view_x.1)
                 {
-                    bars.connect(at(connector.from), at(connector.to));
-                }
-                if !bars.is_empty() {
-                    plot_ui.add(bars);
-                }
-                if !points.is_empty() {
-                    plot_ui.points(
-                        Points::new(PlotPoints::new(points))
-                            .name(series.name())
-                            .radius(2.0_f32)
-                            .color(color),
+                    let middle = (lo + hi) / 2.0;
+                    plot_ui.vline(
+                        egui_plot::VLine::new(middle)
+                            .color(palette.ink_3)
+                            .style(egui_plot::LineStyle::dashed_dense())
+                            .width(2.0_f32),
                     );
+                    if let (0, Some((start, end))) = (track_index, b.gap_at(middle)) {
+                        plot_ui.text(
+                            egui_plot::Text::new(
+                                PlotPoint::new(middle, plot_ui.plot_bounds().max()[1]),
+                                format!("⫽ {} gap", format_gap_length(end - start)),
+                            )
+                            .anchor(egui::Align2::CENTER_TOP)
+                            .color(palette.ink_3),
+                        );
+                    }
                 }
-                if !isolated.is_empty() {
-                    plot_ui.points(
-                        Points::new(PlotPoints::new(isolated))
-                            .name(series.name())
-                            .radius(ISOLATED_MARKER_RADIUS)
-                            .color(color),
+            }
+
+            // Only while the pointer actually hovers the plot: SPEC §4.1's
+            // "exact raw value" cursor readout needs the exact (not
+            // decimation-approximated) nearest sample. `cursor` finds it in
+            // O(log n) on a time-ordered axis and falls back to an exact
+            // linear scan on a non-monotonic one (issue #114) — never by
+            // materializing the whole axis as `f64` every hovered frame, as
+            // this used to.
+            let hovered = plot_ui
+                .pointer_coordinate()
+                .and_then(|pointer| cursor.nearest(&dataset.time, from_x(pointer.x)));
+            (hovered, plot_updating)
+        });
+        let (plot_hovered, plot_updating) = response.inner;
+        hovered = hovered.or(plot_hovered);
+        updating |= plot_updating;
+        let bounds = *response.transform.bounds();
+        // A plot above one that moved this frame (a drag, a zoom) was drawn
+        // before the move; it follows on the next frame, which egui runs
+        // after any input or smooth-scroll step anyway
+        // (`plots_above_a_panned_one_catch_up_without_more_input`).
+        // SPEC §2.3: a click on a cluster next to a gap fits it to the
+        // viewport. A double click is egui_plot's own reset to the full fit,
+        // so it wins.
+        if response.response.clicked() && !response.response.double_clicked() {
+            if let Some(pointer) = response.response.interact_pointer_pos() {
+                let x = response.transform.value_from_position(pointer).x;
+                if let Some(span) = cluster_span_at(fit_bounds, &dataset.time, from_x(x)) {
+                    tracing::info!(
+                        from_seconds = span.0,
+                        to_seconds = span.1,
+                        "cluster fitted to the viewport (SPEC §2.3)"
                     );
+                    *cluster_fit = Some((to_x(span.0), to_x(span.1)));
+                    ui.ctx().request_repaint();
                 }
             }
         }
-
-        // SPEC §2.3: an unmistakable break glyph at every collapsed gap,
-        // naming how long the real gap was.
-        if let Some(b) = broken {
-            for (lo, hi) in b
-                .collapsed_extents()
-                .filter(|&(lo, hi)| hi >= view_x.0 && lo <= view_x.1)
-            {
-                let middle = (lo + hi) / 2.0;
-                plot_ui.vline(
-                    egui_plot::VLine::new(middle)
-                        .color(palette.ink_3)
-                        .style(egui_plot::LineStyle::dashed_dense())
-                        .width(2.0_f32),
-                );
-                if let Some((start, end)) = b.gap_at(middle) {
-                    plot_ui.text(
-                        egui_plot::Text::new(
-                            PlotPoint::new(middle, plot_ui.plot_bounds().max()[1]),
-                            format!("⫽ {} gap", format_gap_length(end - start)),
-                        )
-                        .anchor(egui::Align2::CENTER_TOP)
-                        .color(palette.ink_3),
-                    );
-                }
-            }
+        let frame = *response.transform.frame();
+        if column.is_some() {
+            // Every stacked track carries its channel's name: three palette
+            // colors are under 3:1 on a light surface, so a channel is never
+            // told by its color alone (docs/design).
+            let (color_index, _, series) = members[0];
+            track_name(
+                ui,
+                egui::pos2(gutter_left, frame.top()),
+                frame.height(),
+                series.name(),
+                crate::theme::series_color(&visuals, color_index),
+            );
         }
+        frames.push(frame);
+        last_bounds = Some(bounds);
+        #[cfg(test)]
+        drawn.push(DrawnTrack {
+            column: *column,
+            plot_id,
+            frame,
+        });
+    }
+    ui.spacing_mut().item_spacing.y = item_spacing;
+    #[cfg(test)]
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(egui::Id::new("time_drawn_tracks"), drawn));
 
-        // Only while the pointer actually hovers the plot: SPEC §4.1's "exact
-        // raw value" cursor readout needs the exact (not
-        // decimation-approximated) nearest sample. `cursor` finds it in
-        // O(log n) on a time-ordered axis and falls back to an exact linear
-        // scan on a non-monotonic one (issue #114) — never by materializing
-        // the whole axis as `f64` every hovered frame, as this used to.
-        let hovered = plot_ui
-            .pointer_coordinate()
-            .and_then(|pointer| cursor.nearest(&dataset.time, from_x(pointer.x)));
-        (
-            hovered,
-            range,
-            updating.then(|| *plot_ui.transform().frame()),
-        )
-    });
-    let (hovered, visible, updating) = response.inner;
-    // SPEC §2.3: a click on a cluster next to a gap fits it to the viewport.
-    // A double click is egui_plot's own reset to the full fit, so it wins.
-    if response.response.clicked() && !response.response.double_clicked() {
-        if let Some(pointer) = response.response.interact_pointer_pos() {
-            let x = response.transform.value_from_position(pointer).x;
-            if let Some(span) = cluster_span_at(fit_bounds, &dataset.time, from_x(x)) {
-                tracing::info!(
-                    from_seconds = span.0,
-                    to_seconds = span.1,
-                    "cluster fitted to the viewport (SPEC §2.3)"
-                );
-                *cluster_fit = Some((to_x(span.0), to_x(span.1)));
-                ui.ctx().request_repaint();
-            }
+    let area = frames
+        .iter()
+        .copied()
+        .reduce(|a, b| a.union(b))
+        .unwrap_or(egui::Rect::NOTHING);
+    *shared_axis = match (fit, last_bounds, frames.last()) {
+        (Some(fit), Some(bounds), Some(frame)) => Some(SharedAxis {
+            fit,
+            x_range: (bounds.min()[0], bounds.max()[0]),
+            left: frame.left(),
+            width: frame.width(),
+            frame: area,
+        }),
+        _ => None,
+    };
+
+    if updating {
+        if let Some(first) = frames.first() {
+            // Painted over the plot rather than laid out under it, so it
+            // never moves the views below it as it comes and goes.
+            ui.painter().text(
+                first.left_top() + egui::vec2(8.0, 8.0),
+                egui::Align2::LEFT_TOP,
+                "Updating…",
+                egui::TextStyle::Body.resolve(ui.style()),
+                ui.visuals().weak_text_color(),
+            );
         }
     }
-    let frame = response.transform.frame();
-    let bounds = response.transform.bounds();
-    *shared_axis = fit.map(|fit| SharedAxis {
-        fit,
-        x_range: (bounds.min()[0], bounds.max()[0]),
-        left: frame.left(),
-        width: frame.width(),
-        frame: *frame,
-    });
 
-    if let Some(frame) = updating {
-        // Painted over the plot rather than laid out under it, so it never
-        // moves the views below it as it comes and goes.
-        ui.painter().text(
-            frame.left_top() + egui::vec2(8.0, 8.0),
-            egui::Align2::LEFT_TOP,
-            "Updating…",
-            egui::TextStyle::Body.resolve(ui.style()),
-            ui.visuals().weak_text_color(),
-        );
-    }
-
-    channels::show(ui, "time", response.response.rect, channels, |index| {
+    // The picker floats over the tracks' top right corner.
+    channels::show(ui, "time", area, channels, |index| {
         crate::theme::series_color(&visuals, index)
     });
 
@@ -926,8 +927,260 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             }
         },
     );
-    visible
+    decimated_view.map_or((0, 0), |(range, _)| range)
 }
+
+/// A shown numeric channel: its index among the channels (its color), its
+/// column index in the dataset, and its series.
+type ShownChannel<'a> = (usize, usize, &'a Series);
+
+/// Decimates every channel in `plotted` whose cached decimation is not for
+/// `view` (`(range, pixel_columns, converged)`), in parallel on the `rayon`
+/// compute pool (docs/ARCHITECTURE.md §Threading model: "Compute pool
+/// (rayon): decimation queries"; issue #114): columns are independent
+/// queries, so a multi-channel file costs about one column's query per frame
+/// instead of the sum of all of them. Hidden channels are not in `plotted`
+/// at all, so they cost nothing; an unchanged view reuses every shown
+/// channel's decimation (issue #135). With a `background` decimator, the
+/// stale channels are decimated off the UI thread instead and this returns
+/// at once (a running decimation is left to finish — the next one catches up
+/// with the latest view).
+#[allow(clippy::too_many_arguments)]
+fn decimate_shown<P: Pyramid + Sync>(
+    dataset: &Dataset,
+    pyramids: &[Option<P>],
+    ticks: &[i128],
+    sample_cache: &[Option<Vec<f64>>],
+    level0_caches: &[Option<Arc<Level0Cache>>],
+    fit_bounds: &FitBounds,
+    plotted: &[(usize, usize, &Series)],
+    cache: &mut Vec<Option<CachedDecimation>>,
+    background: &Option<BackgroundDecimator>,
+    pending: &mut Option<PendingDecimation>,
+    (range, pixel_columns, converged): ((i128, i128), usize, bool),
+    ctx: &egui::Context,
+) {
+    cache.resize_with(dataset.columns.len(), || None);
+    let stale: Vec<usize> = plotted
+        .iter()
+        .map(|&(_, column_index, _)| column_index)
+        .filter(|&column_index| {
+            !cache[column_index].as_ref().is_some_and(|cached| {
+                cached.range == range && cached.pixel_columns == pixel_columns
+            })
+        })
+        .collect();
+    match background {
+        Some(decimator) => {
+            if pending.is_none() && !stale.is_empty() {
+                *pending = Some(PendingDecimation::spawn(
+                    decimator,
+                    stale,
+                    range,
+                    pixel_columns,
+                    ctx.clone(),
+                ));
+            }
+        }
+        None => {
+            let decimate = |&column_index: &usize| {
+                decimate_column(
+                    dataset,
+                    pyramids,
+                    ticks,
+                    sample_cache,
+                    level0_caches,
+                    fit_bounds.gaps(),
+                    column_index,
+                    range,
+                    pixel_columns,
+                )
+            };
+            // A lone column has nothing to run alongside, and the pool
+            // hand-off would only add its own latency to the frame.
+            let fresh: Vec<Vec<Bucket>> = if stale.len() > 1 {
+                use rayon::prelude::*;
+                stale.par_iter().map(decimate).collect()
+            } else {
+                stale.iter().map(decimate).collect()
+            };
+            for (column_index, buckets) in stale.into_iter().zip(fresh) {
+                cache[column_index] = Some(CachedDecimation {
+                    range,
+                    pixel_columns,
+                    converged,
+                    buckets,
+                });
+            }
+        }
+    }
+}
+
+/// Draws one channel's decimation `cached` into `plot_ui` in `color`, the
+/// way it was computed: SPEC §3.1's raw samples joined by a line, or its
+/// per-column min/max extents joined by connectors.
+#[allow(clippy::too_many_arguments)]
+fn draw_series(
+    plot_ui: &mut egui_plot::PlotUi,
+    time: &TimeAxis,
+    name: &str,
+    cached: &CachedDecimation,
+    color: egui::Color32,
+    to_x: &dyn Fn(f64) -> f64,
+    gap_threshold: Option<f64>,
+    bar_encoding: BarEncoding,
+) {
+    let buckets: &[Bucket] = &cached.buckets;
+    let marks = off_scale_marks(buckets);
+    if !marks.is_empty() {
+        plot_ui.add(OffScaleMarks {
+            name: name.to_owned(),
+            color,
+            marks: marks
+                .into_iter()
+                .map(|(tick, above)| (to_x(tick_to_seconds(time, tick)), above))
+                .collect(),
+            highlighted: false,
+        });
+    }
+
+    if cached.converged {
+        // SPEC §3.1's raw-samples regime (docs/ROADMAP.md M2): a connected
+        // line through consecutive raw samples, broken at each gap bucket
+        // (SPEC §1.3), plus point markers on top so "the user must be able
+        // to reach the individual sample". A bug found from a real repro:
+        // this used to push every converged bucket into the point-markers
+        // list only, with no connecting line at all, rendering a small file
+        // as scattered disconnected dots instead of a line plot.
+        let mut segments = bucket_segments(time, buckets, gap_threshold);
+        for point in segments.iter_mut().flatten() {
+            point[0] = to_x(point[0]);
+        }
+        for segment in &segments {
+            plot_ui.line(
+                Line::new(PlotPoints::new(segment.clone()))
+                    .name(name)
+                    .color(color),
+            );
+        }
+        // A run of one sample has no line to show it (issue #207): it gets
+        // the larger marker.
+        let (isolated, connected): (Vec<_>, Vec<_>) =
+            segments.into_iter().partition(|segment| segment.len() == 1);
+        let points: Vec<[f64; 2]> = connected.into_iter().flatten().collect();
+        if !points.is_empty() {
+            plot_ui.points(
+                Points::new(PlotPoints::new(points))
+                    .name(name)
+                    .radius(2.0_f32)
+                    .color(color),
+            );
+        }
+        let isolated: Vec<[f64; 2]> = isolated.into_iter().flatten().collect();
+        if !isolated.is_empty() {
+            plot_ui.points(
+                Points::new(PlotPoints::new(isolated))
+                    .name(name)
+                    .radius(ISOLATED_MARKER_RADIUS)
+                    .color(color),
+            );
+        }
+    } else {
+        // SPEC §3.1's aggregated regime: one vertical extent per pixel
+        // column, and a connector from each column's last raw sample to the
+        // next column's first — the line the convergence regime draws
+        // between those two samples, so a steep signal stays one continuous
+        // trace instead of looking dashed (issue #147). Never a connector
+        // touching a NaN sample, so a gap bucket stays a visible break (SPEC
+        // §1.3). All of a channel's extents and connectors are one plot item
+        // (issue #137), not one `Line` each.
+        let mut points: Vec<[f64; 2]> = Vec::new();
+        let mut bars = MinMaxBars::new(name, color, bar_encoding);
+        let mut isolated: Vec<[f64; 2]> = Vec::new();
+        let gap_at = |index: Option<usize>| {
+            index
+                .and_then(|index| buckets.get(index))
+                .is_none_or(bucket_is_gap)
+        };
+        for (index, bucket) in buckets.iter().enumerate() {
+            if bucket_is_gap(bucket) {
+                continue;
+            }
+            let bucket_x = to_x(tick_to_seconds(
+                time,
+                (bucket.first_ts + bucket.last_ts) / 2,
+            ));
+            if bucket.min == bucket.max {
+                // A lone ±∞ is only marked at the edge (issue #203).
+                if bucket.min.is_finite() {
+                    // Between two empty columns, nothing joins it (issue
+                    // #207): the larger marker.
+                    if gap_at(index.checked_sub(1)) && gap_at(Some(index + 1)) {
+                        isolated.push([bucket_x, bucket.min]);
+                    } else {
+                        points.push([bucket_x, bucket.min]);
+                    }
+                }
+            } else {
+                bars.push(bucket_x, bucket.min, bucket.max);
+            }
+        }
+        let at = |(tick, value): (i128, f64)| [to_x(tick_to_seconds(time, tick)), value];
+        // Never a connector to an infinite sample: like NaN, it breaks the
+        // trace (issue #203).
+        for connector in connectors_across_gaps(buckets, gap_threshold)
+            .filter(|c| c.from.1.is_finite() && c.to.1.is_finite())
+        {
+            bars.connect(at(connector.from), at(connector.to));
+        }
+        if !bars.is_empty() {
+            plot_ui.add(bars);
+        }
+        if !points.is_empty() {
+            plot_ui.points(
+                Points::new(PlotPoints::new(points))
+                    .name(name)
+                    .radius(2.0_f32)
+                    .color(color),
+            );
+        }
+        if !isolated.is_empty() {
+            plot_ui.points(
+                Points::new(PlotPoints::new(isolated))
+                    .name(name)
+                    .radius(ISOLATED_MARKER_RADIUS)
+                    .color(color),
+            );
+        }
+    }
+}
+
+/// A stacked track's name, in the gutter left of its plot (the approved
+/// mockup): a short bar in the channel's color, then the name, cut with an
+/// ellipsis before the y labels' side of the gutter. `top_left` is the
+/// gutter's top left corner for this track, `height` the track's height.
+fn track_name(ui: &egui::Ui, top_left: egui::Pos2, height: f32, name: &str, color: egui::Color32) {
+    let painter = ui.painter();
+    let bar_height = (height - 4.0).clamp(0.0, 30.0);
+    painter.rect_filled(
+        egui::Rect::from_min_size(top_left + egui::vec2(0.0, 2.0), egui::vec2(3.0, bar_height)),
+        1.5,
+        color,
+    );
+    let ink = ui.visuals().strong_text_color();
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        name.to_owned(),
+        egui::TextStyle::Body.resolve(ui.style()),
+        ink,
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(NAME_GUTTER - TRACK_NAME_INSET - 64.0);
+    let galley = ui.fonts(|fonts| fonts.layout_job(job));
+    let y = top_left.y + (10.0 - galley.size().y / 2.0).max(0.0);
+    painter.galley(egui::pos2(top_left.x + TRACK_NAME_INSET, y), galley, ink);
+}
+
+/// How far right of the gutter's edge a stacked track's name starts.
+const TRACK_NAME_INSET: f32 = 10.0;
 
 /// Draws the time view's one time axis (issue #230): a row of time labels
 /// under the last track, over exactly the plot's frame and linked to it, so
@@ -3125,6 +3378,15 @@ mod render_tests {
         (pyramids, calls)
     }
 
+    /// A fresh view with every shown channel on one plot — for the tests of
+    /// how that plot draws and frames its channels.
+    fn overlaid() -> TimeViewState {
+        TimeViewState {
+            layout: NumericLayout::Overlaid,
+            ..TimeViewState::default()
+        }
+    }
+
     fn three_channel_dataset() -> Dataset {
         let mut dataset = sample_dataset();
         dataset.columns = ["a", "b", "c"]
@@ -3905,8 +4167,10 @@ mod render_tests {
         let frame = |encoding: BarEncoding, pixels_per_point: f32| {
             let ctx = egui::Context::default();
             ctx.set_pixels_per_point(pixels_per_point);
+            // One plot, so every column's marks share one transform.
             let mut state = TimeViewState {
                 bar_encoding: encoding,
+                layout: NumericLayout::Overlaid,
                 ..TimeViewState::default()
             };
             for _ in 0..3 {
@@ -4124,7 +4388,8 @@ mod render_tests {
         let plot_id = std::cell::Cell::new(None);
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(pixels_per_point);
-        let mut state = TimeViewState::default();
+        // The one plot whose bounds this sets (one channel either way).
+        let mut state = overlaid();
         let mut frame = |focus| {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -4187,7 +4452,8 @@ mod render_tests {
         let fixture = ViewFixture::new(dataset);
         let plot_id = std::cell::Cell::new(None);
         let ctx = egui::Context::default();
-        let mut state = TimeViewState::default();
+        // Every channel on the one plot whose bounds are returned.
+        let mut state = overlaid();
         let mut output = None;
         for _ in 0..4 {
             let input = egui::RawInput {
@@ -4801,7 +5067,9 @@ mod render_tests {
         ];
         let fixture = ViewFixture::new(dataset);
         let ctx = egui::Context::default();
-        let mut state = TimeViewState::default();
+        // One y axis for both: the stacked case is
+        // `fit_to_data_frames_each_stacked_plot_on_its_own_channel`.
+        let mut state = overlaid();
         let (shapes, id) = frame_with_events(&ctx, &fixture, &mut state, Vec::new());
         state.channels.toggle(1);
         // Somewhere else entirely, as a zoom would leave it.
@@ -4901,6 +5169,512 @@ mod render_tests {
             !output.shapes.is_empty(),
             "must draw something for a large, decimated dataset without panicking"
         );
+    }
+
+    // ---- Stacked numeric view (SPEC §4.1, issue #198) ----
+
+    /// Three channels on very different scales, like the engine test
+    /// bench's lambda (≈1) next to its combustion-cycle counter (thousands).
+    fn three_scales_dataset() -> Dataset {
+        let n = 200usize;
+        let mut dataset = sample_dataset();
+        dataset.time = TimeAxis::Absolute {
+            timestamps: (0..n as i128)
+                .map(|i| Timestamp::new(i, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        dataset.columns = vec![
+            Series::new(
+                "small",
+                SeriesValues::F64((0..n).map(|i| (i as f64 * 0.1).sin()).collect()),
+            ),
+            Series::new(
+                "huge",
+                SeriesValues::F64((0..n).map(|i| 1_000.0 + i as f64).collect()),
+            ),
+            Series::new(
+                "mid",
+                SeriesValues::F64((0..n).map(|i| 50.0 + (i % 10) as f64).collect()),
+            ),
+        ];
+        dataset
+    }
+
+    /// The finite min and max of `dataset`'s column `column`.
+    fn column_range(dataset: &Dataset, column: usize) -> (f64, f64) {
+        finite_min_max(
+            dataset.columns[column]
+                .values()
+                .to_f64_vec()
+                .expect("numeric")
+                .into_iter(),
+        )
+        .expect("a finite sample")
+    }
+
+    /// The y bounds the plot `track` keeps in egui's memory.
+    fn y_bounds(ctx: &egui::Context, track: &DrawnTrack) -> (f64, f64) {
+        let memory = egui_plot::PlotMemory::load(ctx, track.plot_id).expect("plot memory");
+        let bounds = memory.bounds();
+        (bounds.min()[1], bounds.max()[1])
+    }
+
+    /// The x bounds the plot `track` keeps in egui's memory.
+    fn x_bounds(ctx: &egui::Context, track: &DrawnTrack) -> (f64, f64) {
+        let memory = egui_plot::PlotMemory::load(ctx, track.plot_id).expect("plot memory");
+        let bounds = memory.bounds();
+        (bounds.min()[0], bounds.max()[0])
+    }
+
+    /// The centre of every text exactly `label` in `shapes`.
+    fn text_centres(shapes: &[egui::epaint::ClippedShape], label: &str) -> Vec<egui::Pos2> {
+        fn find(shape: &egui::Shape, label: &str, found: &mut Vec<egui::Pos2>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, label, found)),
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    found.push(text.pos + text.galley.size() / 2.0)
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in shapes {
+            find(&clipped.shape, label, &mut found);
+        }
+        found
+    }
+
+    /// Whether some text in `shapes` contains `needle`.
+    fn has_text_containing(shapes: &[egui::epaint::ClippedShape], needle: &str) -> bool {
+        fn find(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().any(|s| find(s, needle)),
+                egui::Shape::Text(t) => t.galley.text().contains(needle),
+                _ => false,
+            }
+        }
+        shapes.iter().any(|clipped| find(&clipped.shape, needle))
+    }
+
+    /// A primary click at `pos`, over three frames.
+    fn click_at(
+        ctx: &egui::Context,
+        fixture: &ViewFixture,
+        state: &mut TimeViewState,
+        pos: egui::Pos2,
+    ) {
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        frame_with_events(
+            ctx,
+            fixture,
+            state,
+            vec![egui::Event::PointerMoved(pos), press(true)],
+        );
+        frame_with_events(ctx, fixture, state, vec![press(false)]);
+        frame_with_events(ctx, fixture, state, Vec::new());
+    }
+
+    // Issue #198: with one y axis, the counter flattens every other channel
+    // into the zero line. Stacked — the default of the approved mockup —
+    // gives each shown channel its own plot and its own y range, one under
+    // the other in column order, all in the same frame width so they share
+    // the time axis, and all inside the window.
+    #[test]
+    fn stacked_is_the_default_one_plot_per_channel_each_on_its_own_scale() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        assert_eq!(state.layout, NumericLayout::Stacked);
+        for _ in 0..3 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(
+            tracks.iter().map(|t| t.column).collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
+        for pair in tracks.windows(2) {
+            assert_eq!(pair[0].frame.left(), pair[1].frame.left());
+            assert_eq!(pair[0].frame.width(), pair[1].frame.width());
+            assert!(pair[0].frame.bottom() <= pair[1].frame.top());
+            assert_eq!(pair[0].frame.height(), pair[1].frame.height());
+        }
+        assert!(
+            tracks.last().unwrap().frame.bottom() <= 600.0,
+            "every track fits in the window"
+        );
+        for track in &tracks {
+            let column = track.column.unwrap();
+            let (lo, hi) = column_range(&fixture.dataset, column);
+            let (y_min, y_max) = y_bounds(&ctx, track);
+            assert!(
+                y_min <= lo && y_max >= hi,
+                "column {column}: {y_min}..{y_max} must show {lo}..{hi}"
+            );
+            assert!(
+                y_max - y_min <= (hi - lo) * 1.2,
+                "column {column}: {y_min}..{y_max} is not its own scale ({lo}..{hi})"
+            );
+        }
+        // The lanes and the time axis line up with the tracks as a whole.
+        let shared = state.shared_axis().expect("the plots share their axis");
+        assert_eq!(shared.left, tracks[0].frame.left());
+        assert_eq!(shared.width, tracks[0].frame.width());
+        assert_eq!(shared.frame.top(), tracks[0].frame.top());
+        assert_eq!(shared.frame.bottom(), tracks[2].frame.bottom());
+    }
+
+    // A hidden channel has no plot; the shown ones share its room.
+    #[test]
+    fn a_hidden_channel_has_no_stacked_plot_and_the_others_take_its_room() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        for _ in 0..2 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let three = drawn_tracks(&ctx)[0].frame.height();
+        state.channels.toggle(1);
+        for _ in 0..2 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(
+            tracks.iter().map(|t| t.column).collect::<Vec<_>>(),
+            vec![Some(0), Some(2)]
+        );
+        assert!(tracks[0].frame.height() > three);
+
+        // None shown: one empty plot, so the picker and the axis stay.
+        state.channels.toggle(0);
+        state.channels.toggle(2);
+        for _ in 0..2 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].column, None);
+        assert!(state.shared_axis().is_some());
+    }
+
+    // Every stacked track carries its channel's name in the gutter left of
+    // its frame: three palette colors are under 3:1 on white, so a channel
+    // is never identified by color alone (docs/design).
+    #[test]
+    fn every_stacked_plot_is_named_in_the_gutter() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = frame_with_events(&ctx, &fixture, &mut state, Vec::new()).0;
+        }
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), 3);
+        for track in tracks {
+            let name = fixture.dataset.columns[track.column.unwrap()].name();
+            assert!(
+                text_centres(&shapes, name).iter().any(|centre| {
+                    centre.x < track.frame.left()
+                        && (track.frame.top()..=track.frame.bottom()).contains(&centre.y)
+                }),
+                "{name} is written left of its plot"
+            );
+        }
+    }
+
+    // The toggle, the same control the spectrum panel has: Overlaid puts
+    // every shown channel on one plot, with one y axis covering them all.
+    #[test]
+    fn overlaid_puts_every_shown_channel_on_one_plot() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = frame_with_events(&ctx, &fixture, &mut state, Vec::new()).0;
+        }
+        assert!(has_text(&shapes, "Stacked"));
+        click_at(&ctx, &fixture, &mut state, text_centre(&shapes, "Overlaid"));
+        frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        assert_eq!(state.layout, NumericLayout::Overlaid);
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].column, None);
+        let (y_min, y_max) = y_bounds(&ctx, &tracks[0]);
+        assert!(y_min <= column_range(&fixture.dataset, 0).0);
+        assert!(y_max >= column_range(&fixture.dataset, 1).1);
+
+        // And back: one plot per channel again, each on its own scale.
+        let shapes = frame_with_events(&ctx, &fixture, &mut state, Vec::new()).0;
+        click_at(&ctx, &fixture, &mut state, text_centre(&shapes, "Stacked"));
+        frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        assert_eq!(state.layout, NumericLayout::Stacked);
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), 3);
+        let (lo, hi) = column_range(&fixture.dataset, 0);
+        let (y_min, y_max) = y_bounds(&ctx, &tracks[0]);
+        assert!(y_min <= lo && y_max >= hi && y_max - y_min <= (hi - lo) * 1.2);
+    }
+
+    // SPEC §4.1: "sharing a single, synchronized time axis". Dragging one
+    // stacked plot pans every one of them to the same time span.
+    #[test]
+    fn dragging_one_stacked_plot_pans_them_all() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        for _ in 0..3 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let tracks = drawn_tracks(&ctx);
+        let before = x_bounds(&ctx, &tracks[0]);
+        let start = tracks[2].frame.center();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let end = start - egui::vec2(200.0, 0.0);
+        let mid = start - egui::vec2(100.0, 0.0);
+        for events in [
+            vec![egui::Event::PointerMoved(start)],
+            vec![button(start, true)],
+            vec![egui::Event::PointerMoved(mid)],
+            vec![egui::Event::PointerMoved(end)],
+            vec![button(end, false)],
+            Vec::new(),
+            Vec::new(),
+        ] {
+            frame_with_events(&ctx, &fixture, &mut state, events);
+        }
+        let tracks = drawn_tracks(&ctx);
+        let after = x_bounds(&ctx, &tracks[2]);
+        assert!(
+            after.0 > before.0 + 1.0,
+            "the drag panned: {before:?} -> {after:?}"
+        );
+        for track in &tracks {
+            assert_eq!(x_bounds(&ctx, track), after, "column {:?}", track.column);
+        }
+        assert_eq!(state.shared_axis().unwrap().x_range, after);
+    }
+
+    // "Fit to data" frames every stacked plot on its own channel, wherever
+    // each was zoomed to.
+    #[test]
+    fn fit_to_data_frames_each_stacked_plot_on_its_own_channel() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = frame_with_events(&ctx, &fixture, &mut state, Vec::new()).0;
+        }
+        for track in drawn_tracks(&ctx) {
+            let mut memory = egui_plot::PlotMemory::load(&ctx, track.plot_id).unwrap();
+            memory.auto_bounds = egui::Vec2b::FALSE;
+            memory.set_bounds(PlotBounds::from_min_max([10.0, -500.0], [20.0, -400.0]));
+            memory.store(&ctx, track.plot_id);
+        }
+        click_at(
+            &ctx,
+            &fixture,
+            &mut state,
+            text_centre(&shapes, "Fit to data"),
+        );
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), 3);
+        for track in tracks {
+            let column = track.column.unwrap();
+            let fitted = fixture.fit.frame([column]).expect("finite samples");
+            let memory = egui_plot::PlotMemory::load(&ctx, track.plot_id).unwrap();
+            let bounds = memory.bounds();
+            assert_eq!(
+                (bounds.min(), bounds.max()),
+                (fitted.min(), fitted.max()),
+                "column {column}"
+            );
+        }
+    }
+
+    // SPEC §2.3's toggle keeps the view where it was, re-expressed in the
+    // other coordinates, on every stacked plot alike. The re-map starts from
+    // the span on screen, not from each plot's own memory: a channel shown
+    // again on the very frame of the toggle has a plot whose memory is still
+    // where it was when it was hidden, and re-mapping that would leave it on
+    // another span than the rest.
+    #[test]
+    fn compressing_keeps_every_stacked_plot_on_the_same_span() {
+        let mut dataset = gap_heavy_dataset();
+        let second = Series::new(
+            "second",
+            SeriesValues::F64((0..dataset.time.len()).map(|i| 100.0 + i as f64).collect()),
+        );
+        dataset.columns.push(second);
+        let fixture = ViewFixture::new(dataset);
+        let broken = fixture.fit.compress.clone().expect("compressible");
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        // Both plots drawn once, at the fit; then the second is hidden while
+        // the view moves.
+        for _ in 0..2 {
+            state_frame(&ctx, &fixture, &mut state, None);
+        }
+        state.channels.toggle(1);
+        for _ in 0..2 {
+            state_frame(&ctx, &fixture, &mut state, Some((10.0, 10_060.0)));
+        }
+        // Shown again on the frame the axis is compressed.
+        state.channels.toggle(1);
+        state.compressed = true;
+        for _ in 0..3 {
+            state_frame(&ctx, &fixture, &mut state, None);
+        }
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), 2);
+        let expected = (broken.compress(10.0), broken.compress(10_060.0));
+        for track in &tracks {
+            let (lo, hi) = x_bounds(&ctx, track);
+            assert!(
+                (lo - expected.0).abs() < 1e-6 && (hi - expected.1).abs() < 1e-6,
+                "column {:?}: {lo}..{hi}, expected {expected:?}",
+                track.column
+            );
+        }
+    }
+
+    // A lower plot that pans moves the plots above it only on the next frame
+    // (they were drawn before it moved). Like eframe, run frames only while
+    // something asks for one: a smooth wheel pan's last step comes with no
+    // input of its own, and the plots above must still end on its span, not
+    // a step behind.
+    #[test]
+    fn plots_above_a_panned_one_catch_up_without_more_input() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        for _ in 0..20 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let tracks = drawn_tracks(&ctx);
+        let before = x_bounds(&ctx, &tracks[0]);
+        let over = tracks[2].frame.center();
+        frame_with_events(
+            &ctx,
+            &fixture,
+            &mut state,
+            vec![
+                egui::Event::PointerMoved(over),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(-150.0, 0.0),
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        let mut frames = 0;
+        while ctx.has_requested_repaint() && frames < 200 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+            frames += 1;
+        }
+        let tracks = drawn_tracks(&ctx);
+        let panned = x_bounds(&ctx, &tracks[2]);
+        assert!(
+            panned.0 > before.0,
+            "the wheel panned: {before:?} -> {panned:?}"
+        );
+        for track in &tracks {
+            assert_eq!(x_bounds(&ctx, track), panned, "column {:?}", track.column);
+        }
+    }
+
+    // However many channels are stacked, the plots, the readout and the time
+    // axis under them stay in the window: the gaps between plots shrink
+    // with the plots (issue #230's layout; the 8-channel cap is #257).
+    #[test]
+    fn many_stacked_channels_stay_inside_the_window() {
+        let n = 200usize;
+        let columns: Vec<(String, Vec<f64>)> = (0..n)
+            .map(|c| (format!("ch{c}"), (0..50).map(|i| (i + c) as f64).collect()))
+            .collect();
+        let fixture = ViewFixture::new(dataset_of(
+            columns
+                .iter()
+                .map(|(name, values)| (name.as_str(), values.clone()))
+                .collect(),
+        ));
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        for _ in 0..3 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let tracks = drawn_tracks(&ctx);
+        assert_eq!(tracks.len(), n);
+        for pair in tracks.windows(2) {
+            assert!(pair[0].frame.bottom() <= pair[1].frame.top());
+        }
+        let readout_row = ctx.style().text_styles[&egui::TextStyle::Body].size;
+        assert!(
+            tracks.last().unwrap().frame.bottom() + readout_row <= 600.0,
+            "the last plot ends at {}, the readout below it must fit",
+            tracks.last().unwrap().frame.bottom()
+        );
+    }
+
+    // A view nobody touches stops asking for frames, or an idle window
+    // would burn a core.
+    #[test]
+    fn an_idle_stacked_view_stops_repainting() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        // egui's own start-up animations end within the first few frames.
+        for _ in 0..20 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        assert_eq!(drawn_tracks(&ctx).len(), 3);
+        assert!(
+            !ctx.has_requested_repaint(),
+            "an untouched view requests no further frame"
+        );
+    }
+
+    // The readout under the tracks names every shown channel's value at the
+    // pointer, whichever plot it hovers.
+    #[test]
+    fn hovering_any_stacked_plot_reads_every_shown_channel() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        for _ in 0..2 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let last = drawn_tracks(&ctx)[2].frame.center();
+        frame_with_events(
+            &ctx,
+            &fixture,
+            &mut state,
+            vec![egui::Event::PointerMoved(last)],
+        );
+        let shapes = frame_with_events(
+            &ctx,
+            &fixture,
+            &mut state,
+            vec![egui::Event::PointerMoved(last)],
+        )
+        .0;
+        for name in ["small: ", "huge: ", "mid: "] {
+            assert!(has_text_containing(&shapes, name), "{name} in the readout");
+        }
     }
 }
 
