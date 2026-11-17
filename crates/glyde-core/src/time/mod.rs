@@ -43,6 +43,7 @@ mod cluster;
 mod format;
 mod gap;
 mod monotonic;
+mod navigation;
 mod ticks;
 
 pub use axis_labels::{
@@ -57,9 +58,10 @@ pub use format::{
 pub use gap::{
     classify_sampling, detect_gaps, for_each_segment, gap_threshold, is_uniform_range, scan_range,
     summarize_ticks, summarize_ticks_with_median, visit_gaps, Gap, RangeScan, SamplingClass,
-    TimeAxisStats,
+    TimeAxisStats, GAP_MULTIPLE_OF_MEDIAN,
 };
 pub use monotonic::{detect_monotonicity, detect_monotonicity_from, MonotonicityReport};
+pub use navigation::{XLimits, MIN_STEPS_PER_VIEW, VIEW_MARGIN_FRACTION};
 pub use ticks::{TickSource, TICK_CHUNK_LEN};
 
 /// Reads a `testdata/corpus/` fixture's raw column text, shared by this

@@ -30,6 +30,33 @@ Versioning: [Semantic Versioning](https://semver.org/).
   view; Inter and JetBrains Mono embedded in the app.
 
 ### Changed
+- **Zooming and panning move along time only, and the y axis follows what you
+  see (issue #197).** Before, Ctrl/⌘ + wheel zoomed both axes, so a few steps
+  into `01_engine_testbench.csv` left an empty plot; after a pan the y range
+  stayed put and a signal that changed level left the screen; and zoom-out went
+  on until the whole file was a dot. Now:
+  - **The wheel, a pinch and a drag act on time only**, on every plot and state
+    lane alike.
+  - **Each plot's y range frames the values it is showing**, with a little room
+    above and below, and moves with them as you pan and zoom. A flat stretch is
+    shown around its value, not squashed onto a line.
+  - **A box-zoom (drag with the right mouse button) still zooms y too**, and that
+    plot's y then stays where you put it while you pan, until **Fit to data** or
+    a double-click on that plot hands it back to the data.
+  - **Zoom-out stops at the whole file plus 5 % either side; zoom-in stops at one
+    typical sample interval** (two samples across the plot). **A pan never takes
+    the view off the data**: the middle of the view stays on the file.
+  - **Fit to data now leaves the same 5 % room above and below** as the first
+    view of a file and the y that follows the view, so the highest and lowest
+    samples are never cut by the plot's frame.
+
+  **Assumptions to veto** (SPEC §4.1 says "pan, zoom (wheel/pinch, box-select),
+  fit-to-data" and nothing about y): y follows the view, a box-zoom pins y, the
+  deepest zoom is one median sample interval, and there is no separate y-zoom
+  gesture (such as Shift + wheel). **Try it:** open `01_engine_testbench.csv`,
+  Ctrl/⌘ + wheel into 09:16 → every signal stays framed; drag left and right →
+  y follows; zoom all the way out → the file fills the plot and stops there.
+
 - **Time reads as dates and times, everywhere (issue #196).** Before, a file
   timed in epoch seconds/ms/µs/ns, LabVIEW or Excel serial days showed raw
   numbers (`1782036250587450`, `46023.86`) on the time axis and in the cursor
