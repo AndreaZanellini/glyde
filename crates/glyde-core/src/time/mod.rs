@@ -37,6 +37,7 @@
 //! signature level, the same way `dsp::welch` enforces "raw samples only" by
 //! never taking a pyramid type.
 
+mod axis_labels;
 mod broken_axis;
 mod cluster;
 mod format;
@@ -44,6 +45,9 @@ mod gap;
 mod monotonic;
 mod ticks;
 
+pub use axis_labels::{
+    calendar_ticks, format_cursor_timestamp, AxisLabelStyle, AxisZone, CalendarTick, DateOrder,
+};
 pub use broken_axis::{gap_share, should_offer_compression, BrokenAxis, OFFER_GAP_SHARE};
 pub use cluster::cluster_at;
 pub use format::{
