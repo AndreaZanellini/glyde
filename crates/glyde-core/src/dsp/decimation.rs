@@ -821,6 +821,39 @@ pub fn finite_range<L: BucketLevel>(pyramid: &[L], samples: &[f64]) -> Option<(f
     finite_range_from::<L, 0>(pyramid, samples)
 }
 
+/// The smallest and largest finite value drawn by `buckets` — a decimated
+/// view, as [`decimate_viewport`] returns it — or `None` when none of them
+/// holds a finite value: what the time view's y axis follows as it pans and
+/// zooms (issue #197).
+///
+/// A gap bucket (no finite sample: NaN, or the `min > max` sentinel of an
+/// all-NaN bucket) adds nothing. An end of a bucket's envelope that is ±∞
+/// (SPEC §1.3, flagged and drawn as an off-scale mark, issue #203) is left
+/// out; the bucket's other end and its finite first and last values still
+/// count. Reads the buckets only, never a sample: O(`buckets.len()`), the
+/// pixel width of the view.
+pub fn envelope(buckets: &[Bucket]) -> Option<(f64, f64)> {
+    let mut range = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut widen = |value: f64| {
+        if value.is_finite() {
+            range.0 = range.0.min(value);
+            range.1 = range.1.max(value);
+        }
+    };
+    for bucket in buckets {
+        // NaN in either end, or the all-NaN sentinel: no finite sample.
+        let has_finite_sample = bucket.min <= bucket.max;
+        if !has_finite_sample {
+            continue;
+        }
+        widen(bucket.min);
+        widen(bucket.max);
+        widen(bucket.first_value);
+        widen(bucket.last_value);
+    }
+    (range.0 <= range.1).then_some(range)
+}
+
 /// [`finite_range`] for a pyramid whose level 0 is not stored (an on-disk
 /// one, issue #174): under a level-1 bucket whose envelope reaches ±∞, its
 /// (at most `PYRAMID_FACTOR²`) samples are scanned instead of its level-0
@@ -926,5 +959,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn view_bucket(min: f64, max: f64, first_value: f64, last_value: f64) -> Bucket {
+        Bucket {
+            min,
+            max,
+            first_ts: 0,
+            last_ts: 1,
+            first_value,
+            last_value,
+            nan_count: 0,
+        }
+    }
+
+    // Issue #197: the y axis follows the finite values a view draws.
+    #[test]
+    fn the_envelope_of_a_view_is_its_finite_extremes() {
+        let buckets = [
+            view_bucket(-1.0, 2.0, 0.0, 1.0),
+            view_bucket(0.5, 7.5, 7.5, 0.5),
+            view_bucket(-3.0, -2.0, -2.0, -3.0),
+        ];
+        assert_eq!(envelope(&buckets), Some((-3.0, 7.5)));
+        // One sample per bucket (SPEC §3.1 convergence).
+        let converged = [view_bucket(4.0, 4.0, 4.0, 4.0)];
+        assert_eq!(envelope(&converged), Some((4.0, 4.0)));
+    }
+
+    #[test]
+    fn gap_buckets_add_nothing_to_the_envelope() {
+        let gaps = [
+            view_bucket(f64::NAN, f64::NAN, f64::NAN, f64::NAN),
+            view_bucket(f64::INFINITY, f64::NEG_INFINITY, f64::NAN, f64::NAN),
+        ];
+        assert_eq!(envelope(&gaps), None);
+        assert_eq!(envelope(&[]), None);
+        let mixed = [gaps[0], view_bucket(1.0, 2.0, 1.0, 2.0), gaps[1]];
+        assert_eq!(envelope(&mixed), Some((1.0, 2.0)));
+    }
+
+    #[test]
+    fn an_infinite_end_is_left_out_of_the_envelope() {
+        // min -inf, max 5: the finite max and the finite edge values count.
+        let buckets = [view_bucket(f64::NEG_INFINITY, 5.0, -2.0, 3.0)];
+        assert_eq!(envelope(&buckets), Some((-2.0, 5.0)));
+        let both = [
+            view_bucket(f64::NEG_INFINITY, f64::INFINITY, f64::NAN, 1.0),
+            view_bucket(0.0, 0.5, 0.0, 0.5),
+        ];
+        assert_eq!(envelope(&both), Some((0.0, 1.0)));
+        let nothing_finite = [view_bucket(
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::INFINITY,
+        )];
+        assert_eq!(envelope(&nothing_finite), None);
     }
 }

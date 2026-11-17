@@ -78,7 +78,7 @@ pub struct TimeAxisStats {
 const UNIFORM_JITTER_TOLERANCE: f64 = 0.01;
 
 /// SPEC §2.2–2.3: `gap = Δt > 10 × median Δt`.
-const GAP_MULTIPLE_OF_MEDIAN: f64 = 10.0;
+pub const GAP_MULTIPLE_OF_MEDIAN: f64 = 10.0;
 
 /// Buckets per refinement pass of [`select_kth`]. 2¹⁶ narrows the
 /// surviving key range by a factor of 65536 per pass, so the full `u128` key

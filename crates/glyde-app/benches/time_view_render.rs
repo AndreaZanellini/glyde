@@ -656,8 +656,10 @@ fn bench_fit_click(c: &mut Criterion, fixture: &Fixture) {
     let elapsed = click(&mut state);
     let memory = egui_plot::PlotMemory::load(&ctx, plot_id).expect("plot memory");
     let bounds = memory.bounds();
+    // Every channel is a sine: -1..1, and the 5% of room above and below
+    // every y range leaves (issue #197).
     assert!(
-        bounds.max()[1] <= 1.0 && bounds.min()[1] >= -1.0,
+        bounds.max()[1] <= 1.1 + 1e-9 && bounds.min()[1] >= -1.1 - 1e-9,
         "the click must frame the channels' values (every one a sine), not \
          leave the plot at y {:?}..{:?}",
         bounds.min()[1],
