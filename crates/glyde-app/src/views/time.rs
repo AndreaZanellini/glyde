@@ -841,7 +841,12 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             // Issue #197: y follows the finite values this plot draws, unless
             // a box-zoom pinned it, a double-click is resetting it this
             // frame, or its bounds were set outright above.
-            if !y_pinned && !bounds_set && !plot_ui.response().double_clicked() {
+            // On the frame a secondary-button drag ends, y is left to the
+            // box alone, so whether the box moved it can be told below.
+            let box_ends = plot_ui
+                .response()
+                .drag_stopped_by(egui::PointerButton::Secondary);
+            if !y_pinned && !bounds_set && !box_ends && !plot_ui.response().double_clicked() {
                 let visible = members
                     .iter()
                     .filter_map(|&(_, column_index, _)| cache[column_index].as_ref())
@@ -889,12 +894,18 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             let hovered = plot_ui
                 .pointer_coordinate()
                 .and_then(|pointer| cursor.nearest(&dataset.time, from_x(pointer.x)));
-            (hovered, plot_updating)
+            let start_y = (
+                plot_ui.plot_bounds().min()[1],
+                plot_ui.plot_bounds().max()[1],
+            );
+            (hovered, plot_updating, start_y)
         });
-        let (plot_hovered, plot_updating) = response.inner;
+        let (plot_hovered, plot_updating, start_y) = response.inner;
         // Issue #197: a box-zoom (egui_plot's secondary-button drag) sets
         // y by hand, so y stops following the data on this plot; a
-        // double-click (egui_plot's reset to the fit) hands it back.
+        // double-click (egui_plot's reset to the fit) hands it back. A
+        // drag egui_plot did not turn into a zoom (a box with no height)
+        // left y as it was, and pins nothing.
         if response.response.double_clicked() {
             if pinned_y.remove(&plot_id) {
                 tracing::info!(column = ?column, "y follows the visible data again (issue #197)");
@@ -902,6 +913,10 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         } else if response
             .response
             .drag_stopped_by(egui::PointerButton::Secondary)
+            && (
+                response.transform.bounds().min()[1],
+                response.transform.bounds().max()[1],
+            ) != start_y
             && pinned_y.insert(plot_id)
         {
             tracing::info!(
@@ -2073,8 +2088,7 @@ impl FitBounds {
         let gap_threshold = drawing_gap_threshold(ticks);
         let gaps = gap_ticks(ticks, sorted, gap_threshold);
         let compress = compressible(dataset, ticks, sorted, x, gap_threshold, gaps.as_deref());
-        let typical_step = gap_threshold
-            .map(|threshold| ticks_as_seconds(&dataset.time, threshold / GAP_MULTIPLE_OF_MEDIAN));
+        let typical_step = typical_step(&dataset.time, ticks, x, gap_threshold);
         Self {
             x,
             y,
@@ -2946,6 +2960,32 @@ fn follow_visible_y(plot_ui: &mut egui_plot::PlotUi<'_>, target: (f64, f64)) {
     // A translation in `f32` can fall short far from zero; the next frame
     // finishes it.
     plot_ui.ctx().request_repaint();
+}
+
+/// The axis's typical sample interval in plot seconds, what the deepest
+/// zoom-in is measured in (issue #197): the median of its non-zero Δt,
+/// recovered from `gap_threshold` (no second pass over the axis). An axis
+/// with no usable median — mostly backwards steps kept in file order (SPEC
+/// §2.1), or every timestamp equal — falls back to its mean interval, the
+/// fit's span `x` over its sample count, so zoom-in still works on it.
+/// `None` with fewer than two samples.
+fn typical_step(
+    time: &TimeAxis,
+    ticks: &[i128],
+    x: Option<(f64, f64)>,
+    gap_threshold: Option<f64>,
+) -> Option<f64> {
+    if let Some(threshold) = gap_threshold {
+        return Some(ticks_as_seconds(time, threshold / GAP_MULTIPLE_OF_MEDIAN));
+    }
+    let (lo, hi) = x?;
+    let intervals = ticks.len().checked_sub(1).filter(|&n| n > 0)?;
+    let step = (hi - lo) / intervals as f64;
+    tracing::info!(
+        step_seconds = step,
+        "no median sample interval on this axis: the zoom-in limit uses the mean one (issue #197)"
+    );
+    Some(step)
 }
 
 /// A span of `ticks` (fractional: a median Δt) in plot seconds, the scale
@@ -6404,22 +6444,17 @@ mod render_tests {
         );
     }
 
-    // Issue #197: a box-zoom (secondary-button drag) is a deliberate y
-    // zoom, so y stays where the box put it while the view pans, until
-    // "Fit to data" hands it back to the data.
-    #[test]
-    fn a_box_zoom_pins_y_until_fit_to_data() {
-        let fixture = level_change_fixture();
-        let ctx = egui::Context::default();
-        let mut state = TimeViewState::default();
-        let mut shapes = Vec::new();
-        for _ in 0..3 {
-            shapes = frame_with_events(&ctx, &fixture, &mut state, Vec::new()).0;
-        }
-        let track = drawn_tracks(&ctx)[0];
-        let frame = track.frame;
-        let start = frame.lerp_inside(egui::vec2(0.6, 0.2));
-        let end = frame.lerp_inside(egui::vec2(0.9, 0.4));
+    /// A secondary-button drag over `track` from `start` to `end` (in
+    /// fractions of its frame): egui_plot's box-zoom.
+    fn box_drag(
+        ctx: &egui::Context,
+        fixture: &ViewFixture,
+        state: &mut TimeViewState,
+        track: &DrawnTrack,
+        start: egui::Vec2,
+        end: egui::Vec2,
+    ) {
+        let (start, end) = (track.frame.lerp_inside(start), track.frame.lerp_inside(end));
         let button = |pos, pressed| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Secondary,
@@ -6433,24 +6468,117 @@ mod render_tests {
             vec![egui::Event::PointerMoved(end)],
             vec![button(end, false)],
         ] {
-            frame_with_events(&ctx, &fixture, &mut state, events);
+            frame_with_events(ctx, fixture, state, events);
         }
-        settle(&ctx, &fixture, &mut state);
-        let boxed = plot_bounds(&ctx, &track);
+        settle(ctx, fixture, state);
+    }
+
+    /// A double-click at `at`.
+    fn double_click_at(
+        ctx: &egui::Context,
+        fixture: &ViewFixture,
+        state: &mut TimeViewState,
+        at: egui::Pos2,
+    ) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        frame_with_events(ctx, fixture, state, vec![egui::Event::PointerMoved(at)]);
+        for pressed in [true, false, true, false] {
+            frame_with_events(ctx, fixture, state, vec![button(pressed)]);
+        }
+        settle(ctx, fixture, state);
+    }
+
+    /// Pans `track` with the wheel until its view ends before `x`.
+    fn pan_left_of(
+        ctx: &egui::Context,
+        fixture: &ViewFixture,
+        state: &mut TimeViewState,
+        track: &DrawnTrack,
+        x: f64,
+    ) {
+        for _ in 0..40 {
+            if x_bounds(ctx, track).1 < x {
+                return;
+            }
+            input_at(ctx, fixture, state, track.frame.center(), wheel(200.0));
+        }
+        panic!(
+            "the wheel never panned left of {x}: {:?}",
+            x_bounds(ctx, track)
+        );
+    }
+
+    // Issue #197: a box-zoom (secondary-button drag) is a deliberate y
+    // zoom, so y stays where the box put it while the view pans — even
+    // across a level change that would move a following y — until a
+    // double-click or "Fit to data" hands it back to the data.
+    #[test]
+    fn a_box_zoom_pins_y_until_a_double_click_or_fit_to_data() {
+        let fixture = level_change_fixture();
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = frame_with_events(&ctx, &fixture, &mut state, Vec::new()).0;
+        }
+        let track = drawn_tracks(&ctx)[0];
+        // Over the second half (level 1000..1006), most of the plot high.
+        let boxed_once = |ctx: &egui::Context, state: &mut TimeViewState| {
+            box_drag(
+                ctx,
+                &fixture,
+                state,
+                &track,
+                egui::vec2(0.6, 0.05),
+                egui::vec2(0.9, 0.6),
+            );
+            plot_bounds(ctx, &track)
+        };
+        let boxed = boxed_once(&ctx, &mut state);
+        let (x_min, x_max) = (boxed.min()[0], boxed.max()[0]);
         assert!(
-            boxed.height() < 1_006.0 / 2.0,
-            "the box set a narrower y: {boxed:?}"
+            x_min > 100.0 && x_max - x_min < 100.0,
+            "the box set x: {boxed:?}"
+        );
+        // Following would frame 1000..1006, a few units high.
+        assert!(
+            boxed.height() > 100.0,
+            "y is the box's, not the visible data's: {boxed:?}"
         );
 
-        input_at(&ctx, &fixture, &mut state, frame.center(), wheel(100.0));
+        // Into the first half, where a following y would drop to 0.
+        pan_left_of(&ctx, &fixture, &mut state, &track, 100.0);
         let panned = plot_bounds(&ctx, &track);
-        assert_ne!(panned.min()[0], boxed.min()[0], "the wheel panned");
         assert_eq!(
             (panned.min()[1], panned.max()[1]),
             (boxed.min()[1], boxed.max()[1]),
             "y stays where the box put it"
         );
 
+        // A double-click on the plot: the fit, and y follows again.
+        double_click_at(&ctx, &fixture, &mut state, track.frame.center());
+        assert!(state.pinned_y.is_empty(), "the double-click unpinned y");
+        input_at(
+            &ctx,
+            &fixture,
+            &mut state,
+            track.frame.left_center() + egui::vec2(track.frame.width() / 8.0, 0.0),
+            egui::Event::Zoom(4.0),
+        );
+        assert_y_close(
+            &plot_bounds(&ctx, &track),
+            with_y_margin(0.0, 0.0),
+            "following after the double-click",
+        );
+
+        // Pinned again; "Fit to data" hands it back too.
+        boxed_once(&ctx, &mut state);
+        assert_eq!(state.pinned_y.len(), 1, "pinned again");
         click_at(
             &ctx,
             &fixture,
@@ -6458,18 +6586,162 @@ mod render_tests {
             text_centre(&shapes, "Fit to data"),
         );
         settle(&ctx, &fixture, &mut state);
-        let fitted = plot_bounds(&ctx, &track);
-        assert_y_close(&fitted, with_y_margin(0.0, 1_006.0), "fitted again");
-        // And y follows the view again.
+        assert!(state.pinned_y.is_empty(), "Fit to data unpinned y");
+        assert_y_close(
+            &plot_bounds(&ctx, &track),
+            with_y_margin(0.0, 1_006.0),
+            "fitted again",
+        );
         input_at(
             &ctx,
             &fixture,
             &mut state,
-            frame.left_center() + egui::vec2(frame.width() / 8.0, 0.0),
+            track.frame.left_center() + egui::vec2(track.frame.width() / 8.0, 0.0),
             egui::Event::Zoom(4.0),
         );
-        let zoomed = plot_bounds(&ctx, &track);
-        assert_y_close(&zoomed, with_y_margin(0.0, 0.0), "following again");
+        assert_y_close(
+            &plot_bounds(&ctx, &track),
+            with_y_margin(0.0, 0.0),
+            "following after Fit to data",
+        );
+    }
+
+    // Issue #197 (PR #260 review): a secondary-button drag that egui_plot
+    // does not turn into a zoom (here, a box with no height) leaves y as it
+    // was, so it pins nothing: y keeps following the data.
+    #[test]
+    fn a_box_with_no_height_pins_nothing() {
+        let fixture = level_change_fixture();
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        for _ in 0..3 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let track = drawn_tracks(&ctx)[0];
+        box_drag(
+            &ctx,
+            &fixture,
+            &mut state,
+            &track,
+            egui::vec2(0.2, 0.5),
+            egui::vec2(0.4, 0.5),
+        );
+        assert!(state.pinned_y.is_empty(), "nothing pinned");
+        input_at(
+            &ctx,
+            &fixture,
+            &mut state,
+            track.frame.left_center() + egui::vec2(track.frame.width() / 8.0, 0.0),
+            egui::Event::Zoom(4.0),
+        );
+        assert_y_close(
+            &plot_bounds(&ctx, &track),
+            with_y_margin(0.0, 0.0),
+            "y follows the data",
+        );
+    }
+
+    // Issue #197: switching between stacked and overlaid gives every plot
+    // back to the data: the pinned plot no longer exists as it was.
+    #[test]
+    fn a_layout_change_unpins_every_plot() {
+        let fixture = ViewFixture::new(three_scales_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = frame_with_events(&ctx, &fixture, &mut state, Vec::new()).0;
+        }
+        let track = drawn_tracks(&ctx)[1];
+        box_drag(
+            &ctx,
+            &fixture,
+            &mut state,
+            &track,
+            egui::vec2(0.3, 0.2),
+            egui::vec2(0.6, 0.7),
+        );
+        assert_eq!(state.pinned_y.len(), 1, "the box pinned its plot");
+        click_at(&ctx, &fixture, &mut state, text_centre(&shapes, "Overlaid"));
+        settle(&ctx, &fixture, &mut state);
+        assert!(state.pinned_y.is_empty(), "the layout change unpinned it");
+    }
+
+    // Issue #197 on SPEC §2.3's compressed axis: the zoom-out limit is the
+    // compressed fit (plus its margin), in compressed coordinates.
+    #[test]
+    fn zoom_out_on_a_compressed_axis_stops_at_its_fit() {
+        let fixture = ViewFixture::new(gap_heavy_dataset());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState {
+            compressed: true,
+            ..Default::default()
+        };
+        for _ in 0..4 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let track = drawn_tracks(&ctx)[0];
+        for _ in 0..5 {
+            input_at(
+                &ctx,
+                &fixture,
+                &mut state,
+                track.frame.center(),
+                egui::Event::Zoom(0.1),
+            );
+        }
+        let shared = state.shared_axis().expect("the plot is drawn");
+        let linear = fixture.fit.x().expect("samples");
+        let fit = shared.fit;
+        assert!(
+            fit.1 - fit.0 < (linear.1 - linear.0) / 2.0,
+            "the fit is in compressed coordinates: {fit:?} against {linear:?}"
+        );
+        let (x_min, x_max) = shared.x_range;
+        let extent = fit.1 - fit.0;
+        assert!(
+            (x_max - x_min - 1.1 * extent).abs() <= 1e-6 * extent,
+            "at most the compressed fit and 5% either side: {x_min}..{x_max} for {fit:?}"
+        );
+    }
+
+    // Issue #197 (PR #260 review): an axis with no median Δt — here every
+    // step runs backwards, kept in file order (SPEC §2.1) — still zooms in,
+    // down to its mean sample interval.
+    #[test]
+    fn an_axis_with_no_median_interval_still_zooms_in() {
+        let n = 200i128;
+        let mut dataset = dataset_of(vec![("value", (0..n).map(|i| i as f64).collect())]);
+        dataset.time = TimeAxis::Absolute {
+            timestamps: (0..n)
+                .rev()
+                .map(|i| Timestamp::new(i, TimeUnit::Seconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochSeconds,
+        };
+        let fixture = ViewFixture::new(dataset);
+        assert_eq!(fixture.fit.typical_step, Some(1.0), "the mean interval");
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        for _ in 0..3 {
+            frame_with_events(&ctx, &fixture, &mut state, Vec::new());
+        }
+        let track = drawn_tracks(&ctx)[0];
+        for _ in 0..8 {
+            input_at(
+                &ctx,
+                &fixture,
+                &mut state,
+                track.frame.center(),
+                egui::Event::Zoom(10.0),
+            );
+        }
+        let (x_min, x_max) = x_bounds(&ctx, &track);
+        assert!(
+            (x_max - x_min - 1.0).abs() < 1e-6,
+            "down to one mean interval: {x_min}..{x_max}"
+        );
     }
 
     // SPEC §4.1: "sharing a single, synchronized time axis". Dragging one

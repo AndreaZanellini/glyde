@@ -41,11 +41,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
     above and below, and moves with them as you pan and zoom. A flat stretch is
     shown around its value, not squashed onto a line.
   - **A box-zoom (drag with the right mouse button) still zooms y too**, and that
-    plot's y then stays where you put it while you pan, until **Fit to data** or
-    a double-click on that plot hands it back to the data.
+    plot's y then stays where you put it while you pan, until **Fit to data**, a
+    double-click on that plot, or switching Stacked/Overlaid hands it back to the
+    data. A right-button drag that does not zoom (no height) changes nothing.
   - **Zoom-out stops at the whole file plus 5 % either side; zoom-in stops at one
-    typical sample interval** (two samples across the plot). **A pan never takes
-    the view off the data**: the middle of the view stays on the file.
+    typical sample interval** (two samples across the plot; for a file whose time
+    column mostly runs backwards, the average interval). **A pan never takes the
+    view off the data**: the middle of the view stays on the file.
   - **Fit to data now leaves the same 5 % room above and below** as the first
     view of a file and the y that follows the view, so the highest and lowest
     samples are never cut by the plot's frame.
