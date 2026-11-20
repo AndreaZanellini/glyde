@@ -201,7 +201,12 @@ Versioning: [Semantic Versioning](https://semver.org/).
   deepest zoom-in (one sample interval, issue #197) now also holds on
   microsecond-sampled epoch data, where it did not. How time is stored and how
   the readout shows it are unchanged. **To try:** open `case-41` → six
-  separate points, labelled one picosecond apart.
+  separate points, labelled one picosecond apart. **Assumptions to veto:** the
+  plot counts from the file's first row (nothing on screen shows this: labels
+  and readout stay absolute times); the log line for a cluster fitted to the
+  viewport now gives seconds from that first row, plus its exact ticks. Known
+  limit, older than this change: a row with more than 9 decimals in a column
+  that otherwise has at most 9 is still drawn in the wrong place (issue #264).
 - **Files whose timestamps repeat no longer report a "gap" every second
   (issue #188).** A log sampled faster than its timestamps change (whole
   seconds on a 10 Hz recorder, for example) has most rows sharing a

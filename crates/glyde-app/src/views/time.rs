@@ -938,10 +938,15 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             if let Some(pointer) = response.response.interact_pointer_pos() {
                 let x = response.transform.value_from_position(pointer).x;
                 if let Some(span) = cluster_span_at(fit_bounds, &dataset.time, from_x(x)) {
+                    // Plot x counts from the file's first sample (issue
+                    // #206): the exact ticks place the span on their own.
                     tracing::info!(
                         from_seconds = span.0,
                         to_seconds = span.1,
-                        "cluster fitted to the viewport (SPEC §2.3)"
+                        from_tick = %seconds_to_tick(&dataset.time, span.0),
+                        to_tick = %seconds_to_tick(&dataset.time, span.1),
+                        "cluster fitted to the viewport, seconds from the file's first \
+                         sample (SPEC §2.3)"
                     );
                     *cluster_fit = Some((to_x(span.0), to_x(span.1)));
                     ui.ctx().request_repaint();
@@ -2836,7 +2841,7 @@ fn absolute_origin(time: &TimeAxis) -> Option<(i128, i128)> {
 pub fn tick_to_seconds(time: &TimeAxis, tick: i128) -> f64 {
     match absolute_origin(time) {
         Some((origin, ticks_per_second)) => {
-            tick.wrapping_sub(origin) as f64 / ticks_per_second as f64
+            offset_as_f64(tick.wrapping_sub(origin)) / ticks_per_second as f64
         }
         None => progressive_tick_to_value(tick),
     }
@@ -2855,6 +2860,19 @@ pub(crate) fn seconds_to_tick(time: &TimeAxis, seconds: f64) -> i128 {
     }
 }
 
+/// A tick offset from the origin as `f64`, rounded to nearest exactly as
+/// `offset as f64` would be. An offset that fits in `i64` (292 years of
+/// nanoseconds, 106 days of picoseconds) takes the one-instruction `i64`
+/// conversion instead of the much slower `i128` one, which keeps the
+/// per-sample cursor lookup as cheap as before #206.
+#[inline]
+fn offset_as_f64(offset: i128) -> f64 {
+    match i64::try_from(offset) {
+        Ok(offset) => offset as f64,
+        Err(_) => offset as f64,
+    }
+}
+
 /// One absolute sample's plot x ([`tick_to_seconds`]'s space), from its own
 /// unit: a row promoted to a finer unit than the first (SPEC §2.1, a
 /// sub-nanosecond fraction) is compared with the origin in that finer unit,
@@ -2864,7 +2882,7 @@ fn timestamp_x(origin: (i128, i128), timestamp: &Timestamp) -> f64 {
     let per_second = timestamp.unit.ticks_per_second();
     // Almost every row shares the first row's unit: no `i128` scaling.
     if per_second == origin_per_second {
-        return timestamp.ticks.wrapping_sub(origin_ticks) as f64 / per_second as f64;
+        return offset_as_f64(timestamp.ticks.wrapping_sub(origin_ticks)) / per_second as f64;
     }
     // Units are powers of 1000 apart, so the finer one divides exactly.
     let (ticks, origin_ticks, per_second) = if per_second >= origin_per_second {
@@ -2882,7 +2900,7 @@ fn timestamp_x(origin: (i128, i128), timestamp: &Timestamp) -> f64 {
             origin_per_second,
         )
     };
-    ticks.wrapping_sub(origin_ticks) as f64 / per_second as f64
+    offset_as_f64(ticks.wrapping_sub(origin_ticks)) / per_second as f64
 }
 
 /// The axis-aligned bounding box of `x` and every plottable value across
@@ -3083,7 +3101,7 @@ fn plot_x(time: &TimeAxis) -> impl Fn(usize) -> f64 + '_ {
             timestamps.get(index).map_or(f64::NAN, |timestamp| {
                 // The common case, inline: the row is in the first row's unit.
                 if timestamp.unit == first.unit {
-                    timestamp.ticks.wrapping_sub(first.ticks) as f64 / divisor
+                    offset_as_f64(timestamp.ticks.wrapping_sub(first.ticks)) / divisor
                 } else {
                     timestamp_x((first.ticks, first.unit.ticks_per_second()), &timestamp)
                 }
@@ -8211,7 +8229,9 @@ mod tests {
     }
 
     // Issue #206: a row promoted to picoseconds (SPEC §2.1, a sub-nanosecond
-    // fraction) on a nanosecond axis is placed exactly, from its own unit.
+    // fraction) on a nanosecond axis gets its exact x from its own unit, for
+    // the cursor lookup. The pyramid's ticks still mix units for such a row,
+    // so the trace does not yet agree (issue #264, pre-existing).
     #[test]
     fn a_row_in_a_finer_unit_is_placed_exactly_from_the_file_start() {
         let start = 1_770_000_000_000_000_000_i128;
@@ -8226,5 +8246,25 @@ mod tests {
 
         assert_eq!(x_axis_seconds(&time), vec![0.0, 1.5e-9]);
         assert_eq!(plot_x(&time)(1), 1.5e-9);
+    }
+
+    // Issue #206: the fast `i64` path and the `i128` fallback round the
+    // same way as a plain `as f64`, on both sides of the `i64` range.
+    #[test]
+    fn a_tick_offset_converts_exactly_as_a_plain_cast_would() {
+        for offset in [
+            0_i128,
+            1,
+            -1,
+            (1 << 53) + 1,
+            i128::from(i64::MAX),
+            i128::from(i64::MIN),
+            i128::from(i64::MAX) + 1,
+            i128::from(i64::MIN) - 1,
+            1_770_000_000_000_000_000_000_000,
+            -1_770_000_000_000_000_000_000_000,
+        ] {
+            assert_eq!(offset_as_f64(offset), offset as f64, "{offset}");
+        }
     }
 }
