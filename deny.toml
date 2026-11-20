@@ -33,6 +33,8 @@ unmaintained = "workspace"
 ignore = [
     { id = "RUSTSEC-2026-0194", reason = "quick-xml is a build-time transitive of wayland-scanner (Linux GUI codegen). Glyde never parses network/untrusted XML; this DoS surface is unreachable. Remove when wayland-scanner moves to quick-xml >=0.41." },
     { id = "RUSTSEC-2026-0195", reason = "same: transitive via wayland-scanner, no untrusted-XML path in Glyde. Remove when the upstream tree allows quick-xml >=0.41." },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (no vulnerability). Direct dep of glyde-core for timestamp parsing/formatting, and transitive via arrow/parquet, which has no replacement. Remove when glyde-core migrates and arrow drops it." },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained (no vulnerability). Direct dep of glyde-core for named time zones. Remove when glyde-core migrates off chrono-tz." },
 ]
 
 [licenses]
