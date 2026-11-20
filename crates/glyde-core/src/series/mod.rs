@@ -24,6 +24,7 @@ mod categorical;
 mod collapse;
 mod dtype;
 mod markers;
+mod measure;
 mod samples;
 mod state;
 
@@ -39,6 +40,7 @@ pub use dtype::{Dtype, SeriesValues, SpilledValues, ViewKind};
 pub use markers::{
     is_marker_column, Marker, MarkerBuilder, MarkerLane, MARKER_OVERVIEW_CELLS, MAX_EXACT_MARKERS,
 };
+pub use measure::{measure_between, CursorMeasurement, Reading, ValueDelta};
 pub use samples::{SampleSource, SeriesSamples, SAMPLE_CHUNK_LEN};
 pub use state::{
     bool_state_bands, BoolBand, BoolBandBuilder, BoolLane, BOOL_OVERVIEW_CELLS,

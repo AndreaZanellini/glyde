@@ -29,6 +29,40 @@ Versioning: [Semantic Versioning](https://semver.org/).
   first 8 in file order shown on open; state lanes capped at 32 % of the time
   view; Inter and JetBrains Mono embedded in the app.
 
+### Added
+- **Measurement cursors A and B on the time view (issue #231).** Press
+  **Cursors** in the time view's toolbar: two vertical lines, A and B, appear
+  at a third and two thirds of what you are looking at, across every numeric
+  plot and state lane down to the time axis. Drag a line to move it; it jumps
+  to the nearest sample. A panel on the right reads:
+  - the timestamp of the sample under A and under B;
+  - **Δt = B − A**, exact (picoseconds stay picoseconds, `case-41` reads
+    `5 ps` from its first to its last row), and **1/Δt** in Hz;
+  - for every numeric channel you show: its value at A and at B, exactly as
+    in the file, **ΔY = B − A** and the slope **ΔY/Δt** per second.
+
+  Every value is read from the file's own sample under the cursor, never
+  from the drawn overview. A missing sample (NaN) reads `missing`, with no
+  ΔY or slope: nothing is interpolated. On a compressed axis Δt is still the
+  real time between the two samples. Press **Cursors** again to remove them;
+  opening another file (or correcting this one) removes them too.
+  **To try it:** place A and B on a ramp and compare Δt, ΔY and the slope with
+  a hand calculation.
+
+  **Assumptions to veto:**
+  - ΔY of a decimal column is rounded to the most decimals either value is
+    written with, so `10.4 − 10.1` reads `+0.3`, not the computer's
+    `0.3000000000000007`. Whole-number columns differ exactly, even beyond
+    2⁵³ (`case-50` reads `+1`).
+  - Slopes and 1/Δt show 6 significant digits; Δt is never rounded.
+  - On a file whose time column is a plain index (no unit), the panel says
+    **Δx** instead of Δt and the slope has no "/s".
+  - A cursor is grabbed only on the numeric plots (within 6 px of its line),
+    not on the state lanes, where a drag still pans.
+  - Not in this change: the per-channel unit next to ΔY (issue #237, v0.2)
+    and the optional horizontal cursors for a pure vertical distance (SPEC
+    §4.1; the approved mockup left them for later).
+
 ### Changed
 - **Zooming and panning move along time only, and the y axis follows what you
   see (issue #197).** Before, Ctrl/⌘ + wheel zoomed both axes, so a few steps

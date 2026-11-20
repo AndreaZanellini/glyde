@@ -350,6 +350,28 @@ pub enum TimeAxis {
 }
 
 impl TimeAxis {
+    /// The span from row `from` to row `to` (`to − from`) for SPEC §4.1's
+    /// measurement cursors (issue #231): exact real time on an absolute
+    /// axis ([`crate::time::TimeSpan`], from integer ticks), the difference
+    /// of the index's own numbers on a progressive one. `None` when either
+    /// row is past the end.
+    pub fn span(&self, from: usize, to: usize) -> Option<crate::time::AxisSpan> {
+        match self {
+            TimeAxis::Absolute { timestamps, .. } => {
+                let (from, to) = (timestamps.get(from)?, timestamps.get(to)?);
+                Some(crate::time::AxisSpan::Time(crate::time::TimeSpan::between(
+                    &from, &to,
+                )))
+            }
+            TimeAxis::Progressive { values } => {
+                let values = values.as_slice();
+                Some(crate::time::AxisSpan::Progressive(
+                    values.get(to)? - values.get(from)?,
+                ))
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             TimeAxis::Absolute { timestamps, .. } => timestamps.len(),
