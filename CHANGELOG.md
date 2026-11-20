@@ -190,6 +190,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
   use a red picked here (the series red, darkened to read on the panel).
 
 ### Fixed
+- **Very finely timed data is drawn exactly where it was recorded (issue
+  #206).** Plot positions used to be counted in seconds since 1970, and at
+  today's dates a computer number resolves those only to about a quarter of a
+  microsecond. So `case-41-picosecond-resolution-index.csv` (six samples 1 ps
+  apart) was drawn as one vertical line, and a file sampled at 1 MHz or faster
+  looked jittered at deep zoom. The plot now counts time from the file's first
+  sample, so every sample gets its own position down to the picosecond, and the
+  axis labels show the file's exact times (`00:00:00.000000000001`, …). The
+  deepest zoom-in (one sample interval, issue #197) now also holds on
+  microsecond-sampled epoch data, where it did not. How time is stored and how
+  the readout shows it are unchanged. **To try:** open `case-41` → six
+  separate points, labelled one picosecond apart.
 - **Files whose timestamps repeat no longer report a "gap" every second
   (issue #188).** A log sampled faster than its timestamps change (whole
   seconds on a 10 Hz recorder, for example) has most rows sharing a

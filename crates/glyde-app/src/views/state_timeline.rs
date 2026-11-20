@@ -2467,7 +2467,8 @@ mod tests {
             format: TimestampFormat::EpochSeconds,
         };
 
-        assert_eq!(axis_bounds(5, 5, &time), (4.0, 6.0));
+        // Plot x counts from the first sample (issue #206).
+        assert_eq!(axis_bounds(5, 5, &time), (-1.0, 1.0));
     }
 
     #[test]
