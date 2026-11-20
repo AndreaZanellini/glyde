@@ -61,7 +61,7 @@ use glyde_core::ingest::{
 use glyde_core::series::{Series, SeriesValues, ViewKind};
 use glyde_core::time::{
     calendar_ticks, cluster_at, format_cursor_timestamp, should_offer_compression, visit_gaps,
-    AxisLabelStyle, BrokenAxis, XLimits, GAP_MULTIPLE_OF_MEDIAN,
+    AxisLabelStyle, BrokenAxis, Timestamp, XLimits, GAP_MULTIPLE_OF_MEDIAN,
 };
 
 use crate::views::channels::{self, ChannelVisibility};
@@ -938,10 +938,15 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             if let Some(pointer) = response.response.interact_pointer_pos() {
                 let x = response.transform.value_from_position(pointer).x;
                 if let Some(span) = cluster_span_at(fit_bounds, &dataset.time, from_x(x)) {
+                    // Plot x counts from the file's first sample (issue
+                    // #206): the exact ticks place the span on their own.
                     tracing::info!(
                         from_seconds = span.0,
                         to_seconds = span.1,
-                        "cluster fitted to the viewport (SPEC §2.3)"
+                        from_tick = %seconds_to_tick(&dataset.time, span.0),
+                        to_tick = %seconds_to_tick(&dataset.time, span.1),
+                        "cluster fitted to the viewport, seconds from the file's first \
+                         sample (SPEC §2.3)"
                     );
                     *cluster_fit = Some((to_x(span.0), to_x(span.1)));
                     ui.ctx().request_repaint();
@@ -2144,7 +2149,8 @@ pub(crate) fn axis_bounds(min_tick: i128, max_tick: i128, time: &TimeAxis) -> (f
 
 /// `time`'s samples as plain `f64` x-coordinates for `egui_plot`, which only
 /// ever plots `f64` points. For [`TimeAxis::Absolute`] this converts each
-/// [`glyde_core::time::Timestamp`]'s integer ticks to seconds-since-epoch —
+/// [`glyde_core::time::Timestamp`]'s integer ticks to seconds since the
+/// axis's first sample ([`absolute_origin`], issue #206) —
 /// a rendering-only coordinate transform for pixel placement, not a change
 /// to how time is stored (SPEC §2.1's "never store absolute time as `f64`
 /// seconds" governs [`Dataset`]'s own fields, which stay `i128` ticks; nothing
@@ -2157,10 +2163,13 @@ pub(crate) fn axis_bounds(min_tick: i128, max_tick: i128, time: &TimeAxis) -> (f
 #[cfg(test)]
 fn x_axis_seconds(time: &TimeAxis) -> Vec<f64> {
     match time {
-        TimeAxis::Absolute { timestamps, .. } => timestamps
-            .iter()
-            .map(|timestamp| timestamp.ticks as f64 / timestamp.unit.ticks_per_second() as f64)
-            .collect(),
+        TimeAxis::Absolute { timestamps, .. } => match absolute_origin(time) {
+            Some(origin) => timestamps
+                .iter()
+                .map(|timestamp| timestamp_x(origin, &timestamp))
+                .collect(),
+            None => Vec::new(),
+        },
         TimeAxis::Progressive { values } => values.as_slice().to_vec(),
     }
 }
@@ -2800,39 +2809,98 @@ fn bucket_segments(
     segments
 }
 
-/// `time`'s own ticks-per-second, for converting a single synthesized pyramid
-/// tick (a bucket boundary, not necessarily any real sample's own tick) to
-/// and from plot seconds — the same scale [`x_axis_seconds`] applies to every
-/// real sample, generalized to an arbitrary tick. `None` for
-/// [`TimeAxis::Progressive`], whose ticks instead use the fixed
-/// [`glyde_core::ingest::PROGRESSIVE_TICK_SCALE`] via
+/// The tick an absolute axis's plot x is measured from, and its
+/// ticks-per-second: its first sample's own tick and unit (issue #206).
+/// `None` for an empty axis and for [`TimeAxis::Progressive`], whose ticks
+/// instead use the fixed [`glyde_core::ingest::PROGRESSIVE_TICK_SCALE`] via
 /// [`progressive_tick_to_value`]/[`progressive_value_to_tick`].
-fn absolute_ticks_per_second(time: &TimeAxis) -> Option<i128> {
+///
+/// Plot x is `f64` seconds *since the file start*, not since the epoch: near
+/// 1.7e9 epoch seconds an `f64` resolves only ~0.24 µs, so sub-µs samples
+/// collapsed onto one x and labels showed float residue. Relative to the
+/// first sample the same `f64` resolves picoseconds across hours of data.
+/// The subtraction is done in `i128` ticks, so it is exact. It wraps rather
+/// than saturates (cheaper on the per-sample path): two parsed timestamps
+/// are never ~1.7e38 ticks apart, so it never actually wraps. Every reading
+/// of one file keeps its first row, so the origin never moves under a view;
+/// a new reading (a correction, a sort) is fitted afresh anyway.
+fn absolute_origin(time: &TimeAxis) -> Option<(i128, i128)> {
     match time {
-        TimeAxis::Absolute { timestamps, .. } => Some(timestamps.get(0)?.unit.ticks_per_second()),
+        TimeAxis::Absolute { timestamps, .. } => {
+            let first = timestamps.get(0)?;
+            Some((first.ticks, first.unit.ticks_per_second()))
+        }
         TimeAxis::Progressive { .. } => None,
     }
 }
 
 /// Inverse of [`seconds_to_tick`]: a pyramid tick (e.g. a [`Bucket`]'s
-/// midpoint) as a plot-seconds x-coordinate, the same coordinate space
-/// [`x_axis_seconds`] produces for real samples.
+/// midpoint) as a plot x-coordinate, the same coordinate space
+/// [`x_axis_seconds`] produces for real samples — seconds since the axis's
+/// first sample on an absolute axis ([`absolute_origin`]).
 pub fn tick_to_seconds(time: &TimeAxis, tick: i128) -> f64 {
-    match absolute_ticks_per_second(time) {
-        Some(ticks_per_second) => tick as f64 / ticks_per_second as f64,
+    match absolute_origin(time) {
+        Some((origin, ticks_per_second)) => {
+            offset_as_f64(tick.wrapping_sub(origin)) / ticks_per_second as f64
+        }
         None => progressive_tick_to_value(tick),
     }
 }
 
-/// Inverse of [`tick_to_seconds`]: a plot-seconds x-coordinate (e.g. the
-/// current viewport bounds from `egui_plot`) back to a pyramid tick, for
-/// querying [`decimate_viewport`] with a range in the same tick units
+/// Inverse of [`tick_to_seconds`]: a plot x-coordinate (e.g. the current
+/// viewport bounds from `egui_plot`) back to a pyramid tick, for querying
+/// [`decimate_viewport`] with a range in the same tick units
 /// `glyde_core::ingest::TimeAxis::to_pyramid_ticks` produces.
 pub(crate) fn seconds_to_tick(time: &TimeAxis, seconds: f64) -> i128 {
-    match absolute_ticks_per_second(time) {
-        Some(ticks_per_second) => (seconds * ticks_per_second as f64).round() as i128,
+    match absolute_origin(time) {
+        Some((origin, ticks_per_second)) => {
+            origin.saturating_add((seconds * ticks_per_second as f64).round() as i128)
+        }
         None => progressive_value_to_tick(seconds),
     }
+}
+
+/// A tick offset from the origin as `f64`, rounded to nearest exactly as
+/// `offset as f64` would be. An offset that fits in `i64` (292 years of
+/// nanoseconds, 106 days of picoseconds) takes the one-instruction `i64`
+/// conversion instead of the much slower `i128` one, which keeps the
+/// per-sample cursor lookup as cheap as before #206.
+#[inline]
+fn offset_as_f64(offset: i128) -> f64 {
+    match i64::try_from(offset) {
+        Ok(offset) => offset as f64,
+        Err(_) => offset as f64,
+    }
+}
+
+/// One absolute sample's plot x ([`tick_to_seconds`]'s space), from its own
+/// unit: a row promoted to a finer unit than the first (SPEC §2.1, a
+/// sub-nanosecond fraction) is compared with the origin in that finer unit,
+/// so the subtraction stays exact in `i128`.
+fn timestamp_x(origin: (i128, i128), timestamp: &Timestamp) -> f64 {
+    let (origin_ticks, origin_per_second) = origin;
+    let per_second = timestamp.unit.ticks_per_second();
+    // Almost every row shares the first row's unit: no `i128` scaling.
+    if per_second == origin_per_second {
+        return offset_as_f64(timestamp.ticks.wrapping_sub(origin_ticks)) / per_second as f64;
+    }
+    // Units are powers of 1000 apart, so the finer one divides exactly.
+    let (ticks, origin_ticks, per_second) = if per_second >= origin_per_second {
+        let scale = per_second / origin_per_second;
+        (
+            timestamp.ticks,
+            origin_ticks.saturating_mul(scale),
+            per_second,
+        )
+    } else {
+        let scale = origin_per_second / per_second;
+        (
+            timestamp.ticks.saturating_mul(scale),
+            origin_ticks,
+            origin_per_second,
+        )
+    };
+    offset_as_f64(ticks.wrapping_sub(origin_ticks)) / per_second as f64
 }
 
 /// The axis-aligned bounding box of `x` and every plottable value across
@@ -2991,8 +3059,8 @@ fn typical_step(
 /// A span of `ticks` (fractional: a median Δt) in plot seconds, the scale
 /// [`tick_to_seconds`] applies to a single tick.
 fn ticks_as_seconds(time: &TimeAxis, ticks: f64) -> f64 {
-    match absolute_ticks_per_second(time) {
-        Some(ticks_per_second) => ticks / ticks_per_second as f64,
+    match absolute_origin(time) {
+        Some((_, ticks_per_second)) => ticks / ticks_per_second as f64,
         None => ticks * progressive_tick_to_value(1),
     }
 }
@@ -3017,16 +3085,30 @@ fn nearest_index(x: &[f64], target: f64) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-/// `time`'s `index`-th sample as the `f64` plot x-coordinate — exactly the
-/// value [`x_axis_seconds`] produces for it, one sample at a time.
-fn x_at(time: &TimeAxis, index: usize) -> f64 {
-    match time {
-        TimeAxis::Absolute { timestamps, .. } => {
+/// `time`'s samples as `f64` plot x-coordinates, one index at a time —
+/// exactly the values [`x_axis_seconds`] produces. The origin
+/// ([`absolute_origin`]) and its divisor are read once, not per sample: the
+/// cursor lookup calls this for many samples per frame (issue #143's
+/// `restarting/hovered` bench).
+fn plot_x(time: &TimeAxis) -> impl Fn(usize) -> f64 + '_ {
+    let first = match time {
+        TimeAxis::Absolute { timestamps, .. } => timestamps.get(0),
+        TimeAxis::Progressive { .. } => None,
+    };
+    let divisor = first.map_or(1.0, |first| first.unit.ticks_per_second() as f64);
+    move |index| match (time, first) {
+        (TimeAxis::Absolute { timestamps, .. }, Some(first)) => {
             timestamps.get(index).map_or(f64::NAN, |timestamp| {
-                timestamp.ticks as f64 / timestamp.unit.ticks_per_second() as f64
+                // The common case, inline: the row is in the first row's unit.
+                if timestamp.unit == first.unit {
+                    offset_as_f64(timestamp.ticks.wrapping_sub(first.ticks)) / divisor
+                } else {
+                    timestamp_x((first.ticks, first.unit.ticks_per_second()), &timestamp)
+                }
             })
         }
-        TimeAxis::Progressive { values } => values.as_slice()[index],
+        (TimeAxis::Absolute { .. }, None) => f64::NAN,
+        (TimeAxis::Progressive { values }, _) => values.as_slice()[index],
     }
 }
 
@@ -3065,9 +3147,9 @@ impl CursorLookup {
     /// never per frame.
     pub fn for_time(time: &TimeAxis) -> Self {
         let len = time.len();
-        let sorted = (1..len).all(|index| x_at(time, index - 1) <= x_at(time, index));
-        let unsorted =
-            (!sorted && len > 0).then(|| Arc::new(XRanges::build(len, |index| x_at(time, index))));
+        let x = plot_x(time);
+        let sorted = (1..len).all(|index| x(index - 1) <= x(index));
+        let unsorted = (!sorted && len > 0).then(|| Arc::new(XRanges::build(len, &x)));
         Self { sorted, unsorted }
     }
 
@@ -3076,7 +3158,7 @@ impl CursorLookup {
         if len == 0 {
             return None;
         }
-        let x = |index| x_at(time, index);
+        let x = plot_x(time);
         if !target.is_finite() {
             return linear_nearest(len, x, target);
         }
@@ -7756,7 +7838,9 @@ mod tests {
                     );
                     let mut previous_day = None;
                     for mark in &marks {
-                        let day = (mark.x / 86_400.0).floor() as i64;
+                        // x counts from the first sample (issue #206): the
+                        // day comes from the epoch tick.
+                        let day = seconds_to_tick(&time, mark.x).div_euclid(86_400);
                         if previous_day.is_some_and(|d| d != day) && mark.label.contains(':') {
                             assert!(
                                 mark.context
@@ -8034,5 +8118,153 @@ mod tests {
 
         assert_eq!(tick_to_seconds(&time, 2_500_000_000), 2.5);
         assert_eq!(seconds_to_tick(&time, 2.5), 2_500_000_000);
+    }
+
+    fn corpus_dataset(name: &str) -> Dataset {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/corpus")
+            .join(name);
+        glyde_core::ingest::load(&path).expect("corpus case must load")
+    }
+
+    // Issue #206: case-41's six samples are 1 ps apart in 2026. As absolute
+    // `f64` seconds (~1.77e9, resolution ~0.24 µs) they all landed on one x.
+    // Relative to the file start every sample has its own x, in order.
+    #[test]
+    fn picosecond_samples_get_six_distinct_plot_positions() {
+        let dataset = corpus_dataset("case-41-picosecond-resolution-index.csv");
+        let ticks = dataset.time.to_pyramid_ticks();
+        assert_eq!(ticks.len(), 6);
+
+        let x = x_axis_seconds(&dataset.time);
+        assert!(x.windows(2).all(|pair| pair[0] < pair[1]), "{x:?}");
+        for (index, &tick) in ticks.iter().enumerate() {
+            let at = tick_to_seconds(&dataset.time, tick);
+            assert_eq!(at, plot_x(&dataset.time)(index));
+            assert_eq!(at, x[index]);
+            assert_eq!(seconds_to_tick(&dataset.time, at), tick, "round trip");
+        }
+    }
+
+    /// The time-of-day labels [`time_axis_marks`] puts under the full view
+    /// of corpus file `name`, 1 400 points wide.
+    fn corpus_full_view_labels(name: &str) -> Vec<String> {
+        let dataset = corpus_dataset(name);
+        let ticks = dataset.time.to_pyramid_ticks();
+        let view = full_view(&dataset.time, &ticks);
+        time_axis_marks(&dataset.time, &ticks, view, 1_400.0, None, CHAR_PX)
+            .into_iter()
+            .map(|mark| mark.label)
+            .collect()
+    }
+
+    // Issue #206: case-41's axis read `…23:59:59.000000069632` — float error
+    // printed as if it were data. Each picosecond now gets its exact label.
+    #[test]
+    fn picosecond_labels_carry_no_float_residue() {
+        let expected: Vec<String> = (0..=5)
+            .map(|ps| format!("00:00:00.00000000000{ps}"))
+            .collect();
+
+        assert_eq!(
+            corpus_full_view_labels("case-41-picosecond-resolution-index.csv"),
+            expected
+        );
+    }
+
+    // Issue #206: case-32's labels carried +256 ns of float error. They are
+    // now the exact tenths of a second the file holds.
+    #[test]
+    fn epoch_nanosecond_labels_carry_no_float_residue() {
+        let expected: Vec<String> = (0..=5).map(|tenth| format!("02:40:00.{tenth}")).collect();
+
+        assert_eq!(
+            corpus_full_view_labels("case-32-epoch-nanoseconds.csv"),
+            expected
+        );
+    }
+
+    // Issue #206: an absolute axis plots from its first sample, so a view's
+    // x stays small whatever the epoch, and converts back to exact ticks.
+    #[test]
+    fn an_absolute_axis_is_plotted_relative_to_its_first_sample() {
+        let start = 1_770_000_000_000_000_000_i128;
+        let time = TimeAxis::Absolute {
+            timestamps: vec![
+                Timestamp::new(start, TimeUnit::Nanoseconds),
+                Timestamp::new(start + 1, TimeUnit::Nanoseconds),
+                Timestamp::new(start + 2_500_000_000, TimeUnit::Nanoseconds),
+            ]
+            .into(),
+            format: TimestampFormat::EpochNanos,
+        };
+
+        assert_eq!(x_axis_seconds(&time), vec![0.0, 1e-9, 2.5]);
+        assert_eq!(tick_to_seconds(&time, start - 1_000_000_000), -1.0);
+        assert_eq!(seconds_to_tick(&time, 1e-9), start + 1);
+        assert_eq!(seconds_to_tick(&time, 2.5), start + 2_500_000_000);
+    }
+
+    // Issue #206 (PR #260 review note): `XLimits::clamp`'s slack scales with
+    // the extent's magnitude. At epoch seconds it was ~6 µs, so a 1 MHz file's
+    // zoom-in stop (one sample interval) was never enforced. Relative to the
+    // file start the slack is tiny and the stop holds.
+    #[test]
+    fn the_zoom_in_stop_holds_on_a_megahertz_epoch_axis() {
+        let start = 1_770_000_000_000_000_000_i128;
+        let time = TimeAxis::Absolute {
+            timestamps: (0..1_000)
+                .map(|i| Timestamp::new(start + i * 1_000, TimeUnit::Nanoseconds))
+                .collect::<Vec<_>>()
+                .into(),
+            format: TimestampFormat::EpochNanos,
+        };
+        let ticks = time.to_pyramid_ticks();
+        let limits = XLimits::new(full_view(&time, &ticks), Some(1e-6)).expect("a valid extent");
+
+        let centre = tick_to_seconds(&time, start + 500_000);
+        let (lo, hi) = limits.clamp((centre - 5e-8, centre + 5e-8));
+
+        assert!((hi - lo - 1e-6).abs() < 1e-12, "span {}", hi - lo);
+    }
+
+    // Issue #206: a row promoted to picoseconds (SPEC §2.1, a sub-nanosecond
+    // fraction) on a nanosecond axis gets its exact x from its own unit, for
+    // the cursor lookup. The pyramid's ticks still mix units for such a row,
+    // so the trace does not yet agree (issue #264, pre-existing).
+    #[test]
+    fn a_row_in_a_finer_unit_is_placed_exactly_from_the_file_start() {
+        let start = 1_770_000_000_000_000_000_i128;
+        let time = TimeAxis::Absolute {
+            timestamps: vec![
+                Timestamp::new(start, TimeUnit::Nanoseconds),
+                Timestamp::new(start * 1_000 + 1_500, TimeUnit::Picoseconds),
+            ]
+            .into(),
+            format: TimestampFormat::Iso8601WithOffset,
+        };
+
+        assert_eq!(x_axis_seconds(&time), vec![0.0, 1.5e-9]);
+        assert_eq!(plot_x(&time)(1), 1.5e-9);
+    }
+
+    // Issue #206: the fast `i64` path and the `i128` fallback round the
+    // same way as a plain `as f64`, on both sides of the `i64` range.
+    #[test]
+    fn a_tick_offset_converts_exactly_as_a_plain_cast_would() {
+        for offset in [
+            0_i128,
+            1,
+            -1,
+            (1 << 53) + 1,
+            i128::from(i64::MAX),
+            i128::from(i64::MIN),
+            i128::from(i64::MAX) + 1,
+            i128::from(i64::MIN) - 1,
+            1_770_000_000_000_000_000_000_000,
+            -1_770_000_000_000_000_000_000_000,
+        ] {
+            assert_eq!(offset_as_f64(offset), offset as f64, "{offset}");
+        }
     }
 }
