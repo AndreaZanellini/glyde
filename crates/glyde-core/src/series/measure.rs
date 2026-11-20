@@ -191,6 +191,26 @@ mod tests {
         assert_eq!(delta.text, "0");
     }
 
+    // A column too large for memory is read from the spill cache in its own
+    // dtype too: beyond 2⁵³ it still differs exactly.
+    #[test]
+    fn a_spilled_integer_column_differs_exactly() {
+        use crate::index::spill::{SpillSet, SpillVecWriter};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let set = SpillSet::create(dir.path()).expect("spill set");
+        let mut writer = SpillVecWriter::<i64>::create(&set, "value").expect("writer");
+        writer
+            .extend_from_slice(&[9_223_372_036_854_775_806, 9_223_372_036_854_775_807])
+            .expect("write");
+        let values = SeriesValues::Spilled(SpilledValues::I64(writer.finish().expect("finish")));
+        let measured = measure_between(&values, 0, 1).expect("numeric");
+        assert_eq!(
+            measured.at_to,
+            Reading::Value("9223372036854775807".to_owned())
+        );
+        assert_eq!(measured.delta.expect("numbers").text, "+1");
+    }
+
     #[test]
     fn an_f32_difference_is_that_of_the_shown_numbers() {
         // 0.3_f32 − 0.1_f32 in f64 is 0.20000000298023224.

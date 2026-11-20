@@ -375,6 +375,12 @@ impl TimeViewState {
         self.cursors.set(None);
     }
 
+    /// Turns SPEC §2.3's compressed axis on or off, as its toggle does.
+    #[cfg(test)]
+    pub(crate) fn set_compressed(&mut self, on: bool) {
+        self.compressed = on;
+    }
+
     /// Whether the compressed axis is on (the cursor panel says that `Δt`
     /// stays real time on it).
     pub fn compressed(&self) -> bool {

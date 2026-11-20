@@ -56,7 +56,8 @@ Versioning: [Semantic Versioning](https://semver.org/).
     2⁵³ (`case-50` reads `+1`).
   - Slopes and 1/Δt show 6 significant digits; Δt is never rounded.
   - On a file whose time column is a plain index (no unit), the panel says
-    **Δx** instead of Δt and the slope has no "/s".
+    **Δx** instead of Δt and the slope has no "/s". Δx is never rounded
+    either: rows `0` and `1234567` read `1234567`.
   - A cursor is grabbed only on the numeric plots (within 6 px of its line),
     not on the state lanes, where a drag still pans.
   - Not in this change: the per-channel unit next to ΔY (issue #237, v0.2)

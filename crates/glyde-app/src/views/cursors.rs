@@ -86,7 +86,7 @@ impl MeasurementCursors {
     }
 
     /// Turns them on at `rows` (already snapped), or off.
-    pub(crate) fn set(&mut self, rows: Option<(usize, usize)>) {
+    pub fn set(&mut self, rows: Option<(usize, usize)>) {
         self.rows = rows;
         self.drag = None;
         if rows.is_none() {
@@ -227,7 +227,8 @@ fn delta_name(span: &AxisSpan) -> &'static str {
 fn span_text(span: &AxisSpan) -> String {
     match span {
         AxisSpan::Time(span) => span.to_string(),
-        AxisSpan::Progressive(difference) => format_significant(*difference),
+        // The index's own numbers, exactly (shortest round-trip text).
+        AxisSpan::Progressive(difference) => difference.to_string(),
     }
 }
 
@@ -321,6 +322,17 @@ pub(crate) fn readout(
     })
 }
 
+/// [`readout`] for the rows `cursors` are on: the per-frame reads the
+/// panel does, for the frame-time bench (issue #231).
+#[doc(hidden)]
+pub fn readout_for_bench(
+    dataset: &Dataset,
+    cursors: &MeasurementCursors,
+    shown: &[ShownColumn],
+) -> Option<impl std::fmt::Debug> {
+    cursors.rows.and_then(|rows| readout(dataset, rows, shown))
+}
+
 /// The cursor panel (docs/design: right of the time view, 316 px):
 /// A and B's timestamps, `Δt = B − A` and `1/Δt`, then one block per
 /// shown numeric channel.
@@ -386,9 +398,12 @@ pub(crate) fn show_readout(
         });
     ui.add_space(4.0);
     let footer = if compressed {
-        "Every value is the raw sample nearest the cursor, read from the file. A missing sample          stays missing; nothing is interpolated. Δt is the real time between the two samples,          also on the compressed axis."
+        "Every value is the raw sample nearest the cursor, read from the file. A missing sample \
+         stays missing; nothing is interpolated. Δt is the real time between the two samples, \
+         also on the compressed axis."
     } else {
-        "Every value is the raw sample nearest the cursor, read from the file. A missing sample          stays missing; nothing is interpolated."
+        "Every value is the raw sample nearest the cursor, read from the file. A missing sample \
+         stays missing; nothing is interpolated."
     };
     egui::TopBottomPanel::bottom("cursor_readout_footer")
         .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(0, 6)))
@@ -757,11 +772,158 @@ mod tests {
                 "{expected:?} in {shown:?}"
             );
         }
-        assert!(
-            shown
-                .iter()
-                .any(|text| text.contains("also on the compressed axis")),
-            "{shown:?}"
+        // The whole footer, word for word: no stray runs of spaces.
+        let footer = "Every value is the raw sample nearest the cursor, read from the file. \
+                      A missing sample stays missing; nothing is interpolated. Δt is the real \
+                      time between the two samples, also on the compressed axis.";
+        assert!(shown.iter().any(|text| text == footer), "{shown:?}");
+    }
+
+    // Δx on a plain index is never rounded: rows 0 and 1 234 567 are
+    // 1 234 567 apart.
+    #[test]
+    fn a_progressive_difference_is_written_exactly() {
+        use glyde_core::ingest::{ProgressiveValues, TimeAxis};
+        use glyde_core::series::{Series, SeriesValues};
+        let dataset = Dataset {
+            time: TimeAxis::Progressive {
+                values: ProgressiveValues::Memory(vec![0.0, 1_234_567.0, 1_234_567.25]),
+            },
+            time_column_name: "sample".to_owned(),
+            columns: vec![Series::new("v", SeriesValues::F64(vec![0.0, 1.0, 2.0]))],
+        };
+        assert_eq!(
+            readout(&dataset, (0, 1), &[]).expect("rows").span,
+            "1234567"
         );
+        assert_eq!(
+            readout(&dataset, (0, 2), &[]).expect("rows").span,
+            "1234567.25"
+        );
+    }
+
+    /// Two 50-sample clusters at 1 Hz, `0..=49 s` and `10_050..=10_099 s`:
+    /// the gap is 99 % of the span, so the compressed axis is offered.
+    fn two_clusters() -> Dataset {
+        use glyde_core::series::{Series, SeriesValues};
+        use glyde_core::time::{TimeUnit, Timestamp, TimestampFormat};
+        let seconds: Vec<i128> = (0..50).chain(10_050..10_100).collect();
+        Dataset {
+            time: glyde_core::ingest::TimeAxis::Absolute {
+                timestamps: seconds
+                    .iter()
+                    .map(|&s| Timestamp::new(s, TimeUnit::Seconds))
+                    .collect::<Vec<_>>()
+                    .into(),
+                format: TimestampFormat::EpochSeconds,
+            },
+            time_column_name: "timestamp".to_owned(),
+            columns: vec![Series::new(
+                "value",
+                SeriesValues::F64(seconds.iter().map(|&s| s as f64).collect()),
+            )],
+        }
+    }
+
+    /// Drags `handle`'s line from where it is drawn by `dx` points.
+    fn drag_by(
+        fixture: &Fixture,
+        ctx: &egui::Context,
+        state: &mut TimeViewState,
+        handle: Handle,
+        dx: f32,
+    ) {
+        let screen = state.cursors.screen().expect("drawn");
+        let x = match handle {
+            Handle::A => screen.a,
+            Handle::B => screen.b,
+        }
+        .expect("in view");
+        let y = screen.area.center().y;
+        let start = egui::pos2(x + 1.0, y);
+        fixture.frame(ctx, state, vec![egui::Event::PointerMoved(start)]);
+        fixture.frame(ctx, state, vec![click(start, true)]);
+        for step in 1..=4 {
+            let at = egui::pos2(start.x + dx * step as f32 / 4.0, y);
+            fixture.frame(ctx, state, vec![egui::Event::PointerMoved(at)]);
+        }
+        fixture.frame(ctx, state, vec![click(egui::pos2(start.x + dx, y), false)]);
+        fixture.frame(ctx, state, Vec::new());
+    }
+
+    // On a compressed axis the lines sit on their samples in both clusters,
+    // a drag snaps through the compressed coordinates, and Δt stays the
+    // real time across the collapsed gap.
+    #[test]
+    fn on_a_compressed_axis_cursors_snap_and_measure_real_time() {
+        let fixture = Fixture::new(two_clusters());
+        let ctx = egui::Context::default();
+        let mut state = TimeViewState::default();
+        state.set_compressed(true);
+        for _ in 0..3 {
+            fixture.frame(&ctx, &mut state, Vec::new());
+        }
+        // Row 10 is 10 s, row 60 is 10 060 s.
+        state.cursors.set(Some((10, 60)));
+        fixture.frame(&ctx, &mut state, Vec::new());
+        let screen = state.cursors.screen().expect("drawn");
+        let (a, b) = (screen.a.expect("A in view"), screen.b.expect("B in view"));
+        // Compressed, the clusters sit side by side: A and B are both well
+        // inside the view, B right of A.
+        assert!(
+            a < b && b - a < screen.area.width() * 0.9,
+            "A at {a}, B at {b}"
+        );
+        let view = state.shared_axis().expect("drawn").x_range;
+        let px_per_second = screen.area.width() / (view.1 - view.0) as f32;
+
+        // Five seconds left, inside the second cluster: row 55, 10 055 s.
+        drag_by(&fixture, &ctx, &mut state, Handle::B, -5.0 * px_per_second);
+        assert_eq!(state.cursors.rows(), Some((10, 55)));
+        let readout = readout(&fixture.dataset, (10, 55), &[(0, 0)]).expect("rows");
+        // 10 055 − 10 = 10 045 s, real time, the collapsed gap included.
+        assert_eq!(readout.span, "10045 s");
+        assert_eq!(readout.channels[0].delta, "+10045");
+        assert_eq!(readout.channels[0].slope, "+1 /s");
+    }
+
+    // A click on a cursor line next to a gap grabs the cursor; it does not
+    // fit the cluster under it (SPEC §2.3's cluster click). The same click
+    // a little away from the line does: the guard is what keeps the view.
+    #[test]
+    fn a_click_on_a_cursor_line_does_not_fit_the_cluster() {
+        let fixture = Fixture::new(two_clusters());
+        // A single click `offset` points right of cursor A, in a fresh
+        // window; the view before and after it, and the rows after.
+        let click_near_a = |offset: f32| {
+            let ctx = egui::Context::default();
+            let mut state = TimeViewState::default();
+            state.set_compressed(true);
+            for _ in 0..3 {
+                fixture.frame(&ctx, &mut state, Vec::new());
+            }
+            state.cursors.set(Some((20, 70)));
+            fixture.frame(&ctx, &mut state, Vec::new());
+            let before = state.shared_axis().expect("drawn").x_range;
+            let screen = state.cursors.screen().expect("drawn");
+            let at = egui::pos2(
+                screen.a.expect("A in view") + offset,
+                screen.area.center().y,
+            );
+            fixture.frame(&ctx, &mut state, vec![egui::Event::PointerMoved(at)]);
+            fixture.frame(&ctx, &mut state, vec![click(at, true)]);
+            fixture.frame(&ctx, &mut state, vec![click(at, false)]);
+            for _ in 0..3 {
+                fixture.frame(&ctx, &mut state, Vec::new());
+            }
+            let after = state.shared_axis().expect("drawn").x_range;
+            (before, after, state.cursors.rows())
+        };
+        let (before, after, rows) = click_near_a(1.0);
+        assert_eq!(after, before, "a click on the line keeps the view");
+        assert_eq!(rows, Some((20, 70)));
+        let (before, after, rows) = click_near_a(40.0);
+        assert_ne!(after, before, "a click off the line fits the cluster");
+        assert_eq!(rows, Some((20, 70)));
     }
 }
