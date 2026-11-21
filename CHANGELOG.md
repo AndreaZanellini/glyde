@@ -47,6 +47,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
     #272 and #273 ask you to decide two known limits, documented for now:
     a CSV truncated by another program *while* Glyde reads it still crashes
     on macOS and Linux, and cached values carry no checksum.
+  - **Known limits found by fuzzing, not fixed here** (they sit inside the
+    Parquet library; a candidate for the v0.1 release notes): a crafted
+    Parquet file of about 1 KB can make Glyde use all your memory (#274), or
+    make its open spin forever without being cancellable (#275). Ordinary
+    corrupted files are very unlikely to look like this.
   - **To check:** open `testdata/corpus/case-64-parquet-negative-column-chunk-offset.parquet`
     and `testdata/corpus/case-65-parquet-dictionary-page-missing.parquet`.
     Each shows an error message, and the app stays open.

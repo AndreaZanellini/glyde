@@ -71,6 +71,18 @@ the public open API end to end: `csv_open`, `parquet_open` and
   guard cannot catch it, and the count is in a page header, not the footer.
   The fix belongs upstream, or in a page-header pre-pass: #274, with the
   reproducer.
+- **Found, not fixed:** four crafted ~900-byte Parquet files make the open
+  spin for minutes inside the `parquet` crate's page-header reader. The UI
+  stays responsive, but that open never finishes and Cancel cannot interrupt
+  it: #275, with a reproducer.
+- **What ran, on 2026-11-21** (a 4-core sandbox, in parallel): `csv_open` 45
+  min, 274 450 inputs, clean. `cache_reopen` 45 min, 90 411 inputs, clean.
+  `parquet_open` ran in four rounds: 1 min and about 10 min until the
+  two crashes, each fixed before the next round; then 16 min until the
+  over-allocation (#274); then 30 min that skipped out-of-memory inputs
+  (3.5 million inputs), which found the hangs (#275) and no further crash. The
+  issue asked for several hours per target. Longer runs before the release
+  are worth doing (`fuzzing.md`), above all `parquet_open`.
 
 **Partitioned directories** (`ingest/parquet.rs`, `index/level0.rs`). Both
 walks are iterative, so a very deep tree cannot overflow the stack. Symlinked
