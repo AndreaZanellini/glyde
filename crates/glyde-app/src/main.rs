@@ -20,7 +20,16 @@
 
 use glyde_app::GlydeApp;
 
+// Issue #233: catching a panic in the Parquet decoders needs unwinding.
+#[cfg(panic = "abort")]
+compile_error!(
+    "glyde-app must be built with panic = \"unwind\": see glyde_core::panic_guard (issue #233)"
+);
+
 fn main() -> anyhow::Result<()> {
+    // Issue #233: any panic outside a guarded Parquet open still ends the
+    // process, as `panic = "abort"` did.
+    glyde_core::panic_guard::install_abort_outside_guards();
     // Keep the guard alive for the whole process: dropping it stops the
     // background thread that flushes log lines to disk.
     let _logging_guard = glyde_app::logging::init()?;

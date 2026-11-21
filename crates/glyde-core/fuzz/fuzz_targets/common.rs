@@ -28,7 +28,20 @@ pub fn budget(in_memory: bool) -> RamBudget {
     RamBudget::from_total_ram_bytes(if in_memory { u64::MAX } else { 0 })
 }
 
+/// Replaces libfuzzer's abort-on-every-panic hook with the app's own policy
+/// (`glyde_core::panic_guard`): a panic inside a guarded Parquet open is
+/// reported as an unreadable file, any other panic aborts. The fuzzer then
+/// finds exactly what would crash the app.
+fn use_the_apps_panic_policy() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        drop(std::panic::take_hook());
+        glyde_core::panic_guard::install_abort_outside_guards();
+    });
+}
+
 pub fn open_and_derive(path: &Path, budget: RamBudget, cache_dir: &Path) {
+    use_the_apps_panic_policy();
     let Ok((_summary, _report, dataset)) = ingest::open_dataset_progressive_in(
         path,
         IngestOverrides::default(),

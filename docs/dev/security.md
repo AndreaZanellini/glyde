@@ -12,8 +12,8 @@ hurt a user:
 - **Untrusted files.** CSV, TSV, TXT and Parquet files, and Parquet dataset
   directories, come from colleagues, instruments and the internet. Opening
   one must never crash, hang or exhaust the machine. A release build aborts
-  on any panic (`panic = "abort"` in `Cargo.toml`), so for a user every panic
-  is a crash.
+  on any panic outside a guarded Parquet open (see below), so for a user a
+  panic is a crash.
 - **Glyde's own caches.** They sit in the OS cache directory, which anything
   running as the user can write. A reopen treats them as untrusted input too.
 - **What Glyde leaves on disk.** The caches hold decoded copies of the user's
@@ -45,12 +45,26 @@ the public open API end to end: `csv_open`, `parquet_open` and
   time column) against the row and column counts, before trusting any of
   them. Locked by
   `a_cache_whose_metadata_disagrees_with_its_arrays_falls_back_to_parsing`.
-- **Catching panics instead.** We considered switching the release profile to
-  `panic = "unwind"` and wrapping each open in `catch_unwind`. Not done: a
-  panic inside `parquet`/`arrow` can leave their state inconsistent, unwinding
-  costs binary size against the 50 MB budget, and pre-validation turns each
-  known crash into an error message that says what is wrong with the file.
-  Each new crash found by fuzzing gets a check and a corpus case, the same way.
+- **Found and contained:** a data page that claims a dictionary its column
+  chunk does not have makes the `parquet` decoder `panic!` ("Decoder for dict
+  should have been set"). No footer check can see that without decoding every
+  page. So every Parquet open now runs inside `glyde_core::panic_guard::catch`:
+  a panic there becomes "could not read … as Parquet: the Parquet reader
+  failed on this file (…)", logged at `warn`, and the app stays open. Locked
+  by torture-corpus case 65.
+  - For this, the release profile changes from `panic = "abort"` to
+    `panic = "unwind"`. **Every other panic still ends the process.** At
+    startup `glyde-app` installs a hook that prints the usual report and
+    then aborts, unless a guarded open is in progress. `glyde-app` refuses
+    to compile under `panic = "abort"`, where nothing could be caught.
+  - The guard counts open sections process-wide, because decoding runs on
+    `rayon` workers and the hook fires on the thread that panicked. So an
+    unrelated panic on another thread *during* a Parquet open unwinds that
+    thread instead of aborting the process. A panic on the UI thread still
+    ends the process.
+  - Pre-validation stays where it is possible (the footer check above): it
+    gives a message that says what is wrong with the file, not only that the
+    decoder failed.
 
 **Partitioned directories** (`ingest/parquet.rs`, `index/level0.rs`). Both
 walks are iterative, so a very deep tree cannot overflow the stack. Symlinked

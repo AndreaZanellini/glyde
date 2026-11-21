@@ -14,11 +14,17 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ### Security
 - **The security review before v0.1 (issue #233).** The full write-up is in
   `docs/dev/security.md`. What changes for you:
-  - **A damaged Parquet file no longer crashes Glyde.** A file whose footer
-    points outside the file now shows "could not read … as Parquet: column
-    chunk N of row group M lies outside the file" instead of closing the app.
-    A fuzzer found this in its first minute; torture-corpus case 64 keeps it
-    fixed.
+  - **A damaged Parquet file no longer crashes Glyde.** A fuzzer found two
+    ways to crash it in its first minutes, and torture-corpus cases 64 and
+    65 now keep both fixed. A file whose footer points outside the file
+    shows "could not read … as Parquet: column chunk N of row group M lies
+    outside the file". Damage deeper inside the data, which only the Parquet
+    library itself notices, shows "could not read … as Parquet: the Parquet
+    reader failed on this file (…)". The app stays open either way.
+    **Assumption to veto:** to make the second message possible, the
+    released app now *unwinds* on an internal error instead of stopping
+    dead, and only a Parquet open is allowed to recover from one. Any other
+    internal error still closes the app, as before.
   - **A damaged reopen cache no longer crashes Glyde either.** If the cached
     copy of a file you opened before is damaged or edited, Glyde now notices,
     reads the original file again and rewrites the cache. Before, one bad
@@ -41,8 +47,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
     #272 and #273 ask you to decide two known limits, documented for now:
     a CSV truncated by another program *while* Glyde reads it still crashes
     on macOS and Linux, and cached values carry no checksum.
-  - **To check:** open `testdata/corpus/case-64-parquet-negative-column-chunk-offset.parquet`.
-    You get an error message, and the app stays open.
+  - **To check:** open `testdata/corpus/case-64-parquet-negative-column-chunk-offset.parquet`
+    and `testdata/corpus/case-65-parquet-dictionary-page-missing.parquet`.
+    Each shows an error message, and the app stays open.
 
 ### Design preview
 - **A mockup of the new look, to review before anything changes in the app

@@ -165,7 +165,23 @@ fn invalid(path: &Path, reason: impl ToString) -> GlydeError {
 }
 
 fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    open_checking_disk(path, request, crate::budget::available_disk_bytes)
+    // Issue #233: the `parquet`/`arrow` decoders panic on some corrupted
+    // pages that no footer check can see; such a file is an error, not a
+    // crash.
+    crate::panic_guard::catch(|| {
+        open_checking_disk(path, request, crate::budget::available_disk_bytes)
+    })
+    .unwrap_or_else(|message| {
+        warn!(
+            path = %path.display(),
+            panic = %message,
+            "the Parquet reader panicked on this file; reporting it as unreadable"
+        );
+        Err(invalid(
+            path,
+            format!("the Parquet reader failed on this file ({message})"),
+        ))
+    })
 }
 
 /// [`open`] with the free-disk-space query a spilled open checks injected,
