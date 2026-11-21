@@ -65,6 +65,12 @@ the public open API end to end: `csv_open`, `parquet_open` and
   - Pre-validation stays where it is possible (the footer check above): it
     gives a message that says what is wrong with the file, not only that the
     decoder failed.
+- **Found, not fixed:** a crafted 920-byte Parquet file whose dictionary page
+  header claims an enormous value count makes the `parquet` decoder allocate
+  more than 10 GB. An allocation failure aborts rather than panics, so the
+  guard cannot catch it, and the count is in a page header, not the footer.
+  The fix belongs upstream, or in a page-header pre-pass: #274, with the
+  reproducer.
 
 **Partitioned directories** (`ingest/parquet.rs`, `index/level0.rs`). Both
 walks are iterative, so a very deep tree cannot overflow the stack. Symlinked
