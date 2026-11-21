@@ -232,8 +232,8 @@ Versioning: [Semantic Versioning](https://semver.org/).
   time takes more than 100 ms. It timed one view: on a slow GitHub macOS
   machine that took 118 ms and blocked PR #266, which does not touch this
   code; a re-run passed. It now times three first views (each on freshly
-  built on-disk summaries, so each one is still a true first view), judges
-  the fastest and always prints the three times. The 100 ms limit is
+  built on-disk summaries, as right after opening a file), judges the
+  fastest and always prints the three times. The 100 ms limit is
   unchanged. Nothing changes in the app.
 - **Very finely timed data is drawn exactly where it was recorded (issue
   #206).** Plot positions used to be counted in seconds since 1970, and at

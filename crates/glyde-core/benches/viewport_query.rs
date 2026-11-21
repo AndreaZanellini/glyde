@@ -164,14 +164,16 @@ fn bench_first_full_view_spilled(c: &mut Criterion) {
     // #243 applied to their gates). One timed view on a shared CI runner is
     // exposed to scheduler and disk noise; a real regression slows every
     // run, so the fastest still catches it. Each run gets a fresh set of
-    // on-disk pyramids, so it reads pages no earlier view has touched and
-    // still measures a *first* view, not a warm one. All runs are printed,
-    // pass or fail.
+    // on-disk pyramids, mapped anew, so no earlier view has touched its
+    // mappings: a *first* view, as right after a load (the files were just
+    // written, so their pages are still in the OS page cache; the cold case
+    // below measures that). All runs are printed, pass or fail.
     let mut pyramids = Vec::new();
     let runs: Vec<Duration> = (0..FIRST_VIEW_GATE_RUNS)
         .map(|_| {
             // Drop the previous run's pyramids (and their spill set) before
-            // building the next, so at most one set is on disk at a time.
+            // building the next; the set's directory is deleted by a
+            // background job, so it may briefly coexist with the new one.
             drop(std::mem::take(&mut pyramids));
             pyramids = glyde_core::ingest::disk_pyramids_for_dataset(&dataset, &spill);
             assert!(
