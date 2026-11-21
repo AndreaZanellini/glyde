@@ -19,6 +19,10 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequiredOverridesAllowed=dialog
 LicenseFile=..\..\LICENSE
+; Issue #232: the installer's own icon, and the one Apps & features shows
+; (taken from glyde.exe, which embeds glyde.ico via crates/glyde-app/build.rs).
+SetupIconFile=glyde.ico
+UninstallDisplayIcon={app}\glyde.exe
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "glyde.exe"

@@ -51,8 +51,17 @@ fn main() -> anyhow::Result<()> {
     }
 
     // SPEC §6: single window, single file at a time.
+    let mut viewport = egui::ViewportBuilder::default().with_title("Glyde");
+    // Issue #232: the icon of the title bar, taskbar and app switcher. A
+    // missing icon is cosmetic: log it and open the window anyway.
+    match glyde_app::icon::window_icon() {
+        Ok(icon) => viewport = viewport.with_icon(std::sync::Arc::new(icon)),
+        Err(err) => {
+            tracing::warn!(error = %err, "window icon could not be decoded; opening without it")
+        }
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Glyde"),
+        viewport,
         ..Default::default()
     };
 

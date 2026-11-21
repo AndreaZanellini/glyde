@@ -17,6 +17,8 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$binary" "$app/Contents/MacOS/glyde"
 chmod +x "$app/Contents/MacOS/glyde"
 sed "s/__VERSION__/$version/g" "$here/Info.plist" > "$app/Contents/Info.plist"
+# Issue #232: the Dock and Finder icon, named by CFBundleIconFile.
+cp "$here/Glyde.icns" "$app/Contents/Resources/Glyde.icns"
 # Drag-to-install: the usual Applications shortcut next to the app.
 ln -s /Applications "$stage/Applications"
 

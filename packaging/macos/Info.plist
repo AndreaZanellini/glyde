@@ -8,6 +8,8 @@
     <string>Glyde</string>
     <key>CFBundleIdentifier</key>
     <string>io.github.andreazanellini.glyde</string>
+    <key>CFBundleIconFile</key>
+    <string>Glyde</string>
     <key>CFBundleExecutable</key>
     <string>glyde</string>
     <key>CFBundlePackageType</key>

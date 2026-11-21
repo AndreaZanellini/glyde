@@ -29,6 +29,12 @@ tracing-appender.workspace = true
 anyhow.workspace = true
 directories.workspace = true
 
+# Issue #232: embeds packaging/windows/glyde.ico in glyde.exe (does nothing
+# on macOS and Linux). The standard crate for Windows resources; writing the
+# .res format by hand would be an untested binary format of our own.
+[build-dependencies]
+embed-resource.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true

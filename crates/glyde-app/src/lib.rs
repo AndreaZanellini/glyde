@@ -25,6 +25,7 @@
 
 pub mod app;
 pub mod error_boundary;
+pub mod icon;
 pub mod inference_bar;
 pub mod logging;
 pub mod plumbing;
