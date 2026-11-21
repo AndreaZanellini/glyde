@@ -32,8 +32,6 @@
 
 use std::path::Path;
 
-use tracing::info;
-
 /// Creates `dir` (and its parents) if missing, then makes it accessible to
 /// its owner only. Logged at `info` when an existing directory was tightened.
 pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -44,6 +42,7 @@ pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn restrict(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    use tracing::info;
     const OWNER_ONLY: u32 = 0o700;
     let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
     if mode != OWNER_ONLY {
