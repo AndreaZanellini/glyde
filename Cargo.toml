@@ -94,7 +94,12 @@ clap = { version = "4.5", features = ["derive"] }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# Issue #233: unwind, so that a panic inside the Parquet decoders on a
+# corrupted file can be caught and reported as an error
+# (`glyde_core::panic_guard`). Every other panic still aborts the process:
+# glyde-app installs a hook that aborts outside guarded sections, and refuses
+# to compile with `panic = "abort"`, under which nothing could be caught.
+panic = "unwind"
 strip = true
 
 # Benchmarks must measure release-grade code (docs/QUALITY.md §3), so this

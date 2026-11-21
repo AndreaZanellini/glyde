@@ -165,7 +165,25 @@ fn invalid(path: &Path, reason: impl ToString) -> GlydeError {
 }
 
 fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, InferenceReport, Dataset)> {
-    open_checking_disk(path, request, crate::budget::available_disk_bytes)
+    // Issue #233: the `parquet`/`arrow` decoders panic on some corrupted
+    // pages that no footer check can see; such a file is an error, not a
+    // crash.
+    crate::panic_guard::catch(|| {
+        open_checking_disk(path, request, crate::budget::available_disk_bytes)
+    })
+    .unwrap_or_else(|message| {
+        warn!(
+            path = %path.display(),
+            panic = %message,
+            "the Parquet reader panicked on this file; reporting it as unreadable"
+        );
+        // The panic text is the library's own wording: logged above, kept
+        // out of the message the user sees (and the corpus locks).
+        Err(invalid(
+            path,
+            "its data is damaged (the Parquet reader failed on it; details are in the log)",
+        ))
+    })
 }
 
 /// [`open`] with the free-disk-space query a spilled open checks injected,
@@ -470,6 +488,44 @@ fn has_parquet_extension(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
 }
 
+/// Rejects a footer whose column chunks do not lie inside the file (issue
+/// #233). The `parquet` crate trusts these offsets and `assert!`s on a
+/// negative one while reading, which a release build (`panic = "abort"`)
+/// turns into a crash; checked here, a corrupted footer is a reported error
+/// naming the file instead.
+fn check_column_chunks(path: &Path, metadata: &ParquetMetaData, file_len: u64) -> Result<()> {
+    for (group_index, group) in metadata.row_groups().iter().enumerate() {
+        for (chunk_index, chunk) in group.columns().iter().enumerate() {
+            let start = chunk
+                .dictionary_page_offset()
+                .unwrap_or_else(|| chunk.data_page_offset());
+            let fits = u64::try_from(start)
+                .ok()
+                .zip(u64::try_from(chunk.compressed_size()).ok())
+                .and_then(|(start, len)| start.checked_add(len))
+                .is_some_and(|end| end <= file_len);
+            if !fits {
+                warn!(
+                    path = %path.display(),
+                    row_group = group_index,
+                    column_chunk = chunk_index,
+                    start,
+                    compressed_size = chunk.compressed_size(),
+                    file_len,
+                    "Parquet footer points outside the file; refusing it"
+                );
+                return Err(invalid(
+                    path,
+                    format!(
+                        "column chunk {chunk_index} of row group {group_index} lies outside the file"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// What a walk of a dataset directory found.
 #[derive(Default)]
 struct DirectoryListing {
@@ -553,6 +609,14 @@ fn source_files(path: &Path) -> Result<Vec<SourceFile>> {
             })?;
             let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
                 .map_err(|e| invalid(&file_path, e))?;
+            let file_len = file
+                .metadata()
+                .map_err(|source| GlydeError::Io {
+                    path: file_path.clone(),
+                    source,
+                })?
+                .len();
+            check_column_chunks(&file_path, metadata.metadata(), file_len)?;
             Ok(SourceFile {
                 path: file_path,
                 partition,
@@ -2104,6 +2168,35 @@ mod tests {
             }
             other => panic!("expected an absolute axis, got {other:?}"),
         }
+    }
+
+    // Issue #233: case 64 covers a negative start; this covers a chunk that
+    // starts inside the file but ends past its last byte.
+    #[test]
+    fn a_column_chunk_that_ends_past_the_file_is_refused() {
+        let path = corpus_path("case-53-clean-parquet-timestamp.parquet");
+        let file = File::open(&path).expect("open corpus 53");
+        let metadata =
+            ArrowReaderMetadata::load(&file, ArrowReaderOptions::default()).expect("footer");
+        let metadata = metadata.metadata();
+        let data_end = metadata
+            .row_groups()
+            .iter()
+            .flat_map(|group| group.columns())
+            .map(|chunk| {
+                let (start, len) = chunk.byte_range();
+                start + len
+            })
+            .max()
+            .expect("at least one column chunk");
+
+        check_column_chunks(&path, metadata, data_end).expect("every chunk fits exactly");
+        let error = check_column_chunks(&path, metadata, data_end - 1)
+            .expect_err("the last chunk now ends one byte past the file");
+        assert!(
+            error.to_string().contains("lies outside the file"),
+            "{error}"
+        );
     }
 
     #[test]

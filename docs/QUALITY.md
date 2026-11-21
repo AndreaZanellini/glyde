@@ -85,6 +85,8 @@ Build it *before* the features it protects. Minimum set for v1:
 61. Parquet whose time column is a plain `INT64` of epoch milliseconds (no `TIMESTAMP` type) — must become an absolute `epoch_ms` time axis, the same decision as the same numbers in a CSV (SPEC §2.1, issue #166)
 62. Blank (empty or whitespace-only) cells in numeric columns — a float column with blanks stays `f64` with one NaN gap per blank, an integer column with a blank is promoted to `f64`, an integer column with a blank and values beyond ±2⁵³ stays exact text, and a column blank on every row stays text (SPEC §1.3, §1.4, issue #189)
 63. Whole-second timestamps on a 10 Hz log (most Δt zero) with one real hole — the gap rule uses the median of the non-zero Δt, so exactly one gap is reported and the inference bar says why (SPEC §2.3, issue #188)
+64. Parquet whose footer puts a column chunk at a negative offset (found by fuzzing) — must be refused with "column chunk 0 of row group 0 lies outside the file", never crash (issue #233)
+65. Parquet whose data page claims a dictionary its column chunk does not have (found by fuzzing) — the decoder's panic must become "its data is damaged …", never crash (issue #233)
 
 **Growth rule:** every `file-wont-open` issue must add its (anonymized) file to the corpus *with the fix in the same PR*. This is the product's growth engine.
 
