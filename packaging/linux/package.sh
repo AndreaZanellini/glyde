@@ -28,7 +28,16 @@ mkdir -p "$appdir/usr/bin"
 cp "$binary" "$appdir/usr/bin/glyde"
 chmod +x "$appdir/usr/bin/glyde"
 cp "$here/glyde.desktop" "$appdir/glyde.desktop"
-cp "$here/glyde.png" "$appdir/glyde.png"
+# Issue #232: the icon at the AppDir root (named after the desktop entry's
+# Icon=) and as .DirIcon, per the AppImage spec; every size in the hicolor
+# theme for desktop integration tools.
+icons="$root/packaging/icon/png"
+cp "$icons/glyde-256.png" "$appdir/glyde.png"
+cp "$icons/glyde-256.png" "$appdir/.DirIcon"
+for size in 16 24 32 48 64 128 256 512; do
+    mkdir -p "$appdir/usr/share/icons/hicolor/${size}x${size}/apps"
+    cp "$icons/glyde-$size.png" "$appdir/usr/share/icons/hicolor/${size}x${size}/apps/glyde.png"
+done
 cat > "$appdir/AppRun" <<'APPRUN'
 #!/bin/sh
 here=$(dirname "$(readlink -f "$0")")

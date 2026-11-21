@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Glyde app icon: the single vector source (issue #232).
+  Every PNG, .ico and .icns in the repository is generated from this file by
+  packaging/icon/build_icons.mjs; edit this file, then rerun that script.
+
+  Drawn on Apple's 1024 px icon grid: the tile is 824 px, inset 100 px.
+  The script crops the inset for Windows and Linux, whose icons fill more of
+  the canvas.
+
+  The wave is the toolbar mark of the approved mockup
+  (docs/design/mockup.src.html, `.brand`), drawn on its 24 px grid and scaled
+  to the tile; chosen by the maintainer on PR #269 over seven alternatives.
+  Colors are the dark-theme tokens of docs/design/README.md: window/surface
+  graphite for the tile, line for its edge, series 1 blue to accent petrol
+  for the wave.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#222830"/>
+      <stop offset="1" stop-color="#14171b"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="4" y1="0" x2="20" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3987e5"/>
+      <stop offset="1" stop-color="#4cb5c3"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Tile -->
+  <rect x="100" y="100" width="824" height="824" rx="186" ry="186" fill="url(#tile)"/>
+  <rect x="102" y="102" width="820" height="820" rx="184" ry="184" fill="none" stroke="#2a3038" stroke-width="4"/>
+
+  <!-- The mockup's mark: its 22 px tile (x, y 1..23) mapped onto this 824 px one -->
+  <g transform="translate(100 100) scale(37.454545) translate(-1 -1)">
+    <path d="M4.5 15.5c2.2 0 2.8-7 5-7s2.6 7 5 7 2.8-4 5-4"
+          fill="none" stroke="url(#wave)" stroke-width="2.2" stroke-linecap="round"/>
+  </g>
+</svg>

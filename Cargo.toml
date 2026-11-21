@@ -78,6 +78,9 @@ rfd = "0.15"
 # correctly. Decimation (min/max pyramid) stays entirely ours (SPEC §3.1);
 # egui_plot is used only as a renderer for whatever points we hand it.
 egui_plot = "0.31"
+# Issue #232: embeds the Windows icon in glyde.exe at build time (build
+# dependency of glyde-app only; nothing of it ships in the binary).
+embed-resource = "3"
 
 # --- Dev / test ------------------------------------------------------------
 criterion = { version = "0.5", features = ["html_reports"] }

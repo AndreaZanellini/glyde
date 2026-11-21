@@ -59,12 +59,17 @@ glyde/
 │   │   │   ├── views/         # time.rs, psd.rs, state_timeline.rs
 │   │   │   ├── inference_bar.rs
 │   │   │   ├── theme.rs       # palette, fonts, light/dark (docs/design/README.md tokens)
+│   │   │   ├── icon.rs        # window icon (packaging/icon/png/glyde-256.png, embedded)
 │   │   │   └── plumbing/      # background jobs, channels
+│   │   ├── build.rs           # embeds packaging/windows/glyde.ico in glyde.exe
 │   │   └── assets/fonts/      # Inter, JetBrains Mono (OFL 1.1), embedded
 │   └── glyde-devtools/        # CI tooling only, never shipped (publish = false)
 │       └── src/bin/
 │           ├── generate_fixtures.rs   # multi-GB synthetic files for benches
 │           └── memory_gate.rs         # headless peak-RSS gate
+├── packaging/                 # per-OS release packaging (run by release.yml)
+│   └── icon/                  # glyde.svg: the icon source; build_icons.mjs regenerates
+│                              # png/, ../windows/glyde.ico, ../macos/Glyde.icns from it
 ├── testdata/
 │   └── corpus/                # torture corpus (small files, committed)
 ├── docs/
