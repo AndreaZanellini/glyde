@@ -479,6 +479,31 @@ impl GlydeApp {
             }
         }
 
+        // SPEC §4.1, issue #231: the measurement-cursor panel, right of the
+        // time view (above the spectrum panel), while the cursors are on.
+        let cursor_dataset = match &self.status {
+            Status::Loaded { dataset, .. } => Some(&**dataset),
+            Status::Loading {
+                partial: Some(partial),
+                ..
+            } => Some(&*partial.dataset),
+            _ => None,
+        };
+        if let Some(dataset) = cursor_dataset.filter(|_| self.time_view.cursors.enabled()) {
+            egui::SidePanel::right("cursor_readout")
+                .resizable(false)
+                .exact_width(views::cursors::READOUT_WIDTH)
+                .show(ctx, |ui| {
+                    views::cursors::show_readout(
+                        ui,
+                        dataset,
+                        &self.time_view.cursors,
+                        &self.time_view.shown_columns(dataset),
+                        self.time_view.compressed(),
+                    );
+                });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| match &self.status {
             Status::Idle => {
                 ui.centered_and_justified(|ui| {
@@ -555,6 +580,7 @@ impl GlydeApp {
                             self.time_view.shared_axis(),
                             &mut self.state_timeline,
                         );
+                        views::time::paint_cursors(ui, &partial.dataset, &self.time_view);
                         views::time::show_time_axis(
                             ui,
                             &partial.dataset.time,
@@ -628,6 +654,8 @@ impl GlydeApp {
                     self.time_view.shared_axis(),
                     &mut self.state_timeline,
                 );
+                // Issue #231: the cursor lines cross every track above.
+                views::time::paint_cursors(ui, dataset, &self.time_view);
                 // Issue #230: the one time axis, under the last track.
                 views::time::show_time_axis(
                     ui,

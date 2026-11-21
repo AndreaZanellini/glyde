@@ -42,6 +42,7 @@ mod broken_axis;
 mod cluster;
 mod format;
 mod gap;
+mod measure;
 mod monotonic;
 mod navigation;
 mod ticks;
@@ -60,6 +61,7 @@ pub use gap::{
     summarize_ticks, summarize_ticks_with_median, visit_gaps, Gap, RangeScan, SamplingClass,
     TimeAxisStats, GAP_MULTIPLE_OF_MEDIAN,
 };
+pub use measure::{format_frequency, format_significant, AxisSpan, TimeSpan};
 pub use monotonic::{detect_monotonicity, detect_monotonicity_from, MonotonicityReport};
 pub use navigation::{XLimits, MIN_STEPS_PER_VIEW, VIEW_MARGIN_FRACTION};
 pub use ticks::{TickSource, TICK_CHUNK_LEN};

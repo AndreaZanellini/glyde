@@ -19,6 +19,8 @@
 mod connected_buckets;
 #[path = "golden/decimation.rs"]
 mod decimation;
+#[path = "golden/measure.rs"]
+mod measure;
 #[path = "golden/time.rs"]
 mod time;
 #[path = "golden/welch.rs"]

@@ -65,7 +65,7 @@ Design first. Nothing is implemented before the maintainer approves the mockup.
 - [x] Time shown as dates and times, not raw numbers (epoch axes, readout, hover) → #196
 - [x] Time navigation: zoom acts on x, y follows the visible data, bounded zoom-out → #197
 - [x] Plot x coordinate relative to the file start, so sub-µs data is exact → #206
-- [ ] Measurement cursors A/B: Δt, 1/Δt, values, ΔY and slope from raw samples → #231
+- [x] Measurement cursors A/B: Δt, 1/Δt, values, ΔY and slope from raw samples → #231
 - [ ] App icon on the three OSes and the window → #232
 
 > **MAINTAINER TEST — Step 2**

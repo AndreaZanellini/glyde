@@ -329,6 +329,9 @@ fn render_frame_with(
                 state,
                 view,
             );
+            // Issue #231: the measurement cursors, painted as the app does
+            // (nothing while they are off).
+            views::time::paint_cursors(ui, &fixture.dataset, state);
         });
     });
     // What `eframe` does with every frame's shapes before painting them:
@@ -752,10 +755,64 @@ fn bench_hover_unordered(c: &mut Criterion, fixture: &Fixture) {
     );
 }
 
+/// Panning with the measurement cursors on (issue #231), hovered: every
+/// frame snaps nothing (no drag) but hit-tests the pointer, places both
+/// lines and paints them, and the readout reads two raw samples per shown
+/// channel ([`views::cursors::readout`]'s work, done here as the app's
+/// panel does it each frame). Same SPEC §5 ceiling.
+fn bench_cursors_on(c: &mut Criterion, fixture: &Fixture, layout: NumericLayout, shown: &str) {
+    let mut state = state_with(layout);
+    let rows = fixture.ticks.len();
+    state.cursors.set(Some((rows / 3, 2 * rows / 3)));
+    let mut label = format!("{}, {shown}cursors on", fixture.label);
+    if layout == NumericLayout::Stacked {
+        label.push_str(", stacked");
+    }
+    let ctx = egui::Context::default();
+    let span_ticks = fixture.ticks.last().expect("non-empty") - fixture.ticks[0];
+    let frame = |ctx: &egui::Context, state: &mut TimeViewState, view| {
+        let visible = render_frame(ctx, fixture, state, true, view);
+        let shown = state.shown_columns(&fixture.dataset);
+        std::hint::black_box(views::cursors::readout_for_bench(
+            &fixture.dataset,
+            &state.cursors,
+            &shown,
+        ));
+        visible
+    };
+    frame(&ctx, &mut state, pan_view(fixture, 37));
+    state.data_changed();
+    let start = Instant::now();
+    let (first, last) = frame(&ctx, &mut state, pan_view(fixture, 37));
+    let elapsed = start.elapsed();
+    assert!(
+        last - first >= span_ticks / 20,
+        "{label}: showed {first}..{last}"
+    );
+    assert!(
+        elapsed <= FRAME_TIME_CEILING,
+        "time-domain view render ({label}, pan) took {elapsed:?}, exceeding the \
+         {FRAME_TIME_CEILING:?} build-blocking ceiling (SPEC §5: pan/zoom p99 ≤100ms)"
+    );
+    let mut step = 0;
+    c.bench_function(&format!("time_view_render/{label}/pan/hovered"), |b| {
+        b.iter(|| {
+            step += 1;
+            frame(
+                std::hint::black_box(&ctx),
+                &mut state,
+                pan_view(fixture, step),
+            )
+        })
+    });
+}
+
 fn bench_time_view_render(c: &mut Criterion) {
     let all = ChannelVisibility::default;
     let overlaid = NumericLayout::Overlaid;
-    bench_one_fixture(c, &f64_fixture(SAMPLE_COUNT), all(), "", overlaid);
+    let f64_fixture = f64_fixture(SAMPLE_COUNT);
+    bench_one_fixture(c, &f64_fixture, all(), "", overlaid);
+    bench_cursors_on(c, &f64_fixture, overlaid, "");
     bench_one_fixture(c, &i64_fixture(SAMPLE_COUNT), all(), "", overlaid);
     bench_one_fixture(
         c,
@@ -773,6 +830,7 @@ fn bench_time_view_render(c: &mut Criterion) {
     let all_shown = format!("all {MULTI_CHANNELS} shown");
     bench_one_fixture(c, &many, all(), &all_shown, overlaid);
     bench_one_fixture(c, &many, all(), &all_shown, NumericLayout::Stacked);
+    bench_cursors_on(c, &many, NumericLayout::Stacked, &format!("{all_shown}, "));
     let mut one_shown = ChannelVisibility::default();
     one_shown.sync((0..MULTI_CHANNELS).map(|channel| many.dataset.columns[channel].name()));
     one_shown.solo(0);

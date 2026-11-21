@@ -1,0 +1,21 @@
+---
+source: crates/glyde-app/src/views/cursors.rs
+expression: readout
+---
+Readout {
+    at_a: "2026-02-02 02:40:00.100 UTC (1770000000100000000)",
+    at_b: "2026-02-02 02:40:00.400 UTC (1770000000400000000)",
+    span_name: "Δt",
+    span: "300 ms",
+    reciprocal: "3.33333 Hz",
+    channels: [
+        ChannelReadout {
+            color_index: 0,
+            name: "value",
+            at_a: "10.1",
+            at_b: "10.4",
+            delta: "+0.3",
+            slope: "+1 /s",
+        },
+    ],
+}

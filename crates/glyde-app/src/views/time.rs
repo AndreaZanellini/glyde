@@ -190,6 +190,8 @@ pub struct TimeViewState {
     /// the last frame's view brought back within [`XLimits`] after a zoom or
     /// pan went past them (issue #197).
     x_clamp: Option<(f64, f64)>,
+    /// SPEC §4.1's measurement cursors A and B (issue #231). View state only.
+    pub cursors: super::cursors::MeasurementCursors,
     /// How aggregated bars are handed to egui; the tests switch it to the
     /// reference encoding to compare the two.
     #[cfg(test)]
@@ -369,6 +371,34 @@ impl TimeViewState {
         self.compressed = false;
         self.pinned_y.clear();
         self.x_clamp = None;
+        // A new reading may have other rows: the cursors are placed afresh.
+        self.cursors.set(None);
+    }
+
+    /// Turns SPEC §2.3's compressed axis on or off, as its toggle does.
+    #[cfg(test)]
+    pub(crate) fn set_compressed(&mut self, on: bool) {
+        self.compressed = on;
+    }
+
+    /// Whether the compressed axis is on (the cursor panel says that `Δt`
+    /// stays real time on it).
+    pub fn compressed(&self) -> bool {
+        self.compressed
+    }
+
+    /// The shown numeric channels of `dataset`, as `(color index, column
+    /// index)`, in channel order: what the cursor panel reads.
+    pub fn shown_columns(&self, dataset: &Dataset) -> Vec<ShownColumn> {
+        dataset
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, series)| series.view_kind() == ViewKind::TimeDomain)
+            .enumerate()
+            .filter(|&(channel, _)| self.channels.is_visible(channel))
+            .map(|(channel, (column, _))| (channel, column))
+            .collect()
     }
 
     /// Whether the next frame resets the view to the fit.
@@ -481,11 +511,19 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         cluster_fit,
         pinned_y,
         x_clamp,
+        cursors: measurement,
         ..
     } = state;
-    let (fit_clicked, layout_changed) = ui
+    measurement.retain_within(dataset.time.len());
+    let (fit_clicked, layout_changed, cursors_toggled) = ui
         .horizontal(|ui| {
             let fit_clicked = ui.button("Fit to data").clicked();
+            ui.separator();
+            // SPEC §4.1, issue #231: two measurement cursors, A and B.
+            let cursors_toggled = ui
+                .selectable_label(measurement.enabled(), "Cursors")
+                .on_hover_text("Two measurement cursors, A and B: Δt, 1/Δt, ΔY and slope")
+                .clicked();
             ui.separator();
             // SPEC §4.1, issue #198: the same control the spectrum panel has.
             let before = *layout;
@@ -493,7 +531,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 .on_hover_text("One plot per channel, one shared time axis");
             ui.selectable_value(layout, NumericLayout::Overlaid, "Overlaid")
                 .on_hover_text("Every channel on one plot, with one y axis");
-            (fit_clicked, *layout != before)
+            (fit_clicked, *layout != before, cursors_toggled)
         })
         .inner;
     if layout_changed {
@@ -535,6 +573,34 @@ pub fn show_with_selection<P: Pyramid + Sync>(
     // (a compressed axis keeps the time scale inside a cluster, so the
     // typical step is the same in both).
     let limits = fit.and_then(|fit| XLimits::new(fit, fit_bounds.typical_step));
+
+    // Issue #231: turned on, A and B land on the samples nearest a third
+    // and two thirds of the span on screen (the approved mockup).
+    if cursors_toggled {
+        let rows = if measurement.enabled() {
+            None
+        } else {
+            shared_axis
+                .map(|shared| shared.x_range)
+                .or(fit)
+                .and_then(|(lo, hi)| {
+                    let at =
+                        |share: f64| cursor.nearest(&dataset.time, from_x(lo + (hi - lo) * share));
+                    Some((at(1.0 / 3.0)?, at(2.0 / 3.0)?))
+                })
+        };
+        measurement.set(rows);
+        tracing::info!(
+            on = rows.is_some(),
+            rows = ?rows,
+            "measurement cursors toggled, each snapped to the nearest sample (SPEC §4.1)"
+        );
+    }
+    // A press near a cursor line drags the cursor, not the view.
+    let grabbed = measurement.grab_at(ui.ctx().input(|input| input.pointer.hover_pos()));
+    if grabbed.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
 
     // Every numeric column is a channel; its index here picks its color, so
     // a channel keeps its color whatever else is hidden. Only the shown ones
@@ -666,7 +732,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             // box-zoom (secondary-button drag) sets both, and pins y.
             .allow_zoom([true, false])
             .allow_scroll([true, false])
-            .allow_drag([true, false])
+            .allow_drag([grabbed.is_none(), false])
             .allow_boxed_zoom(true)
             .link_axis(TIME_AXIS_LINK_GROUP, [true, false])
             // Issue #196: the vertical grid lines sit under the time axis's
@@ -934,7 +1000,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         // SPEC §2.3: a click on a cluster next to a gap fits it to the
         // viewport. A double click is egui_plot's own reset to the full fit,
         // so it wins.
-        if response.response.clicked() && !response.response.double_clicked() {
+        if response.response.clicked() && !response.response.double_clicked() && grabbed.is_none() {
             if let Some(pointer) = response.response.interact_pointer_pos() {
                 let x = response.transform.value_from_position(pointer).x;
                 if let Some(span) = cluster_span_at(fit_bounds, &dataset.time, from_x(x)) {
@@ -1003,6 +1069,36 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         .copied()
         .reduce(|a, b| a.union(b))
         .unwrap_or(egui::Rect::NOTHING);
+
+    // Issue #231: a dragged cursor follows the pointer, snapped to the
+    // nearest sample; then both are placed on this frame's view.
+    if let (Some(bounds), Some(frame)) = (last_bounds, frames.last()) {
+        let (x0, x1) = (bounds.min()[0], bounds.max()[0]);
+        let (left, width) = (frame.left(), frame.width());
+        if measurement.enabled() && width > 0.0 && x1 > x0 {
+            measurement.drag(ui.ctx(), grabbed, |screen_x| {
+                let x = x0 + f64::from((screen_x - left).clamp(0.0, width) / width) * (x1 - x0);
+                cursor.nearest(&dataset.time, from_x(x))
+            });
+            let x_of = plot_x(&dataset.time);
+            let on_screen = |row: usize| {
+                let x = to_x(x_of(row));
+                (x.is_finite() && x >= x0 && x <= x1)
+                    .then(|| left + ((x - x0) / (x1 - x0)) as f32 * width)
+            };
+            measurement.set_screen(
+                measurement
+                    .rows()
+                    .map(|(a, b)| super::cursors::CursorScreen {
+                        a: on_screen(a),
+                        b: on_screen(b),
+                        area,
+                    }),
+            );
+        } else {
+            measurement.set_screen(None);
+        }
+    }
     *shared_axis = match (fit, last_bounds, frames.last()) {
         (Some(fit), Some(bounds), Some(frame)) => Some(SharedAxis {
             fit,
@@ -1058,6 +1154,18 @@ pub fn show_with_selection<P: Pyramid + Sync>(
         },
     );
     decimated_view.map_or((0, 0), |(range, _)| range)
+}
+
+/// A shown numeric channel for the cursor panel: its index among the
+/// channels (its color) and its column index in the dataset.
+pub type ShownColumn = (usize, usize);
+
+/// Paints the measurement cursors (issue #231) from the top of the numeric
+/// tracks down to where the next widget goes — call it right before
+/// [`show_time_axis`], after the state lanes, so the lines cross every
+/// track.
+pub fn paint_cursors(ui: &egui::Ui, dataset: &Dataset, state: &TimeViewState) {
+    super::cursors::paint(ui, &state.cursors, dataset, ui.cursor().top());
 }
 
 /// A shown numeric channel: its index among the channels (its color), its
@@ -3380,7 +3488,7 @@ fn format_series_value(values: &SeriesValues, index: usize) -> Option<String> {
 /// date and time with its exact raw value beside it (issue #196); a
 /// progressive index has no calendar meaning, so its raw numeric
 /// value is shown instead.
-fn format_cursor_time(time: &TimeAxis, index: usize) -> String {
+pub(crate) fn format_cursor_time(time: &TimeAxis, index: usize) -> String {
     match time {
         TimeAxis::Absolute { timestamps, format } => timestamps
             .get(index)

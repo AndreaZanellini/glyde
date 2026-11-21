@@ -18,6 +18,7 @@
 //! [`channels`], the time view's channel picker.
 
 pub mod channels;
+pub mod cursors;
 pub mod psd;
 pub mod state_timeline;
 pub mod time;
