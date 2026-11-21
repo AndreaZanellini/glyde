@@ -177,9 +177,11 @@ fn open(path: &Path, request: OpenRequest<'_>) -> Result<(OpenSummary, Inference
             panic = %message,
             "the Parquet reader panicked on this file; reporting it as unreadable"
         );
+        // The panic text is the library's own wording: logged above, kept
+        // out of the message the user sees (and the corpus locks).
         Err(invalid(
             path,
-            format!("the Parquet reader failed on this file ({message})"),
+            "its data is damaged (the Parquet reader failed on it; details are in the log)",
         ))
     })
 }
@@ -2166,6 +2168,35 @@ mod tests {
             }
             other => panic!("expected an absolute axis, got {other:?}"),
         }
+    }
+
+    // Issue #233: case 64 covers a negative start; this covers a chunk that
+    // starts inside the file but ends past its last byte.
+    #[test]
+    fn a_column_chunk_that_ends_past_the_file_is_refused() {
+        let path = corpus_path("case-53-clean-parquet-timestamp.parquet");
+        let file = File::open(&path).expect("open corpus 53");
+        let metadata =
+            ArrowReaderMetadata::load(&file, ArrowReaderOptions::default()).expect("footer");
+        let metadata = metadata.metadata();
+        let data_end = metadata
+            .row_groups()
+            .iter()
+            .flat_map(|group| group.columns())
+            .map(|chunk| {
+                let (start, len) = chunk.byte_range();
+                start + len
+            })
+            .max()
+            .expect("at least one column chunk");
+
+        check_column_chunks(&path, metadata, data_end).expect("every chunk fits exactly");
+        let error = check_column_chunks(&path, metadata, data_end - 1)
+            .expect_err("the last chunk now ends one byte past the file");
+        assert!(
+            error.to_string().contains("lies outside the file"),
+            "{error}"
+        );
     }
 
     #[test]

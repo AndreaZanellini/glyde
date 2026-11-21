@@ -258,7 +258,7 @@ fn a_cache_whose_metadata_disagrees_with_its_arrays_falls_back_to_parsing() {
     assert!(meta["time_format"].is_string(), "an absolute time axis");
 
     type Tamper = fn(&mut serde_json::Value, u64);
-    let tampers: [(&str, Tamper); 9] = [
+    let tampers: [(&str, Tamper); 10] = [
         ("an enormous row count", |m, _| {
             m["rows"] = (1u64 << 60).into()
         }),
@@ -276,6 +276,10 @@ fn a_cache_whose_metadata_disagrees_with_its_arrays_falls_back_to_parsing() {
         }),
         ("a skipped row past the last row", |m, rows| {
             m["columns"][0]["skipped_rows"] = serde_json::json!([rows + 10])
+        }),
+        ("more skipped rows than the outcome skipped", |m, _| {
+            let skipped = m["outcome"]["skipped_row_count"].as_u64().expect("count");
+            m["columns"][0]["skipped_rows"] = (0..=skipped).collect::<Vec<u64>>().into()
         }),
         ("a time column that does not exist", |m, _| {
             m["inference"]["time_column"] = 99.into()

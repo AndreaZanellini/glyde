@@ -19,12 +19,17 @@ Versioning: [Semantic Versioning](https://semver.org/).
     65 now keep both fixed. A file whose footer points outside the file
     shows "could not read … as Parquet: column chunk N of row group M lies
     outside the file". Damage deeper inside the data, which only the Parquet
-    library itself notices, shows "could not read … as Parquet: the Parquet
-    reader failed on this file (…)". The app stays open either way.
+    library itself notices, shows "could not read … as Parquet: its data is
+    damaged (the Parquet reader failed on it; details are in the log)". The
+    app stays open either way.
     **Assumption to veto:** to make the second message possible, the
     released app now *unwinds* on an internal error instead of stopping
     dead, and only a Parquet open is allowed to recover from one. Any other
-    internal error still closes the app, as before.
+    internal error still closes the app, as before, with one exception: an
+    internal error on a background task (a spectrum, for instance) *while* a
+    Parquet file is opening ends only that task, and it shows "failed". A
+    test checks that an internal error outside a Parquet open still closes
+    the app.
   - **A damaged reopen cache no longer crashes Glyde either.** If the cached
     copy of a file you opened before is damaged or edited, Glyde now notices,
     reads the original file again and rewrites the cache. Before, one bad

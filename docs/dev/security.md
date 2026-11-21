@@ -49,8 +49,11 @@ the public open API end to end: `csv_open`, `parquet_open` and
   chunk does not have makes the `parquet` decoder `panic!` ("Decoder for dict
   should have been set"). No footer check can see that without decoding every
   page. So every Parquet open now runs inside `glyde_core::panic_guard::catch`:
-  a panic there becomes "could not read … as Parquet: the Parquet reader
-  failed on this file (…)", logged at `warn`, and the app stays open. Locked
+  a panic there becomes "could not read … as Parquet: its data is damaged
+  (the Parquet reader failed on it; details are in the log)". The panic text
+  itself goes to the `warn` log only, so a reworded panic in a future
+  `parquet` release cannot change what users see or break the corpus. The
+  app stays open. Locked
   by torture-corpus case 65.
   - For this, the release profile changes from `panic = "abort"` to
     `panic = "unwind"`. **Every other panic still ends the process.** At
@@ -81,8 +84,8 @@ the public open API end to end: `csv_open`, `parquet_open` and
   two crashes, each fixed before the next round; then 16 min until the
   over-allocation (#274); then 30 min that skipped out-of-memory inputs
   (3.5 million inputs), which found the hangs (#275) and no further crash. The
-  issue asked for several hours per target. Longer runs before the release
-  are worth doing (`fuzzing.md`), above all `parquet_open`.
+  issue asked for several hours per target; those runs are #277, due before
+  v0.1.0 is tagged.
 
 **Partitioned directories** (`ingest/parquet.rs`, `index/level0.rs`). Both
 walks are iterative, so a very deep tree cannot overflow the stack. Symlinked
