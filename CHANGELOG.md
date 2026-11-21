@@ -30,15 +30,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
   view; Inter and JetBrains Mono embedded in the app.
 
 ### Added
-- **Glyde has an icon (issue #232).** A dark graphite tile with a blue-to-petrol
-  wave that settles on one sample, in the colors of the new look. You see it in
+- **Glyde has an icon (issue #232).** The wave from the approved mockup's
+  toolbar mark, blue fading to petrol, on a dark graphite tile, in the colors
+  of the new look. You picked it on PR #269 from eight drawn options. You see it in
   the window's title bar, the taskbar and the app switcher on all three systems,
   in the macOS Dock and Finder (`Glyde.app`), on `glyde.exe`, its installer, its
   Start-menu and desktop shortcuts and in Windows' "Apps & features", and in the
   Linux AppImage. **To check:** download the release dry-run artifacts, install
-  or open each one, and look at the Dock / taskbar. **Assumption to veto:** the
-  artwork itself. The mockup never showed an icon, so this design is a proposal:
-  if you do not like it, say what to change; one source file
+  or open each one, and look at the Dock / taskbar. **Known limit:** on a dark
+  desktop or a dark Dock the graphite tile's edge is faint, so the wave carries
+  the icon there. To change the drawing later, one source file
   (`packaging/icon/glyde.svg`) and one command regenerate every size.
 - **Measurement cursors A and B on the time view (issue #231).** Press
   **Cursors** in the time view's toolbar: two vertical lines, A and B, appear

@@ -8,10 +8,12 @@
   The script crops the inset for Windows and Linux, whose icons fill more of
   the canvas.
 
+  The wave is the toolbar mark of the approved mockup
+  (docs/design/mockup.src.html, `.brand`), drawn on its 24 px grid and scaled
+  to the tile; chosen by the maintainer on PR #269 over seven alternatives.
   Colors are the dark-theme tokens of docs/design/README.md: window/surface
-  graphite for the tile, line/grid for the hairlines, accent petrol and
-  series 1 blue for the trace. A decaying wave that settles into one sample:
-  a signal you glide through.
+  graphite for the tile, line for its edge, series 1 blue to accent petrol
+  for the wave.
 -->
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <defs>
@@ -19,7 +21,7 @@
       <stop offset="0" stop-color="#222830"/>
       <stop offset="1" stop-color="#14171b"/>
     </linearGradient>
-    <linearGradient id="trace" x1="216" y1="0" x2="832" y2="0" gradientUnits="userSpaceOnUse">
+    <linearGradient id="wave" x1="4" y1="0" x2="20" y2="0" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#3987e5"/>
       <stop offset="1" stop-color="#4cb5c3"/>
     </linearGradient>
@@ -29,18 +31,9 @@
   <rect x="100" y="100" width="824" height="824" rx="186" ry="186" fill="url(#tile)"/>
   <rect x="102" y="102" width="820" height="820" rx="184" ry="184" fill="none" stroke="#2a3038" stroke-width="4"/>
 
-  <!-- Plot grid: three hairlines, like the time view -->
-  <g stroke="#2a3038" stroke-width="10" stroke-linecap="round">
-    <line x1="200" y1="336" x2="824" y2="336"/>
-    <line x1="200" y1="520" x2="824" y2="520"/>
-    <line x1="200" y1="704" x2="824" y2="704"/>
+  <!-- The mockup's mark: its 22 px tile (x, y 1..23) mapped onto this 824 px one -->
+  <g transform="translate(100 100) scale(37.454545) translate(-1 -1)">
+    <path d="M4.5 15.5c2.2 0 2.8-7 5-7s2.6 7 5 7 2.8-4 5-4"
+          fill="none" stroke="url(#wave)" stroke-width="2.2" stroke-linecap="round"/>
   </g>
-
-  <!-- The trace -->
-  <path d="M216 560 C279 560 255 352 318 352 C397 352 367 684 446 684 C524 684 494 432 572 432 C640 432 614 590 682 590 C739 590 717 496 774 496 C810 496 796 520 832 520"
-        fill="none" stroke="url(#trace)" stroke-width="58" stroke-linecap="round" stroke-linejoin="round"/>
-
-  <!-- The sample it settles on -->
-  <circle cx="832" cy="520" r="52" fill="#4cb5c3"/>
-  <circle cx="832" cy="520" r="22" fill="#14171b"/>
 </svg>
