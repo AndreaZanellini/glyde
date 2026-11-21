@@ -54,6 +54,10 @@ const SPILLED_ROWS: usize = 8_000_000;
 const SPILLED_CHANNELS: usize = 8;
 const SPILLED_PIXEL_COLUMNS: usize = 2_880;
 
+/// Timed first views behind the `first_full_view_spilled` gate; the fastest
+/// one is asserted (issue #267).
+const FIRST_VIEW_GATE_RUNS: usize = 3;
+
 fn bench_viewport_query(c: &mut Criterion) {
     let (samples, timestamps) = support::synthetic_series(SAMPLE_COUNT, FIXTURE_SEED);
     let pyramid = build_pyramid(&samples, &timestamps);
@@ -152,26 +156,57 @@ fn bench_first_full_view_spilled(c: &mut Criterion) {
         dataset.is_spilled(),
         "a zero budget must force the spill path"
     );
-    let pyramids = glyde_core::ingest::disk_pyramids_for_dataset(&dataset, &spill);
-    assert!(
-        pyramids.iter().all(Option::is_some),
-        "every channel gets its on-disk pyramid"
-    );
     let ticks = dataset.time.to_pyramid_ticks();
     let range = (ticks[0], ticks[ticks.len() - 1]);
-    let full_view = || full_view_buckets(&dataset, &pyramids, &ticks, range);
 
-    let start = Instant::now();
-    let buckets = full_view();
-    let elapsed = start.elapsed();
-    assert_eq!(buckets, SPILLED_CHANNELS * SPILLED_PIXEL_COLUMNS);
-    assert!(
-        elapsed <= VIEWPORT_QUERY_CEILING,
-        "the first full view after a spilled load ({SPILLED_CHANNELS} channels, \
-         {SPILLED_ROWS} rows, {SPILLED_PIXEL_COLUMNS} columns) took {elapsed:?}, exceeding \
-         the {VIEWPORT_QUERY_CEILING:?} build-blocking ceiling (SPEC §5: pan/zoom p99 ≤100ms)"
+    // Absolute-ceiling gate: the fastest of `FIRST_VIEW_GATE_RUNS` first
+    // views against the unchanged ceiling (issue #267, the same fix #184 and
+    // #243 applied to their gates). One timed view on a shared CI runner is
+    // exposed to scheduler and disk noise; a real regression slows every
+    // run, so the fastest still catches it. Each run gets a fresh set of
+    // on-disk pyramids, so it reads pages no earlier view has touched and
+    // still measures a *first* view, not a warm one. All runs are printed,
+    // pass or fail.
+    let mut pyramids = Vec::new();
+    let runs: Vec<Duration> = (0..FIRST_VIEW_GATE_RUNS)
+        .map(|_| {
+            // Drop the previous run's pyramids (and their spill set) before
+            // building the next, so at most one set is on disk at a time.
+            drop(std::mem::take(&mut pyramids));
+            pyramids = glyde_core::ingest::disk_pyramids_for_dataset(&dataset, &spill);
+            assert!(
+                pyramids.iter().all(Option::is_some),
+                "every channel gets its on-disk pyramid"
+            );
+            let start = Instant::now();
+            let buckets = full_view_buckets(&dataset, &pyramids, &ticks, range);
+            let elapsed = start.elapsed();
+            assert_eq!(buckets, SPILLED_CHANNELS * SPILLED_PIXEL_COLUMNS);
+            elapsed
+        })
+        .collect();
+    let fastest = runs
+        .iter()
+        .copied()
+        .min()
+        .expect("FIRST_VIEW_GATE_RUNS is at least one");
+    let verdict = if fastest <= VIEWPORT_QUERY_CEILING {
+        "pass"
+    } else {
+        "FAIL"
+    };
+    println!(
+        "first_full_view_spilled gate: runs {runs:?}, fastest {fastest:?}, ceiling \
+         {VIEWPORT_QUERY_CEILING:?}: {verdict}"
     );
-    println!("first_full_view_spilled: first view after the load took {elapsed:?}");
+    assert!(
+        fastest <= VIEWPORT_QUERY_CEILING,
+        "the first full view after a spilled load ({SPILLED_CHANNELS} channels, \
+         {SPILLED_ROWS} rows, {SPILLED_PIXEL_COLUMNS} columns) took {fastest:?} at best over \
+         {FIRST_VIEW_GATE_RUNS} runs ({runs:?}), exceeding the {VIEWPORT_QUERY_CEILING:?} \
+         build-blocking ceiling (SPEC §5: pan/zoom p99 ≤100ms)"
+    );
+    let full_view = || full_view_buckets(&dataset, &pyramids, &ticks, range);
 
     if !page_cache::drop_files_under(&spill) {
         println!(

@@ -225,6 +225,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
   use a red picked here (the series red, darkened to read on the panel).
 
 ### Fixed
+- **The "first full view after a spilled load" speed check in CI no longer
+  fails by chance (issue #267).** Same problem and same fix as the first-plot
+  (#184) and Parquet (#243) checks. This check opens an 8-million-row file too
+  large for memory and fails the build if drawing the whole file the first
+  time takes more than 100 ms. It timed one view: on a slow GitHub macOS
+  machine that took 118 ms and blocked PR #266, which does not touch this
+  code; a re-run passed. It now times three first views (each on freshly
+  built on-disk summaries, so each one is still a true first view), judges
+  the fastest and always prints the three times. The 100 ms limit is
+  unchanged. Nothing changes in the app.
 - **Very finely timed data is drawn exactly where it was recorded (issue
   #206).** Plot positions used to be counted in seconds since 1970, and at
   today's dates a computer number resolves those only to about a quarter of a
