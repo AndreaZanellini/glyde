@@ -20,7 +20,16 @@
 
 use glyde_app::GlydeApp;
 
+// Issue #233: catching a panic in the Parquet decoders needs unwinding.
+#[cfg(panic = "abort")]
+compile_error!(
+    "glyde-app must be built with panic = \"unwind\": see glyde_core::panic_guard (issue #233)"
+);
+
 fn main() -> anyhow::Result<()> {
+    // Issue #233: any panic outside a guarded Parquet open still ends the
+    // process, as `panic = "abort"` did.
+    glyde_core::panic_guard::install_abort_outside_guards();
     // Keep the guard alive for the whole process: dropping it stops the
     // background thread that flushes log lines to disk.
     let _logging_guard = glyde_app::logging::init()?;
@@ -31,6 +40,16 @@ fn main() -> anyhow::Result<()> {
     // background.
     match glyde_core::index::level0::os_cache_dir() {
         Ok(cache_dir) => {
+            // Issue #233: the cache holds decoded copies of opened files, so
+            // its root is readable by its owner only.
+            let root = cache_dir.parent().unwrap_or(&cache_dir);
+            if let Err(err) = glyde_core::index::private_dir::ensure_private_dir(root) {
+                tracing::warn!(
+                    path = %root.display(),
+                    error = %err,
+                    "could not make the cache directory owner-only"
+                );
+            }
             glyde_app::plumbing::spawn_startup_cache_sweep(cache_dir);
         }
         Err(err) => tracing::warn!(error = %err, "no cache directory; skipping the cache sweep"),

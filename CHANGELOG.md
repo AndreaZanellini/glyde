@@ -11,6 +11,56 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+- **The security review before v0.1 (issue #233).** The full write-up is in
+  `docs/dev/security.md`. What changes for you:
+  - **A damaged Parquet file no longer crashes Glyde.** A fuzzer found two
+    ways to crash it in its first minutes, and torture-corpus cases 64 and
+    65 now keep both fixed. A file whose footer points outside the file
+    shows "could not read … as Parquet: column chunk N of row group M lies
+    outside the file". Damage deeper inside the data, which only the Parquet
+    library itself notices, shows "could not read … as Parquet: its data is
+    damaged (the Parquet reader failed on it; details are in the log)". The
+    app stays open either way.
+    **Assumption to veto:** to make the second message possible, the
+    released app now *unwinds* on an internal error instead of stopping
+    dead, and only a Parquet open is allowed to recover from one. Any other
+    internal error still closes the app, as before, with one exception: an
+    internal error on a background task (a spectrum, for instance) *while* a
+    Parquet file is opening ends only that task, and it shows "failed". A
+    test checks that an internal error outside a Parquet open still closes
+    the app.
+  - **A damaged reopen cache no longer crashes Glyde either.** If the cached
+    copy of a file you opened before is damaged or edited, Glyde now notices,
+    reads the original file again and rewrites the cache. Before, one bad
+    number in the cache could close the app on reopen.
+  - **Your cached data and logs are private to your account** on macOS and
+    Linux. The cache folder and the folder holding the logs are made readable
+    by you only, at startup, including folders an older Glyde already created
+    (the log line says "made the directory readable by its owner only").
+    Windows already keeps these folders private.
+  - **The "Log file" box in bug reports** gives the right log folder for macOS
+    (`~/Library/Application Support/com.glyde.Glyde/logs/`) and Windows
+    (`%LOCALAPPDATA%\glyde\Glyde\data\logs\`). It also warns that the log
+    contains file paths, column names and some values, so you can redact them
+    before you attach it.
+  - **Behind the scenes:** two yanked dependencies updated (`clipboard-win`,
+    `async-executor`), and three fuzz targets added for CSV files, Parquet
+    files and Glyde's own caches (`docs/dev/fuzzing.md`).
+  - **Waiting on you:** #271 is a ready-to-paste CI patch (pin GitHub Actions
+    by commit, check `appimagetool`'s checksum, least-privilege tokens).
+    #272 and #273 ask you to decide two known limits, documented for now:
+    a CSV truncated by another program *while* Glyde reads it still crashes
+    on macOS and Linux, and cached values carry no checksum.
+  - **Known limits found by fuzzing, not fixed here** (they sit inside the
+    Parquet library; a candidate for the v0.1 release notes): a crafted
+    Parquet file of about 1 KB can make Glyde use all your memory (#274), or
+    make its open spin forever without being cancellable (#275). Ordinary
+    corrupted files are very unlikely to look like this.
+  - **To check:** open `testdata/corpus/case-64-parquet-negative-column-chunk-offset.parquet`
+    and `testdata/corpus/case-65-parquet-dictionary-page-missing.parquet`.
+    Each shows an error message, and the app stays open.
+
 ### Design preview
 - **A mockup of the new look, to review before anything changes in the app
   (issues #229, #230, #231).** Open `docs/design/glyde-mockup.html` in a

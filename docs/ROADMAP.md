@@ -80,7 +80,8 @@ Design first. Nothing is implemented before the maintainer approves the mockup.
 
 ## Step 3 — Security, cleanup, release
 
-- [ ] Security review: fuzzing, `unsafe` and cache validation, supply chain, log privacy → #233
+- [x] Security review: fuzzing, `unsafe` and cache validation, supply chain, log privacy → #233
+      (record: `docs/dev/security.md`; CI patch to apply by hand → #271)
 - [ ] Repository cleanup and end-user documentation (README, user guide, `docs/dev/`) → #234
 - [ ] Release `v0.1.0`: size check, dry run, release notes with known limitations, tag → #235
 

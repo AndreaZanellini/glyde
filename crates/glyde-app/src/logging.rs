@@ -46,7 +46,12 @@ pub fn init() -> anyhow::Result<LoggingGuard> {
 fn log_dir() -> anyhow::Result<PathBuf> {
     let project_dirs = directories::ProjectDirs::from("com", "glyde", "Glyde")
         .context("could not determine the OS app-data directory")?;
-    let dir = project_dirs.data_local_dir().join("logs");
+    // Issue #233: logs name the files opened and some of their values, so
+    // the app-data root is readable by its owner only.
+    let root = project_dirs.data_local_dir();
+    glyde_core::index::private_dir::ensure_private_dir(root)
+        .with_context(|| format!("could not create app-data directory {}", root.display()))?;
+    let dir = root.join("logs");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("could not create log directory {}", dir.display()))?;
     Ok(dir)

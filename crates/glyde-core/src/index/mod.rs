@@ -20,6 +20,7 @@
 pub mod disk_pyramid;
 pub mod eviction;
 pub mod level0;
+pub mod private_dir;
 pub mod pyramid;
 pub mod row_groups;
 pub mod spill;

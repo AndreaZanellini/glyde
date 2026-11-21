@@ -75,6 +75,10 @@ fn every_implemented_corpus_case_opens_and_matches_its_expected_json() {
                 }
             }
             (Err(err), ExpectedOutcome::Error { error }) => {
+                // An error that names the file (case 64, issue #233) says
+                // `{path}` in its .expected.json: the checkout's absolute
+                // path differs from machine to machine.
+                let error = error.replace("{path}", &case.data_path.display().to_string());
                 if err.to_string() != error {
                     failures.push(format!(
                         "{}: error message disagreed with .expected.json (expected {error:?}, got {err:?})",

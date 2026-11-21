@@ -527,6 +527,11 @@ fn read(inner: impl Read, file_len: u64) -> Result<Parsed> {
     r.bytes(&mut meta)?;
     let meta: Meta = serde_json::from_slice(&meta).map_err(|err| bad(err.to_string()))?;
     let rows = meta.rows;
+    // Issue #233: every count is checked against the bytes the file really
+    // holds before it sizes an allocation, and every index against the row
+    // count before anything downstream can index with it.
+    check_fits(&meta, r.remaining)?;
+    check_indices(&meta)?;
 
     let time = match &meta.time_format {
         Some(name) => {
@@ -653,6 +658,92 @@ fn read(inner: impl Read, file_len: u64) -> Result<Parsed> {
         columns,
     };
     Ok((outcome_out, dataset, inference))
+}
+
+/// Bytes one row takes in `dtype`'s array (a string row: its end offset;
+/// its text comes on top), or `None` for an unknown dtype.
+fn row_bytes(dtype: &str) -> Option<u64> {
+    Some(match dtype {
+        "bool" | "i8" | "u8" => 1,
+        "i16" | "u16" => 2,
+        "i32" | "u32" | "f32" => 4,
+        "i64" | "u64" | "f64" | "string" => 8,
+        _ => return None,
+    })
+}
+
+/// Rejects metadata whose row count needs more bytes than the file has left,
+/// so no array is ever sized from an untrusted count alone.
+fn check_fits(meta: &Meta, remaining: u64) -> Result<()> {
+    let time = match meta.time_format {
+        Some(_) => std::mem::size_of::<PackedTimestamp>() as u64,
+        None => std::mem::size_of::<f64>() as u64,
+    };
+    let per_row = meta.columns.iter().try_fold(time, |sum, column| {
+        let width = row_bytes(&column.dtype)
+            .ok_or_else(|| bad(format!("unknown dtype {}", column.dtype)))?;
+        sum.checked_add(width)
+            .ok_or_else(|| bad("row width overflows"))
+    })?;
+    let needed = u64::try_from(meta.rows)
+        .ok()
+        .and_then(|rows| rows.checked_mul(per_row))
+        .ok_or_else(|| bad("row count overflows"))?;
+    if needed > remaining {
+        return Err(bad("the file is shorter than its row count says"));
+    }
+    Ok(())
+}
+
+/// Rejects indices that point past the data the file describes: NaN runs and
+/// outliers are sample indices, the time column is a source column index.
+/// Skipped rows are source data-row indices of rows that are *not* in the
+/// data, so the row count alone does not bound them: the outcome's kept and
+/// skipped rows together do.
+fn check_indices(meta: &Meta) -> Result<()> {
+    let rows = meta.rows;
+    let source_rows = meta
+        .outcome
+        .row_count
+        .saturating_add(meta.outcome.skipped_row_count);
+    for column in &meta.columns {
+        if column
+            .nan_runs
+            .iter()
+            .any(|&(start, end)| start > end || end > rows)
+        {
+            return Err(bad(format!("a NaN run of {} is out of range", column.name)));
+        }
+        if column.outliers.iter().any(|&index| index >= rows) {
+            return Err(bad(format!(
+                "an outlier of {} is out of range",
+                column.name
+            )));
+        }
+        if column.skipped_rows.len() as u64 > meta.outcome.skipped_row_count
+            || column
+                .skipped_rows
+                .iter()
+                .any(|&index| index as u64 >= source_rows)
+        {
+            return Err(bad(format!(
+                "a skipped row of {} is out of range",
+                column.name
+            )));
+        }
+    }
+    let source_columns = meta.outcome.column_names.len();
+    if meta
+        .inference
+        .time_column
+        .is_some_and(|index| index >= source_columns)
+    {
+        return Err(bad("the time column is out of range"));
+    }
+    if meta.columns.len() > source_columns {
+        return Err(bad("more data columns than source columns"));
+    }
+    Ok(())
 }
 
 fn read_values(r: &mut Reader<impl Read>, dtype: &str, rows: usize) -> Result<SeriesValues> {

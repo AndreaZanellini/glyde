@@ -24,6 +24,7 @@ pub mod dsp;
 mod error;
 pub mod index;
 pub mod ingest;
+pub mod panic_guard;
 pub mod series;
 pub mod time;
 pub use error::{GlydeError, Result};

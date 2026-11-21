@@ -1,0 +1,3 @@
+{
+  "error": "could not read {path} as Parquet: its data is damaged (the Parquet reader failed on it; details are in the log)"
+}
