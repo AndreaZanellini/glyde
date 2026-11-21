@@ -1,0 +1,47 @@
+# Fuzz targets for glyde-core's untrusted inputs (issue #233). Not a workspace
+# member: cargo-fuzz needs a nightly toolchain and sanitizer flags, so this
+# crate builds only through `cargo +nightly fuzz run <target>` (see
+# docs/dev/fuzzing.md) and never enters the workspace's lockfile, CI build or
+# shipped binary.
+[package]
+name = "glyde-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+glyde-core = { path = ".." }
+
+# Its own workspace, so the parent workspace never tries to build it.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "csv_open"
+path = "fuzz_targets/csv_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parquet_open"
+path = "fuzz_targets/parquet_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cache_reopen"
+path = "fuzz_targets/cache_reopen.rs"
+test = false
+doc = false
+bench = false

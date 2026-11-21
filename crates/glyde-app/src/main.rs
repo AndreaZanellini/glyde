@@ -31,6 +31,16 @@ fn main() -> anyhow::Result<()> {
     // background.
     match glyde_core::index::level0::os_cache_dir() {
         Ok(cache_dir) => {
+            // Issue #233: the cache holds decoded copies of opened files, so
+            // its root is readable by its owner only.
+            let root = cache_dir.parent().unwrap_or(&cache_dir);
+            if let Err(err) = glyde_core::index::private_dir::ensure_private_dir(root) {
+                tracing::warn!(
+                    path = %root.display(),
+                    error = %err,
+                    "could not make the cache directory owner-only"
+                );
+            }
             glyde_app::plumbing::spawn_startup_cache_sweep(cache_dir);
         }
         Err(err) => tracing::warn!(error = %err, "no cache directory; skipping the cache sweep"),

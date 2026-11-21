@@ -23,6 +23,14 @@ body:
     id: log
     attributes:
       label: Log file
+      description: |
+        The Glyde log, from
+        macOS `~/Library/Application Support/com.glyde.Glyde/logs/`,
+        Windows `%LOCALAPPDATA%\glyde\Glyde\data\logs\`,
+        Linux `~/.local/share/glyde/logs/`.
+        The log lists the paths of the files you opened, their column names and
+        some cell values (for example a timestamp that could not be read).
+        Look it over and redact anything confidential before you attach it.
       render: shell
   - type: input
     id: environment

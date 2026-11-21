@@ -470,6 +470,44 @@ fn has_parquet_extension(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
 }
 
+/// Rejects a footer whose column chunks do not lie inside the file (issue
+/// #233). The `parquet` crate trusts these offsets and `assert!`s on a
+/// negative one while reading, which a release build (`panic = "abort"`)
+/// turns into a crash; checked here, a corrupted footer is a reported error
+/// naming the file instead.
+fn check_column_chunks(path: &Path, metadata: &ParquetMetaData, file_len: u64) -> Result<()> {
+    for (group_index, group) in metadata.row_groups().iter().enumerate() {
+        for (chunk_index, chunk) in group.columns().iter().enumerate() {
+            let start = chunk
+                .dictionary_page_offset()
+                .unwrap_or_else(|| chunk.data_page_offset());
+            let fits = u64::try_from(start)
+                .ok()
+                .zip(u64::try_from(chunk.compressed_size()).ok())
+                .and_then(|(start, len)| start.checked_add(len))
+                .is_some_and(|end| end <= file_len);
+            if !fits {
+                warn!(
+                    path = %path.display(),
+                    row_group = group_index,
+                    column_chunk = chunk_index,
+                    start,
+                    compressed_size = chunk.compressed_size(),
+                    file_len,
+                    "Parquet footer points outside the file; refusing it"
+                );
+                return Err(invalid(
+                    path,
+                    format!(
+                        "column chunk {chunk_index} of row group {group_index} lies outside the file"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// What a walk of a dataset directory found.
 #[derive(Default)]
 struct DirectoryListing {
@@ -553,6 +591,14 @@ fn source_files(path: &Path) -> Result<Vec<SourceFile>> {
             })?;
             let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
                 .map_err(|e| invalid(&file_path, e))?;
+            let file_len = file
+                .metadata()
+                .map_err(|source| GlydeError::Io {
+                    path: file_path.clone(),
+                    source,
+                })?
+                .len();
+            check_column_chunks(&file_path, metadata.metadata(), file_len)?;
             Ok(SourceFile {
                 path: file_path,
                 partition,

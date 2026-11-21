@@ -221,3 +221,87 @@ fn a_file_too_large_for_memory_is_not_cached() {
     assert!(dataset.is_spilled());
     assert!(cache_files(cache.path()).is_empty());
 }
+
+/// Splits a dataset cache file into its metadata (as JSON) and the raw
+/// arrays after it, so a test can rewrite one metadata field and keep the
+/// rest of the file byte for byte.
+fn split_cache(bytes: &[u8]) -> (Vec<u8>, serde_json::Value, Vec<u8>) {
+    let meta_len = u64::from_ne_bytes(bytes[16..24].try_into().expect("8 bytes")) as usize;
+    let header = bytes[..24].to_vec();
+    let meta = serde_json::from_slice(&bytes[24..24 + meta_len]).expect("metadata is JSON");
+    (header, meta, bytes[24 + meta_len..].to_vec())
+}
+
+fn join_cache(mut header: Vec<u8>, meta: &serde_json::Value, payload: &[u8]) -> Vec<u8> {
+    let meta = serde_json::to_vec(meta).expect("serialize metadata");
+    header[16..24].copy_from_slice(&(meta.len() as u64).to_ne_bytes());
+    header.extend_from_slice(&meta);
+    header.extend_from_slice(payload);
+    header
+}
+
+// Issue #233: the cache lives in a user-writable directory, so its metadata
+// is untrusted input like any source file. A count or index that does not
+// fit the arrays the file actually holds must be a cache miss, never an
+// unbounded allocation or an out-of-range index later on (a panic is an
+// abort in a release build).
+#[test]
+fn a_cache_whose_metadata_disagrees_with_its_arrays_falls_back_to_parsing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let path = write_fixture(dir.path());
+    let first = open(&path, IngestOverrides::default(), u64::MAX, cache.path()).expect("open");
+    let file = cache_files(cache.path()).pop().expect("cache file");
+    let good = std::fs::read(&file).expect("read cache");
+    let (header, meta, payload) = split_cache(&good);
+    let rows = meta["rows"].as_u64().expect("rows");
+    assert!(meta["time_format"].is_string(), "an absolute time axis");
+
+    type Tamper = fn(&mut serde_json::Value, u64);
+    let tampers: [(&str, Tamper); 9] = [
+        ("an enormous row count", |m, _| {
+            m["rows"] = (1u64 << 60).into()
+        }),
+        ("a row count beyond usize", |m, _| {
+            m["rows"] = u64::MAX.into()
+        }),
+        ("a NaN run past the last row", |m, rows| {
+            m["columns"][0]["nan_runs"] = serde_json::json!([[0, rows + 10]])
+        }),
+        ("a NaN run that ends before it starts", |m, _| {
+            m["columns"][0]["nan_runs"] = serde_json::json!([[5, 2]])
+        }),
+        ("an outlier past the last row", |m, rows| {
+            m["columns"][0]["outliers"] = serde_json::json!([rows + 10])
+        }),
+        ("a skipped row past the last row", |m, rows| {
+            m["columns"][0]["skipped_rows"] = serde_json::json!([rows + 10])
+        }),
+        ("a time column that does not exist", |m, _| {
+            m["inference"]["time_column"] = 99.into()
+        }),
+        ("fewer column names than the source had", |m, _| {
+            m["outcome"]["column_names"] = serde_json::json!(["timestamp"])
+        }),
+        ("more data columns than column names", |m, _| {
+            let extra = m["columns"][0].clone();
+            let columns = m["columns"].as_array_mut().expect("columns");
+            for _ in 0..8 {
+                columns.push(extra.clone());
+            }
+        }),
+    ];
+    for (what, tamper) in tampers {
+        let mut tampered = meta.clone();
+        tamper(&mut tampered, rows);
+        std::fs::write(&file, join_cache(header.clone(), &tampered, &payload))
+            .expect("tamper cache");
+        let reopened = open(&path, IngestOverrides::default(), u64::MAX, cache.path()).expect(what);
+        assert_same_open(&first, &reopened);
+        assert_eq!(
+            std::fs::read(&file).expect("read cache"),
+            good,
+            "{what}: the fallback parse rewrites a good cache"
+        );
+    }
+}
