@@ -51,6 +51,17 @@ the public open API end to end: `csv_open`, `parquet_open` and
   multi-exabyte allocation. Each string's length is now checked against the
   bytes left in the file first. Locked by
   `a_cache_whose_string_offsets_point_past_the_file_falls_back_to_parsing`.
+- **Found and fixed (#277, the longer runs):** the gap statistics subtract
+  neighbouring ticks in `i128`, and two ticks near the opposite `i128`
+  limits overflow that subtraction. Two inputs got there: a damaged
+  whole-dataset cache (found by `cache_reopen`), and a CSV progressive index
+  of `-1e300` next to `1e300`, whose ticks saturated at `i128::MIN` and
+  `i128::MAX`. A test or fuzz build panicked. The release build, which has
+  no overflow checks, would have wrapped silently and computed nonsense gap
+  statistics. Every tick now lies within ±`i128::MAX / 2`
+  (`time::MAX_TICK_MAGNITUDE`): progressive values saturate there, and a
+  cache holding a larger tick is a miss. Locked by torture-corpus case 66
+  and `a_cache_whose_timestamps_lie_beyond_any_parse_falls_back_to_parsing`.
 - **Found and contained:** a data page that claims a dictionary its column
   chunk does not have makes the `parquet` decoder `panic!` ("Decoder for dict
   should have been set"). No footer check can see that without decoding every

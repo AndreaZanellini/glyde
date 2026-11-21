@@ -41,6 +41,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
     treats that cache as damaged too: it reads the original file again and
     rewrites the cache, and the log says "a string runs past the end of the
     file".
+  - **Two more crashes found by the longer fuzz runs are fixed (issue #277).**
+    A CSV whose numeric index column holds astronomically large values (for
+    example `-1e300` next to `1e300`) could crash Glyde while it measured the
+    gaps between samples. It now opens normally. A damaged reopen cache whose
+    stored time stamps are impossibly large is now treated as damaged: Glyde
+    reads the original file again, and the log says "a timestamp lies beyond
+    any parsed value".
+    **Assumption to veto:** a numeric index value beyond about ±8.5×10²⁸ is
+    still not stored exactly, as before (the limit used to be ±1.7×10²⁹). It
+    is pinned to that limit, so two such values can land on the same point
+    of the time axis. No real index comes near this. Whether the app should
+    *say so* when it happens is issue #280.
   - **Your cached data and logs are private to your account** on macOS and
     Linux. The cache folder and the folder holding the logs are made readable
     by you only, at startup, including folders an older Glyde already created

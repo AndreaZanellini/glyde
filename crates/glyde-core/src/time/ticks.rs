@@ -40,6 +40,15 @@ use std::ops::Range;
 
 use crate::Result;
 
+/// The largest tick magnitude any axis may hold: half the `i128` range, so
+/// the Δt of any two ticks — the one subtraction [`for_each_delta`] makes —
+/// always fits in an `i128` (issue #277). No parser comes near it: an
+/// absolute timestamp is at most about 2¹⁰³ ticks, and a progressive value
+/// saturates here instead of at the `i128` limits (see
+/// `ingest::progressive_value_to_tick`). A cache that holds a tick beyond it
+/// is damaged and is rebuilt.
+pub(crate) const MAX_TICK_MAGNITUDE: i128 = i128::MAX / 2;
+
 /// Ticks per chunk a [`TickSource`] hands its visitor: 1 MiB worth of `i128`.
 /// Large enough that per-chunk overhead is negligible, small enough that a
 /// scan's footprint is a flat number regardless of how many rows there are.

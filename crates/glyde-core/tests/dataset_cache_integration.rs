@@ -357,3 +357,40 @@ fn a_cache_whose_string_offsets_point_past_the_file_falls_back_to_parsing() {
         );
     }
 }
+
+// Issue #277 (found by the `cache_reopen` fuzz target): no parser produces a
+// tick beyond ±(i128::MAX / 2), and the gap statistics subtract neighbouring
+// ticks, so a cache holding an extreme tick overflowed that subtraction.
+// Such a cache is damaged, never a dataset to summarize.
+#[test]
+fn a_cache_whose_timestamps_lie_beyond_any_parse_falls_back_to_parsing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let path = write_fixture(dir.path());
+    let first = open(&path, IngestOverrides::default(), u64::MAX, cache.path()).expect("open");
+    let file = cache_files(cache.path()).pop().expect("cache file");
+    let good = std::fs::read(&file).expect("read cache");
+    let (header, meta, payload) = split_cache(&good);
+    assert!(meta["time_format"].is_string(), "an absolute time axis");
+
+    // The time axis comes first: one 32-byte packed timestamp per row, its
+    // first 16 bytes the `i128` tick.
+    const PACKED: usize = 32;
+    for (what, tick) in [
+        ("the smallest tick", i128::MIN),
+        ("the largest tick", i128::MAX),
+        ("just past half the range", i128::MAX / 2 + 1),
+    ] {
+        let mut tampered = payload.clone();
+        let row = 131;
+        tampered[row * PACKED..row * PACKED + 16].copy_from_slice(&tick.to_ne_bytes());
+        std::fs::write(&file, join_cache(header.clone(), &meta, &tampered)).expect("tamper cache");
+        let reopened = open(&path, IngestOverrides::default(), u64::MAX, cache.path()).expect(what);
+        assert_same_open(&first, &reopened);
+        assert_eq!(
+            std::fs::read(&file).expect("read cache"),
+            good,
+            "{what}: the fallback parse rewrites a good cache"
+        );
+    }
+}
