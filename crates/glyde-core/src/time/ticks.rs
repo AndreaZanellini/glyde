@@ -42,10 +42,13 @@ use crate::Result;
 
 /// The largest tick magnitude any axis may hold: half the `i128` range, so
 /// the Δt of any two ticks — the one subtraction [`for_each_delta`] makes —
-/// always fits in an `i128` (issue #277). No parser comes near it: an
-/// absolute timestamp is at most about 2¹⁰³ ticks, and a progressive value
-/// saturates here instead of at the `i128` limits (see
-/// `ingest::progressive_value_to_tick`). A cache that holds a tick beyond it
+/// always fits in an `i128` (issue #277). Every source of ticks keeps to it:
+/// an epoch, LabVIEW or Excel numeral whose whole part exceeds ±10²¹ is not
+/// a timestamp (`format::split_decimal`), which keeps those ticks near 10³⁵
+/// at most; calendar formats are bounded by `chrono`'s year range; a Parquet
+/// timestamp is an `i64`; and a progressive value saturates here instead of
+/// at the `i128` limits (see `ingest::progressive_value_to_tick`). A cache
+/// that holds a tick beyond it
 /// is damaged and is rebuilt.
 pub(crate) const MAX_TICK_MAGNITUDE: i128 = i128::MAX / 2;
 

@@ -393,4 +393,21 @@ fn a_cache_whose_timestamps_lie_beyond_any_parse_falls_back_to_parsing() {
             "{what}: the fallback parse rewrites a good cache"
         );
     }
+
+    // At the bound itself the cache is still trusted: served as stored, not
+    // rebuilt (the bound is inclusive, and a good cache is never re-parsed).
+    let at_bound = i128::MAX / 2;
+    let mut tampered = payload.clone();
+    tampered[131 * PACKED..131 * PACKED + 16].copy_from_slice(&at_bound.to_ne_bytes());
+    std::fs::write(&file, join_cache(header, &meta, &tampered)).expect("tamper cache");
+    let (_, _, reopened) =
+        open(&path, IngestOverrides::default(), u64::MAX, cache.path()).expect("at the bound");
+    let ingest::TimeAxis::Absolute { timestamps, .. } = &reopened.time else {
+        panic!("an absolute time axis");
+    };
+    assert_eq!(
+        timestamps.get(131).expect("row 131").ticks,
+        at_bound,
+        "a tick exactly at the bound is read from the cache"
+    );
 }
