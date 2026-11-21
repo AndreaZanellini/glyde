@@ -309,3 +309,51 @@ fn a_cache_whose_metadata_disagrees_with_its_arrays_falls_back_to_parsing() {
         );
     }
 }
+
+// Issue #277 (found by the `cache_reopen` fuzz target): a string column is
+// stored as one end offset per row, then the UTF-8 bytes. An end offset that
+// points far past the end of the file sized the string's buffer before the
+// file length was checked, so a damaged cache aborted the app on a
+// multi-exabyte allocation. It must be a cache miss like any other damage.
+#[test]
+fn a_cache_whose_string_offsets_point_past_the_file_falls_back_to_parsing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let path = write_fixture(dir.path());
+    let first = open(&path, IngestOverrides::default(), u64::MAX, cache.path()).expect("open");
+    let file = cache_files(cache.path()).pop().expect("cache file");
+    let good = std::fs::read(&file).expect("read cache");
+    let (header, meta, payload) = split_cache(&good);
+    let last = meta["columns"]
+        .as_array()
+        .expect("columns")
+        .last()
+        .expect("a column");
+    assert_eq!(last["dtype"], "string", "the fixture's last column is text");
+
+    // The file ends with the last string column: its end offsets, then its
+    // bytes. The last offset is the byte count that follows it.
+    let last_end_at = (0..payload.len() - 8)
+        .rev()
+        .find(|&at| {
+            let end = u64::from_ne_bytes(payload[at..at + 8].try_into().expect("8 bytes"));
+            at as u64 + 8 + end == payload.len() as u64
+        })
+        .expect("the last string end offset");
+
+    for (what, end) in [
+        ("a string end far past the file", 1u64 << 60),
+        ("a string end just past the file", payload.len() as u64),
+    ] {
+        let mut tampered = payload.clone();
+        tampered[last_end_at..last_end_at + 8].copy_from_slice(&end.to_ne_bytes());
+        std::fs::write(&file, join_cache(header.clone(), &meta, &tampered)).expect("tamper cache");
+        let reopened = open(&path, IngestOverrides::default(), u64::MAX, cache.path()).expect(what);
+        assert_same_open(&first, &reopened);
+        assert_eq!(
+            std::fs::read(&file).expect("read cache"),
+            good,
+            "{what}: the fallback parse rewrites a good cache"
+        );
+    }
+}

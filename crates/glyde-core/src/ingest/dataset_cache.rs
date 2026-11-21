@@ -768,6 +768,11 @@ fn read_values(r: &mut Reader<impl Read>, dtype: &str, rows: usize) -> Result<Se
                     .checked_sub(previous)
                     .ok_or_else(|| bad("string offsets go backwards"))?;
                 previous = end;
+                // Issue #277: the offset is untrusted; check it against the
+                // bytes the file still holds before it sizes a buffer.
+                if len > r.remaining {
+                    return Err(bad("a string runs past the end of the file"));
+                }
                 let mut bytes = vec![0u8; usize::try_from(len).map_err(|_| bad("length"))?];
                 r.bytes(&mut bytes)?;
                 strings.push(String::from_utf8(bytes).map_err(|_| bad("string is not UTF-8"))?);

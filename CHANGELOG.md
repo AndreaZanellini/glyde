@@ -34,6 +34,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
     copy of a file you opened before is damaged or edited, Glyde now notices,
     reads the original file again and rewrites the cache. Before, one bad
     number in the cache could close the app on reopen.
+  - **One more damaged-cache crash is fixed (issue #277).** The longer fuzz
+    runs before the release found that a cached text column whose stored
+    length points past the end of the cache file could still close the app
+    on reopen, by asking for an impossibly large block of memory. Glyde now
+    treats that cache as damaged too: it reads the original file again and
+    rewrites the cache, and the log says "a string runs past the end of the
+    file".
   - **Your cached data and logs are private to your account** on macOS and
     Linux. The cache folder and the folder holding the logs are made readable
     by you only, at startup, including folders an older Glyde already created

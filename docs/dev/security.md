@@ -45,6 +45,12 @@ the public open API end to end: `csv_open`, `parquet_open` and
   time column) against the row and column counts, before trusting any of
   them. Locked by
   `a_cache_whose_metadata_disagrees_with_its_arrays_falls_back_to_parsing`.
+- **Found and fixed (#277, the longer runs):** the same cache sized each
+  string's buffer from its stored end offset before checking that the file
+  held that many bytes, so one edited offset aborted the app on a
+  multi-exabyte allocation. Each string's length is now checked against the
+  bytes left in the file first. Locked by
+  `a_cache_whose_string_offsets_point_past_the_file_falls_back_to_parsing`.
 - **Found and contained:** a data page that claims a dictionary its column
   chunk does not have makes the `parquet` decoder `panic!` ("Decoder for dict
   should have been set"). No footer check can see that without decoding every
