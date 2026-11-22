@@ -49,6 +49,29 @@ TMPDIR=/dev/shm cargo +nightly fuzz run csv_open -- \
 background thread, and LeakSanitizer reports that thread's few bytes of
 standard-library state when the fuzzer exits. That is not a leak in Glyde.
 
+### Long runs
+
+- Start each target as a job the session tracks, not a detached
+  `nohup`/`setsid` process: a cloud sandbox that looks idle is reclaimed and
+  takes detached processes with it (#277 lost its first session that way).
+  Long runs resume from `corpus/`, so split a target's hours into rounds.
+- For `parquet_open`, add `-fork=2 -ignore_ooms=1 -ignore_timeouts=1
+  -malloc_limit_mb=3072`. Without an explicit `-malloc_limit_mb`, a #274
+  over-allocation can reach AddressSanitizer's allocator limit first, and the
+  run stops on it as a crash.
+- A timeout in a fuzz build is not proof of a hang in the app: coverage
+  instrumentation slows loops down. Before filing one, time the input in an
+  optimized build against the workspace's own `Cargo.lock`. A fresh lockfile
+  resolves newer dependencies and can hide or invent the bug. The table in
+  `known/README.md` was measured that way.
+
+## Known findings
+
+`known/` keeps every input of a finding that is not fixed yet, by issue
+(see its README). A fix for one of them must be checked against its whole
+folder, not only the input in the issue; then the inputs become corpus cases
+and the folder goes.
+
 ## When it finds something
 
 `cargo fuzz` writes the input to `artifacts/<target>/crash-…` and prints how
