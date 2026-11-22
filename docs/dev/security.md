@@ -10,7 +10,7 @@ Glyde is a local desktop app. Its code makes no network connections. What can
 hurt a user:
 
 - **Untrusted files.** CSV, TSV, TXT and Parquet files, and Parquet dataset
-  directories, come from colleagues, instruments and the internet. Opening
+  directories, come from other people, instruments and the internet. Opening
   one must never crash, hang or exhaust the machine. A release build aborts
   on any panic outside a guarded Parquet open (see below), so for a user a
   panic is a crash.

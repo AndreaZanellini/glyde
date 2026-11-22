@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Issue #234: the end-user documentation (README, user guide) is what a
-//! colleague reads instead of asking. Nothing renders it in CI, so what can
+//! new user reads instead of asking. Nothing renders it in CI, so what can
 //! rot silently is locked here: every relative link and image resolves, every
 //! `#anchor` names a real heading, the first-run workaround matches the
 //! release notes, and the log folders it tells users to attach match the ones
@@ -273,7 +273,7 @@ fn label_pieces(label: &str) -> Vec<String> {
 fn every_bold_control_in_the_user_guide_is_a_label_the_app_shows() {
     // The guide's convention (stated in its first paragraph): bold is
     // exactly what the user sees on screen. A label that drifts from the
-    // app's text leaves a colleague looking for a button that is not there.
+    // app's text leaves a user looking for a button that is not there.
     let root = repo_root();
     let app_text = rust_sources(&root.join("crates/glyde-app/src"))
         + &rust_sources(&root.join("crates/glyde-core/src"));

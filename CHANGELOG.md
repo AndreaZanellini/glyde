@@ -12,7 +12,7 @@ Versioning: [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### v0.1.0 in short
-The first release for colleagues. What Glyde does, in one place; the detailed
+The first public release. What Glyde does, in one place; the detailed
 history of every change follows below this summary.
 - **Open a measurement file and see it at once**: CSV, TSV and TXT with any
   delimiter, decimal separator and common encoding, and Parquet files or folders
@@ -44,7 +44,7 @@ history of every change follows below this summary.
   file, after Fit to data. A test checks that their
   links, the first-run steps, the log and cache folders, and every button name
   the guide prints in bold stay true to the app.
-  **To check:** read the README as if you were a colleague; follow it to a plot.
+  **To check:** read the README as if you were a new user; follow it to a plot.
   - `docs/M3-CLOSEOUT.md` moved to `docs/history/`, next to the old roadmap,
     with a short note on what each archived file was. Code comments that cited
     the old roadmap's milestones now point to `docs/history/ROADMAP-M0-M9.md`.
@@ -556,7 +556,7 @@ history of every change follows below this summary.
     (delimiter, rows, sampling), not column types.
 
 ### Changed
-- **New plan: a first release for colleagues (v0.1.0) in three steps.**
+- **New plan: a first public release (v0.1.0) in three steps.**
   `docs/ROADMAP.md` now holds only the work left before v0.1.0: (1) a
   handful of correctness and stability fixes, (2) a redesign of the look,
   the layout of the time view (state channels included), measurement
