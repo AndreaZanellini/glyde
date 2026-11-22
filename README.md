@@ -81,8 +81,9 @@ The [user guide](docs/USER-GUIDE.md) explains every control in a few pages.
   column, are not yet read as missing values (#240, #241).
 - **Do not let another program shorten a CSV while Glyde has it open**: Glyde may close
   (#272).
-- A deliberately crafted Parquet file can make an open hang or use a lot of memory (#274,
-  #275). Ordinary files are not affected.
+- A deliberately crafted Parquet file can keep an open busy for minutes, or make Glyde
+  close (#274, #275). These come from damaged or hand-made files found by fuzzing, not
+  from files written by normal tools.
 
 ## A file that won't open?
 
