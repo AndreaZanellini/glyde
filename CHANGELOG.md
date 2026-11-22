@@ -57,6 +57,11 @@ history of every change follows below this summary.
     untouched on purpose.
 
 ### Security
+- **A library Glyde uses indirectly is updated to close a published advisory
+  (RUSTSEC-2026-0592, issue #286).** `url` goes from 2.5.8 to 2.5.9. It comes in
+  through the file dialog and the window toolkit; Glyde itself never reads URLs
+  from your files, so nothing changes in use. The advisory had turned the
+  automatic security check red on every pull request.
 - **Longer fuzzing before the release (issue #277).** Each of the three fuzz
   targets ran for over 3 hours. The crashes they led to are fixed (PRs #279
   and #281, described below). What is still open: a crafted Parquet file of about 1 KB
