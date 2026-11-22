@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The compressed ("broken") time axis (docs/SPEC.md §2.3, docs/ROADMAP.md M8).
+//! The compressed ("broken") time axis (docs/SPEC.md §2.3, docs/history/ROADMAP-M0-M9.md M8).
 //!
 //! A **view-state-only** coordinate map over plot seconds: every gap is
 //! collapsed to a fixed narrow width, everything between gaps keeps its true

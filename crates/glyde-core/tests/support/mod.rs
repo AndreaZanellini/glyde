@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Torture-corpus loader and open-vs-expected comparison harness
-//! (docs/QUALITY.md §1, docs/ROADMAP.md M1/M2).
+//! (docs/QUALITY.md §1, docs/history/ROADMAP-M0-M9.md M1/M2).
 //!
 //! Each corpus case is a data file (or, for partitioned Parquet, a directory)
 //! in `testdata/corpus/` paired with a `<name>.expected.json` describing what

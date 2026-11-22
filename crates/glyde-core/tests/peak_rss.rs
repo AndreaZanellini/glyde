@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Coarse peak-RSS regression gate for CSV ingestion (issue #58), ahead of
-//! docs/ROADMAP.md M3's real `glyde-devtools::memory_gate` harness (which
+//! docs/history/ROADMAP-M0-M9.md M3's real `glyde-devtools::memory_gate` harness (which
 //! needs the RAM-budget module and a 20 GB fixture, neither of which exist
 //! yet).
 //!
@@ -31,13 +31,13 @@
 //! owned `Vec<String>` per column. `MAX_RATIO` is tightened accordingly,
 //! still with headroom above the measured post-fix ratio (this is a coarse
 //! regression gate, not proof of the SPEC §5 budget itself — that needs
-//! docs/ROADMAP.md M3's chunked/bounded reader).
+//! docs/history/ROADMAP-M0-M9.md M3's chunked/bounded reader).
 //!
 //! This is its own file (a separate test binary, one test) so the RSS
 //! measurement isn't polluted by unrelated tests sharing the process.
 //! Linux-only: `/proc/self/status`'s `VmHWM` (peak resident set size) has no
 //! portable equivalent, and this crate has no `sysinfo`-based peak-RSS
-//! reader yet (that lands with docs/ROADMAP.md M3's RAM-budget module).
+//! reader yet (that lands with docs/history/ROADMAP-M0-M9.md M3's RAM-budget module).
 
 #![cfg(target_os = "linux")]
 

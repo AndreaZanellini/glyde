@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Corpus manifest gate (docs/QUALITY.md §1, docs/ROADMAP.md M1).
+//! Corpus manifest gate (docs/QUALITY.md §1, docs/history/ROADMAP-M0-M9.md M1).
 //!
 //! `every_committed_case_has_a_well_formed_expected_json` runs on every PR
 //! and covers whatever cases are committed so far. `corpus_has_all_65_cases`

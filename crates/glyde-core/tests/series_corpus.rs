@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Proves the `Series`/`Dtype` model (docs/ROADMAP.md M2 "Series + dtype
+//! Proves the `Series`/`Dtype` model (docs/history/ROADMAP-M0-M9.md M2 "Series + dtype
 //! model") against two torture-corpus shapes it must represent correctly:
 //! case 51 (a constant series, SPEC §1.4's "constant series are valid
 //! inputs") and case 47 (three boolean columns spelled three different ways
 //! in the source text, SPEC §1.4's "`bool` ... series ... route to the
 //! state timeline").
 //!
-//! No CSV reader exists yet (docs/ROADMAP.md M2, later item), so these
+//! No CSV reader exists yet (docs/history/ROADMAP-M0-M9.md M2, later item), so these
 //! tests parse the corpus files' handful of rows directly rather than
 //! going through `ingest::open()` — they exist to grade the `Series` model
 //! itself, not ingestion. This intentionally does not reuse
@@ -105,7 +105,7 @@ fn corpus_case_47_boolean_columns_parse_regardless_of_source_spelling() {
     }
 }
 
-// docs/ROADMAP.md M6 "Boolean series → on/off horizontal bands", SPEC §4.3:
+// docs/history/ROADMAP-M0-M9.md M6 "Boolean series → on/off horizontal bands", SPEC §4.3:
 // end to end through the real ingestion pipeline (`ingest::load`, not the
 // hand-parsed rows the test above uses), proving `bool_state_bands` turns
 // corpus case 47's ISO-8601-second-resolution timestamps into the expected
@@ -157,7 +157,7 @@ fn corpus_case_47_bool_columns_collapse_into_state_bands() {
     );
 }
 
-// docs/ROADMAP.md M6 "String/categorical → labeled state bands", SPEC §4.3:
+// docs/history/ROADMAP-M0-M9.md M6 "String/categorical → labeled state bands", SPEC §4.3:
 // corpus case 48 through the real ingestion pipeline — its `state` column
 // must load as `string` and collapse into four labeled runs, the final
 // single-sample `idle` included.

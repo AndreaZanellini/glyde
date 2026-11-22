@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Shared helpers for `generate_fixtures` and `memory_gate` (docs/QUALITY.md
-//! §3, docs/ROADMAP.md M3). Split out of the two binaries so both agree on
+//! §3, docs/history/ROADMAP-M0-M9.md M3). Split out of the two binaries so both agree on
 //! the fixture path for a given size without a path being passed between the
 //! separate `cargo run` invocations `.github/workflows/ci.yml` makes for
 //! each (see issue #61).

@@ -1,6 +1,6 @@
 # Glyde — Roadmap to v0.1.0
 
-**Goal:** the shortest path to a release an external user (the maintainer's colleagues) can
+**Goal:** the shortest path to a release an external user can
 download and use. Re-planned on 2026-11-11 with the maintainer; it replaces the M0–M9
 roadmap, which is archived unchanged in [`history/ROADMAP-M0-M9.md`](history/ROADMAP-M0-M9.md)
 (M0–M7 done, M8 partly done, M9 folded into Step 3 below). Code comments that cite
@@ -82,11 +82,12 @@ Design first. Nothing is implemented before the maintainer approves the mockup.
 
 - [x] Security review: fuzzing, `unsafe` and cache validation, supply chain, log privacy → #233
       (record: `docs/dev/security.md`; CI patch to apply by hand → #271)
-- [ ] Repository cleanup and end-user documentation (README, user guide, `docs/dev/`) → #234
+- [x] Repository cleanup and end-user documentation (README, user guide, `docs/dev/`) → #234
+      (moving ARCHITECTURE.md and ROUTINES.md under `docs/dev/` waits on your choice → #283)
 - [ ] Release `v0.1.0`: size check, dry run, release notes with known limitations, tag → #235
 
 > **MAINTAINER TEST — Step 3**
-> - Read the new README as if you were a colleague → you can install and reach a plot.
+> - Read the new README as if you were a new user → you can install and reach a plot.
 > - Download the dry-run artifacts on a clean machine → they run after the documented
 >   unsigned-build steps.
 > - Run the 10-file smoke ritual (docs/QUALITY.md §5), then tag `v0.1.0`.

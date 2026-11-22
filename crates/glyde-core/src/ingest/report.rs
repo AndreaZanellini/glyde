@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The torture-corpus open-vs-`.expected.json` comparison shape
-//! (docs/QUALITY.md §1, docs/ROADMAP.md M2 "Activate corpus open→compare
+//! (docs/QUALITY.md §1, docs/history/ROADMAP-M0-M9.md M2 "Activate corpus open→compare
 //! gate for all cases handled so far"). [`OpenSummary`] mirrors the
 //! `.expected.json` schema field for field; [`inspect`] is the pipeline that
 //! produces one from a real delimited-text file by wiring together every
@@ -24,7 +24,7 @@
 //! and monotonicity.
 //!
 //! This is deliberately a smaller, single-purpose pipeline than
-//! docs/ARCHITECTURE.md's [`InferenceReport`] (docs/ROADMAP.md M4 "surfaced
+//! docs/ARCHITECTURE.md's [`InferenceReport`] (docs/history/ROADMAP-M0-M9.md M4 "surfaced
 //! to the UI"): no per-field confidence, no dtype, no pyramid/index build. It
 //! exists to satisfy QUALITY.md §1's corpus gate for the inference already
 //! implemented; Parquet (M7) is a separate, later item. [`open_dataset`]
@@ -151,7 +151,7 @@ fn format_utc_offset(offset_seconds: i32) -> String {
     )
 }
 
-/// docs/ARCHITECTURE.md's `InferenceReport` (docs/ROADMAP.md M4 "surfaced to
+/// docs/ARCHITECTURE.md's `InferenceReport` (docs/history/ROADMAP-M0-M9.md M4 "surfaced to
 /// the UI"): the SPEC §1.2 mandatory inference-bar fields — encoding,
 /// delimiter, decimal separator, time column, timestamp format, sample
 /// count, sampling classification — each paired with its own confidence
@@ -172,7 +172,7 @@ pub struct InferenceReport {
     pub sample_count: u64,
     pub sampling_class: SamplingClass,
     /// SPEC §1.3 "rows ... skipped, counted ... surfaced in the inference
-    /// bar ('142 rows skipped — view details')" (docs/ROADMAP.md M4). Exact
+    /// bar ('142 rows skipped — view details')" (docs/history/ROADMAP-M0-M9.md M4). Exact
     /// and unbounded, unlike `skipped_row_details` below.
     pub skipped_row_count: u64,
     /// A bounded sample of why rows were skipped (see
@@ -356,7 +356,7 @@ pub enum TimeIndexSource {
 
 impl InferenceReport {
     /// SPEC §1.2 "[the inference bar] opens expanded when any inference is
-    /// low-confidence" (docs/ROADMAP.md M4). Lives in `glyde-core`, not
+    /// low-confidence" (docs/history/ROADMAP-M0-M9.md M4). Lives in `glyde-core`, not
     /// `glyde-app`, per docs/ARCHITECTURE.md's Hard rule 2 — the app only
     /// renders this decision, it does not make it.
     pub fn has_low_confidence_field(&self) -> bool {
@@ -395,7 +395,7 @@ fn timestamp_format_label(format: TimestampFormat) -> &'static str {
     }
 }
 
-/// Wires together every inference piece docs/ROADMAP.md M2 has landed so far
+/// Wires together every inference piece docs/history/ROADMAP-M0-M9.md M2 has landed so far
 /// into one [`OpenSummary`], for a delimited-text (`.csv`/`.tsv`/`.txt`) file
 /// at `path`. A single-column file has only a time index and no data series
 /// to plot, and is rejected as [`GlydeError::SingleColumnFile`] (corpus case
@@ -550,7 +550,7 @@ pub(crate) fn count_precision_loss(dataset: &Dataset) -> Vec<PrecisionLossColumn
 }
 
 /// Parses `path` once and returns the [`OpenSummary`] [`inspect`] reports,
-/// the [`InferenceReport`] `glyde-app`'s UI surfaces (docs/ROADMAP.md M4),
+/// the [`InferenceReport`] `glyde-app`'s UI surfaces (docs/history/ROADMAP-M0-M9.md M4),
 /// and the materialized [`Dataset`] [`super::dataset::load`] produces (issue
 /// #58: `glyde-app`'s indexer used to call `inspect` then `load` back to
 /// back, each independently memory-mapping, decoding, and streaming the
@@ -589,7 +589,7 @@ pub fn open_dataset_with_budget(
 }
 
 /// [`open_dataset`], additionally invoking `on_checkpoint` with a
-/// [`Checkpoint`] as the background parse progresses (docs/ROADMAP.md M3
+/// [`Checkpoint`] as the background parse progresses (docs/history/ROADMAP-M0-M9.md M3
 /// "Background progressive build emitting partial levels") — see
 /// [`dataset::load_with_outcome_progressive`], which this wraps the same way
 /// [`open_dataset`] wraps [`dataset::load_with_outcome`]. The
@@ -614,7 +614,7 @@ pub fn open_dataset_progressive(
     with_reader(path, |reader| reader.open_dataset(path, request))
 }
 
-/// [`open_dataset`] with [`super::IngestOverrides`] applied (docs/ROADMAP.md
+/// [`open_dataset`] with [`super::IngestOverrides`] applied (docs/history/ROADMAP-M0-M9.md
 /// M4 "One-click correction of each field → triggers a re-index",
 /// docs/SPEC.md §1.2): each `Some` field in `overrides` bypasses its
 /// inference step and is reported at full confidence, since a deliberate
@@ -636,7 +636,7 @@ pub fn open_dataset_with_overrides(
 
 /// [`open_dataset_progressive`] with [`super::IngestOverrides`] applied — the
 /// entry point `glyde-app`'s background indexer actually calls, since its
-/// normal open always reports progress (docs/ROADMAP.md M3).
+/// normal open always reports progress (docs/history/ROADMAP-M0-M9.md M3).
 pub fn open_dataset_progressive_with_overrides(
     path: &Path,
     overrides: super::IngestOverrides,
@@ -995,7 +995,7 @@ mod tests {
         assert_eq!(dataset, expected_dataset);
     }
 
-    // docs/ROADMAP.md M4 "InferenceReport surfaced to the UI ... proven by:
+    // docs/history/ROADMAP-M0-M9.md M4 "InferenceReport surfaced to the UI ... proven by:
     // report-struct snapshot". A stable, real-fixture snapshot of every
     // field `InferenceReport` carries, so an unintended change to any of
     // them (a field silently dropped, a confidence rule silently changed)
@@ -1048,7 +1048,7 @@ mod tests {
         assert_eq!(report.time_column.confidence, Confidence::High);
     }
 
-    // docs/ROADMAP.md M4 "Skipped-rows detail surface", SPEC §1.3: the
+    // docs/history/ROADMAP-M0-M9.md M4 "Skipped-rows detail surface", SPEC §1.3: the
     // `InferenceReport` the UI actually renders must carry both the exact
     // count and the bounded detail sample, not just `OpenSummary`'s count.
     #[test]
@@ -1102,7 +1102,7 @@ mod tests {
         assert!(matches!(err, GlydeError::Io { .. }));
     }
 
-    // SPEC §1.2 / docs/ROADMAP.md M4's inference-bar expand trigger: a fully
+    // SPEC §1.2 / docs/history/ROADMAP-M0-M9.md M4's inference-bar expand trigger: a fully
     // unambiguous file must never claim low confidence anywhere.
     #[test]
     fn has_low_confidence_field_is_false_for_an_unambiguous_file() {

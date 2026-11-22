@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Benchmark: the time-domain view's real per-frame render path (SPEC §5
-//! "Pan/zoom frame time: p50 ≤16ms, p99 ≤100ms", docs/ROADMAP.md M3, issue
+//! "Pan/zoom frame time: p50 ≤16ms, p99 ≤100ms", docs/history/ROADMAP-M0-M9.md M3, issue
 //! #80). `views::time::show` is what the UI thread calls every frame while
 //! panning/zooming; `dsp::decimation::decimate_viewport` is already
 //! ceiling-gated on its own in `glyde-core/benches/viewport_query.rs`, but a

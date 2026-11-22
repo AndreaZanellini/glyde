@@ -22,7 +22,7 @@
 //! [`parse`] is the streaming single-pass reader (docs/ARCH.md §deps: `csv`
 //! over a memory-mapped file); [`open_path`] is the memmap entry point a
 //! caller reaches for from disk. Dtype inference and the time index are
-//! later docs/ROADMAP.md M2 items — for now every field is carried as its
+//! later docs/history/ROADMAP-M0-M9.md M2 items — for now every field is carried as its
 //! raw source text (Golden Rule 1: never degrade the raw data).
 
 use super::infer::{self, Confidence, DecimalSeparator, Delimiter};
@@ -127,7 +127,7 @@ impl ColumnText {
 
 /// Why one row was skipped during ingestion (SPEC §1.3), captured for the
 /// inference bar's "N rows skipped — view details" affordance
-/// (docs/ROADMAP.md M4).
+/// (docs/history/ROADMAP-M0-M9.md M4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
     /// Ragged-row salvage: the row's field count did not match the header's.
@@ -172,7 +172,7 @@ pub struct SkippedRowDetail {
 /// carries counts only, not the row data itself: SPEC §5.1 ("data is
 /// memory-mapped and read in bounded chunks; the full file is never
 /// loaded") is a hard budget constraint this milestone's item does not yet
-/// enforce (`docs/ROADMAP.md` M3 owns the RAM-budget module and the
+/// enforce (`docs/history/ROADMAP-M0-M9.md` M3 owns the RAM-budget module and the
 /// bounded/chunked reading built on it) — accumulating every row into an
 /// owned `Vec<Vec<String>>` here would bake an unbounded shape into the
 /// first public consumer of this reader, which is exactly the risk M3
@@ -195,7 +195,7 @@ pub struct CsvParseOutcome {
     pub delimiter: Delimiter,
     pub decimal_separator: DecimalSeparator,
     /// SPEC §1.2 "confidence is tracked per inference" — [`InferenceReport`]
-    /// (docs/ROADMAP.md M4) surfaces these to the UI.
+    /// (docs/history/ROADMAP-M0-M9.md M4) surfaces these to the UI.
     ///
     /// [`InferenceReport`]: super::report::InferenceReport
     pub encoding_confidence: Confidence,
@@ -363,7 +363,7 @@ impl Sniff {
 }
 
 /// Runs SPEC §1.2's inference chain over `head_text`, a file's decoded
-/// bounded head sample ([`bounded_head_sample`]). `overrides` (docs/ROADMAP.md
+/// bounded head sample ([`bounded_head_sample`]). `overrides` (docs/history/ROADMAP-M0-M9.md
 /// M4) settles a field outright instead of running its inference step: a
 /// deliberate user correction is reported at [`Confidence::High`], never as a
 /// guess, regardless of what the auto-inference would have scored it.
@@ -377,7 +377,7 @@ fn sniff_from_head(
         Some(delimiter) => {
             info!(
                 delimiter = delimiter.as_str(),
-                "delimiter set by user correction, bypassing inference (docs/ROADMAP.md M4)"
+                "delimiter set by user correction, bypassing inference (docs/history/ROADMAP-M0-M9.md M4)"
             );
             (delimiter, Confidence::High)
         }
@@ -391,7 +391,7 @@ fn sniff_from_head(
             info!(
                 decimal_separator = separator.as_str(),
                 "decimal separator set by user correction, bypassing inference \
-                 (docs/ROADMAP.md M4)"
+                 (docs/history/ROADMAP-M0-M9.md M4)"
             );
             (separator, Confidence::High)
         }
@@ -568,7 +568,7 @@ pub fn parse(bytes: &[u8]) -> Result<CsvParseOutcome> {
 }
 
 /// Parses `bytes` exactly like [`parse`], additionally capturing every kept
-/// row's raw text for `column_index` (docs/ROADMAP.md M2 "Activate corpus
+/// row's raw text for `column_index` (docs/history/ROADMAP-M0-M9.md M2 "Activate corpus
 /// open→compare gate": `ingest::report::inspect` needs the time-index
 /// column's raw values to run `time::infer_timestamp_format` and friends
 /// against). This is bounded by `row_count` strings from *one* column, not
@@ -590,7 +590,7 @@ pub(crate) fn parse_capturing_column(
 
 /// Parses `bytes` exactly like [`parse`], additionally capturing every kept
 /// row's raw text for *every* column, one [`ColumnText`] per column in
-/// header order (docs/ROADMAP.md M2 "Time-domain view v1":
+/// header order (docs/history/ROADMAP-M0-M9.md M2 "Time-domain view v1":
 /// `ingest::dataset::load` needs every data series' raw values, not just the
 /// time index's). This holds the whole table in memory at once, which is
 /// exactly why `super::dataset::load_with_budget` only routes a file here
@@ -606,7 +606,7 @@ pub(crate) fn parse_capturing_all_columns(
 /// snapshot of the parse-so-far (a [`CsvParseOutcome`] whose `row_count`/
 /// `skipped_row_count` reflect only the rows kept up to that point, and the
 /// matching prefix of each column's captured text) at a geometrically
-/// growing row-count schedule (docs/ROADMAP.md M3 "Background progressive
+/// growing row-count schedule (docs/history/ROADMAP-M0-M9.md M3 "Background progressive
 /// build emitting partial levels"): first at [`FIRST_PROGRESS_CHECKPOINT_ROWS`]
 /// kept rows, then doubling. Doubling — rather than a fixed interval — bounds
 /// the *total* extra work every checkpoint costs a caller that re-derives a
@@ -1341,7 +1341,7 @@ mod tests {
         std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
-    // docs/ROADMAP.md M4 "One-click correction of each field → triggers a
+    // docs/history/ROADMAP-M0-M9.md M4 "One-click correction of each field → triggers a
     // re-index": an overridden delimiter must win over whatever
     // `infer_delimiter` would have picked, and be reported at full
     // confidence — a deliberate user choice is never "low confidence"
@@ -1430,7 +1430,7 @@ mod tests {
         assert_eq!(outcome.skipped_row_count, 2);
     }
 
-    // docs/ROADMAP.md M4 "Skipped-rows detail surface ('N rows skipped —
+    // docs/history/ROADMAP-M0-M9.md M4 "Skipped-rows detail surface ('N rows skipped —
     // view details')", SPEC §1.3. Same fixture as above: line 3 is one field
     // short, line 4 has one field too many (1-based, including the header).
     #[test]
@@ -1477,7 +1477,7 @@ mod tests {
     }
 
     // Same fixture, capturing every column: proves the multi-column capture
-    // path (docs/ROADMAP.md M2 "Time-domain view v1") skips exactly the same
+    // path (docs/history/ROADMAP-M0-M9.md M2 "Time-domain view v1") skips exactly the same
     // two ragged rows as the tally-only path, and that every captured
     // column ends up with the same length (one entry per *kept* row, in the
     // same row order) rather than drifting out of alignment with each other.
@@ -1516,7 +1516,7 @@ mod tests {
         assert_eq!(outcome.skipped_row_count, 1);
     }
 
-    // docs/ROADMAP.md M4 skip-detail surface, SPEC §1.3: the truncated tail
+    // docs/history/ROADMAP-M0-M9.md M4 skip-detail surface, SPEC §1.3: the truncated tail
     // is one field short (only the timestamp survives), on line 6.
     #[test]
     fn corpus_case_22_truncated_final_line_capture_skip_detail() {
@@ -1771,7 +1771,7 @@ mod tests {
     }
 
     /// A synthetic CSV with more kept rows than [`FIRST_PROGRESS_CHECKPOINT_ROWS`]
-    /// (docs/ROADMAP.md M3 "Background progressive build emitting partial
+    /// (docs/history/ROADMAP-M0-M9.md M3 "Background progressive build emitting partial
     /// levels"), so the doubling schedule fires more than once.
     fn many_rows_csv(row_count: u64) -> Vec<u8> {
         let mut text = String::from("timestamp,value\n");

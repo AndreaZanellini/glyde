@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The Parquet [`Reader`] (docs/SPEC.md §1.1, docs/ROADMAP.md M7, issue
+//! The Parquet [`Reader`] (docs/SPEC.md §1.1, docs/history/ROADMAP-M0-M9.md M7, issue
 //! #153).
 //!
 //! A Parquet file needs none of SPEC §1.2's text inference: the schema in
@@ -1081,7 +1081,7 @@ impl SourceColumn {
     }
 
     /// Turns every null into SPEC §1.3's gap, in the column's own dtype when
-    /// it has one (docs/ROADMAP.md M7, issue #157):
+    /// it has one (docs/history/ROADMAP-M0-M9.md M7, issue #157):
     ///
     /// - `float`/`double`: NaN, which the series flags as a NaN run.
     /// - Integers: no integer is a gap, so the column becomes `f64` with NaN
@@ -2785,7 +2785,7 @@ mod tests {
 
     /// Asserts that a Parquet file whose time column is `column` reaches
     /// exactly the time-index decision a CSV holding the same values as
-    /// text does (docs/ROADMAP.md M7, issue #166).
+    /// text does (docs/history/ROADMAP-M0-M9.md M7, issue #166).
     fn assert_same_time_index_as_csv(column: ArrayRef, overrides: IngestOverrides) {
         let rows = column.len();
         let fields: Vec<String> = (0..rows)

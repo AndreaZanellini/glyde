@@ -42,7 +42,7 @@ insta.workspace = true
 approx.workspace = true
 tempfile.workspace = true
 
-# On by default (docs/ROADMAP.md M2 "Activate corpus open→compare gate"):
+# On by default (docs/history/ROADMAP-M0-M9.md M2 "Activate corpus open→compare gate"):
 # gates crates/glyde-core/tests/corpus_open_compare.rs, which runs
 # `ingest::inspect()` against every implemented-so-far torture-corpus case and
 # compares the result field-by-field against its `<name>.expected.json`,

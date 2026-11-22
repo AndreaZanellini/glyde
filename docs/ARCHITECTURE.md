@@ -214,7 +214,7 @@ Resolved as follows:
   `Dataset::is_spilled()` — the zero-copy slice path stays the in-memory
   default, so no small-file cost was added.
 - **Pyramid levels are also spilled to disk** (`glyde_core::index::pyramid`,
-  `docs/ROADMAP.md` M3 "Pyramid level spill"): reopening a large file reads
+  `docs/history/ROADMAP-M0-M9.md` M3 "Pyramid level spill"): reopening a large file reads
   the already-computed `Vec<Vec<Bucket>>` back from a cache file, keyed the
   same way as Level 0, instead of rebuilding it from the cached Level 0.
   Unlike Level 0, this cache is not memory-mapped — `dsp::decimation`'s

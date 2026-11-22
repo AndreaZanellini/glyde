@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! RAM budget and affordability checks (docs/SPEC.md §5.1, docs/ARCHITECTURE.md
-//! §budget, docs/ROADMAP.md M3).
+//! §budget, docs/history/ROADMAP-M0-M9.md M3).
 //!
 //! Glyde computes its memory cap from system RAM once at startup and checks
 //! every prospective allocation against it **before** acting, never after —

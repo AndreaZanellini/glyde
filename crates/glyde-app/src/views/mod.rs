@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The three SPEC §4 visualizations (docs/ARCHITECTURE.md workspace layout
-//! `views/`): [`time`] (docs/ROADMAP.md M2 "Time-domain view v1"), [`psd`]
+//! `views/`): [`time`] (docs/history/ROADMAP-M0-M9.md M2 "Time-domain view v1"), [`psd`]
 //! (M5) and [`state_timeline`] (M6, `bool` columns only so far), plus
 //! [`channels`], the time view's channel picker.
 

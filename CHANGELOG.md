@@ -11,7 +11,57 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### v0.1.0 in short
+The first public release. What Glyde does, in one place; the detailed
+history of every change follows below this summary.
+- **Open a measurement file and see it at once**: CSV, TSV and TXT with any
+  delimiter, decimal separator and common encoding, and Parquet files or folders
+  of Parquet files. Files larger than memory open too, the first part of the
+  plot appearing while the rest is read, and Glyde never uses more than
+  `min(25 % of RAM, 4 GB)`.
+- **Glyde says what it guessed**: the Inference line under the file name shows the encoding,
+  delimiter, decimal separator, time column, time format, time zone, sampling
+  rate and gaps, marks anything uncertain, and offers a one-click correction.
+- **Three views on one time axis**: one plot per numeric channel (or all on one
+  plot), compact tracks for on/off flags, states and events, and a Welch
+  spectrum computed on the raw samples of what you are looking at. Gaps look
+  like gaps and can be compressed; two cursors measure Δt, ΔY and slope.
+- **A new look**, light or dark as your system is set, and an app icon.
+- **Known limitations** are listed in the README: speed on very large files is
+  below Glyde's own targets, outliers are not flagged yet (v0.2), and a few
+  input corners are open issues.
+
+### Documentation
+- **A README and a user guide written for you, not for developers (issue
+  #234).** The README now has a screenshot of the app, how to install it on each
+  system (including the one-time step for this unsigned build), first steps,
+  the known limitations of v0.1, where the log file is, and how to report a
+  file that won't open. `docs/USER-GUIDE.md` explains, in a few pages, the
+  inference bar and its corrections, moving around the time view, stacked and
+  overlaid channels, state tracks, gaps and Compress, the cursors, the spectrum,
+  large files, and where the log and the cache live. The screenshot is the real
+  app (this release's build, Linux, 1440 × 900) on the engine test-bench showcase
+  file, after Fit to data. A test checks that their
+  links, the first-run steps, the log and cache folders, and every button name
+  the guide prints in bold stay true to the app.
+  **To check:** read the README as if you were a new user; follow it to a plot.
+  - `docs/M3-CLOSEOUT.md` moved to `docs/history/`, next to the old roadmap,
+    with a short note on what each archived file was. Code comments that cited
+    the old roadmap's milestones now point to `docs/history/ROADMAP-M0-M9.md`.
+  - **Assumptions to veto:** this summary sits at the top of `[Unreleased]`
+    rather than under a `[0.1.0]` heading, because the version is not tagged
+    yet; the release PR (#235) turns `[Unreleased]` into `[0.1.0]`. Moving
+    `ARCHITECTURE.md` and `ROUTINES.md` under `docs/dev/` needs edits to files
+    only you change, so it waits on your choice in issue #283. The golden test
+    files still cite the old roadmap path in their comments: they are left
+    untouched on purpose.
+
 ### Security
+- **A library Glyde uses indirectly is updated to close a published advisory
+  (RUSTSEC-2026-0592, issue #286).** `url` goes from 2.5.8 to 2.5.9. It comes in
+  through the file dialog and the window toolkit; Glyde itself never reads URLs
+  from your files, so nothing changes in use. The advisory had turned the
+  automatic security check red on every pull request.
 - **Longer fuzzing before the release (issue #277).** Each of the three fuzz
   targets ran for over 3 hours. The crashes they led to are fixed (PRs #279
   and #281, described below). What is still open: a crafted Parquet file of about 1 KB
@@ -511,7 +561,7 @@ Versioning: [Semantic Versioning](https://semver.org/).
     (delimiter, rows, sampling), not column types.
 
 ### Changed
-- **New plan: a first release for colleagues (v0.1.0) in three steps.**
+- **New plan: a first public release (v0.1.0) in three steps.**
   `docs/ROADMAP.md` now holds only the work left before v0.1.0: (1) a
   handful of correctness and stability fixes, (2) a redesign of the look,
   the layout of the time view (state channels included), measurement

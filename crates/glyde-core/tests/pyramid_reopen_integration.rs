@@ -15,7 +15,7 @@
 //! Proves issue #81's pyramid half end to end: `ingest::pyramids_for_dataset_cached`
 //! wires `index::pyramid` into the *completed-load* open path, so a second
 //! open of an unchanged file serves each numeric column's pyramid from cache
-//! instead of rebuilding it — docs/ROADMAP.md M3 "Pyramid level spill …
+//! instead of rebuilding it — docs/history/ROADMAP-M0-M9.md M3 "Pyramid level spill …
 //! reopening rebuilds the pyramid from cached Level 0 rather than loading it
 //! too". Level 0 (raw-sample) wiring and skipping the CSV text parse itself
 //! are out of scope here — split into a follow-up issue, same as #80/#88/#90
@@ -144,7 +144,7 @@ fn ambiguous_date_csv(row_count: usize) -> tempfile::NamedTempFile {
     file
 }
 
-// docs/ROADMAP.md M4 "One-click correction of each field → triggers a
+// docs/history/ROADMAP-M0-M9.md M4 "One-click correction of each field → triggers a
 // re-index": correcting a field (e.g. the ambiguous day/month swap) changes
 // the dataset a path parses to *without the file on disk changing at all* —
 // same path, same size, same mtime, the exact "unchanged file" signal

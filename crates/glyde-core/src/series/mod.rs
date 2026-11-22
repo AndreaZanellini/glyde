@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! `Series`, the dtype model, and the anomaly container (docs/SPEC.md
-//! §1.4, docs/ARCHITECTURE.md workspace layout `series/`, docs/ROADMAP.md
+//! §1.4, docs/ARCHITECTURE.md workspace layout `series/`, docs/history/ROADMAP-M0-M9.md
 //! M2). This is a pure data model: it holds whatever a reader ingested in
 //! its native dtype and whatever anomalies were flagged against it. It does
 //! not parse, infer, or index anything itself — that is `ingest`'s and
@@ -189,7 +189,7 @@ impl Series {
     /// anomaly kind is unaffected by reordering the *retained* rows:
     /// `skipped_rows` names *source* row numbers that were never
     /// materialized into this series at all, and `outliers` is not populated
-    /// by anything yet (docs/ROADMAP.md M8).
+    /// by anything yet (docs/history/ROADMAP-M0-M9.md M8).
     pub(crate) fn reorder(&mut self, order: &[usize]) {
         self.values.reorder(order);
         self.row_group_stats = None;

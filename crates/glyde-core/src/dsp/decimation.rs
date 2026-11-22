@@ -422,7 +422,7 @@ pub(crate) fn merge_buckets(left: Bucket, right: Bucket) -> Bucket {
 /// bucket-for-bucket identical to calling `build_pyramid(samples,
 /// timestamps)` from scratch — but touching only the buckets that new
 /// samples can actually change, never re-aggregating the ones that cannot
-/// (docs/ROADMAP.md M3's progressive checkpoint schedule calls this once per
+/// (docs/history/ROADMAP-M0-M9.md M3's progressive checkpoint schedule calls this once per
 /// checkpoint as a file loads; re-running `build_pyramid` on every larger
 /// prefix is `O(n log n)` of pure waste across a full load — issue #90).
 ///

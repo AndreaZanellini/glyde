@@ -196,7 +196,7 @@ fn all_equal_bits<T: Copy, B: PartialEq>(values: &[T], bits: impl Fn(T) -> B) ->
 
 /// The largest integer magnitude an `f64` represents exactly: 2^53, the
 /// width of its mantissa plus the implicit leading bit (SPEC §1.4,
-/// docs/ROADMAP.md M8).
+/// docs/history/ROADMAP-M0-M9.md M8).
 const MAX_EXACT_F64_MAGNITUDE: u128 = 1u128 << 53;
 
 /// Logs (at `warn`) when `magnitude` — an `i64`/`u64` value's absolute
@@ -308,7 +308,7 @@ impl SeriesValues {
     /// Every sample promoted to `f64` (`None` for `Bool`/`String` — the two
     /// dtypes that route to the state timeline, not a numeric plot or
     /// pyramid), for feeding [`crate::dsp::decimation::build_pyramid`]
-    /// (docs/ROADMAP.md M3 "Background progressive build emitting partial
+    /// (docs/history/ROADMAP-M0-M9.md M3 "Background progressive build emitting partial
     /// levels") without every call site re-deriving the same dtype match.
     ///
     /// `i8`/`i16`/`i32`/`u8`/`u16`/`u32`/`f32` always convert losslessly —
@@ -316,7 +316,7 @@ impl SeriesValues {
     /// `i64`/`u64` magnitude beyond [`MAX_EXACT_F64_MAGNITUDE`] does not
     /// convert losslessly; SPEC §1.4 requires that to be "flagged in the log
     /// and in the inference bar" — this only does the log half
-    /// ([`docs/ROADMAP.md`] M8 owns the inference-bar surfacing this
+    /// ([`docs/history/ROADMAP-M0-M9.md`] M8 owns the inference-bar surfacing this
     /// pyramid/plotting path shares with `glyde-app`'s existing
     /// `views::time::value_as_f64`, which has carried the same gap since
     /// M2). Never silently dropping the `warn` here, even though the UI half
@@ -734,7 +734,7 @@ mod tests {
         );
     }
 
-    // SPEC §1.4 / docs/ROADMAP.md M8: an i64/u64 magnitude beyond f64's
+    // SPEC §1.4 / docs/history/ROADMAP-M0-M9.md M8: an i64/u64 magnitude beyond f64's
     // exact-integer range (2^53) must still convert (never panic) — the
     // value it produces is unchanged from before `warn_if_precision_loss`
     // existed, only a `warn` log is now emitted alongside it.

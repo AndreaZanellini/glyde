@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Activates docs/QUALITY.md §1's corpus gate for every case docs/ROADMAP.md
-//! M2 has implemented inference for so far (docs/ROADMAP.md M2 "Activate
+//! Activates docs/QUALITY.md §1's corpus gate for every case docs/history/ROADMAP-M0-M9.md
+//! M2 has implemented inference for so far (docs/history/ROADMAP-M0-M9.md M2 "Activate
 //! corpus open→compare gate for all cases handled so far"):
 //! `glyde_core::ingest::inspect` is run against each committed delimited-text
 //! corpus file and compared field-by-field against its `.expected.json`,
@@ -25,7 +25,7 @@
 //! ahead of satisfying every one of its cases.
 //!
 //! Parquet corpus cases 53-56 and 61 are opened by the Parquet `Reader`
-//! (docs/ROADMAP.md M7, issues #153, #157, #159, #166), case 55 being a
+//! (docs/history/ROADMAP-M0-M9.md M7, issues #153, #157, #159, #166), case 55 being a
 //! partitioned directory. Every corpus case is now asserted.
 //!
 //! Case 21 previously disagreed with `time::classify_sampling`'s robust-CV

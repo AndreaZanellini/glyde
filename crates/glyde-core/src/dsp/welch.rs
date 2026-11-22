@@ -27,7 +27,7 @@
 //! impossible to hand this module anything else.
 //!
 //! `welch_source`/`welch_segmented_source` are the streaming entry points
-//! (SPEC §3.2, docs/ROADMAP.md M5 "Streaming Welch"): they read a
+//! (SPEC §3.2, docs/history/ROADMAP-M0-M9.md M5 "Streaming Welch"): they read a
 //! [`SampleSource`] in its own bounded chunks and hold one analysis window at
 //! a time, never the selection. `welch`/`welch_segmented` are the same code
 //! fed from a resident slice. Choosing *what* to compute on — which samples,

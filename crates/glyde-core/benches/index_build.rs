@@ -16,7 +16,7 @@
 //! docs/QUALITY.md §3): CSV full index build must be ≤30s per 10GB, i.e.
 //! ≤3s for the 1GB fixture benched here.
 //!
-//! Parquet (docs/ROADMAP.md M7, issue #162): SPEC §5's "≤10s per 10GB" is
+//! Parquet (docs/history/ROADMAP-M0-M9.md M7, issue #162): SPEC §5's "≤10s per 10GB" is
 //! ≤1s for the 1GB fixture benched here. It covers what an open does before
 //! the plot can be drawn: the read *and* every column's pyramid, half of
 //! them integer columns whose upper levels come from the row-group

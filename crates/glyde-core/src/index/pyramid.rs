@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Pyramid-level spill cache (docs/ROADMAP.md M3 "Pyramid level spill",
+//! Pyramid-level spill cache (docs/history/ROADMAP-M0-M9.md M3 "Pyramid level spill",
 //! docs/ARCHITECTURE.md §The index "Deferred, tracked separately").
 //!
 //! Only Level 0 was spilled to disk before this module

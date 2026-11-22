@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Benchmark: first_plot. Budget is build-blocking (docs/SPEC.md §5,
-//! docs/ROADMAP.md M3 "Background progressive build emitting partial
+//! docs/history/ROADMAP-M0-M9.md M3 "Background progressive build emitting partial
 //! levels"): "first meaningful plot, any file size: ≤2s (progressive: render
 //! what is indexed, keep indexing in background)".
 //!

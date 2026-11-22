@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Property-test scaffolding (docs/QUALITY.md §2 Property tests,
-//! docs/ROADMAP.md M1): invariants that must hold across the whole input
+//! docs/history/ROADMAP-M0-M9.md M1): invariants that must hold across the whole input
 //! space, not just the fixed golden-test cases.
 
 use glyde_core::dsp::decimation::{build_pyramid, decimate_viewport};

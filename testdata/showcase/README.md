@@ -24,10 +24,8 @@ Generation is deterministic (fixed seeds) and takes about 3 minutes.
 File 02 spills on any machine. The RAM budget is `min(25% of RAM, 4 GB)`, and the file's in-memory estimate is above 6 GB.
 Opening it needs about 1.7 GB free on the cache disk.
 
-Missing samples in the CSVs are written as `NaN`, not as blank cells: blank cells currently turn a numeric
-column into text (issue #189). Both CSVs currently show the delimiter at `Low` confidence, although it is
-inferred correctly (issue #190). Outliers are not yet flagged in the anomaly gutter (ROADMAP M8); today they
-are visible only because min/max decimation keeps them.
+Missing samples in the CSVs are written as `NaN`. Outliers are not yet flagged in the anomaly gutter (v0.2,
+issue #236); today they are visible only because min/max decimation keeps them.
 
 ---
 

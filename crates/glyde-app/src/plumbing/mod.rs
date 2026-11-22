@@ -37,7 +37,7 @@
 //! file). [`run_index_job`] now calls
 //! [`glyde_core::ingest::open_dataset_progressive`] instead, so a large
 //! file's plot fills in while indexing continues rather than staying a bare
-//! spinner until the whole file has been read (docs/ROADMAP.md M3
+//! spinner until the whole file has been read (docs/history/ROADMAP-M0-M9.md M3
 //! "Background progressive build emitting partial levels", SPEC §5 "first
 //! meaningful plot ... ≤ 2s").
 
@@ -133,7 +133,7 @@ pub fn lane_refiner(
 pub enum IndexingMessage {
     /// The indexer thread started work on `path`.
     Started { generation: u64, path: PathBuf },
-    /// A background progress checkpoint (docs/ROADMAP.md M3 "Background
+    /// A background progress checkpoint (docs/history/ROADMAP-M0-M9.md M3 "Background
     /// progressive build emitting partial levels"): `dataset` is every
     /// sample read so far, renderable exactly like a [`Self::Completed`]
     /// dataset, just with fewer rows — `views::time::show` needs no special
@@ -165,7 +165,7 @@ pub enum IndexingMessage {
     },
     /// `path` opened successfully; `summary` is what was inferred, `report`
     /// is the same inference surfaced as SPEC §1.2's mandatory UX fields
-    /// (docs/ROADMAP.md M4), and `dataset` is every sample, ready for
+    /// (docs/history/ROADMAP-M0-M9.md M4), and `dataset` is every sample, ready for
     /// [`crate::views::time::show`]. `pyramids` is the completed dataset's
     /// own min/max pyramid (issue #80) — `None` per column when `dataset`
     /// came from the spilled storage path (`Dataset::is_spilled`);
@@ -326,7 +326,7 @@ pub fn spawn_index_job(
     spawn_index_job_with_overrides(generation, path, IngestOverrides::default(), cancel, tx)
 }
 
-/// [`spawn_index_job`] with [`IngestOverrides`] applied (docs/ROADMAP.md M4
+/// [`spawn_index_job`] with [`IngestOverrides`] applied (docs/history/ROADMAP-M0-M9.md M4
 /// "One-click correction of each field → triggers a re-index"):
 /// `crate::app::GlydeApp` calls this to re-open the current file after the
 /// user corrects a field in the inference bar.
@@ -349,7 +349,7 @@ pub fn spawn_index_job_with_overrides(
 /// (docs/ARCHITECTURE.md §Hard rule 3). Sends nothing if the user cancels.
 ///
 /// Not unit-tested: `rfd`'s native dialog has no headless backend, so this
-/// can only be exercised manually (docs/ROADMAP.md M2's proof for this item).
+/// can only be exercised manually (docs/history/ROADMAP-M0-M9.md M2's proof for this item).
 pub fn spawn_open_dialog(generation: u64, cancel: CancelFlag, tx: Sender<IndexingMessage>) {
     spawn_dialog(generation, cancel, tx, |dialog| dialog.pick_file());
 }
@@ -431,7 +431,7 @@ fn run_index_job(
         return;
     }
 
-    // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1": one parse
+    // SPEC §4.1 / docs/history/ROADMAP-M0-M9.md M2 "Time-domain view v1": one parse
     // produces both the inference summary and the materialized dataset
     // `views::time::show` renders (issue #58). An open that produces a
     // summary but fails to materialize as a dataset still has nothing to
@@ -442,7 +442,7 @@ fn run_index_job(
     // time fields low-confidence, so such a file arrives here as an ordinary
     // (if loudly flagged) success with a real plot behind it.
     //
-    // docs/ROADMAP.md M3 "Background progressive build emitting partial
+    // docs/history/ROADMAP-M0-M9.md M3 "Background progressive build emitting partial
     // levels": every checkpoint along the way is forwarded as its own
     // `Progress` message, so the UI thread can render a growing plot instead
     // of only a spinner while a large file is still being read.
@@ -740,7 +740,7 @@ mod tests {
         }
     }
 
-    /// docs/ROADMAP.md M7 (issue #153): a Parquet file opens through the
+    /// docs/history/ROADMAP-M0-M9.md M7 (issue #153): a Parquet file opens through the
     /// same indexer as a CSV — no longer refused as an unrecognized format —
     /// with its typed timestamp column as the time axis and the same derived
     /// plot inputs (pyramid, Level-0 cache) built for its numeric column.
@@ -787,7 +787,7 @@ mod tests {
         }
     }
 
-    /// docs/ROADMAP.md M7 (issue #159): a partitioned Parquet folder, what
+    /// docs/history/ROADMAP-M0-M9.md M7 (issue #159): a partitioned Parquet folder, what
     /// File → Open folder… and a folder drop hand the indexer, opens as one
     /// dataset with its partition key as a text column.
     #[test]
@@ -817,7 +817,7 @@ mod tests {
         }
     }
 
-    /// docs/ROADMAP.md M3 "Background progressive build emitting partial
+    /// docs/history/ROADMAP-M0-M9.md M3 "Background progressive build emitting partial
     /// levels": a file large enough to cross `glyde_core::ingest`'s first
     /// progress checkpoint must report one or more `Progress` messages,
     /// each with a growing, real, renderable dataset — between `Started`

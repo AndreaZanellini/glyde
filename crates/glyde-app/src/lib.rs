@@ -18,7 +18,7 @@
 //! tested without a window, it belongs in glyde-core. See docs/ARCHITECTURE.md.
 //!
 //! This library target exists only so `src/main.rs` and this crate's own
-//! `benches/` can share one crate root (docs/ROADMAP.md M3, issue #80: a
+//! `benches/` can share one crate root (docs/history/ROADMAP-M0-M9.md M3, issue #80: a
 //! frame-time gate over the real render path needs `views::time::show`
 //! reachable from a `[[bench]]`, which a bin-only crate cannot do) — it is
 //! not a public API for other crates to depend on.

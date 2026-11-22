@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Signal processing: rendering decimation (docs/ROADMAP.md M3) and Welch
-//! PSD (docs/ROADMAP.md M5).
+//! Signal processing: rendering decimation (docs/history/ROADMAP-M0-M9.md M3) and Welch
+//! PSD (docs/history/ROADMAP-M0-M9.md M5).
 //!
 //! Every algorithm here is locked by a golden test written before its
 //! implementation (`crates/glyde-core/tests/golden/`, docs/QUALITY.md §2)

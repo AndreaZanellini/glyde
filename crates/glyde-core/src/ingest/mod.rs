@@ -13,16 +13,16 @@
 // limitations under the License.
 
 //! Readers and the format registry (docs/ARCHITECTURE.md §Hard rule 5,
-//! docs/SPEC.md §1.1, docs/ROADMAP.md M2).
+//! docs/SPEC.md §1.1, docs/history/ROADMAP-M0-M9.md M2).
 //!
 //! [`open`] is routing only: which registered [`Reader`] claims a path.
 //! [`report::inspect`] wires encoding, delimiter, header, decimal separator,
 //! and time-index inference together into one [`OpenSummary`]
-//! (docs/ROADMAP.md M2 "Activate corpus open→compare gate") — counts and
+//! (docs/history/ROADMAP-M0-M9.md M2 "Activate corpus open→compare gate") — counts and
 //! classifications only, no materialized values. [`dataset::load`] wires the
 //! same pieces together with [`infer_column`] (decimal-normalized per SPEC
 //! §1.2.4 first) into a full in-memory [`Dataset`], for `glyde-app`'s
-//! time-domain view (docs/ROADMAP.md M2 "Time-domain view v1").
+//! time-domain view (docs/history/ROADMAP-M0-M9.md M2 "Time-domain view v1").
 
 mod csv;
 mod dataset;
@@ -64,7 +64,7 @@ use crate::{GlydeError, Result};
 use std::path::Path;
 
 /// User-chosen corrections that bypass the corresponding SPEC §1.2 inference
-/// step (docs/ROADMAP.md M4 "One-click correction of each field → triggers a
+/// step (docs/history/ROADMAP-M0-M9.md M4 "One-click correction of each field → triggers a
 /// re-index"). Each `None` field keeps the automatic inference; each `Some`
 /// field is a settled, deliberate choice, so it is always reported at
 /// [`Confidence::High`] — a user's own correction is never "low confidence"
@@ -230,7 +230,7 @@ impl Default for Registry {
 /// Resolves which registered reader claims `path`, by format name.
 ///
 /// This performs format routing only today — actual parsing, inference, and
-/// indexing land with each reader's implementation (docs/ROADMAP.md M2).
+/// indexing land with each reader's implementation (docs/history/ROADMAP-M0-M9.md M2).
 pub fn open(path: &Path) -> Result<&'static str> {
     Registry::default_registry()
         .find(path)

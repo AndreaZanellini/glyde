@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Time-domain view (docs/ROADMAP.md M2/M3, SPEC §4.1/§3.1): renders a
+//! Time-domain view (docs/history/ROADMAP-M0-M9.md M2/M3, SPEC §4.1/§3.1): renders a
 //! [`Dataset`]'s numeric columns as a min/max-decimated plot with
 //! pan/zoom/box-zoom (via `egui_plot`, see the workspace `Cargo.toml`
 //! dependency comment), a "Fit to data" button, and a cursor readout of the
@@ -45,7 +45,7 @@
 //! the top plot's view, and each plot draws its own channels from it.
 //!
 //! Non-numeric columns (`bool`/`string`, SPEC §1.4) are not drawn here —
-//! they route to the state timeline (SPEC §4.3, docs/ROADMAP.md M6,
+//! they route to the state timeline (SPEC §4.3, docs/history/ROADMAP-M0-M9.md M6,
 //! [`super::state_timeline`]), whose lanes share this plot's x axis through
 //! [`TIME_AXIS_LINK_GROUP`] and align to its frame ([`SharedAxis`]).
 
@@ -822,7 +822,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
             // SPEC §3.1: resolve this frame's visible range and pixel width
             // from the plot's own current transform, so a decimation query
             // always matches exactly what is about to be drawn — never a
-            // fixed, once-per-open resampling (docs/ROADMAP.md M3, issue
+            // fixed, once-per-open resampling (docs/history/ROADMAP-M0-M9.md M3, issue
             // #80).
             let plot_bounds = plot_ui.plot_bounds();
             let view_x = (plot_bounds.min()[0], plot_bounds.max()[0]);
@@ -855,7 +855,7 @@ pub fn show_with_selection<P: Pyramid + Sync>(
                 // same condition `decimate_viewport` itself branches on
                 // internally, but needed here too since the branches render
                 // differently: connected (SPEC §3.1's
-                // raw-samples-plus-markers regime, docs/ROADMAP.md M2) vs.
+                // raw-samples-plus-markers regime, docs/history/ROADMAP-M0-M9.md M2) vs.
                 // per-column vertical bars joined by connectors (issue
                 // #147). Kept with each decimation, which is drawn the way
                 // it was computed.
@@ -1283,7 +1283,7 @@ fn draw_series(
     }
 
     if cached.converged {
-        // SPEC §3.1's raw-samples regime (docs/ROADMAP.md M2): a connected
+        // SPEC §3.1's raw-samples regime (docs/history/ROADMAP-M0-M9.md M2): a connected
         // line through consecutive raw samples, broken at each gap bucket
         // (SPEC §1.3), plus point markers on top so "the user must be able
         // to reach the individual sample". A bug found from a real repro:
@@ -3459,7 +3459,7 @@ fn sorted_nearest(len: usize, x: impl Fn(usize) -> f64, target: f64) -> usize {
 }
 
 /// `values[index]` as `f64` for plotting (SPEC §1.4: integer dtypes promote
-/// losslessly for any value within `f64`'s 53-bit mantissa; `docs/ROADMAP.md`
+/// losslessly for any value within `f64`'s 53-bit mantissa; `docs/history/ROADMAP-M0-M9.md`
 /// M8 owns flagging the rare `i64`/`u64` magnitude that doesn't fit). `bool`
 /// and `string` series never reach here — callers only invoke this for
 /// [`ViewKind::TimeDomain`] series.
@@ -3503,7 +3503,7 @@ pub(crate) fn format_cursor_time(time: &TimeAxis, index: usize) -> String {
 }
 
 /// Builds a minimal-but-real dataset and runs [`show`] through a headless
-/// `egui::Context` (docs/ROADMAP.md M2 "Time-domain view v1", proven by
+/// `egui::Context` (docs/history/ROADMAP-M0-M9.md M2 "Time-domain view v1", proven by
 /// "manual + headless render snapshot"). `egui::Context::run` needs no GPU
 /// or display server — only `eframe`'s windowing shell does — so this
 /// exercises the exact widget code path (`Plot::show`, the line/points
@@ -6133,7 +6133,7 @@ mod render_tests {
         );
     }
 
-    // docs/ROADMAP.md M3 "Zoom all the way in → converges to individual
+    // docs/history/ROADMAP-M0-M9.md M3 "Zoom all the way in → converges to individual
     // sample points" / "one-sample spike stays visible at every zoom
     // level" (issue #80): a dataset far larger than any plausible pixel
     // width must still render without panicking, exercising the

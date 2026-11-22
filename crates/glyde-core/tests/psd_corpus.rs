@@ -14,7 +14,7 @@
 
 //! SPEC §3.3's PSD behavior on non-uniform data, proven on the torture
 //! corpus through the real loader (docs/QUALITY.md §1 cases 39 and 40,
-//! docs/ROADMAP.md M5 "`SegmentedUniform` ... `Irregular`").
+//! docs/history/ROADMAP-M0-M9.md M5 "`SegmentedUniform` ... `Irregular`").
 
 use glyde_core::dsp::psd::{
     plan_psd, PsdMemoryCap, PsdSettings, PsdUnavailable, PSD_MEMORY_CAP_BYTES,

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The PSD product logic (docs/SPEC.md §3.2–3.3, §5.1, docs/ROADMAP.md M5):
+//! The PSD product logic (docs/SPEC.md §3.2–3.3, §5.1, docs/history/ROADMAP-M0-M9.md M5):
 //! given a selected interval of a time axis, decide *whether* it may have a
 //! PSD, *what exactly* it is computed on, and *how much memory* computing it
 //! will take — before a single sample is read.
