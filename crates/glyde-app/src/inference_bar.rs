@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The inference bar (docs/ARCHITECTURE.md's "InferenceReport (what +
-//! confidence) -> UI inference bar", docs/ROADMAP.md M4 "Inference bar
+//! confidence) -> UI inference bar", docs/history/ROADMAP-M0-M9.md M4 "Inference bar
 //! widget: persistent and discreet; opens expanded when any inference is
 //! low-confidence"): every SPEC §1.2 mandatory field — encoding, delimiter,
 //! decimal separator, time column, timestamp format, sample count, sampling
@@ -28,7 +28,7 @@
 //! it expanded the moment any field could not be settled unambiguously, so
 //! nothing is ever guessed silently (Golden Rule 2).
 //!
-//! docs/ROADMAP.md M4 "One-click correction of each field → triggers a
+//! docs/history/ROADMAP-M0-M9.md M4 "One-click correction of each field → triggers a
 //! re-index" (docs/SPEC.md §1.2): the delimiter and decimal separator each
 //! get a correction dropdown, and an ambiguous day/month timestamp format
 //! gets the exact "one-click swap" SPEC §2.1's ambiguity rule describes. A
@@ -340,7 +340,7 @@ fn generated_index_text(source: &TimeIndexSource, rows: Option<u64>) -> Option<S
 }
 
 /// SPEC §1.3 "rows ... skipped, counted, logged at `warn`, surfaced in the
-/// inference bar ('142 rows skipped — view details')" (docs/ROADMAP.md M4).
+/// inference bar ('142 rows skipped — view details')" (docs/history/ROADMAP-M0-M9.md M4).
 /// Renders nothing at all for a clean file — same "no control unless there
 /// is something to show" rule the correction controls follow (see the
 /// module docs).
@@ -516,7 +516,7 @@ fn delimiter_from_label(label: &str) -> Option<Delimiter> {
 /// almost always right, and offering a control next to it anyway would
 /// invite fiddling with a setting that already works (see the module docs).
 /// Returns the newly picked delimiter if the user chose one different from
-/// the current value this frame (docs/ROADMAP.md M4, SPEC §1.2).
+/// the current value this frame (docs/history/ROADMAP-M0-M9.md M4, SPEC §1.2).
 fn delimiter_control(
     ui: &mut egui::Ui,
     field: &InferredField<Option<String>>,
@@ -1113,7 +1113,7 @@ mod tests {
         assert_eq!(timezone_label_text(&None), None);
     }
 
-    // corpus 24's shape (docs/ROADMAP.md M4 "corpus 24 (tz displayed)"): a
+    // corpus 24's shape (docs/history/ROADMAP-M0-M9.md M4 "corpus 24 (tz displayed)"): a
     // report with an honored offset must render that offset text somewhere
     // in the bar.
     #[test]
@@ -1182,7 +1182,7 @@ mod tests {
         assert!(header_text(&low, low.has_low_confidence_field()).contains("low confidence"));
     }
 
-    // docs/ROADMAP.md M4: rendering a frame with no user interaction must
+    // docs/history/ROADMAP-M0-M9.md M4: rendering a frame with no user interaction must
     // never report a correction — only an actual click does.
     #[test]
     fn show_reports_no_correction_when_nothing_was_clicked() {
@@ -1228,7 +1228,7 @@ mod tests {
         assert_eq!(decimal_separator_from_label("?"), None);
     }
 
-    // docs/ROADMAP.md M4 follow-up (maintainer review: "I don't want to
+    // docs/history/ROADMAP-M0-M9.md M4 follow-up (maintainer review: "I don't want to
     // leave the user the possibility to change something that breaks the
     // app or is useless in most cases"): a confidently-inferred field must
     // render as a plain label only — no correction control at all. `time_column`

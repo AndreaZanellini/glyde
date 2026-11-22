@@ -22,7 +22,7 @@
 //! plus [`infer_timestamp_format`], which also recognizes when a column is a
 //! progressive numeric index rather than an absolute timestamp, and resolves
 //! the day-vs-month ambiguity per SPEC §2.1 — landed with earlier
-//! docs/ROADMAP.md M2 items. [`detect_gaps`] and [`classify_sampling`] (SPEC
+//! docs/history/ROADMAP-M0-M9.md M2 items. [`detect_gaps`] and [`classify_sampling`] (SPEC
 //! §2.2–2.3) land with M2's "Sampling classification" item.
 //! [`detect_monotonicity`] (SPEC §2.1: non-monotonic and duplicate timestamp
 //! detection) lands with M2's "Non-monotonic + duplicate timestamp detection"

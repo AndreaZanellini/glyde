@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Boolean state bands (docs/SPEC.md §4.3, docs/ROADMAP.md M6): a `bool`
+//! Boolean state bands (docs/SPEC.md §4.3, docs/history/ROADMAP-M0-M9.md M6): a `bool`
 //! series' raw samples collapsed into maximal runs of the same value, one
 //! per [`BoolBand`], so `glyde-app`'s state timeline view (SPEC §4.3: "not
 //! step plots on a numeric axis") can draw one band per run instead of one

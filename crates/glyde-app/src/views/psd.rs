@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The PSD view (docs/SPEC.md §4.2, docs/ROADMAP.md M5 "PSD view").
+//! The PSD view (docs/SPEC.md §4.2, docs/history/ROADMAP-M0-M9.md M5 "PSD view").
 //!
 //! - **Computed only on request.** The "Compute PSD" button takes the
 //!   interval the time view shows at that moment (zoom or box-select to

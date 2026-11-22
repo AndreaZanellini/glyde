@@ -34,7 +34,7 @@ pub enum GlydeError {
 
     /// The file claims to be Parquet (by its extension) but its footer or
     /// pages could not be decoded — truncated, corrupt, or written with a
-    /// codec this build does not include (docs/ROADMAP.md M7).
+    /// codec this build does not include (docs/history/ROADMAP-M0-M9.md M7).
     #[error("could not read {path} as Parquet: {reason}")]
     InvalidParquet { path: PathBuf, reason: String },
 

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Fixture helpers shared by `index_build` and `viewport_query`
-//! (docs/QUALITY.md §3, docs/ROADMAP.md M3). Lives under `benches/support/`
+//! (docs/QUALITY.md §3, docs/history/ROADMAP-M0-M9.md M3). Lives under `benches/support/`
 //! rather than directly in `benches/` so Cargo's bench auto-discovery does
 //! not also try to treat this as its own bench target (mirrors
 //! `tests/support/mod.rs`).

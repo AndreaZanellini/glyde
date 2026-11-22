@@ -18,7 +18,7 @@
 //! [`TimestampFormat::DateTimeSpace`], the four epoch formats,
 //! [`TimestampFormat::DayFirst`] / [`TimestampFormat::MonthFirst`] (with the
 //! SPEC §2.1 day-vs-month ambiguity rule), [`TimestampFormat::LabViewEpoch`],
-//! and [`TimestampFormat::ExcelSerial`] are implemented (docs/ROADMAP.md M2's
+//! and [`TimestampFormat::ExcelSerial`] are implemented (docs/history/ROADMAP-M0-M9.md M2's
 //! "Time index" item, "DD/MM vs MM/DD disambiguation", and the
 //! Excel/LabVIEW/picosecond-index item). `Iso8601WithOffset`, `Iso8601Naive`,
 //! and `DateTimeSpace` also preserve sub-nanosecond (picosecond) fractional
@@ -130,7 +130,7 @@ pub enum TimestampFormat {
     /// Excel serial date: days since 1899-12-30, fractional part is the time
     /// of day.
     ExcelSerial,
-    /// A typed Parquet `TIMESTAMP` column (docs/ROADMAP.md M7): no text to
+    /// A typed Parquet `TIMESTAMP` column (docs/history/ROADMAP-M0-M9.md M7): no text to
     /// infer, the unit (s/ms/µs/ns) and the timezone come from the file's
     /// own schema. A timezone-aware column carries each row's UTC offset
     /// and redisplays as ISO 8601 with that offset; a column without one is

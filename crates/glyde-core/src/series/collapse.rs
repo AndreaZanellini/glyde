@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The state timeline's collapse rule (docs/SPEC.md §4.3, docs/ROADMAP.md
+//! The state timeline's collapse rule (docs/SPEC.md §4.3, docs/history/ROADMAP-M0-M9.md
 //! M6): "when multiple states collapse into one pixel column, render a
 //! 'multiple states' glyph that expands on zoom. Losing an event is a bug."
 //!

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Proves the docs/ROADMAP.md M3 "Pyramid level spill" item end to end: a
+//! Proves the docs/history/ROADMAP-M0-M9.md M3 "Pyramid level spill" item end to end: a
 //! pyramid reopened from `index::pyramid`'s cache is bucket-for-bucket
 //! identical to a freshly built one, and `dsp::decimation::decimate_viewport`
 //! — the golden-tested query engine — produces exactly the same viewport

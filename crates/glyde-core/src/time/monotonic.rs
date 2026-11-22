@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Non-monotonic and duplicate timestamp detection over a timestamp series
-//! (docs/SPEC.md §2.1, docs/ROADMAP.md M2).
+//! (docs/SPEC.md §2.1, docs/history/ROADMAP-M0-M9.md M2).
 
 use std::cmp::Ordering;
 use tracing::warn;

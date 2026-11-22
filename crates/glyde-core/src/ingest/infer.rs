@@ -73,7 +73,7 @@ pub struct EncodingInference {
 /// SPEC §1.2 "Confidence is tracked per inference": whether an inference was
 /// settled unambiguously or is the best guess among competing readings that
 /// SPEC §1.2/§2.1's ambiguity rules could not fully resolve. `Low` is what
-/// the inference bar (docs/ROADMAP.md M4) opens expanded for, instead of
+/// the inference bar (docs/history/ROADMAP-M0-M9.md M4) opens expanded for, instead of
 /// collapsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confidence {
@@ -586,7 +586,7 @@ fn field_looks_like_data(field: &str) -> bool {
     }
     // A crude but sufficient ISO-8601-leaning check: a 4-digit year followed
     // by `-`, e.g. "2026-01-01T00:00:00Z". Full timestamp-format parsing is
-    // docs/ROADMAP.md M2's separate time-index item.
+    // docs/history/ROADMAP-M0-M9.md M2's separate time-index item.
     let bytes = field.as_bytes();
     bytes.len() >= 5 && bytes[..4].iter().all(u8::is_ascii_digit) && bytes[4] == b'-'
 }
@@ -944,7 +944,7 @@ pub(crate) fn parse_f64_field(field: &str) -> f64 {
 ///
 /// Integer columns always parse to `i64` and float columns always to `f64`.
 /// CSV text carries no dtype of its own to "preserve" the way a typed
-/// Parquet column will (a later `docs/ROADMAP.md` M7 reader) — there is
+/// Parquet column will (a later `docs/history/ROADMAP-M0-M9.md` M7 reader) — there is
 /// nothing to preserve *from*, only a dtype to infer — so the widest
 /// lossless signed/floating representation is the safe default; narrower
 /// integer widths (`i8`..`i32`, `u8`..`u64`) and `f32` are a later item's
@@ -970,7 +970,7 @@ pub(crate) enum ObservedNumber {
 /// instead of the three (`i64` attempt, `f64` check, `f64` conversion) the
 /// decide-then-convert form needed.
 ///
-/// Resumable so a progressive load (docs/ROADMAP.md M3) can extend each
+/// Resumable so a progressive load (docs/history/ROADMAP-M0-M9.md M3) can extend each
 /// checkpoint's column by only the rows that arrived since the previous one
 /// instead of re-typing the whole prefix every time; [`infer_column`] is a
 /// single `extend` over the whole slice, so both produce the same [`Series`]
@@ -1396,7 +1396,7 @@ mod tests {
     }
 
     // --- SPEC §1.2.2-1.2.4: joint delimiter / header / decimal-separator
-    // inference (docs/ROADMAP.md M2). Golden tests written first, against
+    // inference (docs/history/ROADMAP-M0-M9.md M2). Golden tests written first, against
     // the torture corpus, per CLAUDE.md's TDD rule for glyde-core::ingest.
 
     fn corpus_sample(file_name: &str) -> String {
@@ -1724,7 +1724,7 @@ mod tests {
         assert!(!header.ambiguous);
     }
 
-    // --- SPEC §1.4: column dtype inference (docs/ROADMAP.md M2). Golden
+    // --- SPEC §1.4: column dtype inference (docs/history/ROADMAP-M0-M9.md M2). Golden
     // tests written first, against the torture corpus, per CLAUDE.md's TDD
     // rule for glyde-core::ingest.
 

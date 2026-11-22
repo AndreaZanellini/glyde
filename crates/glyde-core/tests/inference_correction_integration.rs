@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! docs/ROADMAP.md M4 "One-click correction of each field → triggers a
+//! docs/history/ROADMAP-M0-M9.md M4 "One-click correction of each field → triggers a
 //! re-index" (docs/SPEC.md §1.2 "Each is correctable in one click; correcting
 //! triggers a re-index"): [`glyde_core::ingest::IngestOverrides`] lets a
 //! caller pin the delimiter, decimal separator, and/or timestamp format that
@@ -247,7 +247,7 @@ fn overrides_produce_the_same_dataset_on_both_storage_paths() {
 
 /// A plain progressive-index file has no ambiguity to correct, but the
 /// override plumbing must not be limited to files that already carry an
-/// absolute timestamp (docs/ROADMAP.md M4 applies to every field, delimiter
+/// absolute timestamp (docs/history/ROADMAP-M0-M9.md M4 applies to every field, delimiter
 /// and decimal separator included, independent of the time-index kind).
 #[test]
 fn delimiter_and_decimal_overrides_still_work_on_a_progressive_index_file() {

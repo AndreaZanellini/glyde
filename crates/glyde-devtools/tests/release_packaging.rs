@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Issue #30 / docs/ROADMAP.md M9: what a tagged release publishes is only
+//! Issue #30 / docs/history/ROADMAP-M0-M9.md M9: what a tagged release publishes is only
 //! exercised when a tag is pushed, so the parts that can be checked without
 //! one are locked here — the release notes' mandatory content (docs/SPEC.md
 //! §7, CLAUDE.md §Release checklist) and the release workflow's gate and

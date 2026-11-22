@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! String/categorical state bands (docs/SPEC.md §4.3, docs/ROADMAP.md M6): a
+//! String/categorical state bands (docs/SPEC.md §4.3, docs/history/ROADMAP-M0-M9.md M6): a
 //! `string` series' raw samples collapsed into maximal runs of the same
 //! label, one [`StateBand`] per run, mirroring [`super::BoolBand`].
 //!

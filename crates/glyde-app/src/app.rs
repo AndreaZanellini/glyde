@@ -20,7 +20,7 @@
 //! thread.
 //!
 //! This is the M2 "single egui window" + "Time-domain view v1" slice
-//! (docs/ROADMAP.md): a file opens off-thread, its inference report renders
+//! (docs/history/ROADMAP-M0-M9.md): a file opens off-thread, its inference report renders
 //! in the inference bar, and its samples render as a plot via
 //! [`crate::views::time`].
 
@@ -57,10 +57,10 @@ type Pyramids = Vec<Option<Vec<Vec<Bucket>>>>;
 type Level0Caches = Vec<Option<Arc<Level0Cache>>>;
 
 /// The most recent background progress checkpoint for a file still being
-/// indexed (docs/ROADMAP.md M3 "Background progressive build emitting
+/// indexed (docs/history/ROADMAP-M0-M9.md M3 "Background progressive build emitting
 /// partial levels"): a real, renderable [`Dataset`] with fewer rows than the
 /// final one, plus how many rows it reflects and that checkpoint's own
-/// min/max pyramid (docs/ROADMAP.md M3, issue #80). `ticks` is
+/// min/max pyramid (docs/history/ROADMAP-M0-M9.md M3, issue #80). `ticks` is
 /// `dataset.time`'s own pyramid ticks, and `sample_cache` is every non-`f64`
 /// numeric column's converted samples (`views::time::cache_column_samples`),
 /// both computed once here rather than by [`views::time::show`] on every
@@ -148,7 +148,7 @@ pub struct GlydeApp {
     /// end only for its messages to be dropped.
     load_cancel: CancelFlag,
     /// SPEC §1.2 "[each field is] correctable in one click; correcting
-    /// triggers a re-index" (docs/ROADMAP.md M4): every correction the user
+    /// triggers a re-index" (docs/history/ROADMAP-M0-M9.md M4): every correction the user
     /// has made to the file currently open, applied on top of automatic
     /// inference the next time it is (re-)indexed. Reset to
     /// [`IngestOverrides::default`] whenever a *different* file is opened —
@@ -224,7 +224,7 @@ impl GlydeApp {
         spawn_index_job(self.generation, path, cancel, self.tx.clone());
     }
 
-    /// A one-click field correction from the inference bar (docs/ROADMAP.md
+    /// A one-click field correction from the inference bar (docs/history/ROADMAP-M0-M9.md
     /// M4, SPEC §1.2): folds `correction` into the running set of overrides
     /// for the current file and re-indexes it from scratch under them —
     /// exactly [`Self::open`]'s job, minus resetting `overrides` itself and
@@ -609,15 +609,15 @@ impl GlydeApp {
                 level0_caches,
             } => {
                 ui.heading(path.display().to_string());
-                // SPEC §1.2 mandatory UX / docs/ROADMAP.md M4 "Inference bar
+                // SPEC §1.2 mandatory UX / docs/history/ROADMAP-M0-M9.md M4 "Inference bar
                 // widget: persistent and discreet; opens expanded when any
                 // inference is low-confidence; each field correctable in one
                 // click, correcting triggers a re-index".
                 if let Some(correction) = inference_bar::show(ui, report, path) {
                     pending_correction = Some((path.clone(), correction));
                 }
-                // SPEC §4.1 / docs/ROADMAP.md M2 "Time-domain view v1"; SPEC
-                // §3.1 decimation via `pyramids` (docs/ROADMAP.md M3, issue #80).
+                // SPEC §4.1 / docs/history/ROADMAP-M0-M9.md M2 "Time-domain view v1"; SPEC
+                // §3.1 decimation via `pyramids` (docs/history/ROADMAP-M0-M9.md M3, issue #80).
                 // Its visible interval is the PSD view's selection (SPEC §4.2).
                 // Stacked above the state lanes, which share its time axis
                 // (SPEC §4.1, §4.3).
@@ -641,7 +641,7 @@ impl GlydeApp {
                     prepared.cursor.is_sorted(),
                     visible,
                 ));
-                // SPEC §4.3 / docs/ROADMAP.md M6 "Boolean series → on/off
+                // SPEC §4.3 / docs/history/ROADMAP-M0-M9.md M6 "Boolean series → on/off
                 // horizontal bands", "String/categorical → labeled state
                 // bands", "Markers", the collapse rule and time alignment:
                 // laid out over the plot's frame, on its time axis.
@@ -869,7 +869,7 @@ mod tests {
         }
     }
 
-    /// docs/ROADMAP.md M3 "Background progressive build emitting partial
+    /// docs/history/ROADMAP-M0-M9.md M3 "Background progressive build emitting partial
     /// levels": a `Progress` message tagged with the current generation must
     /// switch the status to `Loading` with a partial dataset attached, so the
     /// UI can render a growing plot instead of only a spinner.
@@ -1210,7 +1210,7 @@ mod tests {
         assert!(app.time_view.fit_requested(), "the next open is fitted");
     }
 
-    // docs/ROADMAP.md M4 "One-click correction of each field → triggers a
+    // docs/history/ROADMAP-M0-M9.md M4 "One-click correction of each field → triggers a
     // re-index": `open` must start every newly opened file from a clean
     // slate — a correction made on the previous file must never leak into
     // the next one.
@@ -1506,7 +1506,7 @@ mod tests {
         );
     }
 
-    /// End to end, headless (docs/ROADMAP.md M5 maintainer test "the PSD
+    /// End to end, headless (docs/history/ROADMAP-M0-M9.md M5 maintainer test "the PSD
     /// peak lands where physics says"): a real CSV opened through the real
     /// background indexer, its whole time-view interval handed to the PSD
     /// view, the PSD computed off-thread and rendered.

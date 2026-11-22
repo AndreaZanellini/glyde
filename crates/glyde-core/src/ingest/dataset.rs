@@ -545,7 +545,7 @@ pub fn load_with_budget(path: &Path, budget: RamBudget, cache_dir: &Path) -> Res
         .map(|(_outcome, dataset, _ambiguous)| dataset)
 }
 
-/// [`load`] with [`IngestOverrides`] applied (docs/ROADMAP.md M4 "One-click
+/// [`load`] with [`IngestOverrides`] applied (docs/history/ROADMAP-M0-M9.md M4 "One-click
 /// correction of each field → triggers a re-index"): each `Some` field bypasses
 /// its inference step and settles the parse outright.
 pub fn load_with_overrides(path: &Path, overrides: IngestOverrides) -> Result<Dataset> {
@@ -756,7 +756,7 @@ pub(crate) fn load_with_outcome_using(
 /// A thin wrapper over [`DatasetBuilder`], which
 /// [`load_with_outcome_progressive`] drives incrementally across checkpoints
 /// — one implementation for both, so a checkpoint can never drift from the
-/// final dataset (docs/ROADMAP.md M3 "Background progressive build emitting
+/// final dataset (docs/history/ROADMAP-M0-M9.md M3 "Background progressive build emitting
 /// partial levels").
 fn build_dataset(
     outcome: &CsvParseOutcome,
@@ -1365,7 +1365,7 @@ impl TimeCandidateScan {
     }
 
     /// [`Self::observe`] for a value that is already a number — a typed
-    /// column (a Parquet integer or float column, docs/ROADMAP.md M7) has no
+    /// column (a Parquet integer or float column, docs/history/ROADMAP-M0-M9.md M7) has no
     /// text to parse.
     ///
     /// Forced inline: [`Self::observe`] runs once per row of every CSV open,
@@ -1530,7 +1530,7 @@ fn load_spilled(
         Ok(())
     })?;
 
-    // docs/ROADMAP.md M4: a user's timestamp-format override settles the
+    // docs/history/ROADMAP-M0-M9.md M4: a user's timestamp-format override settles the
     // question outright, the same as `resolve_timestamp_format` does for the
     // in-memory path — never ambiguous, since it is a deliberate choice.
     let timestamp_format = match overrides.timestamp_format {
@@ -2414,7 +2414,7 @@ impl<'a> SpillPreview<'a> {
 
 /// One progress update from [`load_with_outcome_progressive`]: a real
 /// [`Dataset`] built from the rows read so far, plus that dataset's own
-/// min/max pyramid for every numeric column (docs/ROADMAP.md M3 "Background
+/// min/max pyramid for every numeric column (docs/history/ROADMAP-M0-M9.md M3 "Background
 /// progressive build emitting partial levels", docs/ARCHITECTURE.md
 /// §pipeline: "first level ready → first plot"). `pyramids` is parallel to
 /// `dataset.columns` — `None` at an index whose column is `Bool`/`String`
@@ -2480,7 +2480,7 @@ impl Checkpoint {
 
 /// [`load_with_outcome`], additionally invoking `on_checkpoint` with a
 /// [`Checkpoint`] at each progress update `super::csv`'s row-count-doubling
-/// schedule fires (docs/ROADMAP.md M3 "Background progressive build emitting
+/// schedule fires (docs/history/ROADMAP-M0-M9.md M3 "Background progressive build emitting
 /// partial levels", SPEC §5 "first meaningful plot ... ≤ 2s ... render what
 /// is indexed, keep indexing in background"). Every checkpoint is a real
 /// [`Dataset`] built by the same [`build_dataset`] conversion the final
@@ -2814,7 +2814,7 @@ pub fn disk_pyramids_for_dataset(
 }
 
 /// Per-column pyramid state carried between successive progressive
-/// checkpoints (docs/ROADMAP.md M3, issue #90), so a later, larger
+/// checkpoints (docs/history/ROADMAP-M0-M9.md M3, issue #90), so a later, larger
 /// checkpoint's pyramid is built by *extending* the previous checkpoint's
 /// own pyramid ([`extend_pyramid`]) instead of re-aggregating every sample
 /// read so far from scratch every time — `super::csv`'s row-count-doubling
@@ -2938,7 +2938,7 @@ impl PyramidCursor {
 /// [`build_pyramid`] the pyramid used internally by [`load_with_outcome_progressive`]
 /// checkpoints uses. Public so `glyde-app` can build a final pyramid for a
 /// completed dataset once progressive checkpointing has stopped
-/// (docs/ROADMAP.md M3, issue #80).
+/// (docs/history/ROADMAP-M0-M9.md M3, issue #80).
 ///
 /// A [`Dataset::is_spilled`] dataset is read through
 /// [`build_pyramid_streaming`] instead (issue #88): its columns are
@@ -3007,12 +3007,12 @@ fn streaming_pyramid_for_column(
 /// (path + size + mtime match what was cached) *and* `overrides` matches
 /// what produced the cached entry, and writing the cache after building on a
 /// miss — so a second, completed open of the same file skips the pyramid
-/// aggregation entirely instead of redoing it (issue #81; docs/ROADMAP.md M3
+/// aggregation entirely instead of redoing it (issue #81; docs/history/ROADMAP-M0-M9.md M3
 /// "reopening rebuilds the pyramid from cached Level 0 rather than loading it
 /// too"). Each column gets its own cache entry, keyed by
 /// [`CacheKey::with_column`] and [`CacheKey::with_overrides_signature`], so a
 /// multi-column file's columns never overwrite each other's cache, and a
-/// one-click correction (docs/ROADMAP.md M4) of the same, byte-for-byte
+/// one-click correction (docs/history/ROADMAP-M0-M9.md M4) of the same, byte-for-byte
 /// unchanged file never collides with the pre-correction cache entry either.
 ///
 /// A cache miss or a cache read/write failure both fall back to an ordinary
@@ -3220,7 +3220,7 @@ pub type DerivedCaches = (ColumnPyramids, ColumnLevel0Caches);
 /// Each column gets its own cache entry, keyed by [`CacheKey::with_column`]
 /// and [`CacheKey::with_overrides_signature`], so a multi-column file's
 /// columns never overwrite each other's cache and a one-click correction
-/// (docs/ROADMAP.md M4) of the same, byte-for-byte unchanged file never
+/// (docs/history/ROADMAP-M0-M9.md M4) of the same, byte-for-byte unchanged file never
 /// collides with the pre-correction entry.
 ///
 /// Resolves the OS-standard cache directory itself; see
@@ -3963,7 +3963,7 @@ mod tests {
         file
     }
 
-    // docs/ROADMAP.md M3 "Background progressive build emitting partial
+    // docs/history/ROADMAP-M0-M9.md M3 "Background progressive build emitting partial
     // levels": every checkpoint's dataset must be a true prefix of the final
     // dataset — same values, just fewer rows — and the final result returned
     // by `load_with_outcome_progressive` must equal plain `load_with_outcome`
@@ -4176,7 +4176,7 @@ mod tests {
     // The pyramid attached to each checkpoint must be exactly what
     // `build_pyramid` would compute directly over that checkpoint's own
     // samples — a real, exact aggregation of the rows read so far, not an
-    // approximation (docs/ROADMAP.md M3 "emitting partial levels").
+    // approximation (docs/history/ROADMAP-M0-M9.md M3 "emitting partial levels").
     #[test]
     fn load_with_outcome_progressive_checkpoint_pyramids_match_build_pyramid_on_the_same_prefix() {
         let file = many_rows_temp_csv(70_000);

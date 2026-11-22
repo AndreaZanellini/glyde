@@ -11,6 +11,48 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### v0.1.0 in short
+The first release for colleagues. What Glyde does, in one place; the detailed
+history of every change follows below this summary.
+- **Open a measurement file and see it at once**: CSV, TSV and TXT with any
+  delimiter, decimal separator and common encoding, and Parquet files or folders
+  of Parquet files. Files larger than memory open too, the first part of the
+  plot appearing while the rest is read, and Glyde never uses more than
+  `min(25 % of RAM, 4 GB)`.
+- **Glyde says what it guessed**: the bar under the toolbar shows the encoding,
+  delimiter, decimal separator, time column, time format, time zone, sampling
+  rate and gaps, marks anything uncertain, and offers a one-click correction.
+- **Three views on one time axis**: one plot per numeric channel (or all on one
+  plot), compact tracks for on/off flags, states and events, and a Welch
+  spectrum computed on the raw samples of what you are looking at. Gaps look
+  like gaps and can be compressed; two cursors measure Δt, ΔY and slope.
+- **A new look**, light or dark as your system is set, and an app icon.
+- **Known limitations** are listed in the README: speed on very large files is
+  below Glyde's own targets, outliers are not flagged yet (v0.2), and a few
+  input corners are open issues.
+
+### Documentation
+- **A README and a user guide written for you, not for developers (issue
+  #234).** The README now has a screenshot of the app, how to install it on each
+  system (including the one-time step for this unsigned build), first steps,
+  the known limitations of v0.1, where the log file is, and how to report a
+  file that won't open. `docs/USER-GUIDE.md` explains, in a few pages, the
+  inference bar and its corrections, moving around the time view, stacked and
+  overlaid channels, state tracks, gaps and Compress, the cursors, the spectrum,
+  large files, and where the log and the cache live. A test checks that their
+  links, the first-run steps and the log folders stay right.
+  **To check:** read the README as if you were a colleague; follow it to a plot.
+  - `docs/M3-CLOSEOUT.md` moved to `docs/history/`, next to the old roadmap,
+    with a short note on what each archived file was. Code comments that cited
+    the old roadmap's milestones now point to `docs/history/ROADMAP-M0-M9.md`.
+  - **Assumptions to veto:** this summary sits at the top of `[Unreleased]`
+    rather than under a `[0.1.0]` heading, because the version is not tagged
+    yet; the release PR (#235) turns `[Unreleased]` into `[0.1.0]`. Moving
+    `ARCHITECTURE.md` and `ROUTINES.md` under `docs/dev/` needs edits to files
+    only you change, so it waits on your choice in issue #283. The golden test
+    files still cite the old roadmap path in their comments: they are left
+    untouched on purpose.
+
 ### Security
 - **The security review before v0.1 (issue #233).** The full write-up is in
   `docs/dev/security.md`. What changes for you:

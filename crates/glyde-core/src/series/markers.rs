@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Markers (docs/SPEC.md §4.3, docs/ROADMAP.md M6): single samples at an
+//! Markers (docs/SPEC.md §4.3, docs/history/ROADMAP-M0-M9.md M6): single samples at an
 //! instant, drawn as tick glyphs on their own lane and never decimated away.
 //!
 //! A *marker column* is a `string` column in which most cells are empty and

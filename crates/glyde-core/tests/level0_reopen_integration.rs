@@ -17,7 +17,7 @@
 //! *completed-load* open path, so a second open of an unchanged file serves
 //! each numeric column's raw `(timestamp, value)` pairs from the memory-mapped
 //! cache instead of re-deriving them from `Dataset`'s in-memory columns —
-//! docs/ROADMAP.md M3 "Level-0 typed spill cache … reopen is instant". Skipping
+//! docs/history/ROADMAP-M0-M9.md M3 "Level-0 typed spill cache … reopen is instant". Skipping
 //! the CSV text parse itself stays out of scope (issue #92's own body: a
 //! bigger, product-shaped question), so this only proves the numeric-sample
 //! half, mirroring exactly what `pyramid_reopen_integration.rs` already proves
@@ -167,7 +167,7 @@ fn ambiguous_date_csv(row_count: usize) -> tempfile::NamedTempFile {
     file
 }
 
-// docs/ROADMAP.md M4 "One-click correction of each field → triggers a
+// docs/history/ROADMAP-M0-M9.md M4 "One-click correction of each field → triggers a
 // re-index": correcting a field changes the dataset a path parses to without
 // the file on disk changing at all — same path, same size, same mtime, the
 // exact "unchanged file" signal `derived_caches_for_dataset_cached` otherwise trusts

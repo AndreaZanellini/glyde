@@ -87,7 +87,7 @@ pub struct CacheKey {
     /// construction, not by convention.
     column: Option<u32>,
     /// A fingerprint of whatever `crate::ingest::IngestOverrides` produced
-    /// the dataset this key caches (docs/ROADMAP.md M4 "One-click
+    /// the dataset this key caches (docs/history/ROADMAP-M0-M9.md M4 "One-click
     /// correction of each field → triggers a re-index"), `0` for the
     /// no-overrides case. Path + size + mtime alone assume a given file
     /// always parses to the same dataset — true for every reader until a
@@ -146,7 +146,7 @@ impl CacheKey {
     }
 
     /// Scopes this key to the [`crate::ingest::IngestOverrides`] that
-    /// produced the dataset being cached (docs/ROADMAP.md M4), so a
+    /// produced the dataset being cached (docs/history/ROADMAP-M0-M9.md M4), so a
     /// corrected re-open of the same, byte-for-byte unchanged file never
     /// collides with the cache entry a different set of overrides (or no
     /// overrides at all) wrote for it. `signature` is a plain hash of the

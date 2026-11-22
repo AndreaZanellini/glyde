@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! State timeline (docs/ROADMAP.md M6, SPEC §4.3): renders each `bool`
+//! State timeline (docs/history/ROADMAP-M0-M9.md M6, SPEC §4.3): renders each `bool`
 //! [`glyde_core::series::Series`] as its own compact lane of on/off
 //! horizontal bands — filled rectangles, never a numeric line/step plot
 //! ("Boolean flags → horizontal bands (on/off), not step plots on a numeric
@@ -1361,7 +1361,7 @@ pub fn cache_state_lanes(dataset: &Dataset, ticks: &[i128]) -> Vec<Option<StateL
 }
 
 /// Builds a minimal-but-real dataset with a `bool` column and runs [`show`]
-/// through a headless `egui::Context` (docs/ROADMAP.md M6, proven by
+/// through a headless `egui::Context` (docs/history/ROADMAP-M0-M9.md M6, proven by
 /// "corpus 47 + manual" — this is the same headless-render crash-free proof
 /// `views::time`'s own `render_tests` module uses, see its doc comment for
 /// why `egui::Context::run` alone is enough with no GPU/display server).

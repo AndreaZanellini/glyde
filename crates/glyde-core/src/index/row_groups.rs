@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Pyramid levels from Parquet row-group statistics (docs/ARCHITECTURE.md
-//! §why-Parquet, docs/ROADMAP.md M7, issue #162).
+//! §why-Parquet, docs/history/ROADMAP-M0-M9.md M7, issue #162).
 //!
 //! A Parquet footer carries each row group's min and max per column. A
 //! pyramid level can be taken from them, instead of aggregated from the

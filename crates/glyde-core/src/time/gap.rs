@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Gap detection and sampling classification over a timestamp series
-//! (docs/SPEC.md §2.2–2.3, docs/ROADMAP.md M2).
+//! (docs/SPEC.md §2.2–2.3, docs/history/ROADMAP-M0-M9.md M2).
 //!
 //! Every statistic here is defined against the **median** of the whole Δt
 //! distribution, and every one of them is computed in bounded memory over a
@@ -681,7 +681,7 @@ pub fn summarize_ticks_with_median<S: TickSource + ?Sized>(source: &S) -> Result
 /// Scans consecutive Δt in `timestamps` (non-decreasing, all in the same tick
 /// unit) and reports every gap where `Δt > 10 × median Δt` (SPEC
 /// §2.2–2.3). Feeds both sampling classification (`SegmentedUniform` vs.
-/// `Irregular`, SPEC §2.2) and the gap view (docs/ROADMAP.md M8).
+/// `Irregular`, SPEC §2.2) and the gap view (docs/history/ROADMAP-M0-M9.md M8).
 ///
 /// Returns one [`Gap`] per gap found — a convenience over [`gap_threshold`]
 /// and [`visit_gaps`] for a small, in-memory axis. A caller that only needs
