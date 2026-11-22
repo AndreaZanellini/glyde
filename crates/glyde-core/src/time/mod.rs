@@ -47,6 +47,8 @@ mod monotonic;
 mod navigation;
 mod ticks;
 
+pub(crate) use ticks::MAX_TICK_MAGNITUDE;
+
 pub use axis_labels::{
     calendar_ticks, format_cursor_timestamp, AxisLabelStyle, AxisZone, CalendarTick, DateOrder,
 };

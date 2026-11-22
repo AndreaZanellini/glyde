@@ -715,7 +715,7 @@ fn parse_epoch_integer(
         split_decimal(trimmed).ok_or_else(|| crate::GlydeError::InvalidTimestamp {
             input: input.to_string(),
             format,
-            reason: "not an integer or decimal number of epoch ticks".to_string(),
+            reason: "not an integer or decimal number of epoch ticks within ±10²¹".to_string(),
         })?;
     if frac.is_empty() {
         return Ok(Timestamp::new(whole, unit));
@@ -793,16 +793,32 @@ const SECONDS_PER_DAY: i128 = 86_400;
 /// SPEC §2.1/Golden Rule 1). Returns `None` for anything that is not
 /// `[-]digits[.digits]` (scientific notation, thousands separators,
 /// non-numeric text, a bare trailing `.` with no digits after it, ...).
+///
+/// A whole part beyond ±[`MAX_DECIMAL_WHOLE`] is `None` as well: it is not a
+/// timestamp in any of these formats, and the conversions that follow
+/// multiply and negate it (issue #277).
 fn split_decimal(field: &str) -> Option<(i128, &str)> {
     let field = field.trim();
-    match field.split_once('.') {
+    let (whole, frac) = match field.split_once('.') {
         Some((whole, frac)) if !frac.is_empty() && frac.bytes().all(|b| b.is_ascii_digit()) => {
-            Some((whole.parse().ok()?, frac))
+            (whole.parse::<i128>().ok()?, frac)
         }
-        Some(_) => None,
-        None => Some((field.parse().ok()?, "")),
-    }
+        Some(_) => return None,
+        None => (field.parse::<i128>().ok()?, ""),
+    };
+    (whole.unsigned_abs() <= MAX_DECIMAL_WHOLE.unsigned_abs()).then_some((whole, frac))
 }
+
+/// The largest whole part [`split_decimal`] accepts: 10²¹, beyond every
+/// 64-bit integer (an `i64` epoch value from any source still parses), and
+/// small enough that the largest conversion (Excel days to nanoseconds,
+/// ×8.64×10¹³) stays near 10³⁵ ticks, far inside
+/// [`crate::time::MAX_TICK_MAGNITUDE`] (issue #277).
+const MAX_DECIMAL_WHOLE: i128 = 1_000_000_000_000_000_000_000;
+
+/// The fraction digits [`frac_str_to_ticks`] reads: 10²⁴ times the largest
+/// `ticks_per_whole` (8.64×10¹³) still fits in an `i128` (issue #277).
+const MAX_FRACTION_DIGITS: usize = 24;
 
 /// Exact ticks (in `ticks_per_whole`'s unit) represented by a decimal
 /// fractional-part digit string, e.g. `frac_str_to_ticks("5", 1_000_000_000)`
@@ -810,13 +826,20 @@ fn split_decimal(field: &str) -> Option<(i128, &str)> {
 /// `ticks_per_whole` does not divide evenly — no corpus fixture exercises
 /// that case, and it never arises for the exact multiples this module's
 /// formats produce.
+///
+/// Digits past the 24th are dropped first (issue #277): a longer fraction
+/// would not fit the exact `i128` arithmetic, and those digits lie far below
+/// any unit's resolution. With a power-of-ten `ticks_per_whole` the result is
+/// unchanged; with Excel's day (8.64×10¹³ ns) it can be one tick lower than
+/// exact, for a value written with more than 24 decimals.
 fn frac_str_to_ticks(frac_digits: &str, ticks_per_whole: i128) -> i128 {
+    let frac_digits = &frac_digits[..frac_digits.len().min(MAX_FRACTION_DIGITS)];
     if frac_digits.is_empty() {
         return 0;
     }
     let numerator: i128 = frac_digits
         .parse()
-        .expect("split_decimal only ever returns all-ASCII-digit fractional text");
+        .expect("at most 24 ASCII digits always parse as an i128");
     let denominator = 10_i128.pow(frac_digits.len() as u32);
     numerator * ticks_per_whole / denominator
 }
@@ -850,7 +873,7 @@ fn parse_labview_epoch(input: &str) -> crate::Result<Timestamp> {
         split_decimal(input).ok_or_else(|| crate::GlydeError::InvalidTimestamp {
             input: input.to_string(),
             format: TimestampFormat::LabViewEpoch,
-            reason: "not a decimal number of seconds".to_string(),
+            reason: "not a decimal number of seconds within ±10²¹".to_string(),
         })?;
     let ticks_per_second = TimeUnit::Nanoseconds.ticks_per_second();
     let unix_seconds = whole - LABVIEW_EPOCH_OFFSET_SECONDS;
@@ -876,7 +899,7 @@ fn parse_excel_serial(input: &str) -> crate::Result<Timestamp> {
         split_decimal(input).ok_or_else(|| crate::GlydeError::InvalidTimestamp {
             input: input.to_string(),
             format: TimestampFormat::ExcelSerial,
-            reason: "not a decimal number of days".to_string(),
+            reason: "not a decimal number of days within ±10²¹".to_string(),
         })?;
     let ticks_per_day = SECONDS_PER_DAY * TimeUnit::Nanoseconds.ticks_per_second();
     let unix_days = whole - EXCEL_EPOCH_OFFSET_DAYS;
@@ -1589,6 +1612,76 @@ mod tests {
     // format's own native `TimeUnit`, exactly as before — the fractional
     // path must be additive, never change the existing integer behavior
     // corpus cases 29-32 already lock in.
+    // Issue #277: a fraction is scaled by exact `i128` arithmetic, and one
+    // longer than 38 digits did not fit: the parse panicked, in a release
+    // build too. Digits past the 24th lie far below any unit's resolution.
+    #[test]
+    fn a_fraction_with_very_many_digits_parses_like_its_first_24() {
+        let long = format!("1770000000.5{}", "1".repeat(44));
+        let short = format!("1770000000.5{}", "1".repeat(23));
+        for format in [
+            TimestampFormat::EpochSeconds,
+            TimestampFormat::EpochMillis,
+            TimestampFormat::EpochMicros,
+            TimestampFormat::EpochNanos,
+            TimestampFormat::LabViewEpoch,
+            TimestampFormat::ExcelSerial,
+        ] {
+            let parsed = parse_timestamp(&long, format)
+                .unwrap_or_else(|err| panic!("{long} as {format:?}: {err}"));
+            assert_eq!(
+                parsed,
+                parse_timestamp(&short, format).expect("24 fraction digits"),
+                "{format:?}"
+            );
+        }
+    }
+
+    // Issue #277 (PR #281 review): a numeral's whole part is parsed as an
+    // `i128`, and the epoch, LabVIEW and Excel conversions multiply and
+    // negate it. At the `i128` limits that overflowed (a panic in a test
+    // build, nonsense ticks in a release one), and the Δt of two such ticks
+    // overflowed the gap statistics. A whole part beyond 10²¹ is not a
+    // timestamp; at the bound it still parses.
+    #[test]
+    fn a_numeral_beyond_the_whole_part_bound_is_not_a_timestamp() {
+        let huge = [
+            "170141183460469231731687303715884105727",
+            "-170141183460469231731687303715884105728",
+            "1000000000000000000001",
+            "-1000000000000000000001.5",
+        ];
+        for format in [
+            TimestampFormat::EpochSeconds,
+            TimestampFormat::EpochMillis,
+            TimestampFormat::EpochMicros,
+            TimestampFormat::EpochNanos,
+            TimestampFormat::LabViewEpoch,
+            TimestampFormat::ExcelSerial,
+        ] {
+            for field in huge {
+                assert!(
+                    parse_timestamp(field, format).is_err(),
+                    "{field} must not parse as {format:?}"
+                );
+            }
+            for field in ["1000000000000000000000", "-1000000000000000000000.25"] {
+                let parsed = parse_timestamp(field, format)
+                    .unwrap_or_else(|err| panic!("{field} as {format:?}: {err}"));
+                assert!(
+                    parsed.ticks.unsigned_abs() <= crate::time::MAX_TICK_MAGNITUDE.unsigned_abs(),
+                    "{field} as {format:?} stays within the tick bound"
+                );
+            }
+        }
+        // Inference sees the same fields and must not panic on them either.
+        let _ = infer_timestamp_format(&huge);
+        let mut scan = TimestampFormatScan::default();
+        for field in huge {
+            scan.observe(field);
+        }
+    }
+
     #[test]
     fn epoch_seconds_integer_value_still_parses_at_its_native_unit() {
         let parsed =

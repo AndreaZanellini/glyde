@@ -545,6 +545,12 @@ fn read(inner: impl Read, file_len: u64) -> Result<Parsed> {
             while left > 0 {
                 let take = left.min(4096);
                 for packed in r.array::<PackedTimestamp>(take)? {
+                    // Issue #277: no parse yields a tick this large, and the
+                    // gap statistics' Δt would overflow on it.
+                    if packed.ticks.unsigned_abs() > crate::time::MAX_TICK_MAGNITUDE.unsigned_abs()
+                    {
+                        return Err(bad("a timestamp lies beyond any parsed value"));
+                    }
                     let unit = *UNITS
                         .get(packed.unit as usize)
                         .ok_or_else(|| bad("unknown time unit"))?;

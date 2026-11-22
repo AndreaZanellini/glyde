@@ -338,8 +338,10 @@ Resolved as follows:
   guarantee instead of degrading to "aggregate by sample count" for one of
   the two axis kinds. The ×10⁹ factor is an assumption (SPEC §2.1 does not
   name one): it caps exact representation at magnitudes below
-  `i128::MAX / 1e9` (~1.7×10²⁹) and nine fractional digits, which no
-  realistic progressive numeric index is expected to exceed.
+  `i128::MAX / 2 / 1e9` (~8.5×10²⁸) and nine fractional digits, which no
+  realistic progressive numeric index is expected to exceed. Larger values
+  saturate at that bound, half the `i128` range, so that the Δt of any two
+  ticks still fits in an `i128` (issue #277).
 - **`Bucket` carries no `TimeUnit` field.** `dsp::decimation` stays exactly
   what its own module doc already describes: a pure engine over opaque
   `i128` ticks, unaware of calendar time or which axis kind produced them.
