@@ -55,9 +55,9 @@ warns you once. This is expected; the files are built by this repository's CI.
 ## First steps
 
 1. **Drop a file** on the window, or use **File → Open…**.
-2. **Read the bar under the toolbar.** It says how Glyde read your file: delimiter, time
-   column, time zone, sampling rate, gaps. Anything marked `(low confidence)` has a
-   **Correct…** button next to it.
+2. **Check how Glyde read your file.** Click **▸ Inference** under the file name: it shows
+   the encoding, delimiter, time column, time zone, sampling rate and gaps. Anything marked
+   `(low confidence)` has a **Correct…** button next to it.
 3. **Zoom** with Ctrl/⌘ + wheel or a pinch, **pan** by dragging, **Fit to data** to see
    everything. The row under the plots reads the exact time and values at the pointer.
 4. Press **Cursors** to measure between two points, or **Compute PSD** for the spectrum of

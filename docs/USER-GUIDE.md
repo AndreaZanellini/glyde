@@ -30,8 +30,10 @@ Everything you do in Glyde changes only how the data is *shown*.
 
 ## The inference bar
 
-The bar under the toolbar says what Glyde found in your file. **Read it first**, every
-time: it is how you know the plot shows your data correctly. It lists:
+The **Inference** line under the file name says what Glyde found in your file, for example
+`Inference — 1440000 samples, SegmentedUniform`. Click it to expand the details. **Check
+them first**, every time: they are how you know the plot shows your data correctly. They
+list:
 
 - the **encoding**, the **delimiter** and the **decimal separator**;
 - the **time column**, how it was read (for example `YYYY-MM-DD HH:MM:SS.fff`) and its
@@ -41,7 +43,8 @@ time: it is how you know the plot shows your data correctly. It lists:
   typical spacing for irregular data. A wrong time unit shows up here as a rate 1000×
   too high or too low;
 - the number of **gaps**, and anything Glyde had to absorb: skipped rows, unreadable
-  characters replaced with `�`, very large whole numbers that the plot rounds.
+  characters replaced with `�`, very large whole numbers that the plot rounds. Skipped
+  rows stay visible even while the details are collapsed.
 
 Anything Glyde is **not sure about is marked `(low confidence)`**, and that is where a
 one-click correction appears:

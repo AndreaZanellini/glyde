@@ -19,7 +19,7 @@ history of every change follows below this summary.
   of Parquet files. Files larger than memory open too, the first part of the
   plot appearing while the rest is read, and Glyde never uses more than
   `min(25 % of RAM, 4 GB)`.
-- **Glyde says what it guessed**: the bar under the toolbar shows the encoding,
+- **Glyde says what it guessed**: the Inference line under the file name shows the encoding,
   delimiter, decimal separator, time column, time format, time zone, sampling
   rate and gaps, marks anything uncertain, and offers a one-click correction.
 - **Three views on one time axis**: one plot per numeric channel (or all on one
@@ -39,7 +39,9 @@ history of every change follows below this summary.
   file that won't open. `docs/USER-GUIDE.md` explains, in a few pages, the
   inference bar and its corrections, moving around the time view, stacked and
   overlaid channels, state tracks, gaps and Compress, the cursors, the spectrum,
-  large files, and where the log and the cache live. A test checks that their
+  large files, and where the log and the cache live. The screenshot is the real
+  app (this release's build, Linux, 1440 × 900) on the engine test-bench showcase
+  file, after Fit to data. A test checks that their
   links, the first-run steps and the log folders stay right.
   **To check:** read the README as if you were a colleague; follow it to a plot.
   - `docs/M3-CLOSEOUT.md` moved to `docs/history/`, next to the old roadmap,
