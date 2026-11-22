@@ -321,3 +321,28 @@ fn progressive_open_applies_the_same_override_as_a_plain_open() {
     );
     assert_eq!(report.sampling_class, SamplingClass::Uniform);
 }
+
+/// Issue #277 (PR #281 review): forcing epoch seconds onto a column whose
+/// integers sit at the `i128` limits used to overflow the epoch conversion
+/// and the gap statistics' Δt. Those two values are not timestamps, so the
+/// override must still open the file without a panic, on both storage paths.
+#[test]
+fn an_epoch_override_on_integers_at_the_i128_limits_opens_without_overflow() {
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/corpus/case-67-epoch-integer-beyond-tick-range.csv");
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let overrides = IngestOverrides {
+        timestamp_format: Some(TimestampFormat::EpochSeconds),
+        ..Default::default()
+    };
+    for budget in [unlimited_budget(), zero_budget()] {
+        let err = ingest::load_with_overrides_and_budget(&corpus, overrides, budget, cache.path())
+            .expect_err("a forced format whose values do not parse is refused, as for any column");
+        let message = err.to_string();
+        assert!(
+            message.contains("-170141183460469231731687303715884105728")
+                && message.contains("within ±10²¹"),
+            "the refusal names the value and why: {message}"
+        );
+    }
+}

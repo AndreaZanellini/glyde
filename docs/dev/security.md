@@ -51,6 +51,34 @@ the public open API end to end: `csv_open`, `parquet_open` and
   multi-exabyte allocation. Each string's length is now checked against the
   bytes left in the file first. Locked by
   `a_cache_whose_string_offsets_point_past_the_file_falls_back_to_parsing`.
+- **Found and fixed (#277, the longer runs):** the gap statistics subtract
+  neighbouring ticks in `i128`, and two ticks near the opposite `i128`
+  limits overflow that subtraction. Three inputs got there:
+  - a damaged whole-dataset cache (found by `cache_reopen`);
+  - a CSV progressive index of `-1e300` next to `1e300`, whose ticks
+    saturated at `i128::MIN` and `i128::MAX`;
+  - a CSV integer column at the `i128` limits, read as epoch seconds (found
+    in review of PR #281). Its inference also overflowed earlier, negating
+    `i128::MIN` in `time::format`.
+
+  A test or fuzz build panicked. The release build, which has no overflow
+  checks, would have wrapped silently and computed nonsense ticks and gap
+  statistics. Every tick now lies within ±`i128::MAX / 2`
+  (`time::MAX_TICK_MAGNITUDE`):
+  - progressive values saturate there;
+  - an epoch, LabVIEW or Excel numeral whose whole part exceeds ±10²¹ is not
+    a timestamp (`format::split_decimal`);
+  - a cache holding a larger tick is a miss.
+
+  Next to it, and unrelated to ticks: `frac_str_to_ticks` parsed an epoch,
+  LabVIEW or Excel fraction as one `i128` and `.expect()`ed it, so a value
+  with more than 38 decimals panicked in release builds too. It now reads at
+  most 24 fraction digits (`a_fraction_with_very_many_digits_parses_like_its_first_24`).
+
+  Locked by torture-corpus cases 66 and 67,
+  `a_numeral_beyond_the_whole_part_bound_is_not_a_timestamp`,
+  `an_epoch_override_on_integers_at_the_i128_limits_opens_without_overflow`
+  and `a_cache_whose_timestamps_lie_beyond_any_parse_falls_back_to_parsing`.
 - **Found and contained:** a data page that claims a dictionary its column
   chunk does not have makes the `parquet` decoder `panic!` ("Decoder for dict
   should have been set"). No footer check can see that without decoding every

@@ -472,8 +472,8 @@ impl TickSource for TimeAxis {
 /// docs/ARCHITECTURE.md §The index). Matches the finest resolution already
 /// carried by absolute timestamps (`TimeUnit::Nanoseconds`'s ×10⁹), chosen so
 /// realistic progressive-index magnitudes and fractional precision survive
-/// the round trip; values whose magnitude approaches `i128::MAX / 1e9`
-/// (~1.7×10²⁹) or whose meaningful precision exceeds nine fractional digits
+/// the round trip; values whose magnitude approaches `i128::MAX / 2 / 1e9`
+/// (~8.5×10²⁸) or whose meaningful precision exceeds nine fractional digits
 /// are outside what this scale can represent exactly. Progressive numeric
 /// indices are not expected to reach either extreme in practice (SPEC
 /// §2.1); this is an assumption flagged in `CHANGELOG.md`, not something
@@ -481,12 +481,15 @@ impl TickSource for TimeAxis {
 pub const PROGRESSIVE_TICK_SCALE: f64 = 1e9;
 
 /// Scales one [`TimeAxis::Progressive`] value into a pyramid tick (see
-/// [`PROGRESSIVE_TICK_SCALE`]). Rounds to the nearest tick; the float-to-int
-/// cast saturates rather than panicking on out-of-range input (Rust's
-/// defined `as` semantics), which only matters for the extreme magnitudes
-/// documented on [`PROGRESSIVE_TICK_SCALE`].
+/// [`PROGRESSIVE_TICK_SCALE`]). Rounds to the nearest tick, and saturates
+/// rather than panicking on out-of-range input, which only matters for the
+/// extreme magnitudes documented on [`PROGRESSIVE_TICK_SCALE`]. It saturates
+/// at half the `i128` range, not at its limits, so that the Δt between any
+/// two ticks still fits in an `i128` (issue #277: `-1e300` next to `1e300`
+/// overflowed the gap statistics' subtraction).
 pub fn progressive_value_to_tick(value: f64) -> i128 {
-    (value * PROGRESSIVE_TICK_SCALE).round() as i128
+    let max = crate::time::MAX_TICK_MAGNITUDE;
+    ((value * PROGRESSIVE_TICK_SCALE).round() as i128).clamp(-max, max)
 }
 
 /// Inverse of [`progressive_value_to_tick`]: recovers a pyramid tick's

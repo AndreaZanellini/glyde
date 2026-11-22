@@ -50,6 +50,30 @@ Versioning: [Semantic Versioning](https://semver.org/).
     treats that cache as damaged too: it reads the original file again and
     rewrites the cache, and the log says "a string runs past the end of the
     file".
+  - **More crashes from huge time values are fixed (issue #277).** The
+    longer fuzz runs and the review of their fixes found them. All came from
+    time values too large, or written too long, for Glyde's internal arithmetic.
+    - A CSV whose numeric index column holds astronomically large values (for
+      example `-1e300` next to `1e300`) could crash Glyde while it measured the
+      gaps between samples. It now opens normally.
+    - A column of integers too large to be any real time stamp (beyond ±10²¹,
+      far past what a 64-bit number can hold) could crash Glyde while it
+      guessed the time format, or when you forced "epoch seconds" on it. Such
+      a number is now simply not a time stamp. Without a forced format, the
+      file opens with a numeric index. With "epoch seconds" (or milliseconds,
+      LabVIEW or Excel) forced, Glyde refuses that choice and names the value:
+      "… not an integer or decimal number of epoch ticks within ±10²¹".
+    - An epoch, LabVIEW or Excel time stamp written with more than 38
+      decimal places crashed Glyde on open. Digits past the 24th are now
+      ignored: they are far below any time unit Glyde keeps.
+    - A damaged reopen cache whose stored time stamps are impossibly large is
+      now treated as damaged: Glyde reads the original file again, and the log
+      says "a timestamp lies beyond any parsed value".
+    **Assumption to veto:** a numeric index value beyond about ±8.5×10²⁸ is
+    still not stored exactly, as before (the limit used to be ±1.7×10²⁹). It
+    is pinned to that limit, so two such values can land on the same point
+    of the time axis. No real index comes near this. Whether the app should
+    *say so* when it happens is issue #280.
   - **Your cached data and logs are private to your account** on macOS and
     Linux. The cache folder and the folder holding the logs are made readable
     by you only, at startup, including folders an older Glyde already created

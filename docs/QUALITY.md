@@ -87,6 +87,9 @@ Build it *before* the features it protects. Minimum set for v1:
 63. Whole-second timestamps on a 10 Hz log (most Δt zero) with one real hole — the gap rule uses the median of the non-zero Δt, so exactly one gap is reported and the inference bar says why (SPEC §2.3, issue #188)
 64. Parquet whose footer puts a column chunk at a negative offset (found by fuzzing) — must be refused with "column chunk 0 of row group 0 lies outside the file", never crash (issue #233)
 65. Parquet whose data page claims a dictionary its column chunk does not have (found by fuzzing) — the decoder's panic must become "its data is damaged …", never crash (issue #233)
+66. CSV progressive (numeric) index with values of ±1e300 next to 0 (found while fuzzing) — must open as a progressive index, never overflow the gap statistics' Δt (issue #277)
+67. CSV integer column at the `i128` limits (found in review) — not a timestamp: must open with a progressive index, never overflow inference or the gap statistics (issue #277)
+68. CSV epoch-seconds column with a 45-digit fraction (found in review) — must open as `epoch_s`, reading the first 24 fraction digits, never panic (issue #277)
 
 **Growth rule:** every `file-wont-open` issue must add its (anonymized) file to the corpus *with the fix in the same PR*. This is the product's growth engine.
 
