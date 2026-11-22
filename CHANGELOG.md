@@ -42,7 +42,8 @@ history of every change follows below this summary.
   large files, and where the log and the cache live. The screenshot is the real
   app (this release's build, Linux, 1440 × 900) on the engine test-bench showcase
   file, after Fit to data. A test checks that their
-  links, the first-run steps and the log folders stay right.
+  links, the first-run steps, the log and cache folders, and every button name
+  the guide prints in bold stay true to the app.
   **To check:** read the README as if you were a colleague; follow it to a plot.
   - `docs/M3-CLOSEOUT.md` moved to `docs/history/`, next to the old roadmap,
     with a short note on what each archived file was. Code comments that cited

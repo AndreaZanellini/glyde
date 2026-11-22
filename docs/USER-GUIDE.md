@@ -1,7 +1,8 @@
 # Glyde user guide
 
 This short guide covers everything Glyde v0.1 does. If you have not installed it yet,
-see the [README](../README.md#install).
+see the [README](../README.md#install). In this guide, **bold** words are exactly what you
+see on screen: buttons, menus and labels.
 
 - [Open a file](#open-a-file)
 - [The inference bar: what Glyde guessed, and how to correct it](#the-inference-bar)
@@ -22,7 +23,7 @@ Drag a file onto the window, or use **File → Open…**. Glyde reads:
 
 - delimited text: `.csv`, `.tsv`, `.txt`, with any delimiter and any decimal separator, in
   UTF-8 (with or without a byte-order mark), UTF-16 or Windows-1252 / Latin-1;
-- `.parquet` files, and a **folder** of Parquet files that together form one dataset
+- `.parquet` files, and a *folder* of Parquet files that together form one dataset
   (drop the folder, or use **File → Open folder…**).
 
 One file is open at a time: opening another replaces it. Glyde never changes your file.
@@ -31,22 +32,27 @@ Everything you do in Glyde changes only how the data is *shown*.
 ## The inference bar
 
 The **Inference** line under the file name says what Glyde found in your file, for example
-`Inference — 1440000 samples, SegmentedUniform`. Click it to expand the details. **Check
-them first**, every time: they are how you know the plot shows your data correctly. They
-list:
+`Inference — 1440000 samples, SegmentedUniform`. *Check the details first*, every time:
+they are how you know the plot shows your data correctly.
 
-- the **encoding**, the **delimiter** and the **decimal separator**;
-- the **time column**, how it was read (for example `YYYY-MM-DD HH:MM:SS.fff`) and its
-  **time zone**: the one in the file, `UTC` for epoch times, or `naive local time` when
+- *When Glyde is unsure of something*, rows are out of order or characters had to be
+  replaced, the details *open by themselves*: read them before anything else.
+- Otherwise they start collapsed: click the **Inference** line to open them.
+
+They list:
+
+- the encoding, the delimiter and the decimal separator;
+- the time column, how it was read (for example `YYYY-MM-DD HH:MM:SS.fff`) and its
+  time zone: the one in the file, `UTC` for epoch times, or `naive local time` when
   the file says nothing (Glyde never invents a zone);
-- the **sampling**: `Uniform · 25 kHz`, `median 1 kHz` for bursts, `every 15 min`, or the
+- the sampling: `Uniform · 25 kHz`, `median 1 kHz` for bursts, `every 15 min`, or the
   typical spacing for irregular data. A wrong time unit shows up here as a rate 1000×
   too high or too low;
-- the number of **gaps**, and anything Glyde had to absorb: skipped rows, unreadable
+- the number of gaps, and anything Glyde had to absorb: skipped rows, unreadable
   characters replaced with `�`, very large whole numbers that the plot rounds. Skipped
   rows stay visible even while the details are collapsed.
 
-Anything Glyde is **not sure about is marked `(low confidence)`**, and that is where a
+Anything Glyde is *not sure about* is marked **(low confidence)**, and that is where a
 one-click correction appears:
 
 | You see | What it does |
@@ -66,19 +72,19 @@ the row number, and the bar says so.
 
 ## Moving around the time view
 
-- **Zoom in time:** mouse wheel with Ctrl (⌘ on a Mac), or a trackpad pinch.
-- **Pan in time:** drag with the left button, or scroll sideways. Drag or scroll the
+- *Zoom in time:* mouse wheel with Ctrl (⌘ on a Mac), or a trackpad pinch.
+- *Pan in time:* drag with the left button, or scroll sideways. Drag or scroll the
   time axis row at the bottom to do the same.
-- **Zoom in a box:** drag with the right mouse button. This zooms y too, and that plot
+- *Zoom in a box:* drag with the right mouse button. This zooms y too, and that plot
   keeps its y range while you pan.
-- **Fit to data**, or a **double-click** on a plot: back to the whole file.
-- **Click a cluster** (on a file with gaps): fits the view to that stretch of data.
+- **Fit to data**, or a double-click on a plot: back to the whole file.
+- *Click a cluster* (on a file with gaps): fits the view to that stretch of data.
 
 Every plot and every state track shares one time axis, so they move together. Each
 plot's y range follows the values you are looking at. Zoom stops at two samples across
 the plot, and zoom-out at the whole file plus a small margin.
 
-The **readout row** under the plots shows the exact time and every channel's value at
+The *readout row* under the plots shows the exact time and every channel's value at
 the pointer, read from the file, not from the drawing. Times are shown as dates and
 times of day, with the zone named under the first axis label; a numeric timestamp
 also shows its raw value in brackets.
@@ -90,8 +96,8 @@ the maximum of the samples under it.
 
 - **Stacked** (the default) gives each numeric channel its own plot and y scale, one
   under the other. **Overlaid** puts them all on one plot with one y axis.
-- The **channel list** (top right of the time view) shows or hides each channel. **All**
-  and **None** do what they say; **Alt+click** (Option+click on a Mac) a channel shows
+- The *channel list* (top right of the time view) shows or hides each channel. **All**
+  and **None** do what they say; *Alt+click* (Option+click on a Mac) a channel shows
   only that one, and Alt+click again shows them all. Hiding a channel hides it in the
   spectrum too.
 - A missing value (`NaN`, or a blank cell in a numeric column) breaks the line: nothing
@@ -102,9 +108,9 @@ the maximum of the samples under it.
 Columns that are not plain numbers become compact tracks under the plots, on the same
 time axis:
 
-- **on/off** columns (`true`/`false`, `0`/`1`) are a strip that is filled while "on";
-- **text states** (`idle`, `running`, `fault`) are labelled bands;
-- **events** (a text column that is mostly empty, with a word now and then) are ticks.
+- *on/off* columns (`true`/`false`, `0`/`1`) are a strip that is filled while "on";
+- *text states* (`idle`, `running`, `fault`) are labelled bands;
+- *events* (a text column that is mostly empty, with a word now and then) are ticks.
 
 A text column that could be drawn either way has an **events / bands** button next to
 its name. The tracks are grouped under a "*N* state channels" header: they never take
@@ -114,7 +120,7 @@ zoom in to see them.
 
 ## Gaps and Compress
 
-A **gap** is a pause in recording: two samples more than 10 times the typical spacing
+A *gap* is a pause in recording: two samples more than 10 times the typical spacing
 apart. The time axis is true to scale, so a pause takes its real width, and no line is
 drawn across it.
 
@@ -132,7 +138,7 @@ The panel on the right shows:
 
 - the time of each cursor, and **Δt = B − A** (exact, never rounded) with **1/Δt** in Hz;
 - for each shown channel: its value at A and at B as written in the file,
-  **ΔY = B − A** and the **slope ΔY/Δt** per second.
+  **ΔY = B − A** and the slope **ΔY/Δt** per second.
 
 A missing sample reads `missing`, with no ΔY or slope: nothing is interpolated. On a
 file timed by a plain index the panel says **Δx** instead of Δt. Press **Cursors** again
@@ -141,7 +147,7 @@ to remove them.
 ## Spectrum (PSD)
 
 The panel under the time view computes the power spectral density (Welch's method) of
-each shown channel, on the **raw samples** of the stretch the time view shows.
+each shown channel, on the *raw samples* of the stretch the time view shows.
 
 1. Zoom the time view onto the stretch you want (or **Fit to data** for everything).
 2. Press **Compute PSD**. It runs in the background; **Cancel** stops it.
@@ -155,18 +161,21 @@ are never needed for a correct first result; **Defaults** resets them.
 
 Glyde refuses to compute rather than give a misleading answer, and says why:
 
-- **Bursts separated by gaps:** each burst is analysed separately (no window crosses a
+- *Bursts separated by gaps:* each burst is analysed separately (no window crosses a
   gap) and the results are averaged; bursts too short for one window are listed.
-- **Irregular timestamps:** no spectrum, because Glyde does not resample to fake a
-  uniform rate. If a uniform stretch exists, **Analyze the largest uniform stretch**
+- *Irregular timestamps:* no spectrum, because Glyde does not resample to fake a
+  uniform rate. If a uniform stretch exists, **Show the largest uniform stretch**
   moves the view onto it.
-- **Timestamps out of order:** use **Sort** in the inference bar first.
-- **Missing values:** windows containing one are skipped, and the panel says how many.
+- *Timestamps out of order:* use **Sort** in the inference details first.
+- *Missing values:* windows containing one are skipped, and the panel says how many.
+- *Too much memory:* a spectrum never uses more than 256 MB (less on a small machine).
+  When the chosen segment length would need more, the panel says how much, and
+  **Use N-sample segments** switches to the longest segment length that fits.
 
 ## Large files
 
 Glyde never loads more than it can afford. It allows itself `min(25 % of your RAM, 4 GB)`.
-A file whose data would not fit is **spilled**: its index is written to Glyde's cache
+A file whose data would not fit is *spilled*: its index is written to Glyde's cache
 folder (never next to your file), and a notice says so while it loads. The first part of
 the plot appears while the rest of the file is still being read.
 

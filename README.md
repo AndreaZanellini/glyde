@@ -55,9 +55,10 @@ warns you once. This is expected; the files are built by this repository's CI.
 ## First steps
 
 1. **Drop a file** on the window, or use **File → Open…**.
-2. **Check how Glyde read your file.** Click **▸ Inference** under the file name: it shows
-   the encoding, delimiter, time column, time zone, sampling rate and gaps. Anything marked
-   `(low confidence)` has a **Correct…** button next to it.
+2. **Check how Glyde read your file.** The **Inference** line under the file name shows the
+   encoding, delimiter, time column, time zone, sampling rate and gaps. When Glyde is unsure
+   of something, these details open by themselves; otherwise click the line to open them.
+   Anything marked `(low confidence)` has a correction next to it.
 3. **Zoom** with Ctrl/⌘ + wheel or a pinch, **pan** by dragging, **Fit to data** to see
    everything. The row under the plots reads the exact time and values at the pointer.
 4. Press **Cursors** to measure between two points, or **Compute PSD** for the spectrum of
@@ -79,10 +80,10 @@ The [user guide](docs/USER-GUIDE.md) explains every control in a few pages.
 - **Compress** is not offered on files that also have on/off or text channels (#201).
 - **Blank cells in an on/off column**, and occasional words such as `ERR` in a numeric
   column, are not yet read as missing values (#240, #241).
-- **Do not let another program shorten a CSV while Glyde has it open**: Glyde may close
+- **Do not let another program shorten a CSV while Glyde has it open**: Glyde may crash
   (#272).
 - A deliberately crafted Parquet file can keep an open busy for minutes, or make Glyde
-  close (#274, #275). These come from damaged or hand-made files found by fuzzing, not
+  crash (#274, #275). These come from damaged or hand-made files found by fuzzing, not
   from files written by normal tools.
 
 ## A file that won't open?

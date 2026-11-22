@@ -185,6 +185,159 @@ fn the_readme_gives_the_same_first_run_workaround_as_the_release_notes() {
     }
 }
 
+/// Every `.rs` file under `dir`, concatenated: the text a UI label must
+/// appear in.
+fn rust_sources(dir: &Path) -> String {
+    let mut text = String::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries =
+            std::fs::read_dir(&dir).unwrap_or_else(|err| panic!("list {}: {err}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                text.push_str(&std::fs::read_to_string(&path).expect("read source"));
+                text.push('\n');
+            }
+        }
+    }
+    text
+}
+
+/// The `**bold**` spans of `markdown`, outside fenced code.
+fn bold_spans(markdown: &str) -> Vec<String> {
+    let mut in_code = false;
+    let mut spans = Vec::new();
+    for line in markdown.lines() {
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            continue;
+        }
+        let mut parts = line.split("**");
+        parts.next(); // text before the first `**`
+        while let (Some(bold), Some(_)) = (parts.next(), parts.next()) {
+            spans.push(bold.to_string());
+        }
+    }
+    spans
+}
+
+/// The literal pieces of a bold label the app's source must contain: a menu
+/// path `File → Open…` or a pair `Sort / Keep as-is` is checked piece by
+/// piece, and a standalone `N` stands for a number the app formats in
+/// (`Use N-sample segments` is `format!("Use {}-sample segments", …)`).
+fn label_pieces(label: &str) -> Vec<String> {
+    let mut pieces = Vec::new();
+    for part in label.split(" → ").flat_map(|part| part.split(" / ")) {
+        let words: Vec<&str> = part.split(' ').collect();
+        let mut current = Vec::new();
+        for word in words {
+            if let Some(rest) = word.strip_prefix('N').filter(|rest| {
+                rest.is_empty() || rest.starts_with('-') || rest.starts_with(['.', ','])
+            }) {
+                if !current.is_empty() {
+                    pieces.push(format!("{} ", current.join(" ")));
+                    current.clear();
+                }
+                if !rest.is_empty() {
+                    current.push(rest);
+                }
+            } else {
+                current.push(word);
+            }
+        }
+        if !current.is_empty() {
+            let joined = current.join(" ");
+            // A piece that followed an `N` keeps its leading space.
+            pieces.push(if label.contains(&format!("N {joined}")) {
+                format!(" {joined}")
+            } else {
+                joined
+            });
+        }
+    }
+    pieces.retain(|piece| !piece.trim().is_empty());
+    pieces
+}
+
+#[test]
+fn every_bold_control_in_the_user_guide_is_a_label_the_app_shows() {
+    // The guide's convention (stated in its first paragraph): bold is
+    // exactly what the user sees on screen. A label that drifts from the
+    // app's text leaves a colleague looking for a button that is not there.
+    let root = repo_root();
+    let app_text = rust_sources(&root.join("crates/glyde-app/src"))
+        + &rust_sources(&root.join("crates/glyde-core/src"));
+    let guide = repo_file("docs/USER-GUIDE.md");
+    assert!(guide.contains("**bold** words are exactly what you\nsee on screen"));
+    let mut missing = Vec::new();
+    for label in bold_spans(&guide) {
+        if label == "bold" {
+            continue; // the convention's own statement
+        }
+        for piece in label_pieces(&label) {
+            if !app_text.contains(&piece) {
+                missing.push(format!(
+                    "**{label}** ({piece:?} is not in the app's source)"
+                ));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "docs/USER-GUIDE.md names controls the app does not show:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn label_pieces_split_menu_paths_pairs_and_numbers() {
+    assert_eq!(label_pieces("File → Open…"), ["File", "Open…"]);
+    assert_eq!(label_pieces("Sort / Keep as-is"), ["Sort", "Keep as-is"]);
+    assert_eq!(
+        label_pieces("Use N-sample segments"),
+        ["Use ", "-sample segments"]
+    );
+    assert_eq!(
+        label_pieces("N rows skipped — view details"),
+        [" rows skipped — view details"]
+    );
+    assert_eq!(label_pieces("None"), ["None"]);
+}
+
+#[test]
+fn the_documented_cache_folders_are_the_ones_the_app_uses() {
+    // `ProjectDirs::from("com", "glyde", "Glyde").cache_dir()` resolves to
+    // these three folders; the app keeps its caches below them.
+    let level0 = repo_file("crates/glyde-core/src/index/level0.rs");
+    for required in [
+        "ProjectDirs::from(\"com\", \"glyde\", \"Glyde\")",
+        "project_dirs.cache_dir().join(\"index\")",
+    ] {
+        assert!(
+            level0.contains(required),
+            "os_cache_dir() changed ({required:?} is gone): update the cache folders in \
+             docs/USER-GUIDE.md, then this test"
+        );
+    }
+    let guide = repo_file("docs/USER-GUIDE.md");
+    for folder in [
+        "~/Library/Caches/com.glyde.Glyde/",
+        "%LOCALAPPDATA%\\glyde\\Glyde\\cache\\",
+        "~/.cache/glyde/",
+    ] {
+        assert!(
+            guide.contains(folder),
+            "the user guide lacks the cache folder {folder}"
+        );
+    }
+}
+
 #[test]
 fn the_documented_log_folders_are_the_ones_the_app_writes_to() {
     // `directories::ProjectDirs::from("com", "glyde", "Glyde")` resolves
