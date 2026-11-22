@@ -107,19 +107,56 @@ the public open API end to end: `csv_open`, `parquet_open` and
   more than 10 GB. An allocation failure aborts rather than panics, so the
   guard cannot catch it, and the count is in a page header, not the footer.
   The fix belongs upstream, or in a page-header pre-pass: #274, with the
-  reproducer.
+  reproducer. The #277 runs found 33 such inputs across Bool, Int32, Int64
+  and Double columns; parquet 60.2.0 still aborts on 17 of them.
 - **Found, not fixed:** four crafted ~900-byte Parquet files make the open
   spin for minutes inside the `parquet` crate's page-header reader. The UI
   stays responsive, but that open never finishes and Cancel cannot interrupt
-  it: #275, with a reproducer.
+  it: #275, with a reproducer. The #277 runs found 41 such inputs, 12 of
+  them in the footer rather than a page header. In a release build on
+  parquet 60.1.0 they take up to 9 min 42 s; parquet 60.2.0 refuses every
+  one in at most 7 ms (below).
 - **What ran, on 2026-11-21** (a 4-core sandbox, in parallel): `csv_open` 45
   min, 274 450 inputs, clean. `cache_reopen` 45 min, 90 411 inputs, clean.
   `parquet_open` ran in four rounds: 1 min and about 10 min until the
   two crashes, each fixed before the next round; then 16 min until the
   over-allocation (#274); then 30 min that skipped out-of-memory inputs
   (3.5 million inputs), which found the hangs (#275) and no further crash. The
-  issue asked for several hours per target; those runs are #277, due before
-  v0.1.0 is tagged.
+  issue asked for several hours per target; those runs are #277, recorded
+  next.
+- **The longer runs (#277), on 2026-11-21.** The same 4-core sandbox ran all
+  three targets in parallel, with `-rss_limit_mb=3072 -timeout=10
+  -max_len=262144 -detect_leaks=0`, seeded as in `fuzzing.md`. `parquet_open`
+  also had `-fork=2 -ignore_ooms=1 -ignore_timeouts=1`.
+  - A first session (14:55–15:53 UTC) ran about 1 h per target before the
+    sandbox was reclaimed, then stopped.
+  - The second session (18:17–21:45 UTC) resumed from those corpora, in two
+    rounds per target:
+
+    | Target | Time | Inputs | Found |
+    |---|---|---|---|
+    | `csv_open` | 3 h 05 min | 1.05 M | nothing |
+    | `cache_reopen` | 10 min, then 3 h 05 min on the fix | 290 k | the tick overflow below, then nothing |
+    | `parquet_open` | 3 h 06 min | 43.6 M | no crash in Glyde's code; #274 and #275 inputs only |
+
+  - The first session's `cache_reopen` found the string-offset crash above
+    in its first seconds; `parquet_open` added 7 #274 and 6 #275 inputs.
+  - Every Parquet input is kept in `crates/glyde-core/fuzz/known/`, sorted by
+    issue: 33 over-allocations (#274), 29 page-header hangs and 12 footer
+    hangs (#275). Its README times each one in a release build on parquet
+    60.1.0 and 60.2.0. `byte_stream_split` decoder panics also appeared; the
+    Parquet panic guard contained them, as designed.
+- **A release build, not only a fuzz build.** The known inputs were timed
+  through `ingest::open_dataset_progressive_in` in an optimized build, with a
+  6 GB address-space cap.
+  - With parquet 60.1.0, which Glyde ships, the #275 hangs are real: up to
+    9 min 42 s for a 1 KB file.
+  - **parquet 60.2.0 refuses every one of the 42 hang inputs in at most
+    7 ms.**
+  - #274 is only partly fixed there: 17 of the 33 inputs still abort the app
+    (25 do on 60.1.0).
+  - Updating `parquet` to 60.2.0 is proposed on #275; it is the
+    maintainer's decision.
 
 **Partitioned directories** (`ingest/parquet.rs`, `index/level0.rs`). Both
 walks are iterative, so a very deep tree cannot overflow the stack. Symlinked

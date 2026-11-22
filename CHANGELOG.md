@@ -56,6 +56,15 @@ history of every change follows below this summary.
     untouched on purpose.
 
 ### Security
+- **Longer fuzzing before the release (issue #277).** Each of the three fuzz
+  targets ran for over 3 hours. The crashes they led to are fixed (PRs #279
+  and #281, described below). What is still open: a crafted Parquet file of about 1 KB
+  can make Glyde try to reserve many gigabytes and close (#274), or keep one
+  open busy for minutes (#275). A newer patch release of the Parquet library
+  (60.2.0) removes the second and part of the first; updating to it is
+  proposed on #275 for you to decide. The run is recorded in
+  `docs/dev/security.md`, and every crafted file it found is kept in
+  `crates/glyde-core/fuzz/known/` with timings.
 - **The security review before v0.1 (issue #233).** The full write-up is in
   `docs/dev/security.md`. What changes for you:
   - **A damaged Parquet file no longer crashes Glyde.** A fuzzer found two
