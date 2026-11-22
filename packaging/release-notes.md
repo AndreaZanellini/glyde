@@ -28,6 +28,31 @@ Glyde is not yet signed with an Apple or Microsoft certificate, so your system w
 **Linux**
 - AppImage: `chmod +x glyde-*.AppImage` then run it. No warning is expected.
 
+## Known limitations
+
+This is a first release. What it does not do well yet, in plain words:
+
+- **Speed on very large files** is below the targets Glyde sets itself: on the reference
+  laptop, a CSV indexes at about 100–175 MB/s, the first plot of a file larger than
+  memory takes about 3 s, a Parquet file larger than memory about 5 s per GB, and a
+  Parquet file shows nothing until it is read (#194, #195, #181).
+- **Outliers are not flagged yet**; they stay visible on the plot (v0.2, #236).
+- **Units** from the header are part of the channel name, not shown next to values (#237).
+- **Many channels**: every stacked channel gets an equal share of the height, so with
+  dozens of channels each plot is thin. Use **Overlaid** or hide channels (#257).
+- **Compress** is not offered on files that also have on/off or text channels (#201).
+- **Blank cells in an on/off column**, and occasional words such as `ERR` in a numeric
+  column, are not yet read as missing values (#240, #241).
+- **Do not let another program shorten a CSV while Glyde has it open**: Glyde may crash
+  (#272).
+- A deliberately crafted Parquet file can keep an open busy for minutes, or make Glyde
+  crash (#274, #275). These come from damaged or hand-made files found by fuzzing, not
+  from files written by normal tools.
+
+A file that won't open is the bug we care about most: open an issue with the
+**"My file won't open"** template and attach an anonymized sample and the day's log file
+(the README says where it is).
+
 ## What changed
 
-See `CHANGELOG.md` for this version, in plain language; the commit list follows.
+See the section for this version in `CHANGELOG.md`, in plain language; the commit list follows.
