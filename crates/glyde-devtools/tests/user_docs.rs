@@ -35,7 +35,11 @@ fn repo_root() -> PathBuf {
 
 fn repo_file(relative: &str) -> String {
     let path = repo_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    // A Windows checkout may turn `\n` into `\r\n`; the checks below are
+    // about the words, not the line endings.
+    text.replace("\r\n", "\n")
 }
 
 /// Every link or image target in `markdown`: `[text](target)`,
