@@ -411,9 +411,6 @@ history of every change follows below this summary.
     stays in the README's known limitations.
 
   **To check:** your usual Parquet files open as before.
-  - **Assumptions to veto:** `docs/QUALITY.md` §1 does not list cases 69–110
-    yet: only you edit that file, and the text to paste is in the PR
-    description.
 - **The "first full view after a spilled load" speed check in CI no longer
   fails by chance (issue #267).** Same problem and same fix as the first-plot
   (#184) and Parquet (#243) checks. This check opens an 8-million-row file too

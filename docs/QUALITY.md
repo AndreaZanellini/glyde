@@ -91,6 +91,10 @@ Build it *before* the features it protects. Minimum set for v1:
 67. CSV integer column at the `i128` limits (found in review) — not a timestamp: must open with a progressive index, never overflow inference or the gap statistics (issue #277)
 68. CSV epoch-seconds column with a 45-digit fraction (found in review) — must open as `epoch_s`, reading the first 24 fraction digits, never panic (issue #277)
 
+**Cases 69–98.** Parquet files whose page header hung the Thrift reader (found by fuzzing) — must be refused at once, in memory and spilled, never keep the open busy (issue #275)
+
+**Cases 99–110.** The same, with the hang in the file footer (found by fuzzing, issue #275)
+
 **Growth rule:** every `file-wont-open` issue must add its (anonymized) file to the corpus *with the fix in the same PR*. This is the product's growth engine.
 
 ---
