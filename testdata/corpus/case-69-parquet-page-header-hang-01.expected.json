@@ -1,0 +1,3 @@
+{
+  "error": "could not read {path} as Parquet: Parquet argument error: Parquet error: Unexpected struct field type 15"
+}

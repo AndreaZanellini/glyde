@@ -15,7 +15,7 @@
 //! Corpus manifest gate (docs/QUALITY.md §1, docs/history/ROADMAP-M0-M9.md M1).
 //!
 //! `every_committed_case_has_a_well_formed_expected_json` runs on every PR
-//! and covers whatever cases are committed so far. `corpus_has_all_65_cases`
+//! and covers whatever cases are committed so far. `corpus_has_all_110_cases`
 //! is the milestone-complete gate. Cases 57 (`YYYY-MM-DD HH:MM:SS`
 //! space-separated datetime, issue #82), 58 (a time column in a format Glyde
 //! does not recognize at all, issue #94), 59 (no time column at all), 60
@@ -24,8 +24,10 @@
 //! issue #189), 63 (whole-second timestamps on a faster log, so most Δt
 //! are zero, issue #188), 64 (a fuzzed Parquet footer whose column chunk
 //! starts at a negative offset, issue #233) and 65 (a fuzzed Parquet data
-//! page that claims a dictionary the chunk does not have, issue #233) were
-//! added after M1's original 56-case
+//! page that claims a dictionary the chunk does not have, issue #233), 66-68
+//! (numeric time values beyond every bound, issue #277) and 69-110 (fuzzed
+//! Parquet files that hung the Thrift reader, issue #275: 69-98 in a page
+//! header, 99-110 in the footer) were added after M1's original 56-case
 //! batch, per QUALITY.md §1's growth rule
 //! ("every `file-wont-open` issue must add its file to the corpus with the
 //! fix in the same PR").
@@ -34,7 +36,7 @@ mod support;
 
 use support::{corpus_dir, discover_cases, load_expected};
 
-const EXPECTED_CORPUS_SIZE: usize = 68;
+const EXPECTED_CORPUS_SIZE: usize = 110;
 
 #[test]
 fn every_committed_case_has_a_well_formed_expected_json() {
@@ -55,7 +57,7 @@ fn every_committed_case_has_a_well_formed_expected_json() {
 }
 
 #[test]
-fn corpus_has_all_68_cases() {
+fn corpus_has_all_110_cases() {
     let dir = corpus_dir();
     let cases = discover_cases(&dir).expect("read testdata/corpus");
 
