@@ -11,6 +11,28 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **A damaged or hand-made Parquet file can no longer keep an open busy for
+  minutes (issue #275).** Some ~1 KB files found by fuzzing made an open spin
+  for up to almost ten minutes, with one processor core at full load and Cancel
+  having no effect. Glyde now refuses them at once, with a message saying the
+  file could not be read as Parquet. The fix is in the `parquet` library:
+  Glyde moves from version 60.1.0 to 60.2.0, and nothing else in its
+  dependencies changes except the `arrow` libraries that go with it.
+  - All 42 such files are now torture-corpus cases 69–110, and a test checks
+    that they are refused quickly, in memory and spilled to disk.
+  - The same update clears the security advisory RUSTSEC-2026-0595, which
+    started to block every CI run on 2026-11-25. It concerns writing
+    *encrypted* Parquet files, which Glyde does not do.
+  - Not fixed by this: a crafted file can still make Glyde run out of memory
+    and crash (#274). Of the 33 known files, 17 still do (25 before), so it
+    stays in the README's known limitations.
+
+  **To check:** your usual Parquet files open as before.
+  - **Assumptions to veto:** `docs/QUALITY.md` §1 does not list cases 69–110
+    yet: only you edit that file, and the text to paste is in the PR
+    description.
+
 ### v0.1.0 in short
 The first public release. What Glyde does, in one place; the detailed
 history of every change follows below this summary.

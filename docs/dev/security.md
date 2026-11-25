@@ -109,11 +109,12 @@ the public open API end to end: `csv_open`, `parquet_open` and
   The fix belongs upstream, or in a page-header pre-pass: #274, with the
   reproducer. The #277 runs found 33 such inputs across Bool, Int32, Int64
   and Double columns; parquet 60.2.0 still aborts on 17 of them.
-- **Found, not fixed:** four crafted ~900-byte Parquet files make the open
+- **Found and fixed:** four crafted ~900-byte Parquet files made the open
   spin for minutes inside the `parquet` crate's page-header reader. The UI
-  stays responsive, but that open never finishes and Cancel cannot interrupt
-  it: #275, with a reproducer. The #277 runs found 41 such inputs, 12 of
-  them in the footer rather than a page header. In a release build on
+  stayed responsive, but Cancel could not interrupt that open: #275, with a
+  reproducer. Fixed by updating `parquet` to 60.2.0, and locked by
+  torture-corpus cases 69–110 and `tests/parquet_hang_integration.rs`. The #277 runs found 41 such inputs,
+  12 of them in the footer rather than a page header. In a release build on
   parquet 60.1.0 they take up to 9 min 42 s; parquet 60.2.0 refuses every
   one in at most 7 ms (below).
 - **What ran, on 2026-11-21** (a 4-core sandbox, in parallel): `csv_open` 45
@@ -141,22 +142,22 @@ the public open API end to end: `csv_open`, `parquet_open` and
 
   - The first session's `cache_reopen` found the string-offset crash above
     in its first seconds; `parquet_open` added 7 #274 and 6 #275 inputs.
-  - Every Parquet input is kept in `crates/glyde-core/fuzz/known/`, sorted by
-    issue: 33 over-allocations (#274), 29 page-header hangs and 12 footer
-    hangs (#275). Its README times each one in a release build on parquet
-    60.1.0 and 60.2.0. `byte_stream_split` decoder panics also appeared; the
-    Parquet panic guard contained them, as designed.
+  - Every Parquet input was kept, sorted by issue: the 33 over-allocations
+    (#274) are in `crates/glyde-core/fuzz/known/`, whose README times them in
+    a release build on parquet 60.1.0 and 60.2.0; the 29 page-header hangs and
+    12 footer hangs (#275) are torture-corpus cases 70–110.
+    `byte_stream_split` decoder panics also appeared; the Parquet panic guard contained them, as designed.
 - **A release build, not only a fuzz build.** The known inputs were timed
   through `ingest::open_dataset_progressive_in` in an optimized build, with a
   6 GB address-space cap.
-  - With parquet 60.1.0, which Glyde ships, the #275 hangs are real: up to
+  - With parquet 60.1.0, which Glyde shipped then, the #275 hangs were real: up to
     9 min 42 s for a 1 KB file.
   - **parquet 60.2.0 refuses every one of the 42 hang inputs in at most
     7 ms.**
   - #274 is only partly fixed there: 17 of the 33 inputs still abort the app
     (25 do on 60.1.0).
-  - Updating `parquet` to 60.2.0 is proposed on #275; it is the
-    maintainer's decision.
+  - The maintainer decided on 2026-11-22 to update `parquet` to 60.2.0 before
+    v0.1 (#275); that update also clears RUSTSEC-2026-0595.
 
 **Partitioned directories** (`ingest/parquet.rs`, `index/level0.rs`). Both
 walks are iterative, so a very deep tree cannot overflow the stack. Symlinked
