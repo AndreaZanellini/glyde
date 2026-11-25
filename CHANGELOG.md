@@ -44,10 +44,8 @@ history of every change follows below this summary.
   a dated section here.
   **To check:** once v0.1.0 is tagged, the GitHub Release page shows the
   unsigned-build steps, then the known limitations.
-  - **Still to do before the tag:** the fix for the Parquet file that keeps an
-    open busy (#275, whose entry belongs in this section), the CI hardening
-    patch that only you can apply (#271), a new release dry run after both, and
-    the 10-file smoke ritual.
+  - **Still to do before the tag:** the CI hardening patch that only you can
+    apply (#271), a new release dry run after it, and the 10-file smoke ritual.
   - **Assumptions to veto:** the `[0.1.0]` section is dated 2026-11-22, the
     day this was prepared; it must be set to the day you tag.
 
@@ -396,6 +394,26 @@ history of every change follows below this summary.
   use a red picked here (the series red, darkened to read on the panel).
 
 ### Fixed
+- **A damaged or hand-made Parquet file can no longer keep an open busy for
+  minutes (issue #275).** Some ~1 KB files found by fuzzing made an open spin
+  for up to almost ten minutes, with one processor core at full load and Cancel
+  having no effect. Glyde now refuses them at once, with a message saying the
+  file could not be read as Parquet. The fix is in the `parquet` library:
+  Glyde moves from version 60.1.0 to 60.2.0, and nothing else in its
+  dependencies changes except the `arrow` libraries that go with it.
+  - All 42 such files are now torture-corpus cases 69–110, and a test checks
+    that they are refused quickly, in memory and spilled to disk.
+  - The same update clears the security advisory RUSTSEC-2026-0595, which
+    started to block every CI run on 2026-11-25. It concerns writing
+    *encrypted* Parquet files, which Glyde does not do.
+  - Not fixed by this: a crafted file can still make Glyde run out of memory
+    and crash (#274). Of the 33 known files, 17 still do (25 before), so it
+    stays in the README's known limitations.
+
+  **To check:** your usual Parquet files open as before.
+  - **Assumptions to veto:** `docs/QUALITY.md` §1 does not list cases 69–110
+    yet: only you edit that file, and the text to paste is in the PR
+    description.
 - **The "first full view after a spilled load" speed check in CI no longer
   fails by chance (issue #267).** Same problem and same fix as the first-plot
   (#184) and Parquet (#243) checks. This check opens an 8-million-row file too
