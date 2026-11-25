@@ -11,23 +11,6 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Release
-- **v0.1.0 is ready to tag (issue #235).** The CHANGELOG now has a
-  `[0.1.0]` section holding everything done so far, and an empty
-  `[Unreleased]` above it for what comes next. The release page that GitHub
-  shows on download now lists the **known limitations** of v0.1 in plain
-  language, the same list as the README, after the steps for opening an
-  unsigned build. A test checks that every limitation the README names, by issue
-  number, is on the release page too, and that the version in `Cargo.toml` has
-  a dated section here.
-  **To check:** run the 10-file smoke ritual, then tag `v0.1.0`; the GitHub
-  Release page shows the unsigned-build steps, then the known limitations.
-  - **Assumptions to veto:** the `[0.1.0]` section is dated 2026-11-22, the
-    day this was prepared; if you tag on another day, that date is wrong by
-    that much. Issues #229 and #230 (done, ticked on the roadmap) and #271
-    (CI hardening, waiting on you) are still open in the v0.1 milestone; this
-    PR does not close any of them.
-
 ## [0.1.0] - 2026-11-22
 
 ### v0.1.0 in short
@@ -49,6 +32,24 @@ history of every change follows below this summary.
 - **Known limitations** are listed in the README and on the release page:
   speed on very large files is below Glyde's own targets, outliers are not
   flagged yet (v0.2), and a few input corners are open issues.
+
+### Release
+- **The v0.1.0 release page and this section are prepared (issue #235).** The
+  CHANGELOG now has this `[0.1.0]` section and an `[Unreleased]` one above it
+  for what comes after the release. The release page that GitHub
+  shows on download now lists the **known limitations** of v0.1 in plain
+  language, the same list as the README, after the steps for opening an
+  unsigned build. A test checks that every limitation the README names, by issue
+  number, is on the release page too, and that the version in `Cargo.toml` has
+  a dated section here.
+  **To check:** once v0.1.0 is tagged, the GitHub Release page shows the
+  unsigned-build steps, then the known limitations.
+  - **Still to do before the tag:** the fix for the Parquet file that keeps an
+    open busy (#275, whose entry belongs in this section), the CI hardening
+    patch that only you can apply (#271), a new release dry run after both, and
+    the 10-file smoke ritual.
+  - **Assumptions to veto:** the `[0.1.0]` section is dated 2026-11-22, the
+    day this was prepared; it must be set to the day you tag.
 
 ### Documentation
 - **A README and a user guide written for you, not for developers (issue
