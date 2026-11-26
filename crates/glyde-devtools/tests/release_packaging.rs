@@ -151,6 +151,7 @@ fn the_release_build_restores_no_cache() {
         !workflow.contains("rust-cache"),
         "release.yml must not restore a build cache"
     );
+}
 
 /// The Windows installer runs only on the release runner, so its file list
 /// is checked here: Glyde's license and the third-party notices are
