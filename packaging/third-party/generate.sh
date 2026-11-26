@@ -43,6 +43,9 @@ cargo about generate \
     cat "$fonts/Inter-OFL.txt"
     printf '\n'
     cat "$fonts/JetBrainsMono-OFL.txt"
-} > "$out"
+    # Some crates' license files use Windows line endings: one style for
+    # the whole file, so it reads the same, and regenerates byte for byte,
+    # on every system.
+} | tr -d '\r' > "$out"
 
 echo "wrote $out"
