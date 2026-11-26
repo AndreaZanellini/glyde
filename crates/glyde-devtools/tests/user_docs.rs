@@ -179,7 +179,8 @@ fn the_readme_gives_the_same_first_run_workaround_as_the_release_notes() {
     let readme = repo_file("README.md");
     let notes = repo_file("packaging/release-notes.md");
     for required in [
-        "right-click (or Control-click) Glyde → Open",
+        "System Settings → Privacy & Security",
+        "Open Anyway",
         "xattr -dr com.apple.quarantine /Applications/Glyde.app",
         "More info → Run anyway",
         "chmod +x glyde-*.AppImage",

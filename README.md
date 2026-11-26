@@ -45,9 +45,10 @@ is needed: no runtime, no toolchain.
 Version 0.1 is **not signed** with an Apple or Microsoft certificate yet, so your system
 warns you once. This is expected; the files are built by this repository's CI.
 
-- **macOS:** in **Applications**, **right-click (or Control-click) Glyde → Open**, then
-  click **Open**. If macOS says "Glyde is damaged" or offers no **Open** button, run this
-  in **Terminal**, then open Glyde normally:
+- **macOS:** open Glyde; when macOS says it "could not verify" Glyde, click **Done**. Then
+  in **System Settings → Privacy & Security**, click **Open Anyway** next to the message
+  about Glyde, and confirm. If there is no **Open Anyway** button, run this in
+  **Terminal**, then open Glyde normally:
   `xattr -dr com.apple.quarantine /Applications/Glyde.app`
 - **Windows:** if **"Windows protected your PC"** appears, click **More info → Run anyway**.
 - **Linux:** make the AppImage executable (`chmod +x glyde-*.AppImage`) and run it.
