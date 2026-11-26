@@ -50,15 +50,9 @@ history of every change follows below this summary.
     day this was prepared; it must be set to the day you tag.
 
 ### Documentation
-- **The repository no longer says anything about where Glyde's users work.**
-  The License paragraph of the README described Glyde's users by the kind of
-  organization they work for; it now only says what the license allows:
-  anyone may use, change and redistribute Glyde, with an explicit patent
-  grant. A new test fails if any public document (README, CHANGELOG, `docs/`,
-  the release notes, the issue templates) says where the maintainer works:
-  the people there, the employer, its departments. Three issue and
-  PR descriptions on GitHub that said who the first release was for (#235,
-  #238, #284) were reworded too.
+- **The README's License section says plainly what the license allows:**
+  anyone may use, change and redistribute Glyde, and the license includes an
+  explicit patent grant.
   **To check:** the README's License section, at the bottom.
 - **A README and a user guide written for you, not for developers (issue
   #234).** The README now has a screenshot of the app, how to install it on each
