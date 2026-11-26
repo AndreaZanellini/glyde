@@ -34,7 +34,8 @@ fn release_notes_carry_the_unsigned_build_workarounds_and_the_qa_reminder() {
         // CLAUDE.md §Release checklist, verbatim.
         "Maintainer: run the 10-file smoke ritual (docs/QUALITY.md §Manual QA) before announcing.",
         // docs/SPEC.md §7: the exact first-run workaround on both platforms.
-        "right-click (or Control-click) Glyde → Open",
+        "System Settings → Privacy & Security",
+        "Open Anyway",
         "xattr -dr com.apple.quarantine /Applications/Glyde.app",
         "More info → Run anyway",
     ] {
@@ -43,6 +44,28 @@ fn release_notes_carry_the_unsigned_build_workarounds_and_the_qa_reminder() {
             "release notes must contain {required:?}"
         );
     }
+}
+
+/// Without an ad-hoc signature over the whole bundle, macOS calls the
+/// downloaded app "damaged" and offers only the Bin (found on the v0.1.0 dry
+/// run). The script must sign the bundle and fail the build if the signature
+/// does not verify.
+#[test]
+fn the_macos_package_seals_the_whole_bundle_and_checks_it() {
+    let script = repo_file("packaging/macos/package.sh");
+    let sign = script
+        .find("codesign --force --deep --sign - \"$app\"")
+        .expect("package.sh must ad-hoc sign Glyde.app");
+    let verify = script
+        .find("codesign --verify --deep --strict \"$app\"")
+        .expect("package.sh must verify the bundle signature");
+    let dmg = script
+        .find("hdiutil create")
+        .expect("package.sh builds the dmg");
+    assert!(
+        sign < verify && verify < dmg,
+        "sign, then verify, then build the dmg"
+    );
 }
 
 #[test]

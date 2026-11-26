@@ -407,6 +407,20 @@ history of every change follows below this summary.
   use a red picked here (the series red, darkened to read on the panel).
 
 ### Fixed
+- **The downloaded Mac app no longer says it is "damaged".** On the v0.1.0
+  dry run, opening `Glyde.app` from the `.dmg` showed "Glyde is damaged and
+  can't be opened" with only a Move to Bin button. The cause was in how the
+  `.dmg` was built: only the program inside was signed, not the app around it.
+  The build now gives the whole app an ad-hoc signature, which needs no Apple
+  certificate (v0.1 is still unsigned, as decided), and stops if that
+  signature does not check out. macOS now shows its normal warning for
+  unsigned apps, "Apple could not verify Glyde", which you get past once in
+  **System Settings → Privacy & Security → Open Anyway**. The README and the
+  release page now give these steps: the old right-click → Open trick no
+  longer works on recent macOS versions. The Terminal command stays as a
+  fallback.
+  **To check:** download the `.dmg` from a release dry run, drag Glyde to
+  Applications, open it: you see "could not verify", not "damaged".
 - **A damaged or hand-made Parquet file can no longer keep an open busy for
   minutes (issue #275).** Some ~1 KB files found by fuzzing made an open spin
   for up to almost ten minutes, with one processor core at full load and Cancel

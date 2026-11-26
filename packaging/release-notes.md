@@ -16,8 +16,9 @@ Glyde is not yet signed with an Apple or Microsoft certificate, so your system w
 
 **macOS**
 1. Open the `.dmg` and drag **Glyde** to **Applications**.
-2. In **Applications**, **right-click (or Control-click) Glyde → Open**, then click **Open** in the dialog. You only need to do this once.
-3. If macOS still refuses ("Glyde is damaged" or no **Open** button), open **Terminal** and run:
+2. Open **Glyde**. macOS says **"Apple could not verify “Glyde” is free of malware"**: click **Done**.
+3. Open **System Settings → Privacy & Security**, scroll down to the message about Glyde and click **Open Anyway**, then confirm with **Open Anyway** (and your password). You only need to do this once.
+4. If there is no **Open Anyway** button, open **Terminal** and run:
    `xattr -dr com.apple.quarantine /Applications/Glyde.app`
    then open Glyde normally.
 
