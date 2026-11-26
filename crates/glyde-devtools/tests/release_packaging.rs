@@ -68,6 +68,41 @@ fn the_macos_package_seals_the_whole_bundle_and_checks_it() {
     );
 }
 
+/// appimagetool downloads the AppImage runtime from the moving `continuous`
+/// release at every build unless it is given one, and the runtime is the
+/// first code that runs when a user opens the AppImage. The script must use a
+/// runtime from a tagged release, check its SHA-256, and hand exactly that
+/// file to appimagetool.
+#[test]
+fn the_appimage_runtime_is_pinned_and_checked_before_it_is_used() {
+    let script = repo_file("packaging/linux/package.sh");
+    assert!(
+        !script.contains("/continuous/"),
+        "the runtime must come from a tagged release, not `continuous`"
+    );
+    let url = script
+        .find("runtime_url=https://github.com/AppImage/type2-runtime/releases/download/")
+        .expect("package.sh pins the runtime's release URL");
+    let hash_line = script
+        .lines()
+        .find_map(|line| line.strip_prefix("runtime_sha256="))
+        .expect("package.sh pins the runtime's SHA-256");
+    assert!(
+        hash_line.len() == 64 && hash_line.chars().all(|c| c.is_ascii_hexdigit()),
+        "a full SHA-256, got {hash_line:?}"
+    );
+    let check = script
+        .find("sha256sum -c -")
+        .expect("package.sh checks the runtime");
+    let build = script
+        .find("appimagetool --runtime-file \"$runtime\"")
+        .expect("appimagetool is given the checked runtime");
+    assert!(
+        url < check && check < build,
+        "download, then check, then build"
+    );
+}
+
 #[test]
 fn the_release_workflow_is_gated_on_ci_and_publishes_every_spec_artifact() {
     let workflow = repo_file(".github/workflows/release.yml");

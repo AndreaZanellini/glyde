@@ -236,14 +236,34 @@ fn run_packaging(script: &str, stubs: &Path, out: &Path) {
     assert!(status.success(), "{script} failed");
 }
 
+/// `curl ... -o <path>`: writes stand-in bytes where the runtime should land,
+/// without touching the network.
+#[cfg(unix)]
+const CURL_STUB: &str = r#"out=""; prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then out=$arg; fi
+  prev=$arg
+done
+printf 'not the AppImage runtime' > "$out""#;
+
 #[cfg(unix)]
 #[test]
 fn the_appimage_carries_the_icon_where_linux_looks() {
     let tmp = tempfile::tempdir().unwrap();
     let stubs = tmp.path().join("bin");
     std::fs::create_dir(&stubs).unwrap();
-    // appimagetool <AppDir> <output>: keep the AppDir instead of squashing it.
-    stub(&stubs, "appimagetool", r#"cp -R "$1" "$2""#);
+    // The runtime download and its check are not what this test is about
+    // (see the next test): stand-in bytes, and a check that accepts them.
+    stub(&stubs, "curl", CURL_STUB);
+    stub(&stubs, "sha256sum", "cat > /dev/null");
+    // appimagetool --runtime-file <runtime> <AppDir> <output>: keep the
+    // AppDir instead of squashing it.
+    stub(
+        &stubs,
+        "appimagetool",
+        r#"[ "$1" = "--runtime-file" ] && [ -f "$2" ] || { echo "no --runtime-file" >&2; exit 1; }
+cp -R "$3" "$4""#,
+    );
     let out = tmp.path().join("out");
     run_packaging("packaging/linux/package.sh", &stubs, &out);
 
@@ -263,6 +283,71 @@ fn the_appimage_carries_the_icon_where_linux_looks() {
             expected
         );
     }
+}
+
+/// The AppImage runtime is the first code that runs when a user opens the
+/// AppImage. A runtime that does not match its pinned SHA-256 must stop the
+/// build before appimagetool puts it in the file users download.
+#[cfg(unix)]
+#[test]
+fn the_appimage_is_never_built_on_a_runtime_that_fails_its_checksum() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The real sha256sum does the checking: first prove it is here and
+    // works, so the failure below cannot come from a missing tool.
+    let known = tmp.path().join("known");
+    std::fs::write(&known, b"abc").unwrap();
+    let mut check = std::process::Command::new("sha256sum")
+        .args(["-c", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("sha256sum is on PATH");
+    use std::io::Write;
+    writeln!(
+        check.stdin.take().unwrap(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  {}",
+        known.display()
+    )
+    .unwrap();
+    assert!(check.wait().unwrap().success(), "sha256sum -c works here");
+
+    let stubs = tmp.path().join("bin");
+    std::fs::create_dir(&stubs).unwrap();
+    stub(&stubs, "curl", CURL_STUB);
+    let ran = tmp.path().join("appimagetool-ran");
+    stub(
+        &stubs,
+        "appimagetool",
+        &format!("touch \"{}\"", ran.display()),
+    );
+    let out = tmp.path().join("out");
+    let binary = stubs.join("glyde-binary");
+    std::fs::write(&binary, b"not a real binary").unwrap();
+    let status = std::process::Command::new("bash")
+        .arg(repo_root().join("packaging/linux/package.sh"))
+        .arg(&binary)
+        .arg("0.0.0-test")
+        .arg(&out)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stubs.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("bash runs");
+    assert!(
+        !status.success(),
+        "package.sh must fail on a runtime that does not match"
+    );
+    assert!(
+        !ran.exists(),
+        "appimagetool must not run on an unverified runtime"
+    );
 }
 
 #[cfg(unix)]
