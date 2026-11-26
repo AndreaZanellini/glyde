@@ -22,11 +22,12 @@
 use std::path::{Component, Path, PathBuf};
 
 /// The documents a user (or a contributor arriving from the README) follows.
-const USER_DOCS: [&str; 4] = [
+const USER_DOCS: [&str; 5] = [
     "README.md",
     "docs/USER-GUIDE.md",
     "docs/history/README.md",
     "CONTRIBUTING.md",
+    "SECURITY.md",
 ];
 
 fn repo_root() -> PathBuf {
@@ -190,6 +191,42 @@ fn the_readme_gives_the_same_first_run_workaround_as_the_release_notes() {
     }
 }
 
+/// Whoever downloads a release, from the README or from the release page,
+/// is told the same two ways to check the file: its SHA-256 against
+/// `SHA256SUMS`, and its build provenance with `gh attestation verify`.
+#[test]
+fn the_readme_and_the_release_notes_tell_how_to_check_a_download() {
+    let readme = repo_file("README.md");
+    let notes = repo_file("packaging/release-notes.md");
+    for required in [
+        "Check your download (optional)",
+        "sha256sum -c SHA256SUMS --ignore-missing",
+        "shasum -a 256 -c SHA256SUMS --ignore-missing",
+        "Get-FileHash <file>",
+        "gh attestation verify <file> --repo AndreaZanellini/glyde",
+    ] {
+        assert!(notes.contains(required), "release notes lack {required:?}");
+        assert!(readme.contains(required), "README lacks {required:?}");
+    }
+    // Where to report a security problem: the README links the policy, the
+    // release page (which cannot link into the repository) names the button.
+    assert!(readme.contains("[`SECURITY.md`](SECURITY.md)"));
+    assert!(notes.contains("**Report a vulnerability**"));
+}
+
+/// A security report must not start as a public issue: the policy and the
+/// issue chooser both send it to GitHub's private advisory form.
+#[test]
+fn security_reports_are_sent_to_the_private_advisory_form() {
+    let policy = repo_file("SECURITY.md");
+    assert!(policy.contains("](../../security/advisories/new)"));
+    assert!(policy.contains("](README.md#check-your-download-optional)"));
+    let chooser = repo_file(".github/ISSUE_TEMPLATE/config.yml");
+    assert!(
+        chooser.contains("url: https://github.com/AndreaZanellini/glyde/security/advisories/new")
+    );
+}
+
 /// Every public document: the top-level ones, the release notes, the issue
 /// templates, and every Markdown file under `docs/`.
 fn public_documents() -> Vec<PathBuf> {
@@ -199,6 +236,7 @@ fn public_documents() -> Vec<PathBuf> {
         "CONTRIBUTING.md",
         "CHANGELOG.md",
         "CLAUDE.md",
+        "SECURITY.md",
         "NOTICE",
         "packaging/release-notes.md",
     ]

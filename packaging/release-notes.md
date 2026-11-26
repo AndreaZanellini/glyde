@@ -10,6 +10,21 @@
 
 Nothing else to install: no runtime, no toolchain.
 
+## Check your download (optional)
+
+`SHA256SUMS` below lists every file's fingerprint, and each file has a signed record
+showing it was built by this repository's CI from the released source.
+
+- **Fingerprint:** download `SHA256SUMS` into the same folder and run
+  `sha256sum -c SHA256SUMS --ignore-missing` (macOS:
+  `shasum -a 256 -c SHA256SUMS --ignore-missing`). On Windows, run `Get-FileHash <file>`
+  in PowerShell and compare it with the file's line in `SHA256SUMS`.
+- **Where it was built:** with the GitHub CLI, run
+  `gh attestation verify <file> --repo AndreaZanellini/glyde`.
+
+Found a security problem? Report it privately from the repository's **Security** tab
+(**Report a vulnerability**), not in a public issue.
+
 ## This build is not signed yet — how to open it the first time
 
 Glyde is not yet signed with an Apple or Microsoft certificate, so your system warns you the first time you open it. This is expected for this release; the file is the one built by this repository's CI.
