@@ -1,0 +1,37 @@
+# cargo-about configuration for THIRD-PARTY-LICENSES.txt, the notices that
+# ship with every Glyde package. Regenerate with packaging/third-party/generate.sh.
+#
+# Licenses Glyde may use a dependency under, in order of preference: for a
+# crate offered under several (e.g. "MIT OR Apache-2.0") the first one listed
+# here is used. Apache-2.0 first, the license Glyde itself uses. Keep this
+# list in step with `[licenses] allow` in deny.toml.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+    "BSL-1.0",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+
+# The platforms Glyde ships on (docs/SPEC.md §7).
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+
+# Only what ends up in the binary users download: no build scripts' or tests'
+# dependencies, and not Glyde's own crates.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+private = { ignore = true }
+

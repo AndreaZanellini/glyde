@@ -29,6 +29,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+If `Cargo.lock` changed, regenerate the license notices that ship with every package
+(a test tells you when): `packaging/third-party/generate.sh`, which needs
+`cargo install cargo-about --locked --version 0.9.3 --features cli`.
+
 ## Tests are not optional
 
 - **Ingestion change** → add a file to `testdata/corpus/` with its `.expected.json`.
