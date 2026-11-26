@@ -75,6 +75,19 @@ history of every change follows below this summary.
     untouched on purpose.
 
 ### Security
+- **The build that makes the downloadable files is harder to tamper with
+  (issue #271).** Nothing changes in the app. Every outside GitHub Action CI
+  uses is now fixed to one exact commit, so nobody can swap it later behind a
+  version tag. One of them, the action that installs Rust, has no versions, so
+  it is fixed to the commit its `stable` branch pointed to on 2026-11-21. The AppImage tool is checked against its known
+  fingerprint before it runs. Each CI job gets only the permissions it
+  needs: only the release job, the one that publishes a release, may write to
+  the repository.
+  **To check:** CI runs green; a release dry run still builds the files for all
+  three systems.
+  - Patch applied by hand by the maintainer, as the CI files require. Before
+    that, the fixed versions were checked against their tags and the AppImage
+    tool's fingerprint against the one GitHub shows (2026-11-26).
 - **A library Glyde uses indirectly is updated to close a published advisory
   (RUSTSEC-2026-0592, issue #286).** `url` goes from 2.5.8 to 2.5.9. It comes in
   through the file dialog and the window toolkit; Glyde itself never reads URLs

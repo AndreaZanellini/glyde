@@ -11,8 +11,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Issue #233: least privilege. Only the job that publishes the Release
+# writes; it asks for that itself.
 permissions:
-  contents: write
+  contents: read
 
 defaults:
   run:
@@ -38,11 +40,12 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11-21
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install Linux GUI build deps
         if: runner.os == 'Linux'
         run: |
@@ -74,10 +77,13 @@ jobs:
         env:
           # Pinned appimagetool; extract-and-run because runners have no FUSE.
           APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          # Issue #233: the download is checked before it runs.
+          APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           mkdir -p "$RUNNER_TEMP/bin"
           curl -fsSL "$APPIMAGETOOL_URL" -o "$RUNNER_TEMP/bin/appimagetool"
+          echo "$APPIMAGETOOL_SHA256  $RUNNER_TEMP/bin/appimagetool" | sha256sum -c -
           chmod +x "$RUNNER_TEMP/bin/appimagetool"
           PATH="$RUNNER_TEMP/bin:$PATH" packaging/linux/package.sh target/${{ matrix.target }}/release/glyde "${{ steps.version.outputs.version }}" dist
 
@@ -104,7 +110,7 @@ jobs:
             echo "$f: $size bytes"
             [ "$size" -le 52428800 ] || { echo "::error::$f exceeds 50 MB budget"; exit 1; }
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: glyde-${{ matrix.target }}
           path: dist/*
@@ -115,9 +121,11 @@ jobs:
     # A dry run (workflow_dispatch) stops at the uploaded artifacts.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
       - name: Expect every SPEC §7 artifact
@@ -128,7 +136,7 @@ jobs:
             [ -n "$(find dist -type f -name "$pattern")" ] \
               || { echo "::error::missing release artifact $pattern"; exit 1; }
           done
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/**/*
           # Unsigned-build workaround steps and the maintainer's smoke-ritual
