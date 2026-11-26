@@ -9,6 +9,10 @@ on:
   # nothing unless every job here is green.
   workflow_call:
 
+# Issue #233: least privilege. No job here writes to the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -39,11 +43,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15, windows-latest]
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11-21
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       # Lint the headless crates on Linux. glyde-app (the egui/winit GUI) is not
       # built here: winit refuses to compile on a headless Linux runner, and the
@@ -55,9 +60,11 @@ jobs:
     name: Architecture guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11-21
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # glyde-core must never depend on any GUI crate. See docs/ARCHITECTURE.md.
       - name: Assert glyde-core has no GUI dependencies
         run: |
@@ -75,9 +82,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15, windows-latest]
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11-21
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Unit tests, golden DSP tests, torture-corpus tests, property tests.
       # Scoped to the headless crates so the suite runs identically on all three
       # OSes without needing a display server. GUI build/test is the `gui` job.
@@ -91,11 +100,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15, windows-latest]
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11-21
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # glyde-app needs a windowing backend to compile. On Linux that means the
       # X11/Wayland/GTK system libraries (the same set the release job installs).
       # Since #8 gave eframe the x11+wayland backends, glyde-app now builds on
@@ -138,15 +148,17 @@ jobs:
       # still exceeds the cap and keeps the gate meaningful.
       GLYDE_BENCH_FIXTURE_GB: "4"
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11-21
+        with:
+          toolchain: stable
       # rust-cache keys on Cargo.lock and only saves on a cache *miss*. When a
       # step that builds new dependencies is added (the glyde-app bench, which
       # pulls in the whole GUI tree) the old cache keeps matching and is never
       # refreshed, so those ~255 crates were rebuilt from scratch on every run.
       # Keying on this workflow file makes any change to the job's steps
       # produce a fresh cache.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ hashFiles('.github/workflows/ci.yml') }}
       - name: Report free disk before fixture generation
@@ -183,8 +195,8 @@ jobs:
     name: Licenses & advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
         with:
           # log-level info makes the advisory ID and crate visible in the log,
           # instead of a bare "advisories FAILED". If an advisory still fails
