@@ -114,9 +114,9 @@ history of every change follows below this summary.
   **To check:** after the next release dry run, download one file from its
   artifacts and run `gh attestation verify` on it: it says the attestation
   verified.
-  - Patch to apply by hand, as the CI files require: it is in this PR's
-    description. Until it is applied, the PR's tests are red on purpose:
-    they check that `release.yml` produces the checksums and the record.
+  - Patch applied by hand by the maintainer, as the CI files require. Tests
+    check that `release.yml` produces the checksums and the record, and
+    builds the release files with no cache.
 - **A security policy.** `SECURITY.md` explains how to report a security
   problem privately (the repository's Security tab → Report a
   vulnerability, also offered when someone opens a new issue), what counts as
