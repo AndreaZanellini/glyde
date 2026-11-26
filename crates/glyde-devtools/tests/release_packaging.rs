@@ -151,6 +151,38 @@ fn the_release_build_restores_no_cache() {
         !workflow.contains("rust-cache"),
         "release.yml must not restore a build cache"
     );
+
+/// The Windows installer runs only on the release runner, so its file list
+/// is checked here: Glyde's license and the third-party notices are
+/// installed next to glyde.exe. (The Linux and macOS packages are built for
+/// real in glyde-app's packaging tests.)
+#[test]
+fn the_windows_installer_installs_the_license_files() {
+    let iss = repo_file("packaging/windows/glyde.iss");
+    let files = iss
+        .split("[Files]")
+        .nth(1)
+        .and_then(|rest| rest.split("\n[").next())
+        .expect("glyde.iss has a [Files] section");
+    for file in ["LICENSE", "NOTICE", "THIRD-PARTY-LICENSES.txt"] {
+        assert!(
+            files.contains(&format!("Source: \"..\\..\\{file}\"; DestDir: \"{{app}}\"")),
+            "the installer must install {file}"
+        );
+    }
+}
+
+/// The portable `.exe` is one file with no folder around it, so its notices
+/// are a file of their own on the release page: the Linux job writes it into
+/// the release files, and the release notes say it is there.
+#[test]
+fn the_release_page_carries_the_notices_for_the_portable_exe() {
+    let script = repo_file("packaging/linux/package.sh");
+    assert!(script.contains(
+        "cp \"$root/THIRD-PARTY-LICENSES.txt\" \"$out/glyde-$version-third-party-licenses.txt\""
+    ));
+    let notes = repo_file("packaging/release-notes.md");
+    assert!(notes.contains("`glyde-<version>-third-party-licenses.txt`"));
 }
 
 #[test]

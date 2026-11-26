@@ -236,6 +236,16 @@ fn run_packaging(script: &str, stubs: &Path, out: &Path) {
     assert!(status.success(), "{script} failed");
 }
 
+/// `hdiutil create ... -srcfolder <dir> ... <dmg>`: keeps the staged folder
+/// instead of building a disk image.
+#[cfg(unix)]
+const HDIUTIL_STUB: &str = r#"src=""; prev=""; last=""
+for arg in "$@"; do
+  if [ "$prev" = "-srcfolder" ]; then src=$arg; fi
+  prev=$arg; last=$arg
+done
+cp -R "$src" "$last""#;
+
 /// `curl ... -o <path>`: writes stand-in bytes where the runtime should land,
 /// without touching the network.
 #[cfg(unix)]
@@ -281,6 +291,74 @@ cp -R "$3" "$4""#,
         assert_eq!(
             std::fs::read(&installed).unwrap_or_else(|e| panic!("{}: {e}", installed.display())),
             expected
+        );
+    }
+}
+
+/// The license files every package must carry: Glyde's own, and the notices
+/// of the open-source code compiled into it (MIT, BSD, OFL, … ask that their
+/// text travel with every copy of the binary).
+#[cfg(unix)]
+const LICENSE_FILES: [&str; 3] = ["LICENSE", "NOTICE", "THIRD-PARTY-LICENSES.txt"];
+
+#[cfg(unix)]
+#[test]
+fn the_linux_packages_carry_the_license_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stubs = tmp.path().join("bin");
+    std::fs::create_dir(&stubs).unwrap();
+    stub(&stubs, "curl", CURL_STUB);
+    stub(&stubs, "sha256sum", "cat > /dev/null");
+    stub(&stubs, "appimagetool", r#"cp -R "$3" "$4""#);
+    let out = tmp.path().join("out");
+    run_packaging("packaging/linux/package.sh", &stubs, &out);
+
+    let appdir = out.join("glyde-0.0.0-test-linux-x86_64.AppImage");
+    let unpacked = tmp.path().join("unpacked");
+    std::fs::create_dir(&unpacked).unwrap();
+    let untar = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(out.join("glyde-0.0.0-test-linux-x86_64.tar.gz"))
+        .arg("-C")
+        .arg(&unpacked)
+        .status()
+        .expect("tar runs");
+    assert!(untar.success());
+    let tarball = unpacked.join("glyde-0.0.0-test-linux-x86_64");
+    for file in LICENSE_FILES {
+        let expected = read(file);
+        let in_appimage = appdir.join("usr/share/doc/glyde").join(file);
+        assert_eq!(
+            std::fs::read(&in_appimage)
+                .unwrap_or_else(|e| panic!("{}: {e}", in_appimage.display())),
+            expected
+        );
+        assert_eq!(std::fs::read(tarball.join(file)).unwrap(), expected);
+    }
+    // The portable Windows .exe is a single file: the release page carries
+    // the notices next to it, written by this (once-per-release) job.
+    assert_eq!(
+        std::fs::read(out.join("glyde-0.0.0-test-third-party-licenses.txt")).unwrap(),
+        read("THIRD-PARTY-LICENSES.txt")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_macos_app_bundle_carries_the_license_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stubs = tmp.path().join("bin");
+    std::fs::create_dir(&stubs).unwrap();
+    stub(&stubs, "hdiutil", HDIUTIL_STUB);
+    stub(&stubs, "codesign", "exit 0");
+    let out = tmp.path().join("out");
+    run_packaging("packaging/macos/package.sh", &stubs, &out);
+
+    let resources = out.join("glyde-0.0.0-test-macos-arm64.dmg/Glyde.app/Contents/Resources");
+    for file in LICENSE_FILES {
+        assert_eq!(
+            std::fs::read(resources.join(file)).unwrap_or_else(|e| panic!("{file}: {e}")),
+            read(file)
         );
     }
 }
@@ -356,17 +434,7 @@ fn the_macos_app_bundle_carries_the_icns() {
     let tmp = tempfile::tempdir().unwrap();
     let stubs = tmp.path().join("bin");
     std::fs::create_dir(&stubs).unwrap();
-    // hdiutil create ... -srcfolder <dir> ... <dmg>: keep the staged folder.
-    stub(
-        &stubs,
-        "hdiutil",
-        r#"src=""; prev=""; last=""
-for arg in "$@"; do
-  if [ "$prev" = "-srcfolder" ]; then src=$arg; fi
-  prev=$arg; last=$arg
-done
-cp -R "$src" "$last""#,
-    );
+    stub(&stubs, "hdiutil", HDIUTIL_STUB);
     // codesign: absent on Linux, and on macOS it would refuse the stand-in
     // binary. The signing steps are checked in glyde-devtools'
     // release_packaging tests and on the real build in the release workflow.

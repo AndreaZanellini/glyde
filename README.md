@@ -130,3 +130,7 @@ attach it. Every file reported this way becomes a permanent test case.
 
 Apache License 2.0, see [`LICENSE`](LICENSE): anyone may use, change and redistribute
 Glyde. The license also includes an explicit patent grant.
+
+Glyde is built on open-source libraries and fonts. Their licenses are in
+[`THIRD-PARTY-LICENSES.txt`](THIRD-PARTY-LICENSES.txt), which also comes with every
+download.

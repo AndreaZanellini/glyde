@@ -14,12 +14,18 @@ mkdir -p "$out"
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 
+# The licenses of the open-source code compiled into Glyde travel with every
+# package (THIRD-PARTY-LICENSES.txt, packaging/third-party/generate.sh). The
+# portable Windows .exe is a single file, so the release page also carries
+# them on their own; this job, which runs once per release, writes that copy.
+cp "$root/THIRD-PARTY-LICENSES.txt" "$out/glyde-$version-third-party-licenses.txt"
+
 # Tarball: the binary plus the license files.
 tar_dir="$stage/glyde-$version-linux-x86_64"
 mkdir -p "$tar_dir"
 cp "$binary" "$tar_dir/glyde"
 chmod +x "$tar_dir/glyde"
-cp "$root/LICENSE" "$root/NOTICE" "$root/README.md" "$tar_dir/"
+cp "$root/LICENSE" "$root/NOTICE" "$root/THIRD-PARTY-LICENSES.txt" "$root/README.md" "$tar_dir/"
 tar -C "$stage" -czf "$out/glyde-$version-linux-x86_64.tar.gz" "glyde-$version-linux-x86_64"
 
 # AppImage.
@@ -27,6 +33,8 @@ appdir="$stage/Glyde.AppDir"
 mkdir -p "$appdir/usr/bin"
 cp "$binary" "$appdir/usr/bin/glyde"
 chmod +x "$appdir/usr/bin/glyde"
+mkdir -p "$appdir/usr/share/doc/glyde"
+cp "$root/LICENSE" "$root/NOTICE" "$root/THIRD-PARTY-LICENSES.txt" "$appdir/usr/share/doc/glyde/"
 cp "$here/glyde.desktop" "$appdir/glyde.desktop"
 # Issue #232: the icon at the AppDir root (named after the desktop entry's
 # Icon=) and as .DirIcon, per the AppImage spec; every size in the hicolor

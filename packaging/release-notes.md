@@ -10,6 +10,10 @@
 
 Nothing else to install: no runtime, no toolchain.
 
+Every package also contains Glyde's license and `THIRD-PARTY-LICENSES.txt`, the licenses of
+the open-source libraries and fonts inside Glyde. For the portable `.exe`, that file is
+here as `glyde-<version>-third-party-licenses.txt`.
+
 ## Check your download (optional)
 
 `SHA256SUMS` below lists every file's fingerprint, and each file has a signed record
