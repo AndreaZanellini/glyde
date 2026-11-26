@@ -282,6 +282,10 @@ for arg in "$@"; do
 done
 cp -R "$src" "$last""#,
     );
+    // codesign: absent on Linux, and on macOS it would refuse the stand-in
+    // binary. The signing steps are checked in glyde-devtools'
+    // release_packaging tests and on the real build in the release workflow.
+    stub(&stubs, "codesign", "exit 0");
     let out = tmp.path().join("out");
     run_packaging("packaging/macos/package.sh", &stubs, &out);
 
