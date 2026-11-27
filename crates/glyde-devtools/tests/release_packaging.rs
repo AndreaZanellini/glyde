@@ -24,7 +24,11 @@ fn repo_file(relative: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    // A Windows checkout turns `\n` into `\r\n`; the checks below are about
+    // the words and their order, not the line endings.
+    text.replace("\r\n", "\n")
 }
 
 #[test]
