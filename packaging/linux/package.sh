@@ -44,5 +44,16 @@ here=$(dirname "$(readlink -f "$0")")
 exec "$here/usr/bin/glyde" "$@"
 APPRUN
 chmod +x "$appdir/AppRun"
-ARCH=x86_64 appimagetool "$appdir" "$out/glyde-$version-linux-x86_64.AppImage" >/dev/null
+
+# The AppImage runtime is the small program at the front of the AppImage: the
+# first code that runs when a user opens it. Left to itself, appimagetool
+# downloads it from type2-runtime's moving `continuous` release at every
+# build, unchecked. Use a tagged release instead, check its SHA-256 (the
+# digest GitHub shows for that asset), and hand exactly that file over.
+runtime_url=https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+runtime_sha256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+runtime="$stage/runtime-x86_64"
+curl -fsSL "$runtime_url" -o "$runtime"
+echo "$runtime_sha256  $runtime" | sha256sum -c -
+ARCH=x86_64 appimagetool --runtime-file "$runtime" "$appdir" "$out/glyde-$version-linux-x86_64.AppImage" >/dev/null
 ls "$out"

@@ -79,6 +79,17 @@ history of every change follows below this summary.
     untouched on purpose.
 
 ### Security
+- **The Linux AppImage no longer starts with a piece downloaded unchecked.**
+  Every AppImage begins with a small program, the "runtime", which is the
+  first thing that runs when you open the file. The AppImage tool used to
+  download the newest one at every build, from a release that changes over
+  time, without checking it (seen in the v0.1.0 dry run log). The build now
+  uses the runtime of one fixed release (20251108), checks it against its
+  SHA-256 fingerprint (the one GitHub shows for that file), and stops if it
+  does not match. Tests run the packaging script and check that a runtime
+  with the wrong fingerprint never reaches the AppImage.
+  **To check:** the next release dry run builds the AppImage, and its log
+  shows `runtime-x86_64: OK` and no "Downloading runtime file" line.
 - **The build that makes the downloadable files is harder to tamper with
   (issue #271).** Nothing changes in the app. Every outside GitHub Action CI
   uses is now fixed to one exact commit, so nobody can swap it later behind a
