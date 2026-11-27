@@ -102,6 +102,28 @@ history of every change follows below this summary.
     untouched on purpose.
 
 ### Security
+- **You can check that a file you downloaded is the real one.** v0.1 is not
+  signed, so each release now also publishes a `SHA256SUMS` file with every
+  file's fingerprint, and a signed record, made by GitHub during the build,
+  showing that each file was built by this repository's CI from the released
+  source. The README and the release page explain both checks in two lines:
+  `sha256sum -c SHA256SUMS --ignore-missing` (or `shasum` on macOS,
+  `Get-FileHash` on Windows) and `gh attestation verify <file> --repo
+  AndreaZanellini/glyde`. The release files are now built from source with
+  no build cache carried over from earlier runs.
+  **To check:** after the next release dry run, download one file from its
+  artifacts and run `gh attestation verify` on it: it says the attestation
+  verified.
+  - Patch applied by hand by the maintainer, as the CI files require. Tests
+    check that `release.yml` produces the checksums and the record, and
+    builds the release files with no cache.
+- **A security policy.** `SECURITY.md` explains how to report a security
+  problem privately (the repository's Security tab → Report a
+  vulnerability, also offered when someone opens a new issue), what counts as
+  one, and that only the latest release gets fixes. On GitHub, secret
+  scanning, Dependabot alerts and private vulnerability reporting are now on.
+  **To check:** click New issue on GitHub: "Report a security vulnerability"
+  is in the list.
 - **The Linux AppImage no longer starts with a piece downloaded unchecked.**
   Every AppImage begins with a small program, the "runtime", which is the
   first thing that runs when you open the file. The AppImage tool used to

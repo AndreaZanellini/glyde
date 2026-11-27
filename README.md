@@ -40,6 +40,21 @@ is needed: no runtime, no toolchain.
 | Windows (x64) | `glyde-<version>-windows-x64-setup.exe` (installer) or `glyde-<version>-windows-x64.exe` (portable) |
 | Linux (x64) | `glyde-<version>-linux-x86_64.AppImage`, or the `.tar.gz` |
 
+### Check your download (optional)
+
+Every release also has a `SHA256SUMS` file, and a signed record showing that each file
+was built by this repository's CI from the released source. To check a file you
+downloaded:
+
+- **Its fingerprint:** download `SHA256SUMS` into the same folder and run
+  `sha256sum -c SHA256SUMS --ignore-missing` (macOS:
+  `shasum -a 256 -c SHA256SUMS --ignore-missing`). On Windows, run
+  `Get-FileHash <file>` in PowerShell and compare it with the file's line in `SHA256SUMS`.
+- **Where it was built:** with the [GitHub CLI](https://cli.github.com/), run
+  `gh attestation verify <file> --repo AndreaZanellini/glyde`.
+
+To report a security problem, see [`SECURITY.md`](SECURITY.md).
+
 ### The first time you open it
 
 Version 0.1 is **not signed** with an Apple or Microsoft certificate yet, so your system

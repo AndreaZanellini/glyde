@@ -24,7 +24,11 @@ fn repo_file(relative: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    // A Windows checkout turns `\n` into `\r\n`; the checks below are about
+    // the words and their order, not the line endings.
+    text.replace("\r\n", "\n")
 }
 
 #[test]
@@ -100,6 +104,56 @@ fn the_appimage_runtime_is_pinned_and_checked_before_it_is_used() {
     assert!(
         url < check && check < build,
         "download, then check, then build"
+    );
+}
+
+/// The builds are unsigned until v1.0 (docs/SPEC.md §7), so the release must
+/// let a user check what they downloaded: a `SHA256SUMS` file next to the
+/// packages, and a signed build provenance attestation for each of them,
+/// produced on every run (a dry run too, so a tag never exercises it first).
+#[test]
+fn the_release_publishes_checksums_and_signed_provenance() {
+    let workflow = repo_file(".github/workflows/release.yml");
+    let provenance = workflow
+        .find("\n  provenance:\n")
+        .expect("release.yml has a provenance job");
+    let release = workflow
+        .find("\n  release:\n")
+        .expect("release.yml has a release job");
+    assert!(
+        provenance < release,
+        "provenance runs before the release job"
+    );
+    let job = &workflow[provenance..release];
+    assert!(
+        !job.contains("if: startsWith(github.ref"),
+        "provenance also runs on a dry run"
+    );
+    for required in [
+        "id-token: write",
+        "attestations: write",
+        "sha256sum -- glyde-* > SHA256SUMS",
+        "uses: actions/attest@",
+        "subject-path: dist/glyde-*",
+    ] {
+        assert!(job.contains(required), "provenance job lacks {required:?}");
+    }
+    let publish = &workflow[release..];
+    assert!(publish.contains("needs: provenance"));
+    assert!(
+        publish.contains("files: dist/*"),
+        "SHA256SUMS is published with the packages"
+    );
+}
+
+/// What users download is built from the tagged source alone: no Rust build
+/// cache restored from an earlier run can end up in a release package.
+#[test]
+fn the_release_build_restores_no_cache() {
+    let workflow = repo_file(".github/workflows/release.yml");
+    assert!(
+        !workflow.contains("rust-cache"),
+        "release.yml must not restore a build cache"
     );
 }
 

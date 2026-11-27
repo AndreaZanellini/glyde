@@ -227,9 +227,28 @@ there.
   runs only at build time, inside the `wayland-scanner` proc-macro, never on
   user data. The other findings are "unmaintained" warnings (`chrono`,
   `chrono-tz`, `paste`, …) with no known vulnerability.
-- CI: pin every action by commit SHA, verify `appimagetool`'s checksum, and
-  give each job the least token permission it needs. These are workflow
-  edits, so they are a ready-to-paste patch for the maintainer: #271.
+- CI: every action is pinned by commit SHA, `appimagetool`'s checksum is
+  verified, and each job gets the least token permission it needs (#271,
+  applied by the maintainer, PR #290).
+- **Found and fixed (second pass, 2026-11-26):** `appimagetool` downloaded
+  the AppImage runtime, the first code that runs when a user opens the
+  AppImage, from type2-runtime's moving `continuous` release, unchecked, at
+  every build (visible in the dry run log). `packaging/linux/package.sh` now
+  pins the tagged `20251108` runtime, checks its SHA-256 and passes it with
+  `--runtime-file` (PR #293).
+- **Verifiable downloads.** The builds are unsigned until v1.0, so every
+  release carries a `SHA256SUMS` file and a signed build provenance
+  attestation for each package (`actions/attest`, Sigstore). Users check
+  them with `sha256sum -c` and `gh attestation verify` (README, release
+  notes). The job runs on dry runs too. Release builds restore no Rust cache:
+  only code merged to `main` could write one, but a release should not
+  depend on that.
+- **Repository settings (2026-11-26):** secret scanning with push
+  protection, Dependabot alerts and private vulnerability reporting are on.
+  `SECURITY.md` and the issue chooser send reports to the private advisory
+  form. Dependabot's automatic update PRs stay off: `cargo deny` in CI and
+  the alerts cover advisories, and every dependency change goes through a
+  reviewed PR.
 - Secret scan of the full git history (all 184 commits, every branch): a
   pattern scan of `git log -p` for cloud, GitHub, Slack, npm and AI-provider
   tokens, private-key blocks and `password=`/`token=`-style assignments, plus
