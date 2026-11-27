@@ -45,7 +45,8 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # No Rust cache here: a release is built from source alone, so nothing
+      # restored from an earlier run can end up in the files users download.
       - name: Install Linux GUI build deps
         if: runner.os == 'Linux'
         run: |
@@ -115,9 +116,51 @@ jobs:
           name: glyde-${{ matrix.target }}
           path: dist/*
 
+  # Runs on a dry run too, so the checksums and the provenance step are
+  # exercised before a real tag depends on them.
+  provenance:
+    name: Checksums & provenance
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Sign the build provenance with a short-lived Sigstore certificate, and
+      # store the attestation where `gh attestation verify` finds it.
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: glyde-*
+          path: dist
+          merge-multiple: true
+      - name: Expect every SPEC §7 artifact
+        run: |
+          find dist -type f | sort
+          for pattern in '*-macos-arm64.dmg' '*-windows-x64-setup.exe' '*-windows-x64.exe' \
+                         '*-linux-x86_64.AppImage' '*-linux-x86_64.tar.gz'; do
+            [ -n "$(find dist -type f -name "$pattern")" ] \
+              || { echo "::error::missing release artifact $pattern"; exit 1; }
+          done
+      # One line per file, bare file names, so a user can run `sha256sum -c`
+      # in the folder they downloaded to.
+      - name: Checksums (SHA256SUMS)
+        run: |
+          cd dist
+          sha256sum -- glyde-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/glyde-*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-files
+          path: dist/*
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: provenance
     # A dry run (workflow_dispatch) stops at the uploaded artifacts.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -127,18 +170,11 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
+          name: release-files
           path: dist
-      - name: Expect every SPEC §7 artifact
-        run: |
-          find dist -type f | sort
-          for pattern in '*-macos-arm64.dmg' '*-windows-x64-setup.exe' '*-windows-x64.exe' \
-                         '*-linux-x86_64.AppImage' '*-linux-x86_64.tar.gz'; do
-            [ -n "$(find dist -type f -name "$pattern")" ] \
-              || { echo "::error::missing release artifact $pattern"; exit 1; }
-          done
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: dist/**/*
+          files: dist/*
           # Unsigned-build workaround steps and the maintainer's smoke-ritual
           # reminder (docs/SPEC.md §7, CLAUDE.md §Release checklist), followed
           # by the generated commit list.
