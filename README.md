@@ -113,5 +113,5 @@ attach it. Every file reported this way becomes a permanent test case.
 
 ## License
 
-Apache License 2.0, see [`LICENSE`](LICENSE). It includes an explicit patent grant, which
-is what makes Glyde adoptable inside the industrial R&D organizations its users work for.
+Apache License 2.0, see [`LICENSE`](LICENSE): anyone may use, change and redistribute
+Glyde. The license also includes an explicit patent grant.

@@ -50,6 +50,10 @@ history of every change follows below this summary.
     day this was prepared; it must be set to the day you tag.
 
 ### Documentation
+- **The README's License section says plainly what the license allows:**
+  anyone may use, change and redistribute Glyde, and the license includes an
+  explicit patent grant.
+  **To check:** the README's License section, at the bottom.
 - **A README and a user guide written for you, not for developers (issue
   #234).** The README now has a screenshot of the app, how to install it on each
   system (including the one-time step for this unsigned build), first steps,
