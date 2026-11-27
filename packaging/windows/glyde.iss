@@ -28,6 +28,7 @@ UninstallDisplayIcon={app}\glyde.exe
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "glyde.exe"
 Source: "..\..\LICENSE"; DestDir: "{app}"
 Source: "..\..\NOTICE"; DestDir: "{app}"
+Source: "..\..\THIRD-PARTY-LICENSES.txt"; DestDir: "{app}"
 
 [Icons]
 Name: "{group}\Glyde"; Filename: "{app}\glyde.exe"

@@ -34,6 +34,29 @@ history of every change follows below this summary.
   flagged yet (v0.2), and a few input corners are open issues.
 
 ### Release
+- **Every download now carries the licenses of the open-source code inside
+  Glyde.** Glyde is built on 380-odd open-source libraries and three fonts.
+  Their licenses (MIT, BSD, Apache-2.0, the font licenses and a few more) ask
+  that their copyright and license text come with every copy of the app. Until
+  now only Glyde's own license was in some of the packages. A new file,
+  `THIRD-PARTY-LICENSES.txt`, lists every library and font with the license
+  it is used under, followed by the full text. It is now in every package:
+  - inside the Mac app, next to `LICENSE` and `NOTICE` (in
+    `Glyde.app/Contents/Resources`);
+  - in the Windows installer's folder;
+  - in the Linux AppImage and tarball;
+  - and, for the portable Windows `.exe`, on the release page as
+    `glyde-<version>-third-party-licenses.txt`.
+
+  The README links it. The file is generated from `Cargo.lock` with
+  `cargo-about` (`packaging/third-party/generate.sh`). A test fails when a
+  dependency update leaves it out of date, and says how to regenerate it.
+  **To check:** the next release dry run's artifacts contain the file in each
+  package; open it in a text editor.
+  - Two license texts in it have no copyright line ("Copyright (c) <year>
+    <copyright holders>"). Those crates (the `objc2`/`block2` family for macOS,
+    and `wayland-protocols-plasma`) ship no license file of their own, so the
+    standard MIT text stands in, as it does on crates.io.
 - **The v0.1.0 release page and this section are prepared (issue #235).** The
   CHANGELOG now has this `[0.1.0]` section and an `[Unreleased]` one above it
   for what comes after the release. The release page that GitHub

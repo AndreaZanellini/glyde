@@ -10,6 +10,10 @@
 
 Nothing else to install: no runtime, no toolchain.
 
+Every package also contains Glyde's license and `THIRD-PARTY-LICENSES.txt`, the licenses of
+the open-source libraries and fonts inside Glyde. For the portable `.exe`, that file is
+here as `glyde-<version>-third-party-licenses.txt`.
+
 ## This build is not signed yet — how to open it the first time
 
 Glyde is not yet signed with an Apple or Microsoft certificate, so your system warns you the first time you open it. This is expected for this release; the file is the one built by this repository's CI.

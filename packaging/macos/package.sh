@@ -9,6 +9,7 @@ binary=$1
 version=$2
 out=$3
 here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/../.." && pwd)
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
@@ -19,6 +20,8 @@ chmod +x "$app/Contents/MacOS/glyde"
 sed "s/__VERSION__/$version/g" "$here/Info.plist" > "$app/Contents/Info.plist"
 # Issue #232: the Dock and Finder icon, named by CFBundleIconFile.
 cp "$here/Glyde.icns" "$app/Contents/Resources/Glyde.icns"
+# Glyde's license, and those of the open-source code compiled into it.
+cp "$root/LICENSE" "$root/NOTICE" "$root/THIRD-PARTY-LICENSES.txt" "$app/Contents/Resources/"
 # Drag-to-install: the usual Applications shortcut next to the app.
 ln -s /Applications "$stage/Applications"
 
